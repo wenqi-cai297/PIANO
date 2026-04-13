@@ -1,0 +1,53 @@
+# Stage B: Motion Generator finetune config
+# Finetunes MoMask masked transformer with interaction cross-attention
+
+model:
+  config: configs/model/motion_generator.yaml
+  predictor_config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "openai/clip-vit-large-patch14"
+  freeze_text_encoder: true
+  freeze_predictor: true
+  freeze_vq_vae: true           # keep MoMask VQ-VAE frozen
+  momask_checkpoint: "checkpoints/momask_humanml3d.pth"  # pretrained MoMask weights
+
+data:
+  datasets:
+    - name: "interact"
+      root: "data/interact"
+    - name: "omomo"
+      root: "data/omomo"
+  pseudo_label_dir: "runs/pseudo_labels"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 30
+
+training:
+  batch_size: 64
+  num_epochs: 80
+  optimizer:
+    name: "adamw"
+    lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  # Classifier-free guidance training
+  uncond_prob: 0.1          # probability of dropping interaction condition
+  guidance_scale: 7.5       # inference-time guidance scale
+
+loss:
+  mask_prediction_weight: 1.0   # MoMask's masked token prediction loss
+  velocity_smoothness_weight: 0.01
+
+logging:
+  project: "piano"
+  run_name: "generator"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/generator"

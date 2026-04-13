@@ -1,0 +1,39 @@
+[project]
+name = "piano"
+version = "0.1.0"
+description = "PIANO: Physically-Informed Adaptive iNteraction Orchestration — Object-adaptive human motion generation via structured interaction latents"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "accelerate",
+    "transformers",
+    "diffusers",
+    "einops",
+    "omegaconf",
+    "trimesh",
+    "smplx",
+    "scipy",
+    "scikit-learn",
+    "hmmlearn",
+    "tqdm",
+    "numpy",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+viz = ["matplotlib", "open3d"]
+dev = ["pytest"]
+
+[project.scripts]
+piano-train = "piano.training.trainer:main"
+piano-eval = "piano.evaluation.motion_metrics:main"
+piano-generate = "piano.inference.generate:main"
+piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"

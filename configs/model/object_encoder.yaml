@@ -1,0 +1,22 @@
+# Object Encoder config (PointNet++ wrapper)
+
+pointnet:
+  num_input_points: 1024    # FPS-sampled points from object mesh
+  input_channels: 3         # xyz (can extend with normals -> 6)
+  num_output_tokens: 16     # number of object tokens output
+  feature_dim: 512          # per-token feature dimension
+
+  # PointNet++ set abstraction layers
+  sa_layers:
+    - num_points: 256
+      radius: 0.1
+      num_samples: 32
+      mlp_channels: [64, 64, 128]
+    - num_points: 64
+      radius: 0.2
+      num_samples: 64
+      mlp_channels: [128, 128, 256]
+    - num_points: 16
+      radius: 0.4
+      num_samples: 128
+      mlp_channels: [256, 256, 512]

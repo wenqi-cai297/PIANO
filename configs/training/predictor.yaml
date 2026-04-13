@@ -1,0 +1,52 @@
+# Stage A: Interaction Predictor training config
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "openai/clip-vit-large-patch14"
+  freeze_text_encoder: true
+
+data:
+  datasets:
+    - name: "interact"
+      root: "data/interact"
+    - name: "omomo"
+      root: "data/omomo"
+  pseudo_label_dir: "runs/pseudo_labels"
+  motion_repr: "humanml3d"    # 263-dim
+  max_seq_length: 196
+  fps: 30
+
+training:
+  batch_size: 64
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+loss:
+  contact_weight: 1.0
+  target_weight: 0.5
+  phase_weight: 0.5
+  support_weight: 0.5
+
+priors:
+  reachability_weight: 0.1
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.05
+
+logging:
+  project: "piano"
+  run_name: "predictor"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor"

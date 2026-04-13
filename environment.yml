@@ -1,0 +1,27 @@
+name: piano
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch>=2.0
+    - torchvision
+    - accelerate
+    - transformers
+    - diffusers
+    - einops
+    - omegaconf
+    - trimesh
+    - smplx
+    - scipy
+    - scikit-learn
+    - hmmlearn
+    - open3d
+    - matplotlib
+    - tqdm
+    - wandb
+    - numpy

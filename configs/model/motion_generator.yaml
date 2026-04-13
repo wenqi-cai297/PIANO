@@ -1,0 +1,56 @@
+# Motion Generator architecture config
+# Based on MoMask (CVPR 2024) masked transformer with interaction cross-attention
+
+# --- MoMask Residual VQ-VAE (pretrained, frozen or lightly finetuned) ---
+vq_vae:
+  input_dim: 263                # HumanML3D motion feature dim
+  nb_code: 512                  # codebook size per quantizer
+  code_dim: 512                 # code embedding dimension
+  output_dim: 263
+  down_t: 2                     # temporal downsampling factor
+  stride_t: 2
+  depth: 3                      # number of residual blocks
+  dilation_growth_rate: 3
+  num_quantizers: 2             # base + 1 residual level
+
+# --- MoMask Masked Transformer (main generation model) ---
+masked_transformer:
+  num_layers: 8
+  d_model: 512
+  num_heads: 8
+  dim_feedforward: 2048
+  dropout: 0.1
+  num_tokens: 512               # codebook size (must match vq_vae.nb_code)
+  max_seq_length: 49            # after VQ temporal downsampling (196 / 4)
+
+  # Text conditioning (original MoMask)
+  text_dim: 768                 # CLIP ViT-L/14 output dim
+  text_cross_attn: true
+
+  # Interaction conditioning (our addition)
+  interaction_cross_attn:
+    enabled: true
+    d_model: 512
+    num_heads: 8
+    dropout: 0.1
+    zero_init: true             # preserve pretrained weights at init
+
+# --- MoMask Residual Transformer ---
+residual_transformer:
+  num_layers: 4
+  d_model: 512
+  num_heads: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+
+# --- Generation config ---
+generation:
+  num_iterations: 10            # iterative unmasking steps
+  temperature: 1.0              # sampling temperature
+  mask_schedule: "cosine"       # masking ratio schedule across iterations
+
+# --- Motion representation ---
+motion:
+  repr_dim: 263                 # HumanML3D 263-dim
+  num_joints: 22                # SMPL joints
+  fps: 30

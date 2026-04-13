@@ -1,0 +1,29 @@
+# Interaction Predictor architecture config
+# Temporal Transformer that predicts structured interaction latents
+
+encoder:
+  num_layers: 6
+  d_model: 512
+  num_heads: 8
+  dim_feedforward: 2048
+  dropout: 0.1
+
+object_encoder:
+  # PointNet++ config
+  num_input_points: 1024
+  num_output_tokens: 16
+  feature_dim: 512
+
+input:
+  text_dim: 768           # CLIP ViT-L/14 output dim
+  pose_dim: 263           # HumanML3D representation dim
+
+output:
+  num_body_parts: 5       # left_hand, right_hand, left_foot, right_foot, pelvis
+  num_object_patches: 16  # FPS-sampled surface patches
+  num_phases: 5           # approach, pre-contact, stable-contact, manipulation, release
+  num_support_states: 4   # both_feet, single_foot, sitting, hand_support
+
+sequence:
+  max_length: 196         # max frames (~6.5 sec @ 30fps)
+  fps: 30

@@ -1,4 +1,5 @@
-# PhysInteract: Object-Adaptive Human Motion Generation via Structured Interaction Latents
+# PIANO: Object-Adaptive Human Motion Generation via Structured Interaction Latents
+# (Physically-Informed Adaptive iNteraction Orchestration)
 
 ## Project Specification
 
@@ -89,10 +90,19 @@ The interaction latent `z_int` consists of per-frame structured variables:
 | Component | Choice | Source |
 |-----------|--------|--------|
 | Text encoder | CLIP ViT-L/14 | OpenAI CLIP (frozen) |
-| Motion backbone | MLD (Motion Latent Diffusion) | [github.com/ChenFengYe/motion-latent-diffusion](https://github.com/ChenFengYe/motion-latent-diffusion) |
-| Motion VAE | MLD pretrained VAE | MLD checkpoint |
+| Motion backbone | **MoMask** (CVPR 2024, FID=0.045) | [github.com/EricGuo5513/momask-codes](https://github.com/EricGuo5513/momask-codes) |
+| Motion tokenizer | MoMask Residual VQ-VAE | MoMask pretrained checkpoint |
 | Body model | SMPL (22 joints) | [smplx](https://github.com/vchoutas/smplx) library |
-| Motion representation | HumanML3D 263-dim | MLD built-in |
+| Motion representation | HumanML3D 263-dim | MoMask built-in |
+
+**Why MoMask over MLD:** MoMask achieves FID=0.045 vs MLD's 0.473 (10× better) on HumanML3D. It has 1.3k+ GitHub stars, clean codebase, and pretrained weights available. Using MoMask as backbone ensures our baseline performance is near SOTA, so improvements from interaction conditioning are measured against a strong foundation.
+
+**MoMask architecture summary:**
+1. **Residual VQ-VAE**: encodes 263-dim motion → discrete token sequence at two levels (base + residual)
+2. **Masked Transformer**: iteratively predicts masked tokens conditioned on text (CLIP cross-attention)
+3. **Residual Transformer**: refines base tokens with residual-level detail
+
+**Our modification:** inject interaction cross-attention into MoMask's masked transformer, parallel to the existing text cross-attention. The interaction tokens (from our predictor) are attended to at each transformer layer, guiding which motion tokens are unmasked and what values they take.
 
 ### 4.2 Trainable Components
 
@@ -100,7 +110,7 @@ The interaction latent `z_int` consists of per-frame structured variables:
 |-----------|-------------|-----------------|
 | Object encoder | PointNet++ (PyTorch3D) | ~2M |
 | Interaction predictor | Temporal Transformer (L=6, d=512) | ~25M |
-| Interaction cross-attention (added to MLD denoiser) | Cross-attention layers | ~5M |
+| Interaction cross-attention (added to MoMask masked transformer) | Cross-attention layers | ~5M |
 | Interaction extractor (for consistency loss) | Lightweight Transformer (L=3, d=256) | ~5M |
 
 ### 4.3 Libraries & Tools
@@ -115,7 +125,7 @@ The interaction latent `z_int` consists of per-frame structured variables:
 | Signal processing | scipy (median_filter, savgol_filter) |
 | Phase refinement | hmmlearn |
 | Surface clustering | scikit-learn (KMeans) / Open3D (FPS) |
-| Diffusion scheduling | diffusers (DDPMScheduler / DDIMScheduler) or standalone implementation |
+| Motion tokenization | MoMask Residual VQ-VAE (pretrained) |
 | Evaluation | Custom (based on HumanML3D eval protocol) |
 | Logging | wandb |
 | Config | OmegaConf (yaml configs) |
@@ -128,7 +138,7 @@ We use HuggingFace Accelerate instead of PyTorch Lightning for the following rea
 - **Lighter weight**: no complex callback/hook system, just a thin wrapper around native PyTorch training loops
 - **Mixed precision**: built-in bf16/fp16 support via one config flag
 - **Gradient accumulation**: built-in support, useful when batch size is limited by VRAM
-- **MLD decoupling**: since we extract MLD's VAE and denoiser as standalone modules (not using MLD's Lightning training loop), Accelerate gives us full control over the training loop
+- **MoMask decoupling**: since we extract MoMask's VQ-VAE and transformers as standalone modules, Accelerate gives us full control over the training loop
 
 Usage pattern:
 ```python
@@ -165,20 +175,20 @@ accelerate launch --multi_gpu training/train_predictor.py --config configs/predi
 
 | Dataset | Role | Content |
 |---------|------|---------|
-| HumanML3D | Motion prior pretraining (use MLD pretrained weights) | 14k text-motion pairs, SMPL 22 joints |
+| HumanML3D | Motion prior pretraining (use MoMask pretrained weights) | 14k text-motion pairs, SMPL 22 joints |
 | InterAct (CVPR 2025) | Primary HOI training data + pseudo-label extraction | 30.7h, standardized HOI, SMPL-X |
 | OMOMO (SIGGRAPH Asia 2023) | Supplementary HOI data | 10h, 15 objects, SMPL-X |
 | GRAB (ECCV 2020) | Fine-grained hand-object contact supervision | 51 objects, SMPL-X with hands |
 
 ### 5.2 Data Preprocessing
 
-SMPL-X data from InterAct/OMOMO/GRAB must be **downsampled to SMPL 22 joints** to align with MLD's HumanML3D motion representation. This is a lossy conversion (hand fingers are dropped) but enables full reuse of MLD pretrained weights.
+SMPL-X data from InterAct/OMOMO/GRAB must be **downsampled to SMPL 22 joints** to align with MoMask's HumanML3D motion representation. This is a lossy conversion (hand fingers are dropped) but enables full reuse of MoMask pretrained weights.
 
 Pipeline:
 1. Load SMPL-X sequences
 2. Extract 22 SMPL joint positions + root orientation
 3. Convert to HumanML3D 263-dim format (root velocity, joint positions, joint velocities, foot contact)
-4. Normalize using HumanML3D statistics (mean/std from MLD)
+4. Normalize using HumanML3D statistics (mean/std from MoMask)
 
 ---
 
@@ -280,28 +290,69 @@ Outputs (per frame):
   support_head:  Linear(512, S)     -> softmax  -> support_state   [T, S]
 ```
 
-### 7.2 Conditioned Motion Generator (Modified MLD)
+### 7.2 Conditioned Motion Generator (Modified MoMask)
 
-Modifications to MLD's denoiser (a Transformer-based network):
+MoMask uses a two-stage architecture: (1) Residual VQ-VAE tokenizes motion into
+discrete tokens, (2) Masked Transformer iteratively predicts masked tokens.
+We modify **only the Masked Transformer**, keeping VQ-VAE and Residual Transformer frozen.
 
+**MoMask Masked Transformer — original architecture:**
 ```
-Original MLD denoiser:
-  Input:  noisy_latent_z + timestep_emb
-  Cond:   text_emb via cross-attention
-  Output: predicted noise / denoised latent
-
-Our modification — add interaction cross-attention:
-  For each Transformer block in denoiser:
-    1. self-attention(z)                         # original
-    2. cross-attention(z, text_emb)              # original
-    3. cross-attention(z, interaction_tokens)     # NEW: attend to z_int
-    4. feedforward(z)                            # original
-
-  interaction_tokens = MLP(concat(contact_state, contact_target, phase, support))
-                     -> [T, d_model]
+Input:  partially masked VQ token sequence [S] (S ≈ 49 tokens for 196 frames)
+Cond:   text_emb via cross-attention (CLIP)
+Output: predicted token logits for masked positions
 ```
 
-Interaction tokens are projected to match MLD's hidden dimension and injected via standard cross-attention with separate learned Q/K/V projections.
+**Our modification — add interaction cross-attention:**
+```
+For each Transformer block in Masked Transformer:
+    1. self-attention(tokens)                         # original
+    2. cross-attention(tokens, text_emb)              # original
+    3. cross-attention(tokens, interaction_tokens)     # NEW: attend to z_int
+    4. feedforward(tokens)                            # original
+```
+
+**Temporal alignment:** The interaction predictor outputs per-frame latents (T=196),
+but MoMask tokens are temporally downsampled (S≈49). We align via a learnable
+1D convolution:
+```
+interaction_latent [T, d]  -->  Conv1d(stride=4, kernel=4)  -->  [S, d_model]
+```
+
+**Interaction token construction:**
+```
+z_int = {contact_state [T,5], contact_target [T,5,K], phase [T,P], support [T,S]}
+interaction_tokens = MLP(concat(flatten(z_int)))  -->  [T, d]
+interaction_tokens = temporal_conv(interaction_tokens)  -->  [S, d_model]
+```
+
+The new cross-attention layers use **zero-initialized output projections** so that
+at initialization, the model behaves identically to pretrained MoMask.
+
+**Classifier-free guidance (dual-condition):**
+During training, we randomly drop conditions:
+- 10% probability: drop both text + interaction (fully unconditional)
+- 10% probability: drop only interaction (text-only, like original MoMask)
+- 80% probability: full conditioning
+
+At inference, dual-condition guidance:
+```
+logits = logits_uncond
+       + scale_text * (logits_text_only - logits_uncond)
+       + scale_int  * (logits_full - logits_text_only)
+```
+This allows independent control of text and interaction guidance strength.
+
+**What is frozen vs trainable:**
+
+| Component | Status |
+|-----------|--------|
+| MoMask VQ-VAE (tokenizer) | Frozen |
+| MoMask Residual Transformer | Frozen |
+| MoMask Masked Transformer (original layers) | Finetuned (low LR) |
+| Interaction cross-attention layers (new) | Trained from scratch |
+| Temporal alignment conv | Trained from scratch |
+| Interaction token MLP | Trained from scratch |
 
 ### 7.3 Interaction Extractor (for consistency loss)
 
@@ -321,10 +372,10 @@ Trained jointly during Stage 4 to enforce that generated motion is consistent wi
 
 | Stage | What | Data | Trainable | Duration (1x A100) |
 |-------|------|------|-----------|---------------------|
-| 0 | Download MLD pretrained weights | - | - | - |
+| 0 | Download MoMask pretrained weights | - | - | - |
 | 1 | Pseudo-label extraction | InterAct + OMOMO + GRAB | - (CPU only) | ~hours |
 | 2 | Train Interaction Predictor | HOI data + pseudo-labels | Predictor + Object Encoder | 1-2 days |
-| 3 | Train Conditioned Generator | HOI data + pred/GT z_int | MLD denoiser (finetune) + cross-attn layers | 2-3 days |
+| 3 | Train Conditioned Generator | HOI data + pred/GT z_int | MoMask Masked Transformer (finetune) + interaction cross-attn layers | 2-3 days |
 | 4 | Joint finetune + consistency | HOI data | All trainable + Extractor | 1-2 days |
 
 ### 8.2 Loss Functions
@@ -343,9 +394,13 @@ Initial lambdas: `lambda_c=1.0, lambda_t=0.5, lambda_p=0.5, lambda_s=0.5`
 **Stage 3 — Motion Generator:**
 
 ```
-L_generator = L_diffusion                                        # MLD's standard DDPM loss
-            + lambda_smooth * L_velocity_smoothness              # acceleration penalty
+L_generator = L_mask_pred                                        # MoMask's masked token prediction CE loss
+            + lambda_smooth * L_velocity_smoothness              # acceleration penalty on decoded motion
 ```
+
+The masked prediction loss is cross-entropy between predicted token logits and
+ground-truth VQ tokens at the masked positions — identical to MoMask's original
+training objective, but now the transformer also attends to interaction tokens.
 
 **Stage 4 — Joint Finetune:**
 
@@ -363,16 +418,17 @@ L_joint = L_predictor
 |-----------|-------|
 | Optimizer | AdamW |
 | Learning rate (Predictor) | 1e-4 |
-| Learning rate (Generator finetune) | 5e-5 |
+| Learning rate (Generator finetune — original layers) | 5e-5 |
+| Learning rate (Generator — new interaction layers) | 1e-4 |
 | LR scheduler | Cosine annealing with warmup (1000 steps) |
 | Batch size (per GPU) | 64 (A100) / 32 (3090) |
 | Gradient accumulation steps | 2 (effective batch = per_gpu × num_gpu × accum) |
-| Sequence length | 60-120 frames (2-4 sec @ 30fps) |
-| Diffusion steps (train) | 1000 |
-| Diffusion steps (inference) | 50 (DDIM) |
-| Classifier-free guidance | p_uncond=0.1, guidance_scale=7.5 |
+| Sequence length | 196 frames (~6.5 sec @ 30fps) |
+| MoMask mask ratio (train) | cosine schedule, 50%-100% per iteration |
+| MoMask unmasking iterations (inference) | 10 |
+| Classifier-free guidance | p_uncond_all=0.1, p_uncond_int=0.1, scale_text=4.5, scale_int=2.0 |
 | Mixed precision (Accelerate) | bf16 |
-| Gradient checkpointing | Enabled for Generator |
+| Gradient checkpointing | Enabled for Masked Transformer |
 
 ### 8.4 Accelerate Configuration
 
@@ -432,39 +488,67 @@ L_phase_mono = mean(backward) * lambda_phase
 ## 10. Inference Pipeline
 
 ```
-Input: text_prompt, object_point_cloud, initial_pose
+Input: text_prompt, object_point_cloud, initial_pose, seq_length
 
 Step 1: Encode inputs
-  text_emb = CLIP.encode(text_prompt)
-  obj_tokens = PointNetPP(object_point_cloud)
-  pose_emb = MLP(initial_pose)
+  text_emb = CLIP.encode(text_prompt)                         # [768]
+  obj_tokens = PointNetPP(object_point_cloud)                 # [M, 512]
+  pose_emb = MLP(initial_pose)                                # [512]
 
 Step 2: Predict interaction latent
   z_int = InteractionPredictor(text_emb, obj_tokens, pose_emb)
   # z_int = {contact_state, contact_target, phase, support}  [T, ...]
 
-Step 3: Generate motion
-  interaction_tokens = MLP(flatten(z_int))
-  motion_latent = MLD.sample(
-      conditions=[text_emb, interaction_tokens],
-      num_steps=50,  # DDIM
-      guidance_scale=7.5
-  )
-  motion = MLD.decode(motion_latent)
+Step 3: Prepare interaction tokens for MoMask
+  interaction_tokens = MLP(flatten(z_int))                    # [T, d]
+  interaction_tokens = temporal_conv(interaction_tokens)       # [S, d_model]
+  # S ≈ T/4 after VQ temporal downsampling
 
-Step 4: Post-process (optional)
-  # Standard: root trajectory integration, FK to get joint positions
-  # No heavy IK or physics post-processing needed
+Step 4: MoMask iterative unmasking with dual-condition guidance
+  tokens = fully_masked_sequence(length=S)
+
+  for i in range(num_iterations):   # ~10 iterations
+      mask_ratio = cosine_schedule(i, num_iterations)
+
+      # Three forward passes for dual-condition CFG
+      logits_uncond = MaskedTransformer(tokens, cond=None, interaction=None)
+      logits_text   = MaskedTransformer(tokens, cond=text_emb, interaction=None)
+      logits_full   = MaskedTransformer(tokens, cond=text_emb, interaction=interaction_tokens)
+
+      # Dual-condition guidance
+      logits = logits_uncond
+             + scale_text * (logits_text - logits_uncond)
+             + scale_int  * (logits_full - logits_text)
+
+      # Sample tokens, keep most confident, re-mask the rest
+      sampled = sample_from_logits(logits, temperature)
+      confidence = logits.max(dim=-1).values
+      num_to_unmask = round((1 - mask_ratio) * S)
+      top_k_indices = confidence.topk(num_to_unmask).indices
+      tokens[top_k_indices] = sampled[top_k_indices]
+
+Step 5: Decode VQ tokens to motion
+  base_motion = VQ_VAE.decode(tokens)                         # base level
+  residual = ResidualTransformer.predict(tokens, text_emb)
+  refined_tokens = tokens + residual
+  motion_263 = VQ_VAE.decode(refined_tokens)                  # [T, 263]
+
+Step 6: Post-process
+  # Denormalize using HumanML3D mean/std
+  # Convert to SMPL joint positions via FK
 
 Output: motion_sequence [T, 263] in HumanML3D format
         -> can be converted to SMPL mesh via smplx
 ```
 
+Inference for a single sample takes ~0.5s (10 unmasking iterations × 3 forward passes,
+but each pass is fast since the token sequence is only ~49 tokens long).
+
 ---
 
 ## 11. Evaluation
 
-### 11.1 Standard Motion Metrics (from MLD eval)
+### 11.1 Standard Motion Metrics (HumanML3D eval protocol)
 
 | Metric | Measures |
 |--------|----------|
@@ -528,8 +612,8 @@ Train on a subset of objects, test on held-out objects with known attributes. Re
 
 | Baseline | Description | What comparison shows |
 |----------|-------------|----------------------|
-| MLD (text-only) | No object or interaction information | Value of object-aware generation |
-| MLD + object concat | Object features concatenated to text, no interaction latent | Value of structured latent vs. naive conditioning |
+| MoMask (text-only) | No object or interaction information | Value of object-aware generation |
+| MoMask + object concat | Object features concatenated to text, no interaction latent | Value of structured latent vs. naive conditioning |
 | CG-HOI | Contact-guided HOI generation | Value of temporal structure beyond contact |
 | Text2HOI | Contact map then conditioned generation | Value of phase/support beyond contact |
 | Move as You Say (if applicable) | Affordance map as intermediate | Value of temporal interaction latent vs. spatial affordance |
@@ -546,7 +630,7 @@ Train on a subset of objects, test on held-out objects with known attributes. Re
 ## 12. Project Structure
 
 ```
-physinteract/                            # Repository root
+piano/                            # Repository root
 │
 ├── SPEC.md                              # This specification document
 ├── README.md                            # (create when ready to release)
@@ -562,11 +646,11 @@ physinteract/                            # Repository root
 │   │   └── joint_finetune.yaml          # Joint finetune hparams
 │   └── model/
 │       ├── interaction_predictor.yaml   # Predictor architecture config
-│       ├── motion_generator.yaml        # Modified MLD denoiser config
+│       ├── motion_generator.yaml        # Modified MoMask masked transformer config
 │       └── object_encoder.yaml          # PointNet++ config
 │
 ├── src/                                 # Installable Python package
-│   └── physinteract/
+│   └── piano/
 │       ├── __init__.py                  # Package version
 │       │
 │       ├── data/                        # Data processing & datasets
@@ -587,10 +671,10 @@ physinteract/                            # Repository root
 │       │   ├── __init__.py
 │       │   ├── interaction_predictor.py # Temporal Transformer predictor
 │       │   ├── object_encoder.py        # PointNet++ wrapper (PyTorch3D)
-│       │   ├── interaction_cross_attn.py # Cross-attn layer for MLD denoiser
+│       │   ├── interaction_cross_attn.py # Cross-attn layer for MoMask masked transformer
 │       │   ├── interaction_extractor.py # Lightweight extractor (consistency)
-│       │   ├── motion_generator.py      # MLD VAE + modified denoiser
-│       │   └── diffusion.py             # DDPM / DDIM scheduling utilities
+│       │   ├── motion_generator.py      # MoMask VQ-VAE + modified masked transformer
+│       │   └── masking.py               # Mask scheduling and iterative unmasking
 │       │
 │       ├── training/                    # Training logic (Accelerate-based)
 │       │   ├── __init__.py
@@ -623,7 +707,7 @@ physinteract/                            # Repository root
 │   │   └── download_datasets.sh         # Download InterAct, OMOMO, GRAB
 │   ├── server/
 │   │   ├── setup_env.sh                 # Environment setup on new server
-│   │   ├── download_mld_weights.sh      # Fetch MLD pretrained checkpoints
+│   │   ├── download_momask_weights.sh    # Fetch MoMask pretrained checkpoints
 │   │   ├── run_pseudo_labels.sh         # Full pseudo-label extraction
 │   │   ├── run_train_predictor.sh       # accelerate launch wrapper
 │   │   ├── run_train_generator.sh       # accelerate launch wrapper
@@ -656,7 +740,7 @@ The project is a standard setuptools package. Editable install for development:
 pip install -e ".[wandb]"
 ```
 
-This makes `physinteract` importable everywhere and registers CLI entrypoints.
+This makes `piano` importable everywhere and registers CLI entrypoints.
 
 ### 12.2 Code Conventions
 
@@ -683,7 +767,7 @@ Following the patterns established in the 2026-03-25 reference project:
 ### 13.1 environment.yml
 
 ```yaml
-name: physinteract
+name: piano
 channels:
   - pytorch
   - nvidia
@@ -715,7 +799,7 @@ dependencies:
 
 ```toml
 [project]
-name = "physinteract"
+name = "piano"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
@@ -741,38 +825,63 @@ viz = ["matplotlib", "open3d"]
 dev = ["pytest"]
 
 [project.scripts]
-physinteract-train = "physinteract.training.trainer:main"
-physinteract-eval = "physinteract.evaluation.motion_metrics:main"
-physinteract-generate = "physinteract.inference.generate:main"
-physinteract-pseudo-labels = "physinteract.data.pseudo_labels.run_all:main"
+piano-train = "piano.training.trainer:main"
+piano-eval = "piano.evaluation.motion_metrics:main"
+piano-generate = "piano.inference.generate:main"
+piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
 ```
 
-### 13.3 Quick Start
+### 13.3 Server Setup (Full)
 
 ```bash
-# Option A: conda (recommended for new servers)
-conda env create -f environment.yml
-conda activate physinteract
+# 1. Clone PIANO
+git clone https://github.com/wenqi-cai297/PIANO.git
+cd PIANO
 
-# Option B: pip only
+# 2. Create conda environment
+conda env create -f environment.yml
+conda activate piano
+
+# 3. Install PIANO package (editable)
 pip install -e ".[wandb,viz,dev]"
 
-# PyTorch3D (build from source if pip fails)
+# 4. PyTorch3D (needed for some geometry ops; build from source if pip fails)
 pip install pytorch3d
 
-# Configure accelerate
+# 5. Configure accelerate
 accelerate config
+# → select GPU count, bf16 mixed precision
 
-# Verify
-python -c "from physinteract import __init__; print('OK')"
+# 6. Download MoMask pretrained weights
+#    MoMask is NOT installed as a dependency — we only need its checkpoint files.
+#    Our motion_generator.py reimplements the architecture and loads weights directly.
+mkdir -p checkpoints/momask
+# Download from MoMask's Google Drive links (see their README):
+#   - VQ-VAE:             checkpoints/momask/vq_best.tar
+#   - MaskTransformer:    checkpoints/momask/mask_best.tar
+#   - ResidualTransformer: checkpoints/momask/res_best.tar
+#   - (optional) LengthEstimator: checkpoints/momask/length_est.tar
+
+# 7. Download HumanML3D evaluation data (for FID, R-Precision)
+#    Needed for computing standard motion metrics.
+#    Follow HumanML3D repo instructions to get mean.npy, std.npy, and eval model.
+mkdir -p checkpoints/humanml3d
+
+# 8. Verify installation
+python -c "from piano import __version__; print(f'PIANO v{__version__} OK')"
+python -c "from piano.models.motion_generator import MaskedTransformerWithInteraction; print('Models OK')"
 ```
+
+**Key point: MoMask code is NOT needed on the server.** We reimplemented the
+architecture in `src/piano/models/motion_generator.py` to be weight-compatible
+with MoMask's checkpoints. Only the `.tar` weight files are needed.
 
 ### 13.4 .gitignore
 
@@ -796,10 +905,10 @@ wandb/
 
 | Week | Milestone | Deliverable |
 |------|-----------|-------------|
-| 1-2 | Environment + data | MLD running, datasets downloaded, SMPL-X->SMPL conversion done |
+| 1-2 | Environment + data | MoMask running, datasets downloaded, SMPL-X->SMPL conversion done |
 | 3 | Pseudo-labels | All pseudo-labels extracted, quality verified via visualization |
 | 4-5 | Interaction Predictor | Trained predictor, accuracy metrics on held-out set |
-| 6-7 | Motion Generator | MLD finetuned with interaction conditioning, qualitative results |
+| 6-7 | Motion Generator | MoMask finetuned with interaction conditioning, qualitative results |
 | 8 | Joint finetune | Full pipeline end-to-end, consistency loss working |
 | 9-10 | Evaluation | All metrics computed, ablations done, visualizations ready |
 
@@ -854,6 +963,25 @@ A: Physics-in-the-loop methods (InterPhys, CooHOI) achieve strong physical plaus
 | Generator ignores z_int | Consistency loss + classifier-free guidance on interaction tokens + dropout training |
 | SMPL-X to SMPL information loss | Acceptable for full-body tasks; hand-level tasks deferred to v2 |
 | InterAct data format issues | Start with OMOMO (smaller, well-documented) as sanity check, then scale to InterAct |
-| MLD codebase compatibility | Pin MLD commit hash; test integration early in Week 1 |
+| MoMask weight compatibility | Architecture reimplemented in motion_generator.py with matching param names; verified via load_state_dict(strict=False). If MoMask updates checkpoint format, re-check _remap_key() |
 | Reviewer says "incremental over Move as You Say" | Frame paper around object-adaptive problem (not two-stage architecture); lead with ASS/ASC metrics; show Move as You Say cannot do attribute-sensitive generation |
 | Attribute sensitivity not significant in experiments | Ensure training data covers diverse object attributes; if not, augment by scaling object meshes and adjusting pseudo-labels accordingly |
+
+---
+
+## 17. Implementation Status
+
+| Module | Files | Status | Notes |
+|--------|-------|--------|-------|
+| Project scaffolding | pyproject.toml, environment.yml, configs/ | Done | pip install -e . verified |
+| Utils | io_utils, geometry, smpl_utils | Done | Unit tests passed |
+| Data processing | humanml3d_repr, preprocess_smplx, dataset | Done | 263-dim conversion verified |
+| Pseudo-label extraction | extract_contact/target/phase/support, refine_hmm, run_all | Done | Phase + support unit tests passed; contact/target need trimesh (server) |
+| Object Encoder | object_encoder.py (PointNet++) | Done | Forward pass OK, 0.3M params |
+| Interaction Predictor | interaction_predictor.py | Done | Forward pass OK, 39.7M params |
+| Interaction Cross-Attention | interaction_cross_attn.py | Done | Zero-init verified |
+| Interaction Extractor | interaction_extractor.py | Done | Forward pass OK, 2.5M params |
+| Motion Generator | motion_generator.py (MoMask-compat) + masking.py | Done | Training/CFG/generate forward pass OK; weight-compat with MoMask checkpoints via load_momask_weights() |
+| Training loop | losses.py, priors.py, train_*.py | **TODO** | Next step |
+| Evaluation | motion_metrics, physics_metrics, controllability | **TODO** | |
+| Inference pipeline | generate.py, visualize.py | **TODO** | |
