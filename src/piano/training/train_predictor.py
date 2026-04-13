@@ -93,10 +93,11 @@ def run(config_path: str) -> None:
 
     # Models
     predictor = InteractionPredictor(
-        d_model=512, num_layers=6, num_heads=8,
-        text_dim=512, pose_dim=263,
+        d_model=384, num_layers=10, num_heads=6,
+        dim_feedforward=1024, text_dim=512, pose_dim=263,
+        block_size=2,
     )
-    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=512)
+    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=384)
 
     # CLIP text encoder (frozen) — loaded via OpenAI CLIP
     # In practice: clip.load("ViT-B/32") → clip_model

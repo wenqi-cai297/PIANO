@@ -138,8 +138,8 @@ def run(config_path: str) -> None:
     )
 
     # --- Build models ---
-    predictor = InteractionPredictor(d_model=512, num_layers=6, num_heads=8, text_dim=512, pose_dim=263)
-    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=512)
+    predictor = InteractionPredictor(d_model=384, num_layers=10, num_heads=6, dim_feedforward=1024, text_dim=512, pose_dim=263, block_size=2)
+    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=384)
 
     # Load MoMask VQ-VAE (frozen) and MaskTransformer (with interaction layers)
     vq_vae = load_momask_vqvae(cfg.model.vq_vae_checkpoint, device="cpu")

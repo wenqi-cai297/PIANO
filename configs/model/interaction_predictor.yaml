@@ -1,18 +1,26 @@
 # Interaction Predictor architecture config
-# Temporal Transformer that predicts structured interaction latents
+# Temporal Transformer with Block AttnRes (from MoonshotAI/Attention-Residuals)
+#
+# Scaled design: deeper but narrower than the original, with AttnRes for
+# selective depth-wise aggregation. d_model=384 matches MoMask's latent_dim.
 
 encoder:
-  num_layers: 6
-  d_model: 512
-  num_heads: 8
-  dim_feedforward: 2048
+  num_layers: 10
+  d_model: 384
+  num_heads: 6
+  dim_feedforward: 1024
   dropout: 0.1
+
+block_attn_res:
+  block_size: 2         # layers per block (10 layers / 2 = 5 blocks)
+  # Each sublayer (self-attn, cross-attn, FFN) has its own proj + RMSNorm
+  # Total AttnRes params: 10 layers × 3 sublayers × (384 + 384) ≈ 23K (negligible)
 
 object_encoder:
   # PointNet++ config
   num_input_points: 1024
   num_output_tokens: 16
-  feature_dim: 512
+  feature_dim: 384      # matches d_model
 
 input:
   text_dim: 512           # CLIP ViT-B/32 output dim (matching MoMask)

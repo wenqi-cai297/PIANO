@@ -985,8 +985,8 @@ A: Physics-in-the-loop methods (InterPhys, CooHOI) achieve strong physical plaus
 | Utils | io_utils, geometry, smpl_utils | Done | Unit tests passed |
 | Data processing | humanml3d_repr, preprocess_smplx, dataset | Done | 263-dim conversion verified |
 | Pseudo-label extraction | extract_contact/target/phase/support, refine_hmm, run_all | Done | Phase + support unit tests passed; contact/target need trimesh (server) |
-| Object Encoder | object_encoder.py (PointNet++) | Done | Forward pass OK, 0.3M params |
-| Interaction Predictor | interaction_predictor.py | Done | Forward pass OK, 39.7M params |
+| Object Encoder | object_encoder.py (PointNet++) | Done | Forward pass OK, 0.3M params, feature_dim=384 |
+| Interaction Predictor | interaction_predictor.py | Done | 10 layers, d=384, Block AttnRes (block_size=2, 5 blocks), 31.8M params. AttnRes from MoonshotAI/Attention-Residuals |
 | Interaction Cross-Attention | interaction_cross_attn.py | Done | Zero-init verified |
 | Interaction Extractor | interaction_extractor.py | Done | Forward pass OK, 2.5M params |
 | Motion Generator | motion_generator.py (thin wrapper) + masking.py + backbones/momask_adapter.py | Done | Imports MoMask's original classes directly; patches seqTransEncoder to inject interaction cross-attn; 100% weight-compatible |
