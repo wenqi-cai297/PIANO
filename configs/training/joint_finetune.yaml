@@ -4,7 +4,7 @@ model:
   config: configs/model/motion_generator.yaml
   predictor_config: configs/model/interaction_predictor.yaml
   object_encoder_config: configs/model/object_encoder.yaml
-  text_encoder: "openai/clip-vit-large-patch14"
+  text_encoder: "ViT-B/32"  # matching MoMask's CLIP model
   freeze_text_encoder: true
   freeze_predictor: false     # unfreeze all trainable modules
   predictor_checkpoint: "runs/training/predictor/best.pt"

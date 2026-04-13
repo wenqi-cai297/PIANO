@@ -89,7 +89,7 @@ The interaction latent `z_int` consists of per-frame structured variables:
 
 | Component | Choice | Source |
 |-----------|--------|--------|
-| Text encoder | CLIP ViT-L/14 | OpenAI CLIP (frozen) |
+| Text encoder | CLIP ViT-B/32 (dim=512) | OpenAI CLIP (frozen, matching MoMask) |
 | Motion backbone | **MoMask** (CVPR 2024, FID=0.045) | [github.com/EricGuo5513/momask-codes](https://github.com/EricGuo5513/momask-codes) |
 | Motion tokenizer | MoMask Residual VQ-VAE | MoMask pretrained checkpoint |
 | Body model | SMPL (22 joints) | [smplx](https://github.com/vchoutas/smplx) library |

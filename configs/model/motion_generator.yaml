@@ -1,53 +1,64 @@
 # Motion Generator architecture config
 # Based on MoMask (CVPR 2024) masked transformer with interaction cross-attention
+#
+# Values match MoMask's pretrained HumanML3D checkpoint:
+#   t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns
 
-# --- MoMask Residual VQ-VAE (pretrained, frozen or lightly finetuned) ---
+# --- MoMask Residual VQ-VAE (pretrained, frozen) ---
+# Checkpoint: rvq_nq6_dc512_nc512_noshare_qdp0.2
 vq_vae:
-  input_dim: 263                # HumanML3D motion feature dim
+  input_width: 263              # HumanML3D motion feature dim
   nb_code: 512                  # codebook size per quantizer
   code_dim: 512                 # code embedding dimension
-  output_dim: 263
-  down_t: 2                     # temporal downsampling factor
-  stride_t: 2
-  depth: 3                      # number of residual blocks
+  down_t: 2                     # temporal downsampling layers
+  stride_t: 2                   # stride per layer (total downsample = stride^down_t = 4)
+  width: 512                    # conv hidden width
+  depth: 3                      # residual blocks per layer
   dilation_growth_rate: 3
-  num_quantizers: 2             # base + 1 residual level
+  num_quantizers: 6             # 1 base + 5 residual levels
 
 # --- MoMask Masked Transformer (main generation model) ---
+# Checkpoint: t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns
 masked_transformer:
-  num_layers: 8
-  d_model: 512
-  num_heads: 8
-  dim_feedforward: 2048
-  dropout: 0.1
   num_tokens: 512               # codebook size (must match vq_vae.nb_code)
-  max_seq_length: 49            # after VQ temporal downsampling (196 / 4)
-
-  # Text conditioning (original MoMask)
-  text_dim: 768                 # CLIP ViT-L/14 output dim
-  text_cross_attn: true
+  code_dim: 512                 # token embedding dim (match vq_vae.code_dim)
+  latent_dim: 384               # transformer hidden dim
+  ff_size: 1024                 # feedforward dim
+  num_layers: 8
+  num_heads: 6
+  dropout: 0.1
+  clip_dim: 512                 # CLIP ViT-B/32 embedding dim (MoMask uses B/32)
+  cond_drop_prob: 0.1           # text condition drop for CFG
+  interaction_drop_prob: 0.1    # interaction condition drop for CFG
 
   # Interaction conditioning (our addition)
   interaction_cross_attn:
     enabled: true
-    d_model: 512
-    num_heads: 8
-    dropout: 0.1
     zero_init: true             # preserve pretrained weights at init
 
-# --- MoMask Residual Transformer ---
+# --- MoMask Residual Transformer (frozen) ---
+# Checkpoint: tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw
 residual_transformer:
-  num_layers: 4
-  d_model: 512
-  num_heads: 8
-  dim_feedforward: 1024
+  num_layers: 8
+  latent_dim: 384
+  ff_size: 1024
+  num_heads: 6
   dropout: 0.1
 
 # --- Generation config ---
 generation:
   num_iterations: 10            # iterative unmasking steps
-  temperature: 1.0              # sampling temperature
-  mask_schedule: "cosine"       # masking ratio schedule across iterations
+  temperature: 1.0
+  topk_filter_thres: 0.9
+  cond_scale: 4.5               # text guidance scale
+  interaction_scale: 2.0        # interaction guidance scale
+
+# --- Checkpoint paths ---
+checkpoints:
+  vq_vae: "checkpoints/momask/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+  masked_transformer: "checkpoints/momask/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+  residual_transformer: "checkpoints/momask/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
+  length_estimator: "checkpoints/momask/length_estimator/model/finest.tar"
 
 # --- Motion representation ---
 motion:

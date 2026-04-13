@@ -15,7 +15,7 @@ object_encoder:
   feature_dim: 512
 
 input:
-  text_dim: 768           # CLIP ViT-L/14 output dim
+  text_dim: 512           # CLIP ViT-B/32 output dim (matching MoMask)
   pose_dim: 263           # HumanML3D representation dim
 
 output:
