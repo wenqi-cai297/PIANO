@@ -23,7 +23,8 @@ from piano.data.dataset import HOIDataset, collate_hoi
 from piano.models.interaction_cross_attn import InteractionTokenizer
 from piano.models.interaction_extractor import InteractionExtractor
 from piano.models.interaction_predictor import InteractionPredictor
-from piano.models.motion_generator import MaskedTransformerWithInteraction, RVQVAE
+from piano.models.backbones.momask_adapter import load_momask_vqvae
+from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.losses import ConsistencyLoss, GeneratorLoss, PredictorLoss
 from piano.training.priors import PhysicalPriors
@@ -37,7 +38,7 @@ from piano.training.trainer import (
 def build_joint_step_fn(
     predictor: InteractionPredictor,
     object_encoder: ObjectEncoder,
-    transformer: MaskedTransformerWithInteraction,
+    transformer: InteractionMaskTransformer,
     vq_vae: RVQVAE,
     interaction_tokenizer: InteractionTokenizer,
     extractor: InteractionExtractor,
@@ -139,25 +140,18 @@ def run(config_path: str) -> None:
     # --- Build models ---
     predictor = InteractionPredictor(d_model=512, num_layers=6, num_heads=8, text_dim=512, pose_dim=263)
     object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=512)
-    transformer = MaskedTransformerWithInteraction(
-        num_tokens=512, code_dim=512, latent_dim=384,
-        ff_size=1024, num_layers=8, num_heads=6,
-        clip_dim=512, enable_interaction=True,
+
+    # Load MoMask VQ-VAE (frozen) and MaskTransformer (with interaction layers)
+    vq_vae = load_momask_vqvae(cfg.model.vq_vae_checkpoint, device="cpu")
+    transformer = InteractionMaskTransformer.from_pretrained(
+        cfg.model.generator_checkpoint, device="cpu",
     )
-    vq_vae = RVQVAE(input_width=263, nb_code=512, code_dim=512, down_t=2, stride_t=2, num_quantizers=6)
-    interaction_tokenizer = InteractionTokenizer(d_model=384, temporal_stride=4)
     extractor = InteractionExtractor(motion_dim=263, d_model=256, num_layers=3)
 
-    # Load Stage A/B checkpoints
-    # TODO: load predictor, object_encoder, transformer from cfg.model.*_checkpoint
+    # Load Stage A/B checkpoints for predictor and object_encoder
+    # TODO: load from cfg.model.predictor_checkpoint / cfg.model.object_encoder_checkpoint
 
-    # Freeze VQ-VAE
-    vq_vae.eval()
-    for p in vq_vae.parameters():
-        p.requires_grad = False
-
-    # CLIP (frozen)
-    clip_model = None  # TODO: load on server
+    # CLIP is already loaded inside transformer.mask_transformer
 
     # --- Losses ---
     pred_criterion = PredictorLoss(

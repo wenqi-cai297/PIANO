@@ -1,6 +1,6 @@
 """Stage B: Finetune the Motion Generator with interaction conditioning.
 
-Loads pretrained MoMask weights into MaskedTransformerWithInteraction,
+Loads pretrained MoMask weights into InteractionMaskTransformer,
 freezes the VQ-VAE, and trains the masked transformer (with new interaction
 cross-attention layers) conditioned on GT pseudo-labels.
 
@@ -19,7 +19,8 @@ from torch.utils.data import DataLoader
 
 from piano.data.dataset import HOIDataset, collate_hoi
 from piano.models.interaction_cross_attn import InteractionTokenizer
-from piano.models.motion_generator import MaskedTransformerWithInteraction, RVQVAE
+from piano.models.backbones.momask_adapter import load_momask_vqvae
+from piano.models.motion_generator import InteractionMaskTransformer
 from piano.training.losses import GeneratorLoss
 from piano.training.trainer import (
     build_optimizer,
@@ -29,7 +30,7 @@ from piano.training.trainer import (
 
 
 def build_generator_step_fn(
-    transformer: MaskedTransformerWithInteraction,
+    transformer: InteractionMaskTransformer,
     vq_vae: RVQVAE,
     interaction_tokenizer: InteractionTokenizer,
     clip_model: torch.nn.Module,
@@ -88,36 +89,16 @@ def run(config_path: str) -> None:
         mixed_precision="bf16",
     )
 
-    # Load MoMask VQ-VAE (frozen)
-    vq_vae = RVQVAE(
-        input_width=263, nb_code=512, code_dim=512,
-        down_t=2, stride_t=2, num_quantizers=6,
-    )
-    if hasattr(cfg.model, "momask_checkpoint"):
-        # Load VQ-VAE weights separately if available
-        pass  # TODO: vq_vae.load_momask_weights(cfg.checkpoints.vq_vae)
-    vq_vae.eval()
-    for p in vq_vae.parameters():
-        p.requires_grad = False
+    # Load MoMask VQ-VAE (frozen, with pretrained weights)
+    vq_vae = load_momask_vqvae(cfg.model.momask_checkpoint, device="cpu")
 
-    # Masked Transformer with interaction cross-attention
-    transformer = MaskedTransformerWithInteraction(
-        num_tokens=512, code_dim=512, latent_dim=384,
-        ff_size=1024, num_layers=8, num_heads=6,
-        clip_dim=512, cond_drop_prob=0.1,
-        interaction_drop_prob=0.1, enable_interaction=True,
+    # Load MoMask MaskTransformer + wrap with interaction cross-attention
+    transformer = InteractionMaskTransformer.from_pretrained(
+        cfg.model.momask_checkpoint,
+        interaction_drop_prob=0.1,
+        device="cpu",
     )
-    # Load pretrained MoMask weights (interaction layers stay random/zero-init)
-    # TODO: transformer.load_momask_weights(cfg.checkpoints.masked_transformer)
-
-    # Interaction tokenizer
-    interaction_tokenizer = InteractionTokenizer(
-        d_model=384,  # match transformer latent_dim
-        temporal_stride=4,
-    )
-
-    # CLIP (frozen)
-    clip_model = None  # TODO: load CLIP on server
+    # CLIP is loaded inside MoMask's MaskTransformer constructor (frozen)
 
     # Loss
     criterion = GeneratorLoss(
@@ -135,32 +116,21 @@ def run(config_path: str) -> None:
         shuffle=True, collate_fn=collate_hoi, num_workers=4,
     )
 
-    # Optimizer: different LR for original vs new layers
-    original_params = []
-    new_params = []
-    for name, param in transformer.named_parameters():
-        if "interaction_cross_attn" in name:
-            new_params.append(param)
-        else:
-            original_params.append(param)
-
+    # Optimizer: different LR for backbone vs new interaction layers
     optimizer = build_optimizer(
         [
-            {"params": original_params, "lr": cfg.training.optimizer.lr},
-            {"params": new_params, "lr": cfg.training.optimizer.lr * 2},  # higher LR for new layers
+            {"params": transformer.backbone_parameters(), "lr": cfg.training.optimizer.lr},
+            {"params": transformer.interaction_parameters(), "lr": cfg.training.optimizer.lr * 2},
         ],
         lr=cfg.training.optimizer.lr,
-    )
-    int_tokenizer_opt = build_optimizer(
-        interaction_tokenizer.parameters(), lr=cfg.training.optimizer.lr * 2,
     )
 
     total_steps = len(dataloader) * cfg.training.num_epochs
     scheduler = build_scheduler(optimizer, cfg.training.scheduler.warmup_steps, total_steps)
 
     # Prepare
-    transformer, interaction_tokenizer, optimizer, dataloader, scheduler = accelerator.prepare(
-        transformer, interaction_tokenizer, optimizer, dataloader, scheduler,
+    transformer, optimizer, dataloader, scheduler = accelerator.prepare(
+        transformer, optimizer, dataloader, scheduler,
     )
     vq_vae = vq_vae.to(accelerator.device)
 

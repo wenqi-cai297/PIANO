@@ -4,7 +4,7 @@ End-to-end generation pipeline that:
     1. Encodes text via CLIP
     2. Encodes object point cloud via ObjectEncoder
     3. Predicts interaction latent via InteractionPredictor
-    4. Generates motion tokens via MaskedTransformerWithInteraction
+    4. Generates motion tokens via InteractionMaskTransformer
     5. Decodes tokens to motion features via RVQVAE
     6. Optionally visualizes the result
 
@@ -25,7 +25,8 @@ from torch import Tensor
 from piano.data.humanml3d_repr import denormalize_motion
 from piano.models.interaction_cross_attn import InteractionTokenizer
 from piano.models.interaction_predictor import InteractionPredictor
-from piano.models.motion_generator import MaskedTransformerWithInteraction, RVQVAE
+from piano.models.backbones.momask_adapter import load_momask_vqvae
+from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.object_encoder import ObjectEncoder
 from piano.utils.io_utils import save_npz
 
@@ -57,8 +58,8 @@ class PIANOPipeline:
         self,
         predictor: InteractionPredictor,
         object_encoder: ObjectEncoder,
-        transformer: MaskedTransformerWithInteraction,
-        vq_vae: RVQVAE,
+        transformer: InteractionMaskTransformer,
+        vq_vae: nn.Module,
         interaction_tokenizer: InteractionTokenizer,
         clip_model: torch.nn.Module,
         device: str = "cuda",
