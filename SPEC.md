@@ -982,6 +982,14 @@ A: Physics-in-the-loop methods (InterPhys, CooHOI) achieve strong physical plaus
 | Interaction Cross-Attention | interaction_cross_attn.py | Done | Zero-init verified |
 | Interaction Extractor | interaction_extractor.py | Done | Forward pass OK, 2.5M params |
 | Motion Generator | motion_generator.py (MoMask-compat) + masking.py | Done | Training/CFG/generate forward pass OK; weight-compat with MoMask checkpoints via load_momask_weights() |
-| Training loop | losses.py, priors.py, train_*.py | **TODO** | Next step |
-| Evaluation | motion_metrics, physics_metrics, controllability | **TODO** | |
-| Inference pipeline | generate.py, visualize.py | **TODO** | |
+| Training: Losses | losses.py (PredictorLoss, GeneratorLoss, ConsistencyLoss) | Done | BCE/CE/KL for pseudo-labels; masked token prediction; consistency cycle |
+| Training: Priors | priors.py (PhysicalPriors) | Done | Reachability, contact persistence, support smoothness, phase monotonicity |
+| Training: Stage A | train_predictor.py | Done | Accelerate loop, CLIP encoding, pseudo-label supervision + priors |
+| Training: Stage B | train_generator.py | Done | Frozen VQ-VAE, GT pseudo-labels as condition, dual-LR for new vs original layers |
+| Training: Stage C | train_joint.py | Done | Predicted z_int → generator → extractor → consistency loss |
+| Training: Shared | trainer.py | Done | Generic Accelerate loop, checkpoint save, wandb logging, cosine LR + warmup |
+| Evaluation | motion_metrics.py (FID, R-Prec, MM-Dist, Diversity) | Done | HumanML3D protocol |
+| Evaluation | physics_metrics.py (penetration, contact P/R/F1, foot sliding) | Done | |
+| Evaluation | controllability.py (ASS, ASC, latent sensitivity) | Done | Core novelty metrics |
+| Inference | generate.py (PIANOPipeline class) | Done | End-to-end text+object → motion; CLI entrypoint |
+| Inference | visualize.py (skeleton rendering) | Done | 3D skeleton frames, motion_263 → joints conversion |
