@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+runs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+wandb/
+.DS_Store
+.claude/
