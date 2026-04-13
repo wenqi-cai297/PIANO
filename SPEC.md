@@ -671,10 +671,14 @@ piano/                            # Repository root
 │       │   ├── __init__.py
 │       │   ├── interaction_predictor.py # Temporal Transformer predictor
 │       │   ├── object_encoder.py        # PointNet++ wrapper (PyTorch3D)
-│       │   ├── interaction_cross_attn.py # Cross-attn layer for MoMask masked transformer
+│       │   ├── interaction_cross_attn.py # Cross-attn layer injected into MoMask
 │       │   ├── interaction_extractor.py # Lightweight extractor (consistency)
-│       │   ├── motion_generator.py      # MoMask VQ-VAE + modified masked transformer
-│       │   └── masking.py               # Mask scheduling and iterative unmasking
+│       │   ├── motion_generator.py      # Thin wrapper: patches MoMask with interaction attn
+│       │   ├── masking.py               # Mask scheduling and iterative unmasking
+│       │   └── backbones/               # Generative backbone repos
+│       │       ├── __init__.py
+│       │       ├── momask_adapter.py    # Import + load MoMask classes
+│       │       └── momask/              # git clone of MoMask (gitignored)
 │       │
 │       ├── training/                    # Training logic (Accelerate-based)
 │       │   ├── __init__.py
@@ -879,9 +883,13 @@ python -c "from piano import __version__; print(f'PIANO v{__version__} OK')"
 python -c "from piano.models.motion_generator import MaskedTransformerWithInteraction; print('Models OK')"
 ```
 
-**Key point: MoMask code is NOT needed on the server.** We reimplemented the
-architecture in `src/piano/models/motion_generator.py` to be weight-compatible
-with MoMask's checkpoints. Only the `.tar` weight files are needed.
+**MoMask code IS needed on the server** — we import its classes directly
+(no reimplementation). Clone it into the backbones directory:
+```bash
+git clone https://github.com/EricGuo5513/momask-codes.git \
+    src/piano/models/backbones/momask
+```
+This directory is gitignored — each machine clones its own copy.
 
 ### 13.4 .gitignore
 
@@ -981,7 +989,8 @@ A: Physics-in-the-loop methods (InterPhys, CooHOI) achieve strong physical plaus
 | Interaction Predictor | interaction_predictor.py | Done | Forward pass OK, 39.7M params |
 | Interaction Cross-Attention | interaction_cross_attn.py | Done | Zero-init verified |
 | Interaction Extractor | interaction_extractor.py | Done | Forward pass OK, 2.5M params |
-| Motion Generator | motion_generator.py (MoMask-compat) + masking.py | Done | Training/CFG/generate forward pass OK; weight-compat with MoMask checkpoints via load_momask_weights() |
+| Motion Generator | motion_generator.py (thin wrapper) + masking.py + backbones/momask_adapter.py | Done | Imports MoMask's original classes directly; patches seqTransEncoder to inject interaction cross-attn; 100% weight-compatible |
+| MoMask Backbone | backbones/momask/ (git clone, gitignored) | Done | Cloned from EricGuo5513/momask-codes; not tracked in our repo |
 | Training: Losses | losses.py (PredictorLoss, GeneratorLoss, ConsistencyLoss) | Done | BCE/CE/KL for pseudo-labels; masked token prediction; consistency cycle |
 | Training: Priors | priors.py (PhysicalPriors) | Done | Reachability, contact persistence, support smoothness, phase monotonicity |
 | Training: Stage A | train_predictor.py | Done | Accelerate loop, CLIP encoding, pseudo-label supervision + priors |
