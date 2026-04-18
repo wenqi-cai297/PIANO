@@ -221,9 +221,9 @@ def run_smoke_test(
     print(f"[6/6] Saving run artifacts to {output_dir} ...")
     print("=" * 72)
 
-    # Decoded motions + per-sample metadata
-    save_npz(
-        output_dir / "generated.npz",
+    # Collect input object trajectories (carried through for visualization so
+    # the red marker shows where the conditioning object was positioned).
+    gen_npz_data = dict(
         motion_263=motion_263.cpu().numpy(),
         token_indices=all_indices.cpu().numpy(),
         contact_state=pred["contact_state"].cpu().numpy(),
@@ -231,6 +231,9 @@ def run_smoke_test(
         phase=pred["phase"].cpu().numpy(),
         support=pred["support"].cpu().numpy(),
     )
+    if "object_positions" in batch:
+        gen_npz_data["object_positions"] = batch["object_positions"].cpu().numpy()
+    save_npz(output_dir / "generated.npz", **gen_npz_data)
 
     summary = {
         "timestamp": datetime.now().isoformat(),

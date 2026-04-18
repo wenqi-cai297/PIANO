@@ -261,16 +261,22 @@ def load_real_samples(
 
 
 def load_generated_samples(run_dir: Path) -> list[dict]:
-    """Load generated motions from a smoke-test run directory."""
+    """Load generated motions from a smoke-test run directory.
+
+    Also loads the input ``object_positions`` (if saved by the smoke test)
+    so the red object marker shows where the conditioning object was.
+    """
     npz_path = run_dir / "generated.npz"
     summary_path = run_dir / "summary.json"
     if not npz_path.exists():
         raise FileNotFoundError(f"No generated.npz in {run_dir}")
     data = np.load(npz_path)
     motion = data["motion_263"]  # (B, T, 263)
+    object_positions = data["object_positions"] if "object_positions" in data.files else None
 
     summary = load_json(summary_path) if summary_path.exists() else {}
     texts = summary.get("texts", [f"sample_{i}" for i in range(len(motion))])
+    seq_lens = summary.get("seq_lens", [motion.shape[1]] * len(motion))
 
     samples: list[dict] = []
     for i in range(len(motion)):
@@ -278,9 +284,9 @@ def load_generated_samples(run_dir: Path) -> list[dict]:
             "seq_id": f"generated_{i:02d}",
             "text": texts[i] if i < len(texts) else "",
             "motion_263": motion[i],
-            "joints_22": None,   # need to reconstruct
-            "object_positions": None,
-            "num_frames": int(motion[i].shape[0]),
+            "joints_22": None,          # need to reconstruct from motion_263
+            "object_positions": object_positions[i] if object_positions is not None else None,
+            "num_frames": int(seq_lens[i] if i < len(seq_lens) else motion[i].shape[0]),
         })
     return samples
 

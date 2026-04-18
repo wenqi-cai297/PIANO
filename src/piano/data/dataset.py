@@ -104,6 +104,12 @@ class HOIDataset(Dataset):
         joints = motion_data["joints_22"].astype(np.float32)     # (T, 22, 3)
         seq_len = min(len(motion), self.max_seq_length)
 
+        # Object trajectory in world frame (per-frame object center position).
+        # Used for pseudo-label extraction and for overlay during visualization.
+        object_positions = None
+        if "object_positions" in motion_data.files:
+            object_positions = motion_data["object_positions"].astype(np.float32)
+
         # --- Load object point cloud ---
         obj_id = meta["object_id"]
         obj_path = self.root / "objects" / f"{obj_id}.npy"
@@ -117,6 +123,8 @@ class HOIDataset(Dataset):
         # --- Pad or truncate to max_seq_length ---
         motion = self._pad_or_truncate(motion, self.max_seq_length)
         joints = self._pad_or_truncate(joints, self.max_seq_length)
+        if object_positions is not None:
+            object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
 
         # --- Build output dict ---
         result: dict[str, torch.Tensor] = {
@@ -126,6 +134,8 @@ class HOIDataset(Dataset):
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
             "text": meta.get("text", ""),
         }
+        if object_positions is not None:
+            result["object_positions"] = torch.from_numpy(object_positions)
 
         # Add pseudo-labels if present
         for key in ("contact_state", "contact_target", "phase", "support"):
