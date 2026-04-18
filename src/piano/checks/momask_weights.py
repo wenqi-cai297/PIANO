@@ -10,7 +10,7 @@ Verifies:
     4. CLIP (loaded inside MoMask's MaskTransformer constructor) is available
 
 Usage:
-    python scripts/server/check_momask_weights.py \\
+    python -m piano.checks.momask_weights \\
         [--ckpt-root checkpoints/momask/t2m] \\
         [--device cuda]
 """
@@ -39,21 +39,21 @@ def run_check(ckpt_root: Path, device: str) -> None:
             raise FileNotFoundError(f"{name} checkpoint not found at {path}")
 
     print("=" * 70)
-    print(f"Test 1/3: Load MoMask VQ-VAE")
+    print("Test 1/3: Load MoMask VQ-VAE")
     print("=" * 70)
     vq_vae = load_momask_vqvae(vq_ckpt, device=device)
     print(f"  Params: {sum(p.numel() for p in vq_vae.parameters()) / 1e6:.1f}M")
 
     print()
     print("=" * 70)
-    print(f"Test 2/3: Load MoMask MaskTransformer (includes CLIP)")
+    print("Test 2/3: Load MoMask MaskTransformer (includes CLIP)")
     print("=" * 70)
     mask_trans = load_momask_mask_transformer(mask_ckpt, device=device)
     print(f"  Params: {sum(p.numel() for p in mask_trans.parameters()) / 1e6:.1f}M")
 
     print()
     print("=" * 70)
-    print(f"Test 3/3: Load MoMask ResidualTransformer (includes CLIP)")
+    print("Test 3/3: Load MoMask ResidualTransformer (includes CLIP)")
     print("=" * 70)
     res_trans = load_momask_residual_transformer(res_ckpt, device=device)
     print(f"  Params: {sum(p.numel() for p in res_trans.parameters()) / 1e6:.1f}M")

@@ -30,6 +30,7 @@ piano-train = "piano.training.trainer:main"
 piano-eval = "piano.evaluation.motion_metrics:main"
 piano-generate = "piano.inference.generate:main"
 piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
+piano-check-momask = "piano.checks.momask_weights:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
