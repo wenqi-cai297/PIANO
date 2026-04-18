@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (inference smoke test passed; ready for pseudo-label extraction + training)
+**Last updated:** 2026-04-19 (HumanML3D encoder switched to official MoMask `process_file`; round-trip validated; InterAct downloaded)
 
 ---
 
@@ -49,19 +49,29 @@ When cloned on a GPU server with the environment set up, the following can run:
 - `piano-eval`, `piano-generate`, `piano-train` → CLI entrypoints registered
 - `piano-check-momask` / `bash scripts/server/check_momask_weights.sh` → **verified on A6000 server:** all three MoMask pretrained checkpoints (VQ-VAE 19.4M, MaskTransformer 163.3M, ResidualTransformer 164.6M) load cleanly without warnings
 
-### Data preparation (OMOMO, via CHOIS processed_data)
+### Data preparation
 
+**OMOMO (via CHOIS processed_data)**
 - Source: `/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/processed_data` (30fps SMPL-X mocap, 17 subjects × 15 objects)
 - Preprocessed to PIANO format at `/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano`
-- Pipeline: joblib load → SMPL-X FK → 22 body joints → downsample 30→20fps → HumanML3D 263-dim → object point clouds
+- Pipeline (v2, post encoder-switch): joblib load → SMPL-X FK → 22 body joints → downsample 30→20fps → **MoMask `process_file` encode** → HumanML3D-compatible 263-dim + raw world-frame joints + object positions
 - **Result: 4919 sequences (4380 train + 539 test), 4838 with text (98.4% coverage), 13 object point clouds**
-- **Skipped: 963 sequences involving `vacuum` and `mop`** — these are two-part articulated objects, CHOIS's own pipeline skips them (no canonical rest-pose mesh provided). This is CHOIS's design choice, not ours; we inherit via `PreprocessConfig.skip_objects`. Handling articulated objects is out of scope for PIANO v1.
-- Runtime: ~1 minute on single A6000 (cuda FK)
+- **Skipped: 963 sequences involving `vacuum` and `mop`** — two-part articulated objects; CHOIS's default behavior inherited via `PreprocessConfig.skip_objects`. Articulated-object handling is out of scope for PIANO v1.
+- Runtime: ~4 minutes on single A6000 (cuda FK + CPU uniform-skeleton IK)
+- **Two coordinate frames preserved side-by-side** (intentional):
+  - `motion_263`: HumanML3D canonical + uniform skeleton (for MoMask VQ-VAE)
+  - `joints_22` + `object_positions`: raw world frame (for pseudo-label geometry)
 - See analyses: [omomo_data_inspection](analyses/2026-04-19_omomo_data_inspection.md),
   [omomo_preprocessing](analyses/2026-04-19_omomo_preprocessing.md),
   [hoi_dataset_verification](analyses/2026-04-19_hoi_dataset_verification.md),
   [momask_weight_loading](analyses/2026-04-19_momask_weight_loading.md),
-  [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md)
+  [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md),
+  [humanml3d_encoder_switch](analyses/2026-04-19_humanml3d_encoder_switch.md)
+
+**InterAct (CVPR 2025)**
+- Downloaded to `/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/InterAct.zip` via Google Form
+- Covers: NeuralDome, IMHD, CHAIRS, OMOMO (corrected + augmented) after unzip
+- Not yet unzipped / processed. See PLAN for next steps.
 
 ### End-to-end inference baseline
 
@@ -69,6 +79,11 @@ When cloned on a GPU server with the environment set up, the following can run:
 - All shapes verified; output finite; token_ids within valid VQ range
 - Zero-init interaction cross-attn confirmed to preserve MoMask behavior
 - Fixed: device mismatch where new wrapper layers stayed on CPU
+- **Encoder round-trip validated (2026-04-19)**: after switching to MoMask's
+  `process_file`, generated videos show proper humanoid structure (pelvis
+  at correct height, skeleton coherent); real samples via `--use-recovery`
+  path also recover correctly. This confirms `motion_263` is byte-compatible
+  with MoMask's VQ-VAE input distribution.
 
 ---
 
@@ -98,6 +113,13 @@ All other components are functionally complete.
 | `d31a08d` | 2026-04-14 | Refactor motion_generator to use MoMask source directly |
 | `c8e5e06` | 2026-04-14 | Fix stale references to removed classes |
 | `c02a388` | 2026-04-14 | Scale Interaction Predictor with Block Attention Residuals |
+| `644929e` | 2026-04-19 | Add OMOMO preprocessing: SMPL-X FK + downsample + 263-dim (v1) |
+| `1e8749a` | 2026-04-19 | HOIDataset sanity check + verified 4919 sequences load |
+| `c947228` | 2026-04-19 | End-to-end inference smoke test with zero-init cross-attn |
+| `9eb1c68` | 2026-04-19 | Fix device mismatch in InteractionMaskTransformer |
+| `c115e30` | 2026-04-19 | Standardize: every script writes runs/<cat>/<ts>/summary.json |
+| `031333e` | 2026-04-19 | Switch to MoMask official HumanML3D encoder (process_file) |
+| `3250eb0` | 2026-04-19 | Add `--use-recovery` flag for encode→decode round-trip validation |
 
 ---
 

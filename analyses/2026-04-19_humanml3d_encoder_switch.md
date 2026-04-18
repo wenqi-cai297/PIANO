@@ -78,8 +78,14 @@ on). Keeping both data streams side-by-side avoids the tension.
 
 - [x] Replace custom encoder with official `process_file`
 - [x] Rerun preprocessing — verified 4919 sequences produced
-- [ ] Run encode → decode round-trip visualization:
-  `bash scripts/server/visualize_motion.sh real ... --use-recovery` —
-  real samples should now look normal even via `recover_from_ric`
-- [ ] Rerun inference smoke test on the new preprocessed data
-- [ ] Then: extract pseudo-labels on the 4919 sequences
+- [x] Run encode → decode round-trip visualization: real videos via
+  `--use-recovery` path now render normal humanoid structure (confirmed
+  by user's visual inspection on 2026-04-19). Same for generated videos:
+  pelvis no longer pinned to ground.
+- [ ] Rerun inference smoke test on the new preprocessed data (optional —
+  logic is unchanged, only encoder was swapped; existing smoke test run is
+  still valid for plumbing, just uses old-format motion_263 inputs to CLIP-
+  encoded init pose; re-doing it would give a cleaner baseline artifact)
+- [ ] Next: extract pseudo-labels on the 4919 sequences (uses raw
+  `joints_22` + `object_positions`, not the MoMask-canonical `motion_263`,
+  so geometry is accurate)
