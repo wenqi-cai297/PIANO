@@ -21,6 +21,7 @@ containing the detailed writeup. Sorted by date (most recent first).
 | 2026-04-19 | [omomo_preprocessing](analyses/2026-04-19_omomo_preprocessing.md) | SMPL-X FK → HumanML3D 263-dim on 5882 sequences | 4919 sequences preprocessed in ~1 min on A6000 (92 seq/sec); found + fixed SMPL-X zero-buffer batch-size bug | Explicit batch-sized zero tensors for unused SMPL-X params; downsample 30→20 fps via linear interp |
 | 2026-04-19 | [hoi_dataset_verification](analyses/2026-04-19_hoi_dataset_verification.md) | HOIDataset + collate_hoi on preprocessed data | 4919 sequences, shapes correct, 4838 with text, collate handles str + tensors cleanly | No code changes needed; pipeline is stable |
 | 2026-04-19 | [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md) | End-to-end inference with untrained PIANO + pretrained MoMask | Pipeline runs cleanly (finite, shapes OK), zero-init interaction cross-attn verified (outputs near-uniform as expected). Fixed device mismatch bug where new wrapper layers stayed on CPU. | Added `wrapper.to(device)` in `from_pretrained`; ready for training |
+| 2026-04-19 | [humanml3d_encoder_switch](analyses/2026-04-19_humanml3d_encoder_switch.md) | Replaced custom HumanML3D encoder with MoMask's official `process_file` | Pelvis-on-ground bug traced to missing canonicalization in our encoder; silent VQ-VAE incompatibility would have broken Stage B. Rerun preprocessing OK: 4919 seq in 260s. | HumanML3DEncoder adapter; motion_263 now HumanML3D-compat; raw joints+objects kept separate for pseudo-labels |
 
 ---
 

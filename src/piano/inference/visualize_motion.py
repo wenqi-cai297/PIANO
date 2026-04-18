@@ -282,24 +282,28 @@ def run_visualization(
     fps: float,
     mean: np.ndarray | None = None,
     std: np.ndarray | None = None,
+    use_recovery: bool = False,
 ) -> None:
+    """Render motion videos.
+
+    Parameters
+    ----------
+    use_recovery : if True, always decode via ``motion_263_to_joints``
+        (MoMask's ``recover_from_ric``). For real samples this provides
+        an encode → decode round-trip sanity check: if the new encoder
+        produced HumanML3D-compatible features, the recovered skeleton
+        should look normal (in canonical coordinate frame, not world).
+        If False (default), real uses precomputed joints_22 directly.
+    """
     output_dir = ensure_dir(output_dir)
     index: list[dict] = []
 
     for sample in samples:
         seq_id = sample["seq_id"]
-        # Two code paths with a reason:
-        #   - Real samples: use precomputed joints_22 (world-frame ground truth
-        #     from SMPL-X FK in preprocessing). We do NOT round-trip through
-        #     motion_263_to_joints because our ``joints_to_humanml3d`` does
-        #     not apply HumanML3D's canonicalization (heading alignment,
-        #     ground-centering), so the encoded features are NOT decodable
-        #     by MoMask's ``recover_from_ric``. Fixing encoding is tracked
-        #     separately; for visualization joints_22 is authoritative.
-        #   - Generated samples: MoMask's VQ-VAE output is already in
-        #     HumanML3D's canonicalized space, so ``recover_from_ric`` +
-        #     mean/std denormalization produces correct joint positions.
-        if sample["joints_22"] is not None:
+        # Default: real uses precomputed joints_22 (world frame); generated
+        # uses recover_from_ric (canonical frame). Override with use_recovery
+        # to force recovery path on real samples for round-trip validation.
+        if sample["joints_22"] is not None and not use_recovery:
             joints = sample["joints_22"]
         else:
             joints = motion_263_to_joints(
@@ -365,6 +369,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "MoMask-generated motion back to world units")
         p.add_argument("--std", type=Path, default=None,
                        help="HumanML3D std.npy — paired with --mean")
+        p.add_argument("--use-recovery", action="store_true",
+                       help="Force motion_263 → recover_from_ric path even for "
+                            "real samples. Useful for validating that the "
+                            "encoder round-trips correctly.")
     return parser
 
 
@@ -385,7 +393,10 @@ def main() -> None:
     else:
         samples = load_generated_samples(args.run_dir)
 
-    run_visualization(samples, output_dir, args.source, fps=args.fps, mean=mean, std=std)
+    run_visualization(
+        samples, output_dir, args.source, fps=args.fps,
+        mean=mean, std=std, use_recovery=args.use_recovery,
+    )
 
 
 if __name__ == "__main__":
