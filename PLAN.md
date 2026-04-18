@@ -10,14 +10,15 @@ Current priorities and next steps. Updated after each experiment analysis cycle.
 
 ### 1.1 Server-side Setup (blocking everything)
 
-- [ ] Clone PIANO on GPU server: `git clone git@github.com:wenqi-cai297/PIANO.git`
-- [ ] Clone MoMask backbone: `git clone https://github.com/EricGuo5513/momask-codes.git src/piano/models/backbones/momask`
-- [ ] Create conda env: `conda env create -f environment.yml`
-- [ ] Install package: `pip install -e ".[wandb,viz,dev]"`
-- [ ] Install PyTorch3D
-- [ ] Configure accelerate: `accelerate config`
-- [ ] Download MoMask HumanML3D checkpoints (~188MB zip from Google Drive)
-- [ ] Download HumanML3D mean/std and eval model for metrics
+- [x] Clone PIANO on GPU server (done on A6000)
+- [x] Clone MoMask backbone into `src/piano/models/backbones/momask`
+- [x] Create conda env + install package (`pip install -e ".[wandb,viz,dev]"`)
+- [x] Install OpenAI CLIP (`pip install ftfy regex git+https://github.com/openai/CLIP.git`)
+- [x] Configure accelerate (bf16, RTX A6000 supports it)
+- [x] Download MoMask HumanML3D checkpoints (188MB)
+- [x] **Verify MoMask weight loading:** `bash scripts/server/check_momask_weights.sh` — all three models load cleanly
+- [ ] PyTorch3D: skipped (not currently needed — object_encoder is pure PyTorch)
+- [ ] Download HumanML3D mean/std and eval model for metrics (still needed for FID/R-Precision evaluation)
 
 ### 1.2 Data Preparation
 

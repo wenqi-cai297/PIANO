@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19
+**Last updated:** 2026-04-19 (MoMask weights verified loading on server)
 
 ---
 
@@ -47,6 +47,7 @@ When cloned on a GPU server with the environment set up, the following can run:
 - Forward passes on all models verified with synthetic inputs
 - `piano-pseudo-labels --data-dir ... --output-dir ...` → CLI entrypoint registered
 - `piano-eval`, `piano-generate`, `piano-train` → CLI entrypoints registered
+- `piano-check-momask` / `bash scripts/server/check_momask_weights.sh` → **verified on A6000 server:** all three MoMask pretrained checkpoints (VQ-VAE 19.4M, MaskTransformer 163.3M, ResidualTransformer 164.6M) load cleanly without warnings
 
 ---
 
