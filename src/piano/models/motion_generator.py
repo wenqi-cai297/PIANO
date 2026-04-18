@@ -182,7 +182,12 @@ class InteractionMaskTransformer(nn.Module):
                 temporal_stride=4,
             )
 
-        return cls(mask_transformer, interaction_tokenizer, interaction_drop_prob)
+        wrapper = cls(mask_transformer, interaction_tokenizer, interaction_drop_prob)
+        # ``mask_transformer`` was loaded onto ``device``, but the newly-created
+        # interaction layers (and the tokenizer) start on CPU. Move everything
+        # to the same device so forward passes don't cross CPU/GPU.
+        wrapper.to(device)
+        return wrapper
 
     def trans_forward(
         self,
