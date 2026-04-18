@@ -20,6 +20,7 @@ containing the detailed writeup. Sorted by date (most recent first).
 | 2026-04-19 | [omomo_data_inspection](analyses/2026-04-19_omomo_data_inspection.md) | CHOIS processed_data format check | `.p` files are joblib pickles (not vanilla); `obj_trans` has trailing singleton axis; 16 betas; no rest-pose meshes for vacuum/mop | Switched to `joblib.load`; added joblib dep; documented field conventions |
 | 2026-04-19 | [omomo_preprocessing](analyses/2026-04-19_omomo_preprocessing.md) | SMPL-X FK → HumanML3D 263-dim on 5882 sequences | 4919 sequences preprocessed in ~1 min on A6000 (92 seq/sec); found + fixed SMPL-X zero-buffer batch-size bug | Explicit batch-sized zero tensors for unused SMPL-X params; downsample 30→20 fps via linear interp |
 | 2026-04-19 | [hoi_dataset_verification](analyses/2026-04-19_hoi_dataset_verification.md) | HOIDataset + collate_hoi on preprocessed data | 4919 sequences, shapes correct, 4838 with text, collate handles str + tensors cleanly | No code changes needed; pipeline is stable |
+| 2026-04-19 | [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md) | End-to-end inference with untrained PIANO + pretrained MoMask | Pipeline runs cleanly (finite, shapes OK), zero-init interaction cross-attn verified (outputs near-uniform as expected). Fixed device mismatch bug where new wrapper layers stayed on CPU. | Added `wrapper.to(device)` in `from_pretrained`; ready for training |
 
 ---
 

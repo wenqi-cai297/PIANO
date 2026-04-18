@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (OMOMO data + HOIDataset verified; ready for pseudo-labels or smoke test)
+**Last updated:** 2026-04-19 (inference smoke test passed; ready for pseudo-label extraction + training)
 
 ---
 
@@ -60,7 +60,15 @@ When cloned on a GPU server with the environment set up, the following can run:
 - See analyses: [omomo_data_inspection](analyses/2026-04-19_omomo_data_inspection.md),
   [omomo_preprocessing](analyses/2026-04-19_omomo_preprocessing.md),
   [hoi_dataset_verification](analyses/2026-04-19_hoi_dataset_verification.md),
-  [momask_weight_loading](analyses/2026-04-19_momask_weight_loading.md)
+  [momask_weight_loading](analyses/2026-04-19_momask_weight_loading.md),
+  [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md)
+
+### End-to-end inference baseline
+
+- Ran `inference_smoke_test.sh` on 4 OMOMO samples (2026-04-19 063940)
+- All shapes verified; output finite; token_ids within valid VQ range
+- Zero-init interaction cross-attn confirmed to preserve MoMask behavior
+- Fixed: device mismatch where new wrapper layers stayed on CPU
 
 ---
 

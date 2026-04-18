@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-19 (post OMOMO preprocessing; smoke test next)
+**Last updated:** 2026-04-19 (post smoke test; ready to extract pseudo-labels)
 
 ---
 
@@ -28,8 +28,8 @@ Current priorities and next steps. Updated after each experiment analysis cycle.
 - [x] SMPL-X → SMPL 22-joint + HumanML3D 263-dim conversion
   - 4919 sequences ready at `/media/.../datasets/omomo/piano/`
 - [x] Verify `HOIDataset` loads preprocessed data
-- [ ] **End-to-end inference smoke test** (next, before committing to training)
-  - Baseline output = pure MoMask text-only (interaction cross-attn zero-init)
+- [x] **End-to-end inference smoke test done** (2026-04-19_063940 run)
+  - Verified plumbing + zero-init cross-attn behavior. Baseline = pure MoMask.
 - [ ] Extract pseudo-labels on the 4919 preprocessed sequences
   - `bash scripts/data/extract_pseudo_labels_omomo.sh`
   - Expected runtime ~1-2h CPU (trimesh distance queries + HMM refinement)
