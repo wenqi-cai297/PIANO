@@ -1,8 +1,12 @@
-"""SMPL-X to SMPL 22-joint preprocessing pipeline.
+"""SMPL-X to SMPL 22-joint preprocessing pipeline (generic, DEPRECATED).
 
-Reads raw HOI dataset sequences (SMPL-X format), extracts the 22 body
-joints, converts to HumanML3D 263-dim representation, and saves the
-results as compressed npz files alongside the original data.
+This generic preprocessor was written before we integrated MoMask's official
+``process_file``. It still uses the naive ``joints_to_humanml3d`` and
+therefore produces features NOT compatible with MoMask's VQ-VAE.
+
+For OMOMO, use ``piano.data.preprocess_omomo`` instead (which calls
+``HumanML3DEncoder`` wrapping MoMask's process_file). For new datasets,
+write a similar adapter following preprocess_omomo as the template.
 
 Usage (standalone):
     python -m piano.data.preprocess_smplx \

@@ -1,7 +1,4 @@
-"""HumanML3D 263-dimensional motion representation.
-
-Converts SMPL 22-joint positions into the canonical 263-dim feature vector
-used by MoMask, MLD, and other HumanML3D-ecosystem models.
+"""HumanML3D 263-dimensional motion representation — helpers and (deprecated) encoder.
 
 The 263-dim vector per frame is composed of:
     - root angular velocity (1)
@@ -15,8 +12,18 @@ Total = 1 + 2 + 1 + 63 + 66 + 126 + 4 = 263
 
 Reference: Guo et al., "Generating Diverse and Natural 3D Human Motions
 from Text", CVPR 2022.
+
+**Important:** ``joints_to_humanml3d`` in this file is a naive, incomplete
+implementation kept only for historical reference. It lacks HumanML3D's
+canonicalization (uniform-skeleton rescale + heading alignment + ground
+centering), so its output is NOT compatible with MoMask's pretrained VQ-VAE
+or with ``recover_from_ric``. For new code, use
+``piano.data.humanml3d_encoder.HumanML3DEncoder`` which wraps MoMask's
+official ``process_file`` exactly.
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
@@ -27,12 +34,11 @@ def joints_to_humanml3d(
     positions: np.ndarray,
     fps: float = 30.0,
 ) -> np.ndarray:
-    """Convert joint positions to the HumanML3D 263-dim representation.
+    """**DEPRECATED** — use ``HumanML3DEncoder`` instead.
 
-    This is a *simplified* version that computes the positional and velocity
-    components.  The 6D rotation component requires SMPL body parameters
-    (not just joint positions) and is handled separately when full SMPL
-    parameters are available.
+    Naive simplification that lacks HumanML3D's required canonicalization
+    (uniform skeleton, ground-centering, heading alignment). Output is NOT
+    compatible with MoMask's VQ-VAE.
 
     Parameters
     ----------
@@ -41,8 +47,13 @@ def joints_to_humanml3d(
 
     Returns
     -------
-    features : (T, 263) HumanML3D feature vector
+    features : (T, 263) HumanML3D-shaped (but NOT HumanML3D-compatible) features
     """
+    warnings.warn(
+        "joints_to_humanml3d is deprecated — output is NOT compatible with "
+        "MoMask's VQ-VAE. Use piano.data.humanml3d_encoder.HumanML3DEncoder.",
+        DeprecationWarning, stacklevel=2,
+    )
     T, J, _ = positions.shape
     assert J == 22, f"Expected 22 joints, got {J}"
 

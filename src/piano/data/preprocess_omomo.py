@@ -38,7 +38,7 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from piano.data.humanml3d_repr import joints_to_humanml3d
+from piano.data.humanml3d_encoder import HumanML3DEncoder
 from piano.data.smplx_fk import load_smplx_model, run_smplx_fk
 from piano.utils.io_utils import ensure_dir, save_json, save_npz
 
@@ -114,50 +114,74 @@ def sample_object_point_cloud(
 # Per-sequence preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess_sequence(
+def fk_and_downsample(
     seq: dict,
     smplx_models: dict[str, torch.nn.Module],
     config: PreprocessConfig,
-) -> dict[str, np.ndarray] | None:
-    """Convert one CHOIS sequence dict to our HumanML3D-compatible format.
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Run SMPL-X FK + 30→20 fps downsampling.
 
-    Returns None if the sequence should be skipped.
+    Returns ``(joints_22_20fps, object_positions_20fps)`` in raw world frame,
+    or ``None`` if the sequence cannot be processed.
     """
     gender = str(seq["gender"])
     if gender not in smplx_models:
-        # Unknown gender string — default to male
         gender = "male"
     model = smplx_models[gender]
 
-    betas = seq["betas"].astype(np.float32)            # (1, 16)
-    root_orient = seq["root_orient"].astype(np.float32)  # (T, 3)
-    pose_body = seq["pose_body"].astype(np.float32)     # (T, 63)
-    trans = seq["trans"].astype(np.float32)             # (T, 3)
+    betas = seq["betas"].astype(np.float32)
+    root_orient = seq["root_orient"].astype(np.float32)
+    pose_body = seq["pose_body"].astype(np.float32)
+    trans = seq["trans"].astype(np.float32)
 
-    # Step 1: SMPL-X FK → (T, 55, 3) joints
     joints_smplx = run_smplx_fk(
         model, betas, root_orient, pose_body, trans, device=config.device,
     )
-
-    # Step 2: keep first 22 body joints (SMPL standard)
     joints_22 = joints_smplx[:, :22, :]
-
-    # Step 3: temporal downsample 30 → 20 fps
     joints_22_ds = downsample_temporal(joints_22, config.source_fps, config.target_fps)
 
-    # Step 4: compute object world position per frame, downsampled
     obj_pos_src = compute_object_positions(
         seq["obj_trans"], seq["obj_rot"], seq["obj_scale"],
     )
     obj_pos_ds = downsample_temporal(obj_pos_src, config.source_fps, config.target_fps)
 
-    # Step 5: HumanML3D 263-dim
-    motion_263 = joints_to_humanml3d(joints_22_ds, fps=config.target_fps)
+    return joints_22_ds.astype(np.float32), obj_pos_ds.astype(np.float32)
+
+
+def preprocess_sequence(
+    seq: dict,
+    smplx_models: dict[str, torch.nn.Module],
+    encoder: HumanML3DEncoder,
+    config: PreprocessConfig,
+) -> dict[str, np.ndarray] | None:
+    """Convert one CHOIS sequence to PIANO format.
+
+    Output carries two coordinate frames:
+      - ``motion_263``: MoMask-compatible (HumanML3D canonicalized + uniform
+        skeleton), for feeding to the pretrained VQ-VAE
+      - ``joints_22`` and ``object_positions``: raw world-frame, for
+        pseudo-label extraction (contact/support depend on accurate geometry)
+
+    ``process_file`` drops one frame for velocity computation, so all three
+    arrays are truncated to the same length T' = T-1.
+    """
+    result = fk_and_downsample(seq, smplx_models, config)
+    if result is None:
+        return None
+    joints_raw, obj_pos_raw = result                  # (T, 22, 3), (T, 3)
+
+    # MoMask-compatible encoding (HumanML3D canonical + uniform skeleton).
+    features, _aligned_joints = encoder.encode(joints_raw)   # (T-1, 263)
+
+    # Match lengths — process_file loses the last frame to velocity diff.
+    T_minus_1 = features.shape[0]
+    joints_raw = joints_raw[:T_minus_1]
+    obj_pos_raw = obj_pos_raw[:T_minus_1]
 
     return {
-        "joints_22": joints_22_ds.astype(np.float32),
-        "motion_263": motion_263.astype(np.float32),
-        "object_positions": obj_pos_ds.astype(np.float32),
+        "joints_22": joints_raw,                 # raw world frame, for pseudo-labels
+        "motion_263": features,                  # HumanML3D canonical, for VQ-VAE
+        "object_positions": obj_pos_raw,         # raw world frame, for pseudo-labels
     }
 
 
@@ -219,6 +243,33 @@ def run_pipeline(config: PreprocessConfig) -> None:
         object_names.add(name)
     print(f"Saved {len(object_names)} object point clouds")
 
+    # --- Initialize HumanML3D encoder with a reference skeleton ---
+    # Use the first frame of the first valid training sequence as the
+    # reference. MoMask's uniform_skeleton will rescale every other sequence
+    # to match this skeleton scale, ensuring consistent 263-dim features.
+    print("\nInitializing HumanML3D encoder (needs a reference skeleton) ...")
+    train_pkl = omomo_dir / "train_diffusion_manip_seq_joints24.p"
+    train_data = joblib.load(train_pkl)
+    reference_joints: np.ndarray | None = None
+    for key, seq in train_data.items():
+        seq_name = seq.get("seq_name", str(key))
+        try:
+            obj_id = _parse_object_id(seq_name)
+        except ValueError:
+            continue
+        if obj_id in config.skip_objects or obj_id not in object_names:
+            continue
+        result = fk_and_downsample(seq, smplx_models, config)
+        if result is None:
+            continue
+        reference_joints = result[0][0]  # first frame of first valid sequence, (22, 3)
+        print(f"  Reference skeleton taken from {seq_name} (frame 0)")
+        break
+    if reference_joints is None:
+        raise RuntimeError("Could not find a valid sequence to initialize encoder")
+
+    encoder = HumanML3DEncoder(reference_joints=reference_joints, feet_thre=0.002)
+
     # --- Process each split ---
     metadata: list[dict] = []
     for split in ("train", "test"):
@@ -228,7 +279,10 @@ def run_pipeline(config: PreprocessConfig) -> None:
             continue
 
         print(f"\nProcessing {split} split ...")
-        data = joblib.load(pkl_path)
+        if split == "train":
+            data = train_data       # already loaded above
+        else:
+            data = joblib.load(pkl_path)
         print(f"  {len(data)} sequences in {split}")
 
         for key, seq in tqdm(data.items(), desc=f"  {split}"):
@@ -242,7 +296,7 @@ def run_pipeline(config: PreprocessConfig) -> None:
                 continue
 
             try:
-                processed = preprocess_sequence(seq, smplx_models, config)
+                processed = preprocess_sequence(seq, smplx_models, encoder, config)
             except Exception as e:
                 print(f"  [warn] failed on {seq_name}: {e}")
                 continue
