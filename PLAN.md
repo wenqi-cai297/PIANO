@@ -37,15 +37,14 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
 - [x] Fix rtree dependency (trimesh.proximity.closest_point needs spatial index)
   - Added to `environment.yml` + `pyproject.toml`; server needs
     `conda install -c conda-forge rtree -y`
-- [ ] **NEXT: run preprocess_interact smoke test** (10 seq / subset)
-  - `bash scripts/data/preprocess_interact.sh --num-samples-limit 10 --device cuda`
-- [ ] Full InterAct preprocessing
-  - `bash scripts/data/preprocess_interact.sh --device cuda`
-  - Expected: ~8-10 minutes for 8478 sequences
-- [ ] Extract pseudo-labels on all 4 subsets
+- [x] **Full InterAct preprocessing done** (2026-04-19 08:25:12):
+  8475 / 8478 sequences in 9.4 min on A6000, 100% text, 106 unique objects.
+  See [analyses/interact_preprocessing_complete](analyses/2026-04-19_interact_preprocessing_complete.md).
+- [ ] **IN PROGRESS: extract pseudo-labels on all 4 subsets** (running in tmux)
   - `bash scripts/data/extract_pseudo_labels_interact.sh`
-  - Expected: 1-3 hours CPU (trimesh + HMM across 8478 sequences)
+  - Expected: 1-3 hours CPU (trimesh + HMM across 8475 sequences)
 - [ ] Visualize 5-10 samples per subset after pseudo-label extraction
+- [ ] Update `configs/training/predictor.yaml` with multi-root InterAct paths
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo

@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (switched to InterAct-only data track, 8478 sequences across 4 subsets)
+**Last updated:** 2026-04-19 (InterAct full preprocessing complete: 8475/8478 seq across 4 subsets, 100% text coverage)
 
 ---
 
@@ -88,6 +88,10 @@ When cloned on a GPU server with the environment set up, the following can run:
   so `HOIDataset` can combine multiple roots at training time
 - `extract_pseudo_labels_interact.sh` iterates all 4 subsets
 - `_find_mesh` extended to handle InterAct's nested `objects/<name>/<name>.obj` layout
+- **Full preprocessing run 2026-04-19 08:25:12**: 8475/8478 sequences processed
+  in 9.4 min on A6000, 100% text coverage, 106 unique objects. Only 3 seqs
+  in imhd skipped (0.04% failure). See
+  [interact_preprocessing_complete](analyses/2026-04-19_interact_preprocessing_complete.md).
 
 **CHOIS-OMOMO path: retired.** 4919-sequence preprocessing was successful but
 `omomo_correct_v2` inside InterAct supersedes it. `preprocess_omomo.py` code
