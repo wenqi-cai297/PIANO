@@ -288,17 +288,23 @@ def run_visualization(
 
     for sample in samples:
         seq_id = sample["seq_id"]
-        # Use the reconstruction path for ALL sources so the visualization
-        # tests the recovery formula end-to-end. Real samples don't need
-        # mean/std (our preprocessing stores unnormalized features), so
-        # pass None for them on the real branch.
-        use_denorm = source == "generated"
-        joints = motion_263_to_joints(
-            sample["motion_263"],
-            fps=fps,
-            mean=mean if use_denorm else None,
-            std=std if use_denorm else None,
-        )
+        # Two code paths with a reason:
+        #   - Real samples: use precomputed joints_22 (world-frame ground truth
+        #     from SMPL-X FK in preprocessing). We do NOT round-trip through
+        #     motion_263_to_joints because our ``joints_to_humanml3d`` does
+        #     not apply HumanML3D's canonicalization (heading alignment,
+        #     ground-centering), so the encoded features are NOT decodable
+        #     by MoMask's ``recover_from_ric``. Fixing encoding is tracked
+        #     separately; for visualization joints_22 is authoritative.
+        #   - Generated samples: MoMask's VQ-VAE output is already in
+        #     HumanML3D's canonicalized space, so ``recover_from_ric`` +
+        #     mean/std denormalization produces correct joint positions.
+        if sample["joints_22"] is not None:
+            joints = sample["joints_22"]
+        else:
+            joints = motion_263_to_joints(
+                sample["motion_263"], fps=fps, mean=mean, std=std,
+            )
 
         # Clip joints to actual number of frames
         n_frames = sample["num_frames"]
