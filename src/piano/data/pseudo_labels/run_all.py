@@ -97,24 +97,34 @@ def process_sequence(
 def run_pipeline(
     data_dir: Path,
     output_dir: Path,
+    mesh_dir: Path,
     metadata_path: Path | None = None,
     use_hmm: bool = True,
+    mesh_suffixes: tuple[str, ...] = ("_cleaned_simplified", ""),
 ) -> None:
     """Batch pseudo-label extraction for all sequences.
 
-    Expects preprocessed data with:
-        - ``data_dir/motions/<seq_id>.npz`` containing ``joints_22``
-        - ``data_dir/objects/<obj_id>.{obj,ply}`` — object meshes
-        - ``data_dir/metadata.json`` — list of {seq_id, object_id, ...}
+    Expects preprocessed data at *data_dir*::
+
+        data_dir/
+            metadata.json            # list of {seq_id, object_id, ...}
+            motions/<seq_id>.npz     # contains joints_22, object_positions
+
+    Object meshes live at *mesh_dir* (typically the source dataset's
+    captured_objects folder), as ``<obj_id><suffix>.{obj,ply,...}`` files.
 
     Parameters
     ----------
-    data_dir : root of preprocessed dataset
+    data_dir : root of preprocessed (PIANO-format) dataset
     output_dir : where to write pseudo-label npz files
-    metadata_path : override metadata file location
-    use_hmm : whether to use HMM refinement for phases
+    mesh_dir : directory containing source object meshes
+    metadata_path : override metadata.json location
+    use_hmm : whether to refine phases with HMM
+    mesh_suffixes : suffixes to try appending to object_id when searching
+        for the mesh file (OMOMO uses ``_cleaned_simplified``).
     """
     data_dir = Path(data_dir)
+    mesh_dir = Path(mesh_dir)
     output_dir = ensure_dir(output_dir)
 
     if metadata_path is None:
@@ -122,9 +132,15 @@ def run_pipeline(
     metadata = load_json(metadata_path)
 
     print(f"Extracting pseudo-labels for {len(metadata)} sequences")
-    print(f"  Data: {data_dir}")
+    print(f"  Data:   {data_dir}")
+    print(f"  Meshes: {mesh_dir}")
     print(f"  Output: {output_dir}")
 
+    # Cache mesh paths per object_id to avoid re-searching
+    mesh_cache: dict[str, Path | None] = {}
+
+    n_ok = 0
+    n_skip = 0
     for entry in tqdm(metadata, desc="Pseudo-labels"):
         seq_id = entry["seq_id"]
         obj_id = entry["object_id"]
@@ -132,40 +148,52 @@ def run_pipeline(
         # Load preprocessed motion
         motion_path = data_dir / "motions" / f"{seq_id}.npz"
         if not motion_path.exists():
-            print(f"  Skipping {seq_id}: motion file not found")
+            n_skip += 1
             continue
         motion_data = np.load(motion_path, allow_pickle=False)
         joints = motion_data["joints_22"]  # (T, 22, 3)
 
-        # Find object mesh
-        mesh_path = _find_mesh(data_dir / "objects", obj_id)
+        # Find object mesh (cached)
+        if obj_id not in mesh_cache:
+            mesh_cache[obj_id] = _find_mesh(mesh_dir, obj_id, mesh_suffixes)
+        mesh_path = mesh_cache[obj_id]
         if mesh_path is None:
-            print(f"  Skipping {seq_id}: object mesh '{obj_id}' not found")
+            n_skip += 1
             continue
 
-        # Object positions (if available in the data)
+        # Object positions (from preprocessing)
         object_positions = motion_data.get("object_positions", None)
 
-        # Run extraction
-        labels = process_sequence(
-            joints=joints,
-            object_mesh_path=mesh_path,
-            object_positions=object_positions,
-            use_hmm_refinement=use_hmm,
-        )
+        try:
+            labels = process_sequence(
+                joints=joints,
+                object_mesh_path=mesh_path,
+                object_positions=object_positions,
+                use_hmm_refinement=use_hmm,
+            )
+        except Exception as e:
+            print(f"  [warn] {seq_id}: {e}")
+            n_skip += 1
+            continue
 
-        # Save
         save_npz(output_dir / f"{seq_id}.npz", **labels)
+        n_ok += 1
 
-    print(f"Done. Pseudo-labels saved to {output_dir}")
+    print(f"Done. {n_ok} labels written, {n_skip} skipped. Output: {output_dir}")
 
 
-def _find_mesh(objects_dir: Path, obj_id: str) -> Path | None:
-    """Find object mesh file, trying common extensions."""
-    for ext in (".obj", ".ply", ".stl", ".off"):
-        path = objects_dir / f"{obj_id}{ext}"
-        if path.exists():
-            return path
+def _find_mesh(
+    mesh_dir: Path,
+    obj_id: str,
+    suffixes: tuple[str, ...],
+) -> Path | None:
+    """Look up an object mesh file by id + suffix, trying common extensions."""
+    extensions = (".obj", ".ply", ".stl", ".off")
+    for suffix in suffixes:
+        for ext in extensions:
+            path = mesh_dir / f"{obj_id}{suffix}{ext}"
+            if path.exists():
+                return path
     return None
 
 
@@ -179,7 +207,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-dir", type=Path, required=True,
-        help="Root of preprocessed dataset (contains motions/, objects/, metadata.json)",
+        help="Root of preprocessed PIANO dataset (contains motions/, metadata.json)",
+    )
+    parser.add_argument(
+        "--mesh-dir", type=Path, required=True,
+        help="Directory containing source object meshes (e.g. OMOMO captured_objects/)",
     )
     parser.add_argument(
         "--output-dir", type=Path, required=True,
@@ -188,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--metadata", type=Path, default=None,
         help="Override metadata file path (default: <data-dir>/metadata.json)",
+    )
+    parser.add_argument(
+        "--mesh-suffix", type=str, default="_cleaned_simplified",
+        help="Filename suffix for mesh files (default: '_cleaned_simplified' for OMOMO)",
     )
     parser.add_argument(
         "--no-hmm", action="store_true",
@@ -199,11 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI entrypoint for ``piano-pseudo-labels``."""
     args = build_parser().parse_args()
+    # Try the specified suffix first, then no suffix as fallback
+    suffixes = (args.mesh_suffix, "") if args.mesh_suffix else ("",)
     run_pipeline(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
+        mesh_dir=args.mesh_dir,
         metadata_path=args.metadata,
         use_hmm=not args.no_hmm,
+        mesh_suffixes=suffixes,
     )
 
 
