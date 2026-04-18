@@ -55,56 +55,36 @@ def motion_263_to_joints(
     mean: np.ndarray | None = None,
     std: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Reconstruct approximate absolute joint positions from HumanML3D features.
+    """Reconstruct 22 absolute joint positions from HumanML3D 263-dim features.
 
-    The 263-dim representation encodes:
-        [0]     root angular velocity (rad/s)
-        [1:3]   root xz linear velocity (m/s)
-        [3]     root height (m)
-        [4:67]  relative joint positions w.r.t. root (21 joints × 3)
-        [67:133] joint velocities (22 × 3)
-        [133:259] 6D joint rotations (21 × 6)
-        [259:263] foot contact labels
-
-    IMPORTANT: MoMask's VQ-VAE decodes into *normalized* HumanML3D space
-    (mean≈0, std≈1). To interpret as world units, pass the training
-    ``mean`` and ``std`` from the HumanML3D stats bundle. Without them,
-    the integrated trajectory is meaningless.
-
-    Our own preprocessing (`joints_to_humanml3d`) produces UNNORMALIZED
-    features, so real samples from the dataset do not need denormalization.
+    Delegates to MoMask's official ``recover_from_ric`` helper so the
+    heading rotation, per-joint XZ offsets and absolute Y handling are
+    all correct. Naive "subtract root, add height" code does not work
+    because HumanML3D canonicalizes the heading before encoding.
 
     Parameters
     ----------
     motion : (T, 263) — HumanML3D features
-    fps : frame rate (used to convert root velocity m/s → per-frame delta)
-    mean, std : (263,) optional — denormalization stats
+    fps : unused (kept for API compatibility; recovery is frame-rate agnostic)
+    mean, std : (263,) optional — denormalization stats applied before recovery
 
     Returns
     -------
-    joints : (T, 22, 3) — absolute joint positions (world units)
+    joints : (T, 22, 3) — absolute joint positions in world frame
     """
+    import torch
+
+    # MoMask's utils imports expect sys.path to include the backbone repo,
+    # which the adapter already sets up when first imported.
+    import piano.models.backbones.momask_adapter  # noqa: F401 — path side-effect
+    from utils.motion_process import recover_from_ric
+
     if mean is not None and std is not None:
         motion = motion * std + mean
 
-    T = len(motion)
-    dt = 1.0 / fps
-
-    root_vel_xz = motion[:, 1:3]          # (T, 2) — m/s
-    root_height = motion[:, 3]            # (T,)   — m
-    rel_positions = motion[:, 4:67].reshape(T, 21, 3)  # (T, 21, 3) relative to root
-
-    # Integrate root xz trajectory
-    root_pos = np.zeros((T, 3), dtype=np.float32)
-    root_pos[:, 1] = root_height
-    for t in range(1, T):
-        root_pos[t, 0] = root_pos[t - 1, 0] + root_vel_xz[t, 0] * dt
-        root_pos[t, 2] = root_pos[t - 1, 2] + root_vel_xz[t, 1] * dt
-
-    joints = np.zeros((T, 22, 3), dtype=np.float32)
-    joints[:, 0, :] = root_pos
-    joints[:, 1:, :] = rel_positions + root_pos[:, None, :]
-    return joints
+    data = torch.from_numpy(motion).float().unsqueeze(0)  # (1, T, 263)
+    joints = recover_from_ric(data, joints_num=22)         # (1, T, 22, 3)
+    return joints.squeeze(0).cpu().numpy().astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -308,13 +288,17 @@ def run_visualization(
 
     for sample in samples:
         seq_id = sample["seq_id"]
-        # Prefer precomputed absolute joints; otherwise reconstruct from motion_263
-        if sample["joints_22"] is not None:
-            joints = sample["joints_22"]
-        else:
-            joints = motion_263_to_joints(
-                sample["motion_263"], fps=fps, mean=mean, std=std,
-            )
+        # Use the reconstruction path for ALL sources so the visualization
+        # tests the recovery formula end-to-end. Real samples don't need
+        # mean/std (our preprocessing stores unnormalized features), so
+        # pass None for them on the real branch.
+        use_denorm = source == "generated"
+        joints = motion_263_to_joints(
+            sample["motion_263"],
+            fps=fps,
+            mean=mean if use_denorm else None,
+            std=std if use_denorm else None,
+        )
 
         # Clip joints to actual number of frames
         n_frames = sample["num_frames"]
