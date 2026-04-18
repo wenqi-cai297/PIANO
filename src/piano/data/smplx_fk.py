@@ -100,14 +100,25 @@ def run_smplx_fk(
         pose_body_chunk = torch.from_numpy(np.ascontiguousarray(pose_body[start:end])).float().to(device)
         trans_chunk = torch.from_numpy(np.ascontiguousarray(trans[start:end])).float().to(device)
 
-        # The model was created with a fixed batch_size, but smplx supports
-        # passing any batch size at call time via the forward kwargs.
+        # Explicit zero buffers for face/hand params to match the dynamic
+        # batch size. Without these, smplx falls back to its batch_size=1
+        # default buffers and fails the tensor-size check on forward.
+        zeros3 = torch.zeros(chunk, 3, device=device, dtype=torch.float32)
+        zeros_hand = torch.zeros(chunk, 45, device=device, dtype=torch.float32)
+        zeros_expr = torch.zeros(chunk, model.num_expression_coeffs, device=device, dtype=torch.float32)
+
         with torch.no_grad():
             output = model(
                 betas=betas_chunk,
                 global_orient=root_orient_chunk,
                 body_pose=pose_body_chunk,
                 transl=trans_chunk,
+                jaw_pose=zeros3,
+                leye_pose=zeros3,
+                reye_pose=zeros3,
+                left_hand_pose=zeros_hand,
+                right_hand_pose=zeros_hand,
+                expression=zeros_expr,
                 return_verts=False,
             )
 
