@@ -34,6 +34,7 @@ piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
 piano-check-momask = "piano.checks.momask_weights:main"
 piano-check-omomo = "piano.checks.omomo_format:main"
 piano-preprocess-omomo = "piano.data.preprocess_omomo:main"
+piano-check-hoi-dataset = "piano.checks.hoi_dataset:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
