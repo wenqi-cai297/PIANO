@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (MoMask weights verified loading on server)
+**Last updated:** 2026-04-19 (OMOMO data preprocessed: 4919 sequences ready)
 
 ---
 
@@ -48,6 +48,15 @@ When cloned on a GPU server with the environment set up, the following can run:
 - `piano-pseudo-labels --data-dir ... --output-dir ...` → CLI entrypoint registered
 - `piano-eval`, `piano-generate`, `piano-train` → CLI entrypoints registered
 - `piano-check-momask` / `bash scripts/server/check_momask_weights.sh` → **verified on A6000 server:** all three MoMask pretrained checkpoints (VQ-VAE 19.4M, MaskTransformer 163.3M, ResidualTransformer 164.6M) load cleanly without warnings
+
+### Data preparation (OMOMO, via CHOIS processed_data)
+
+- Source: `/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/processed_data` (30fps SMPL-X mocap, 17 subjects × 15 objects)
+- Preprocessed to PIANO format at `/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano`
+- Pipeline: joblib load → SMPL-X FK → 22 body joints → downsample 30→20fps → HumanML3D 263-dim → object point clouds
+- **Result: 4919 sequences (4380 train + 539 test), 4838 with text (98.4% coverage), 13 object point clouds**
+- **Skipped: 963 sequences involving `vacuum` and `mop`** — these are two-part articulated objects, CHOIS's own pipeline skips them (no canonical rest-pose mesh provided). This is CHOIS's design choice, not ours; we inherit via `PreprocessConfig.skip_objects`. Handling articulated objects is out of scope for PIANO v1.
+- Runtime: ~1 minute on single A6000 (cuda FK)
 
 ---
 
