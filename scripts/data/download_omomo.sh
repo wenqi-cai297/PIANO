@@ -40,10 +40,20 @@ echo ""
 echo "[1/1] Downloading CHOIS processed_data..."
 gdown "https://drive.google.com/file/d/1ZG-9--RfUWj5oWYnvcONNuRuxaH_Zpw1/view?usp=sharing"
 
+# The file may come down as either .tar.gz or .zip; handle both.
 echo ""
-echo "Unzipping..."
-unzip -q processed_data.zip
-rm processed_data.zip
+echo "Extracting..."
+if [ -f processed_data.tar.gz ]; then
+    tar -xzf processed_data.tar.gz
+    rm processed_data.tar.gz
+elif [ -f processed_data.zip ]; then
+    unzip -q processed_data.zip
+    rm processed_data.zip
+else
+    echo "ERROR: expected processed_data.tar.gz or processed_data.zip not found" >&2
+    ls -la
+    exit 1
+fi
 
 echo ""
 echo "================================================================"
