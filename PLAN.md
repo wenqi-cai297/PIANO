@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-19
+**Last updated:** 2026-04-19 (post OMOMO preprocessing; smoke test next)
 
 ---
 
@@ -22,12 +22,17 @@ Current priorities and next steps. Updated after each experiment analysis cycle.
 
 ### 1.2 Data Preparation
 
-- [ ] Download CORE4D from HuggingFace (open, no form)
-- [ ] Apply for InterAct subsets that require Google Form access
-- [ ] Run SMPL-X → SMPL 22-joint conversion on all data
-  - `python -m piano.data.preprocess_smplx --input-dir ... --output-dir ...`
-- [ ] Extract pseudo-labels on the full preprocessed dataset
-  - `piano-pseudo-labels --data-dir data/processed --output-dir runs/pseudo_labels`
+- [x] Download OMOMO (via CHOIS processed_data bundle, 8.6GB)
+- [x] Verify data format matches assumptions (`check_omomo_format.sh`)
+- [ ] Apply for InterAct via Google Form (user action, parallel track)
+- [x] SMPL-X → SMPL 22-joint + HumanML3D 263-dim conversion
+  - 4919 sequences ready at `/media/.../datasets/omomo/piano/`
+- [x] Verify `HOIDataset` loads preprocessed data
+- [ ] **End-to-end inference smoke test** (next, before committing to training)
+  - Baseline output = pure MoMask text-only (interaction cross-attn zero-init)
+- [ ] Extract pseudo-labels on the 4919 preprocessed sequences
+  - `bash scripts/data/extract_pseudo_labels_omomo.sh`
+  - Expected runtime ~1-2h CPU (trimesh distance queries + HMM refinement)
 - [ ] Visualize 10-20 random samples to verify pseudo-label quality before training
 
 ### 1.3 Code Gaps to Fill On-Server

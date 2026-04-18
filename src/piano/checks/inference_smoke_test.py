@@ -22,6 +22,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +39,7 @@ from piano.models.interaction_cross_attn import InteractionTokenizer
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.object_encoder import ObjectEncoder
+from piano.utils.io_utils import ensure_dir, save_json, save_npz
 
 
 def run_smoke_test(
@@ -45,8 +48,14 @@ def run_smoke_test(
     num_samples: int,
     device: str,
     max_seq_length: int,
+    output_dir: Path,
 ) -> None:
-    """Load a few samples and run through the full inference pipeline."""
+    """Load a few samples and run through the full inference pipeline.
+
+    Writes a summary and decoded motions to *output_dir* so the run can be
+    referenced later from an analysis file.
+    """
+    output_dir = ensure_dir(output_dir)
     # ---------------------------------------------------------------
     # 1. Load pretrained MoMask components
     # ---------------------------------------------------------------
@@ -198,19 +207,78 @@ def run_smoke_test(
         print(f"  Decoded motion_263:   {tuple(motion_263.shape)}")
 
         # Basic output sanity
-        finite = torch.isfinite(motion_263).all()
-        print(f"  Output finite:        {bool(finite)}")
-        print(f"  Output mean/std:      {motion_263.mean().item():.3f} / {motion_263.std().item():.3f}")
+        finite = bool(torch.isfinite(motion_263).all())
+        out_mean = float(motion_263.mean().item())
+        out_std = float(motion_263.std().item())
+        print(f"  Output finite:        {finite}")
+        print(f"  Output mean/std:      {out_mean:.3f} / {out_std:.3f}")
 
+    # ---------------------------------------------------------------
+    # 6. Save run artifacts for later analysis
+    # ---------------------------------------------------------------
+    print()
+    print("=" * 72)
+    print(f"[6/6] Saving run artifacts to {output_dir} ...")
+    print("=" * 72)
+
+    # Decoded motions + per-sample metadata
+    save_npz(
+        output_dir / "generated.npz",
+        motion_263=motion_263.cpu().numpy(),
+        token_indices=all_indices.cpu().numpy(),
+        contact_state=pred["contact_state"].cpu().numpy(),
+        contact_target=pred["contact_target"].cpu().numpy(),
+        phase=pred["phase"].cpu().numpy(),
+        support=pred["support"].cpu().numpy(),
+    )
+
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "device": device,
+        "num_samples": num_samples,
+        "max_seq_length": max_seq_length,
+        "data_dir": str(data_dir),
+        "momask_dir": str(momask_dir),
+        "texts": batch["text"],
+        "seq_lens": batch["seq_len"].tolist(),
+        "shapes": {
+            "text_emb": list(text_emb.shape),
+            "obj_tokens": list(obj_tokens.shape),
+            "interaction_tokens": list(interaction_tokens.shape),
+            "gen_token_ids": list(gen_token_ids.shape),
+            "all_indices": list(all_indices.shape),
+            "motion_263": list(motion_263.shape),
+        },
+        "output_stats": {
+            "finite": finite,
+            "mean": out_mean,
+            "std": out_std,
+            "token_min": int(gen_token_ids.min().item()),
+            "token_max": int(gen_token_ids.max().item()),
+        },
+        "params": {
+            "interaction_cross_attn_M": round(n_interaction / 1e6, 3),
+            "momask_backbone_M": round(n_backbone / 1e6, 3),
+            "object_encoder_M": round(
+                sum(p.numel() for p in object_encoder.parameters()) / 1e6, 3,
+            ),
+            "predictor_M": round(
+                sum(p.numel() for p in predictor.parameters()) / 1e6, 3,
+            ),
+        },
+        "note": (
+            "With PIANO components untrained and interaction cross-attn "
+            "zero-initialized, the output should match pure MoMask text-only "
+            "generation. This run is the pre-training baseline."
+        ),
+    }
+    save_json(output_dir / "summary.json", summary)
+
+    print(f"  Wrote generated.npz and summary.json to {output_dir}")
     print()
     print("=" * 72)
     print("SUCCESS: end-to-end inference pipeline runs cleanly.")
     print("=" * 72)
-    print()
-    print("Note: with all PIANO components untrained and interaction")
-    print("cross-attn zero-initialized, the output at this stage is equivalent")
-    print("to pure MoMask text-only generation. This is the expected baseline")
-    print("before any finetuning — it proves the plumbing works.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -226,18 +294,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--max-seq-length", type=int, default=196)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Output directory (default: runs/smoke_tests/<timestamp>/)",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.output_dir is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_dir = Path("runs/smoke_tests") / timestamp
+    else:
+        output_dir = args.output_dir
+
     run_smoke_test(
         data_dir=args.data_dir,
         momask_dir=args.momask_dir,
         num_samples=args.num_samples,
         device=device,
         max_seq_length=args.max_seq_length,
+        output_dir=output_dir,
     )
 
 

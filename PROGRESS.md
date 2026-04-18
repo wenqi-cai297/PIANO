@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (OMOMO data preprocessed: 4919 sequences ready)
+**Last updated:** 2026-04-19 (OMOMO data + HOIDataset verified; ready for pseudo-labels or smoke test)
 
 ---
 
@@ -57,6 +57,10 @@ When cloned on a GPU server with the environment set up, the following can run:
 - **Result: 4919 sequences (4380 train + 539 test), 4838 with text (98.4% coverage), 13 object point clouds**
 - **Skipped: 963 sequences involving `vacuum` and `mop`** — these are two-part articulated objects, CHOIS's own pipeline skips them (no canonical rest-pose mesh provided). This is CHOIS's design choice, not ours; we inherit via `PreprocessConfig.skip_objects`. Handling articulated objects is out of scope for PIANO v1.
 - Runtime: ~1 minute on single A6000 (cuda FK)
+- See analyses: [omomo_data_inspection](analyses/2026-04-19_omomo_data_inspection.md),
+  [omomo_preprocessing](analyses/2026-04-19_omomo_preprocessing.md),
+  [hoi_dataset_verification](analyses/2026-04-19_hoi_dataset_verification.md),
+  [momask_weight_loading](analyses/2026-04-19_momask_weight_loading.md)
 
 ---
 
