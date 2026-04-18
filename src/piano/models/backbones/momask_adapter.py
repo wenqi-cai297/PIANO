@@ -37,6 +37,21 @@ if _momask_path not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# Numpy backwards-compat shim for MoMask's older code
+# ---------------------------------------------------------------------------
+# MoMask's common/quaternion.py (and similar files) still use deprecated
+# numpy aliases like ``np.float``, ``np.int``, ``np.bool`` which were
+# removed in numpy >= 1.24. Rather than editing upstream source, we
+# restore these aliases at import time.
+import numpy as _np  # noqa: E402
+
+for _attr, _alias in (("float", float), ("int", int), ("bool", bool),
+                      ("object", object), ("complex", complex), ("str", str)):
+    if not hasattr(_np, _attr):
+        setattr(_np, _attr, _alias)
+
+
+# ---------------------------------------------------------------------------
 # Lazy imports from MoMask (deferred to avoid import-time CLIP loading)
 # ---------------------------------------------------------------------------
 
