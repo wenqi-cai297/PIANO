@@ -3,6 +3,11 @@
 
 ## Project Specification
 
+> **Document layout:** This file is the **stable design spec** — problem framing,
+> methodology, architecture, evaluation protocol. For dynamic content see:
+> [`PROGRESS.md`](PROGRESS.md) (what's built), [`PLAN.md`](PLAN.md) (what's next),
+> [`ANALYSIS.md`](ANALYSIS.md) (experiment findings index → `analyses/`).
+
 ---
 
 ## 1. Problem Statement
@@ -909,22 +914,9 @@ wandb/
 
 ---
 
-## 14. Timeline
+## 14. Differentiation from Prior Work
 
-| Week | Milestone | Deliverable |
-|------|-----------|-------------|
-| 1-2 | Environment + data | MoMask running, datasets downloaded, SMPL-X->SMPL conversion done |
-| 3 | Pseudo-labels | All pseudo-labels extracted, quality verified via visualization |
-| 4-5 | Interaction Predictor | Trained predictor, accuracy metrics on held-out set |
-| 6-7 | Motion Generator | MoMask finetuned with interaction conditioning, qualitative results |
-| 8 | Joint finetune | Full pipeline end-to-end, consistency loss working |
-| 9-10 | Evaluation | All metrics computed, ablations done, visualizations ready |
-
----
-
-## 15. Differentiation from Prior Work
-
-### 15.1 Why This Is Not "Move as You Say with More Variables"
+### 14.1 Why This Is Not "Move as You Say with More Variables"
 
 | Dimension | Move as You Say (CVPR 2024) | Ours |
 |-----------|----------------------------|------|
@@ -937,7 +929,7 @@ wandb/
 
 The structural resemblance (both are two-stage with an intermediate representation) is intentional — two-stage is a proven design. The contribution is not the architecture pattern but **what the intermediate representation encodes and what new capability it enables**.
 
-### 15.2 Contributions (Paper Framing)
+### 14.2 Contributions (Paper Framing)
 
 1. **Problem contribution**: We identify object-adaptive interaction as a neglected but fundamental aspect of physically plausible motion generation. We show that existing methods — including affordance-based two-stage approaches — produce attribute-insensitive motions.
 
@@ -947,7 +939,7 @@ The structural resemblance (both are two-stage with an intermediate representati
 
 4. **Evaluation contribution**: We introduce Attribute Sensitivity Score (ASS) and Attribute-Strategy Consistency (ASC) as new metrics for evaluating object-adaptive motion generation — an evaluation axis absent from prior work.
 
-### 15.3 Anticipated Reviewer Questions and Answers
+### 14.3 Anticipated Reviewer Questions and Answers
 
 **Q: "This is just Move as You Say with richer features."**
 A: Move as You Say predicts *where* (spatial affordance). We predict *how and when* (temporal interaction plan). More importantly, Move as You Say's affordance does not change with object properties — our latent does. This enables a fundamentally new capability (object-adaptive generation) that we validate with dedicated metrics (ASS/ASC).
@@ -963,42 +955,14 @@ A: Physics-in-the-loop methods (InterPhys, CooHOI) achieve strong physical plaus
 
 ---
 
-## 16. Risk Mitigation & Reviewer Defense
+## Companion documents
 
-| Risk | Mitigation |
-|------|------------|
-| Pseudo-label noise | Soft labels + temporal smoothing + region-level (not point-level) supervision |
-| Generator ignores z_int | Consistency loss + classifier-free guidance on interaction tokens + dropout training |
-| SMPL-X to SMPL information loss | Acceptable for full-body tasks; hand-level tasks deferred to v2 |
-| InterAct data format issues | Start with OMOMO (smaller, well-documented) as sanity check, then scale to InterAct |
-| MoMask weight compatibility | Architecture reimplemented in motion_generator.py with matching param names; verified via load_state_dict(strict=False). If MoMask updates checkpoint format, re-check _remap_key() |
-| Reviewer says "incremental over Move as You Say" | Frame paper around object-adaptive problem (not two-stage architecture); lead with ASS/ASC metrics; show Move as You Say cannot do attribute-sensitive generation |
-| Attribute sensitivity not significant in experiments | Ensure training data covers diverse object attributes; if not, augment by scaling object meshes and adjusting pseudo-labels accordingly |
+This file describes the **stable design** — what we're building and why.
+For current state, plans, and experimental findings, see:
 
----
+- **[PROGRESS.md](PROGRESS.md)** — current implementation status, module-level
+- **[PLAN.md](PLAN.md)** — next-step action plan, open decisions, timeline, risk watch
+- **[ANALYSIS.md](ANALYSIS.md)** — index of experiment analyses (individual files in `analyses/`)
 
-## 17. Implementation Status
-
-| Module | Files | Status | Notes |
-|--------|-------|--------|-------|
-| Project scaffolding | pyproject.toml, environment.yml, configs/ | Done | pip install -e . verified |
-| Utils | io_utils, geometry, smpl_utils | Done | Unit tests passed |
-| Data processing | humanml3d_repr, preprocess_smplx, dataset | Done | 263-dim conversion verified |
-| Pseudo-label extraction | extract_contact/target/phase/support, refine_hmm, run_all | Done | Phase + support unit tests passed; contact/target need trimesh (server) |
-| Object Encoder | object_encoder.py (PointNet++) | Done | Forward pass OK, 0.3M params, feature_dim=384 |
-| Interaction Predictor | interaction_predictor.py | Done | 10 layers, d=384, Block AttnRes (block_size=2, 5 blocks), 31.8M params. AttnRes from MoonshotAI/Attention-Residuals |
-| Interaction Cross-Attention | interaction_cross_attn.py | Done | Zero-init verified |
-| Interaction Extractor | interaction_extractor.py | Done | Forward pass OK, 2.5M params |
-| Motion Generator | motion_generator.py (thin wrapper) + masking.py + backbones/momask_adapter.py | Done | Imports MoMask's original classes directly; patches seqTransEncoder to inject interaction cross-attn; 100% weight-compatible |
-| MoMask Backbone | backbones/momask/ (git clone, gitignored) | Done | Cloned from EricGuo5513/momask-codes; not tracked in our repo |
-| Training: Losses | losses.py (PredictorLoss, GeneratorLoss, ConsistencyLoss) | Done | BCE/CE/KL for pseudo-labels; masked token prediction; consistency cycle |
-| Training: Priors | priors.py (PhysicalPriors) | Done | Reachability, contact persistence, support smoothness, phase monotonicity |
-| Training: Stage A | train_predictor.py | Done | Accelerate loop, CLIP encoding, pseudo-label supervision + priors |
-| Training: Stage B | train_generator.py | Done | Frozen VQ-VAE, GT pseudo-labels as condition, dual-LR for new vs original layers |
-| Training: Stage C | train_joint.py | Done | Predicted z_int → generator → extractor → consistency loss |
-| Training: Shared | trainer.py | Done | Generic Accelerate loop, checkpoint save, wandb logging, cosine LR + warmup |
-| Evaluation | motion_metrics.py (FID, R-Prec, MM-Dist, Diversity) | Done | HumanML3D protocol |
-| Evaluation | physics_metrics.py (penetration, contact P/R/F1, foot sliding) | Done | |
-| Evaluation | controllability.py (ASS, ASC, latent sensitivity) | Done | Core novelty metrics |
-| Inference | generate.py (PIANOPipeline class) | Done | End-to-end text+object → motion; CLI entrypoint |
-| Inference | visualize.py (skeleton rendering) | Done | 3D skeleton frames, motion_263 → joints conversion |
+This three-document split means SPEC.md stays mostly static (design decisions)
+while PROGRESS.md and PLAN.md evolve as work proceeds.
