@@ -287,8 +287,9 @@ def run_smoke_test(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "--data-dir", type=Path, default=Path("/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano"),
-        help="Preprocessed PIANO dataset directory",
+        "--data-dir", type=Path,
+        default=Path("/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"),
+        help="Preprocessed PIANO dataset directory (any InterAct subset root)",
     )
     parser.add_argument(
         "--momask-dir", type=Path, default=Path("checkpoints/momask/t2m"),

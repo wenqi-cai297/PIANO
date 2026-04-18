@@ -2,9 +2,9 @@
 # Render skeleton motion videos (mp4) from real or generated motion sources.
 #
 # Usage:
-#   # Real OMOMO samples (first 4)
+#   # Real InterAct samples (first 4 from one subset)
 #   bash scripts/server/visualize_motion.sh real \
-#       --data-dir /media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano
+#       --data-dir /media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2
 #
 #   # Generated motion from a smoke-test run
 #   bash scripts/server/visualize_motion.sh generated \

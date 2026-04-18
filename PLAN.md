@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-19 (encoder round-trip validated; InterAct downloaded; time to extract OMOMO pseudo-labels + unzip InterAct in parallel)
+**Last updated:** 2026-04-19 (switched to InterAct-only data track, dropped CHOIS-OMOMO; rtree dep fix queued for the server)
 
 ---
 
@@ -22,33 +22,35 @@ Current priorities and next steps. Updated after each experiment analysis cycle.
 
 ### 1.2 Data Preparation
 
-**OMOMO track (v2 preprocessing using MoMask's `process_file`):**
-- [x] Download OMOMO (via CHOIS processed_data bundle, 8.6GB)
-- [x] Verify data format matches assumptions (`check_omomo_format.sh`)
-- [x] SMPL-X → SMPL 22-joint + HumanML3D 263-dim conversion (v2, MoMask-compatible)
-  - 4919 sequences ready at `/media/.../datasets/omomo/piano/`
-- [x] Verify `HOIDataset` loads preprocessed data
-- [x] End-to-end inference smoke test (2026-04-19_063940 run)
-- [x] **Encoder round-trip validated** — motion_263 decodes cleanly via `recover_from_ric`
-- [ ] **NEXT: extract pseudo-labels on the 4919 OMOMO sequences**
-  - `bash scripts/data/extract_pseudo_labels_omomo.sh`
-  - Expected runtime ~1-2h CPU (trimesh distance queries + HMM refinement)
-  - Can run in tmux/nohup while InterAct is being prepared in parallel
-- [ ] Visualize 10-20 random samples to verify pseudo-label quality before training
+**Data track: InterAct only (CHOIS-OMOMO path retired)**
 
-**InterAct track (v1 preprocessing, parallel to OMOMO pseudo-labels):**
-- [x] Apply for InterAct via Google Form
-- [x] Download `InterAct.zip` (approval received)
-- [ ] **NEXT: unzip** `InterAct.zip` and inspect directory layout
-  - `cd /media/.../datasets/InterAct && unzip InterAct.zip && ls -la`
-- [ ] Write `src/piano/checks/interact_format.py` (mirror `omomo_format.py`)
-- [ ] Write `src/piano/data/preprocess_interact.py` (reuse `HumanML3DEncoder`
-  + `run_smplx_fk`; only needs per-subset field remapping — joints source,
-  object pose convention)
-- [ ] Run preprocessing → PIANO format under `/media/.../datasets/InterAct/piano/`
-- [ ] Extract pseudo-labels on the InterAct-preprocessed sequences
-- [ ] Combine with OMOMO-preprocessed data for Stage A training (shared
-  `HOIDataset` can stack multiple roots — see `configs/training/predictor.yaml`)
+Decision (2026-04-19): drop `preprocess_omomo.py` output from training plan —
+`omomo_correct_v2` inside InterAct is the same dataset curated further by the
+InterAct team, and using only InterAct gives us a single unified preprocessing
+path across all 4 subsets (chairs / imhd / neuraldome / omomo_correct_v2).
+Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
+
+- [x] Download `InterAct.zip` + unzip
+- [x] Inspect format (`check_interact_format.sh`); schema is uniform across subsets
+- [x] Write `preprocess_interact.py` (reuses `HumanML3DEncoder` + `run_smplx_fk`)
+- [x] Format-verification: 4 subsets detected, sample human/object npz keys match expectations
+- [x] Fix rtree dependency (trimesh.proximity.closest_point needs spatial index)
+  - Added to `environment.yml` + `pyproject.toml`; server needs
+    `conda install -c conda-forge rtree -y`
+- [ ] **NEXT: run preprocess_interact smoke test** (10 seq / subset)
+  - `bash scripts/data/preprocess_interact.sh --num-samples-limit 10 --device cuda`
+- [ ] Full InterAct preprocessing
+  - `bash scripts/data/preprocess_interact.sh --device cuda`
+  - Expected: ~8-10 minutes for 8478 sequences
+- [ ] Extract pseudo-labels on all 4 subsets
+  - `bash scripts/data/extract_pseudo_labels_interact.sh`
+  - Expected: 1-3 hours CPU (trimesh + HMM across 8478 sequences)
+- [ ] Visualize 5-10 samples per subset after pseudo-label extraction
+
+**CHOIS-OMOMO path is retired but preserved:**
+- `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo
+  (reference implementation for CHOIS-style joblib datasets). No longer the
+  primary training data path.
 
 ### 1.3 Code Gaps to Fill On-Server
 

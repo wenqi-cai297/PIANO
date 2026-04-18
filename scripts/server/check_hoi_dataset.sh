@@ -8,7 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DATA_DIR="/media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano"
+DATA_DIR="/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do

@@ -12,6 +12,7 @@ dependencies = [
     "einops",
     "omegaconf",
     "trimesh",
+    "rtree",           # required by trimesh.proximity.closest_point (spatial index)
     "smplx",
     "scipy",
     "scikit-learn",

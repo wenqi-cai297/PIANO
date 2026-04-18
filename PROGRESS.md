@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (HumanML3D encoder switched to official MoMask `process_file`; round-trip validated; InterAct downloaded)
+**Last updated:** 2026-04-19 (switched to InterAct-only data track, 8478 sequences across 4 subsets)
 
 ---
 
@@ -68,10 +68,34 @@ When cloned on a GPU server with the environment set up, the following can run:
   [inference_smoke_test](analyses/2026-04-19_inference_smoke_test.md),
   [humanml3d_encoder_switch](analyses/2026-04-19_humanml3d_encoder_switch.md)
 
-**InterAct (CVPR 2025)**
-- Downloaded to `/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/InterAct.zip` via Google Form
-- Covers: NeuralDome, IMHD, CHAIRS, OMOMO (corrected + augmented) after unzip
-- Not yet unzipped / processed. See PLAN for next steps.
+**InterAct (CVPR 2025) — primary data track**
+- Downloaded + unzipped at `/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/InterAct/`
+- Format inspected via `check_interact_format.sh` — 4 subsets share a uniform schema
+  (human.npz with poses/betas/trans/gender, object.npz with angles/trans/name, text.txt)
+
+| Subset | Sequences | Unique objects |
+|--------|----------:|---------------:|
+| chairs | 1502 | 60 |
+| imhd | 595 | 10 |
+| neuraldome | 1491 | 21 |
+| omomo_correct_v2 | 4890 | 15 |
+| **Total** | **8478** | **106** |
+
+- `preprocess_interact.py` written: shared `HumanML3DEncoder` + SMPL-X FK
+  pipeline with pose-splitting [0:3] root / [3:66] body (hands ignored for v1)
+  and betas padded to 16 (chairs ships 10)
+- Each subset writes to its own PIANO root (`/media/.../InterAct/piano/<subset>/`)
+  so `HOIDataset` can combine multiple roots at training time
+- `extract_pseudo_labels_interact.sh` iterates all 4 subsets
+- `_find_mesh` extended to handle InterAct's nested `objects/<name>/<name>.obj` layout
+
+**CHOIS-OMOMO path: retired.** 4919-sequence preprocessing was successful but
+`omomo_correct_v2` inside InterAct supersedes it. `preprocess_omomo.py` code
+retained for reference / future CHOIS-style datasets.
+
+**Dependency note**: `rtree` (required by `trimesh.proximity.closest_point`)
+must be installed from `conda-forge` so `libspatialindex` comes along.
+Added to `environment.yml`.
 
 ### End-to-end inference baseline
 

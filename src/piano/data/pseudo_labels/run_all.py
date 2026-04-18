@@ -210,13 +210,20 @@ def _find_mesh(
     obj_id: str,
     suffixes: tuple[str, ...],
 ) -> Path | None:
-    """Look up an object mesh file by id + suffix, trying common extensions."""
+    """Look up an object mesh file by id + suffix.
+
+    Tries two layouts to support different upstream conventions:
+        - Flat:    ``mesh_dir/<obj_id><suffix>.<ext>``         (OMOMO/CHOIS)
+        - Nested:  ``mesh_dir/<obj_id>/<obj_id><suffix>.<ext>`` (InterAct)
+    """
     extensions = (".obj", ".ply", ".stl", ".off")
-    for suffix in suffixes:
-        for ext in extensions:
-            path = mesh_dir / f"{obj_id}{suffix}{ext}"
-            if path.exists():
-                return path
+    candidate_dirs = (mesh_dir, mesh_dir / obj_id)
+    for d in candidate_dirs:
+        for suffix in suffixes:
+            for ext in extensions:
+                path = d / f"{obj_id}{suffix}{ext}"
+                if path.exists():
+                    return path
     return None
 
 

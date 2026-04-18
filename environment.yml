@@ -7,6 +7,9 @@ channels:
 dependencies:
   - python=3.10
   - pip
+  # rtree is installed from conda-forge so libspatialindex (system C lib)
+  # comes along for the ride. trimesh.proximity.closest_point needs it.
+  - rtree
   - pip:
     - torch>=2.0
     - torchvision
