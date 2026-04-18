@@ -52,6 +52,8 @@ SKELETON_CONNECTIONS: list[tuple[int, int]] = [
 def motion_263_to_joints(
     motion: np.ndarray,
     fps: float = 20.0,
+    mean: np.ndarray | None = None,
+    std: np.ndarray | None = None,
 ) -> np.ndarray:
     """Reconstruct approximate absolute joint positions from HumanML3D features.
 
@@ -64,14 +66,27 @@ def motion_263_to_joints(
         [133:259] 6D joint rotations (21 × 6)
         [259:263] foot contact labels
 
-    We integrate the root xz velocity to recover root trajectory, then
-    add relative joint positions to produce (T, 22, 3) absolute positions.
+    IMPORTANT: MoMask's VQ-VAE decodes into *normalized* HumanML3D space
+    (mean≈0, std≈1). To interpret as world units, pass the training
+    ``mean`` and ``std`` from the HumanML3D stats bundle. Without them,
+    the integrated trajectory is meaningless.
+
+    Our own preprocessing (`joints_to_humanml3d`) produces UNNORMALIZED
+    features, so real samples from the dataset do not need denormalization.
 
     Parameters
     ----------
-    motion : (T, 263) — HumanML3D features (in the same unit as training)
+    motion : (T, 263) — HumanML3D features
     fps : frame rate (used to convert root velocity m/s → per-frame delta)
+    mean, std : (263,) optional — denormalization stats
+
+    Returns
+    -------
+    joints : (T, 22, 3) — absolute joint positions (world units)
     """
+    if mean is not None and std is not None:
+        motion = motion * std + mean
+
     T = len(motion)
     dt = 1.0 / fps
 
@@ -279,6 +294,8 @@ def run_visualization(
     output_dir: Path,
     source: str,
     fps: float,
+    mean: np.ndarray | None = None,
+    std: np.ndarray | None = None,
 ) -> None:
     output_dir = ensure_dir(output_dir)
     index: list[dict] = []
@@ -289,7 +306,9 @@ def run_visualization(
         if sample["joints_22"] is not None:
             joints = sample["joints_22"]
         else:
-            joints = motion_263_to_joints(sample["motion_263"], fps=fps)
+            joints = motion_263_to_joints(
+                sample["motion_263"], fps=fps, mean=mean, std=std,
+            )
 
         # Clip joints to actual number of frames
         n_frames = sample["num_frames"]
@@ -345,6 +364,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--output-dir", type=Path, default=None,
                        help="Default: runs/visualizations/<timestamp>/")
         p.add_argument("--fps", type=float, default=20.0)
+        p.add_argument("--mean", type=Path, default=None,
+                       help="HumanML3D mean.npy — required to denormalize "
+                            "MoMask-generated motion back to world units")
+        p.add_argument("--std", type=Path, default=None,
+                       help="HumanML3D std.npy — paired with --mean")
     return parser
 
 
@@ -357,12 +381,15 @@ def main() -> None:
     else:
         output_dir = args.output_dir
 
+    mean = np.load(args.mean).astype(np.float32) if args.mean else None
+    std = np.load(args.std).astype(np.float32) if args.std else None
+
     if args.source == "real":
         samples = load_real_samples(args.data_dir, args.seq_ids, args.num_samples)
     else:
         samples = load_generated_samples(args.run_dir)
 
-    run_visualization(samples, output_dir, args.source, fps=args.fps)
+    run_visualization(samples, output_dir, args.source, fps=args.fps, mean=mean, std=std)
 
 
 if __name__ == "__main__":
