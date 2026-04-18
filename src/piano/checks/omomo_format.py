@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 from pathlib import Path
 
+import joblib
 import numpy as np
 
 
@@ -27,9 +27,8 @@ EXPECTED_SEQ_KEYS = {
 
 
 def inspect_sequence_pickle(pkl_path: Path) -> dict:
-    """Load the per-sequence pickle and return a summary dict."""
-    with pkl_path.open("rb") as f:
-        data = pickle.load(f)
+    """Load the per-sequence pickle (joblib format) and return a summary dict."""
+    data = joblib.load(pkl_path)
 
     if not isinstance(data, dict):
         raise TypeError(f"Expected dict at {pkl_path}, got {type(data)}")
