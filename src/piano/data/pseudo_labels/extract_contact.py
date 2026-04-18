@@ -41,8 +41,14 @@ class ContactConfig:
 
 
 def _soft_sigmoid(x: np.ndarray, threshold: float, sigma: float) -> np.ndarray:
-    """Smooth step function: 1 when x < threshold, 0 when x >> threshold."""
-    return 1.0 / (1.0 + np.exp((x - threshold) / sigma))
+    """Smooth step function: 1 when x < threshold, 0 when x >> threshold.
+
+    Uses ``scipy.special.expit`` (numerically stable logistic) instead of
+    the naive ``1 / (1 + exp(...))`` to avoid overflow warnings when the
+    argument is large (distances much farther than the threshold).
+    """
+    from scipy.special import expit
+    return expit(-(x - threshold) / sigma)
 
 
 def extract_contact_state(

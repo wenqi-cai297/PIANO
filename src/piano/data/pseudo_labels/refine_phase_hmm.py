@@ -93,8 +93,18 @@ def refine_phases_hmm(
     hmm.covars_ = covars
 
     # --- Fit and predict ---
-    hmm.fit(features)
-    refined_phases = hmm.predict(features)
+    # hmmlearn's ConvergenceMonitor prints "Model is not converging" to
+    # stdout on some sequences (short clips, weak phase structure). It
+    # still returns the best-so-far parameters, so the warning is noise.
+    import logging
+    hmmlearn_logger = logging.getLogger("hmmlearn")
+    original_level = hmmlearn_logger.level
+    hmmlearn_logger.setLevel(logging.ERROR)
+    try:
+        hmm.fit(features)
+        refined_phases = hmm.predict(features)
+    finally:
+        hmmlearn_logger.setLevel(original_level)
 
     return refined_phases.astype(np.int64)
 
