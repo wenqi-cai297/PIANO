@@ -33,6 +33,7 @@ piano-generate = "piano.inference.generate:main"
 piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
 piano-check-momask = "piano.checks.momask_weights:main"
 piano-check-omomo = "piano.checks.omomo_format:main"
+piano-preprocess-omomo = "piano.data.preprocess_omomo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
