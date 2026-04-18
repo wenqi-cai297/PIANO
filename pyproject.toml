@@ -36,6 +36,7 @@ piano-check-omomo = "piano.checks.omomo_format:main"
 piano-preprocess-omomo = "piano.data.preprocess_omomo:main"
 piano-check-hoi-dataset = "piano.checks.hoi_dataset:main"
 piano-smoke-test = "piano.checks.inference_smoke_test:main"
+piano-visualize-motion = "piano.inference.visualize_motion:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
