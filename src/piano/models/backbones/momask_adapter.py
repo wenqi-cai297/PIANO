@@ -73,14 +73,20 @@ def build_momask_opt(
     num_quantizers: int = 6,
     shared_codebook: bool = False,
     quantize_dropout_prob: float = 0.2,
+    mu: float = 0.99,
     device: str = "cpu",
 ) -> SimpleNamespace:
-    """Build a minimal ``opt`` namespace that MoMask constructors expect."""
+    """Build a minimal ``opt`` namespace that MoMask constructors expect.
+
+    Default values mirror MoMask's ``options/vq_option.py`` defaults so
+    pretrained checkpoints load without mismatch.
+    """
     return SimpleNamespace(
         num_tokens=num_tokens,
         num_quantizers=num_quantizers,
         shared_codebook=shared_codebook,
         quantize_dropout_prob=quantize_dropout_prob,
+        mu=mu,                          # EMA decay for codebook (MoMask default: 0.99)
         device=device,
     )
 
