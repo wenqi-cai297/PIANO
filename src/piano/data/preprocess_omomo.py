@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -174,6 +176,7 @@ def _parse_object_id(seq_name: str) -> str:
 
 def run_pipeline(config: PreprocessConfig) -> None:
     """Run the full OMOMO preprocessing pipeline."""
+    t_start = time.time()
     omomo_dir = config.omomo_dir
     output_dir = ensure_dir(config.output_dir)
     motions_dir = ensure_dir(output_dir / "motions")
@@ -259,10 +262,42 @@ def run_pipeline(config: PreprocessConfig) -> None:
 
     # --- Write metadata.json ---
     save_json(output_dir / "metadata.json", metadata)
+    elapsed = time.time() - t_start
+    n_train = sum(1 for m in metadata if m["split"] == "train")
+    n_test = sum(1 for m in metadata if m["split"] == "test")
+    n_text = sum(1 for m in metadata if m["text"])
     print(f"\nWrote metadata for {len(metadata)} sequences to {output_dir / 'metadata.json'}")
-    print(f"Train sequences: {sum(1 for m in metadata if m['split'] == 'train')}")
-    print(f"Test sequences:  {sum(1 for m in metadata if m['split'] == 'test')}")
-    print(f"With text:       {sum(1 for m in metadata if m['text'])}")
+    print(f"Train sequences: {n_train}")
+    print(f"Test sequences:  {n_test}")
+    print(f"With text:       {n_text}")
+    print(f"Elapsed:         {elapsed:.1f}s")
+
+    # --- Write summary.json for later analysis ---
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "device": config.device,
+        "omomo_dir": str(omomo_dir),
+        "output_dir": str(output_dir),
+        "smplx_dir": str(config.smplx_dir),
+        "config": {
+            "num_betas": config.num_betas,
+            "source_fps": config.source_fps,
+            "target_fps": config.target_fps,
+            "num_object_points": config.num_object_points,
+            "skip_objects": list(config.skip_objects),
+        },
+        "counts": {
+            "num_sequences_total": len(metadata),
+            "num_train": n_train,
+            "num_test": n_test,
+            "num_with_text": n_text,
+            "num_objects": len(object_names),
+            "object_names": sorted(object_names),
+        },
+        "elapsed_sec": round(elapsed, 2),
+    }
+    save_json(output_dir / "summary.json", summary)
+    print(f"Summary:         {output_dir / 'summary.json'}")
 
 
 # ---------------------------------------------------------------------------

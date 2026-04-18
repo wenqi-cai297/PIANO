@@ -307,7 +307,7 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        output_dir = Path("runs/smoke_tests") / timestamp
+        output_dir = Path("runs/checks/inference_smoke_test") / timestamp
     else:
         output_dir = args.output_dir
 

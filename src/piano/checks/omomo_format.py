@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import joblib
 import numpy as np
+
+from piano.utils.io_utils import ensure_dir, save_json
 
 
 EXPECTED_SEQ_KEYS = {
@@ -117,8 +120,10 @@ def inspect_contacts(contact_dir: Path) -> dict:
     }
 
 
-def run_inspection(data_dir: Path) -> None:
-    """Run all format checks and print a report."""
+def run_inspection(data_dir: Path, output_dir: Path) -> None:
+    """Run all format checks, print a report, and save a summary."""
+    output_dir = ensure_dir(output_dir)
+
     print("=" * 72)
     print(f"OMOMO format inspection: {data_dir}")
     print("=" * 72)
@@ -126,12 +131,22 @@ def run_inspection(data_dir: Path) -> None:
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
+    summary: dict = {
+        "timestamp": datetime.now().isoformat(),
+        "data_dir": str(data_dir),
+        "splits": {},
+        "meshes": {},
+        "text": {},
+        "contacts": {},
+    }
+
     # --- Sequence pickles ---
     for split in ("train", "test"):
         pkl = data_dir / f"{split}_diffusion_manip_seq_joints24.p"
         print(f"\n[1.{split}] Sequence pickle: {pkl.name}")
         if not pkl.exists():
             print(f"  MISSING: {pkl}")
+            summary["splits"][split] = {"exists": False}
             continue
         report = inspect_sequence_pickle(pkl)
         print(f"  Number of sequences: {report['num_sequences']}")
@@ -143,6 +158,7 @@ def run_inspection(data_dir: Path) -> None:
             print(f"    {k:20s} {v}")
         if report["extra_keys"]:
             print(f"  Extra keys present: {report['extra_keys']}")
+        summary["splits"][split] = {"exists": True, **report}
 
     # --- Object meshes ---
     print("\n[2] Object meshes")
@@ -155,6 +171,7 @@ def run_inspection(data_dir: Path) -> None:
             print(f"{rpt['num_obj_files']} .obj, {rpt['num_ply_files']} .ply, {len(rpt['unique_object_names'])} unique objects")
             if rpt["unique_object_names"]:
                 print(f"    Names: {', '.join(rpt['unique_object_names'][:10])}{'...' if len(rpt['unique_object_names']) > 10 else ''}")
+        summary["meshes"][sub] = rpt
 
     # --- Text annotations ---
     print("\n[3] Text annotations")
@@ -165,6 +182,7 @@ def run_inspection(data_dir: Path) -> None:
         print(f"  {rpt['num_files']} JSON files in {rpt['path']}")
         print(f"  Sample: {rpt.get('sample_file', 'n/a')}")
         print(f"  Content: {rpt.get('sample_content', 'n/a')}")
+    summary["text"] = rpt
 
     # --- Contact labels ---
     print("\n[4] Contact labels")
@@ -174,9 +192,12 @@ def run_inspection(data_dir: Path) -> None:
     else:
         print(f"  {rpt['num_files']} .npy files")
         print(f"  Sample shape: {rpt['sample_shape']}, dtype: {rpt['sample_dtype']}, range: {rpt['value_range']}")
+    summary["contacts"] = rpt
+
+    save_json(output_dir / "summary.json", summary)
 
     print("\n" + "=" * 72)
-    print("Inspection complete.")
+    print(f"Inspection complete. Summary: {output_dir / 'summary.json'}")
     print("=" * 72)
 
 
@@ -186,12 +207,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--data-dir", type=Path, default=Path("data/omomo/processed_data"),
         help="Path to OMOMO processed_data directory",
     )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Output directory (default: runs/checks/omomo_format/<timestamp>/)",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_inspection(args.data_dir)
+    if args.output_dir is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_dir = Path("runs/checks/omomo_format") / timestamp
+    else:
+        output_dir = args.output_dir
+    run_inspection(args.data_dir, output_dir)
 
 
 if __name__ == "__main__":

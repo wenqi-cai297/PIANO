@@ -11,6 +11,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +28,7 @@ from piano.data.pseudo_labels.refine_phase_hmm import (
     refine_phases_hmm,
 )
 from piano.utils.geometry import load_mesh
-from piano.utils.io_utils import ensure_dir, load_json, save_npz
+from piano.utils.io_utils import ensure_dir, load_json, save_json, save_npz
 
 
 def process_sequence(
@@ -123,6 +125,7 @@ def run_pipeline(
     mesh_suffixes : suffixes to try appending to object_id when searching
         for the mesh file (OMOMO uses ``_cleaned_simplified``).
     """
+    t_start = time.time()
     data_dir = Path(data_dir)
     mesh_dir = Path(mesh_dir)
     output_dir = ensure_dir(output_dir)
@@ -179,7 +182,27 @@ def run_pipeline(
         save_npz(output_dir / f"{seq_id}.npz", **labels)
         n_ok += 1
 
+    elapsed = time.time() - t_start
     print(f"Done. {n_ok} labels written, {n_skip} skipped. Output: {output_dir}")
+    print(f"Elapsed: {elapsed:.1f}s  ({n_ok / max(elapsed, 1e-6):.1f} seq/s)")
+
+    # Summary
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "data_dir": str(data_dir),
+        "mesh_dir": str(mesh_dir),
+        "output_dir": str(output_dir),
+        "use_hmm": use_hmm,
+        "mesh_suffixes": list(mesh_suffixes),
+        "counts": {
+            "num_in_metadata": len(metadata),
+            "num_labels_written": n_ok,
+            "num_skipped": n_skip,
+        },
+        "elapsed_sec": round(elapsed, 2),
+        "throughput_seq_per_sec": round(n_ok / max(elapsed, 1e-6), 2),
+    }
+    save_json(output_dir / "summary.json", summary)
 
 
 def _find_mesh(
