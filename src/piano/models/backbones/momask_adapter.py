@@ -234,9 +234,14 @@ def load_momask_residual_transformer(
     num_tokens: int = 512,
     num_quantizers: int = 6,
     shared_codebook: bool = False,
+    share_weight: bool = True,
     device: str = "cpu",
 ) -> nn.Module:
-    """Load a pretrained MoMask ResidualTransformer."""
+    """Load a pretrained MoMask ResidualTransformer.
+
+    Defaults match MoMask's HumanML3D checkpoint
+    ``tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw`` (``_sw`` = share_weight=True).
+    """
     ResidualTransformer = _import_residual_transformer()
 
     opt = build_momask_opt(
@@ -257,7 +262,7 @@ def load_momask_residual_transformer(
         clip_dim=clip_dim,
         cond_drop_prob=cond_drop_prob,
         clip_version=clip_version,
-        share_weight=False,
+        share_weight=share_weight,
         shared_codebook=shared_codebook,
         opt=opt,
     )
