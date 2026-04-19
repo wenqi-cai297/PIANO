@@ -33,7 +33,7 @@ from piano.utils.io_utils import ensure_dir, load_json, save_json, save_npz
 
 def process_sequence(
     joints: np.ndarray,
-    object_mesh_path: str | Path,
+    object_mesh: "trimesh.Trimesh | str | Path",
     object_positions: np.ndarray | None = None,
     contact_config: ContactConfig | None = None,
     target_config: TargetConfig | None = None,
@@ -47,7 +47,8 @@ def process_sequence(
     Parameters
     ----------
     joints : (T, 22, 3) — SMPL 22-joint positions
-    object_mesh_path : path to object mesh file (obj, ply, etc.)
+    object_mesh : a pre-loaded ``trimesh.Trimesh`` (preferred, enables caching
+        across sequences with the same object) or a path to load
     object_positions : (T, 3) or None — object center per frame
     *_config : per-stage configuration (uses defaults if None)
     use_hmm_refinement : whether to refine phase labels with HMM
@@ -61,7 +62,10 @@ def process_sequence(
         ``phase`` : (T,)
         ``support`` : (T,)
     """
-    mesh = load_mesh(str(object_mesh_path))
+    if isinstance(object_mesh, (str, Path)):
+        mesh = load_mesh(str(object_mesh))
+    else:
+        mesh = object_mesh
 
     # Step 1: Contact state
     contact_state = extract_contact_state(joints, mesh, contact_config)
@@ -139,14 +143,24 @@ def run_pipeline(
     print(f"  Meshes: {mesh_dir}")
     print(f"  Output: {output_dir}")
 
-    # Cache mesh paths per object_id to avoid re-searching
-    mesh_cache: dict[str, Path | None] = {}
+    # Cache LOADED meshes (not just paths) so each object is loaded once
+    # and its trimesh spatial index is reused across all sequences using
+    # that object — critical for speed/memory on datasets with large meshes.
+    import trimesh
+    mesh_cache: dict[str, trimesh.Trimesh | None] = {}
 
     n_ok = 0
     n_skip = 0
+    n_resume = 0
     for entry in tqdm(metadata, desc="Pseudo-labels"):
         seq_id = entry["seq_id"]
         obj_id = entry["object_id"]
+
+        # Resume support: skip sequences we've already written
+        out_path = output_dir / f"{seq_id}.npz"
+        if out_path.exists():
+            n_resume += 1
+            continue
 
         # Load preprocessed motion
         motion_path = data_dir / "motions" / f"{seq_id}.npz"
@@ -156,11 +170,19 @@ def run_pipeline(
         motion_data = np.load(motion_path, allow_pickle=False)
         joints = motion_data["joints_22"]  # (T, 22, 3)
 
-        # Find object mesh (cached)
+        # Lazily load and cache the mesh for this object_id
         if obj_id not in mesh_cache:
-            mesh_cache[obj_id] = _find_mesh(mesh_dir, obj_id, mesh_suffixes)
-        mesh_path = mesh_cache[obj_id]
-        if mesh_path is None:
+            mesh_path = _find_mesh(mesh_dir, obj_id, mesh_suffixes)
+            if mesh_path is None:
+                mesh_cache[obj_id] = None
+            else:
+                try:
+                    mesh_cache[obj_id] = load_mesh(str(mesh_path))
+                except Exception as e:
+                    print(f"  [warn] failed to load mesh {mesh_path}: {e}")
+                    mesh_cache[obj_id] = None
+        mesh = mesh_cache[obj_id]
+        if mesh is None:
             n_skip += 1
             continue
 
@@ -170,7 +192,7 @@ def run_pipeline(
         try:
             labels = process_sequence(
                 joints=joints,
-                object_mesh_path=mesh_path,
+                object_mesh=mesh,
                 object_positions=object_positions,
                 use_hmm_refinement=use_hmm,
             )
@@ -179,11 +201,12 @@ def run_pipeline(
             n_skip += 1
             continue
 
-        save_npz(output_dir / f"{seq_id}.npz", **labels)
+        save_npz(out_path, **labels)
         n_ok += 1
 
     elapsed = time.time() - t_start
-    print(f"Done. {n_ok} labels written, {n_skip} skipped. Output: {output_dir}")
+    print(f"Done. {n_ok} labels written, {n_resume} resumed (already existed), "
+          f"{n_skip} skipped. Output: {output_dir}")
     print(f"Elapsed: {elapsed:.1f}s  ({n_ok / max(elapsed, 1e-6):.1f} seq/s)")
 
     # Summary
@@ -197,6 +220,7 @@ def run_pipeline(
         "counts": {
             "num_in_metadata": len(metadata),
             "num_labels_written": n_ok,
+            "num_resumed": n_resume,
             "num_skipped": n_skip,
         },
         "elapsed_sec": round(elapsed, 2),
@@ -252,8 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override metadata file path (default: <data-dir>/metadata.json)",
     )
     parser.add_argument(
-        "--mesh-suffix", type=str, default="_cleaned_simplified",
-        help="Filename suffix for mesh files (default: '_cleaned_simplified' for OMOMO)",
+        "--mesh-suffixes", nargs="+", default=["_cleaned_simplified", ""],
+        help="Filename suffixes to try in order when searching for the mesh. "
+             "Empty string = bare filename. Default favors simplified variants: "
+             "('_cleaned_simplified', '') for OMOMO. For InterAct subsets that "
+             "ship simplified variants, pass '_face1000 _simplified \"\"'.",
     )
     parser.add_argument(
         "--no-hmm", action="store_true",
@@ -265,15 +292,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI entrypoint for ``piano-pseudo-labels``."""
     args = build_parser().parse_args()
-    # Try the specified suffix first, then no suffix as fallback
-    suffixes = (args.mesh_suffix, "") if args.mesh_suffix else ("",)
     run_pipeline(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         mesh_dir=args.mesh_dir,
         metadata_path=args.metadata,
         use_hmm=not args.no_hmm,
-        mesh_suffixes=suffixes,
+        mesh_suffixes=tuple(args.mesh_suffixes),
     )
 
 

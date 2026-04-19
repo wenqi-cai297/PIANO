@@ -36,11 +36,13 @@ for subset in "${SUBSETS[@]}"; do
         continue
     fi
 
+    # Prefer simplified mesh variants for speed/memory. run_all will try
+    # each suffix in order until it finds a file.
     python -m piano.data.pseudo_labels.run_all \
         --data-dir "$data_dir" \
         --mesh-dir "$mesh_dir" \
         --output-dir "$output_dir" \
-        --mesh-suffix ""
+        --mesh-suffixes "_face1000" "_simplified" ""
 done
 
 echo ""
