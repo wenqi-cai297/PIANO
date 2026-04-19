@@ -317,6 +317,8 @@ def _process_subset(
         "num_skipped": n_skip,
         "num_objects": len(obj_names_saved),
         "num_with_text": sum(1 for m in metadata if m["text"]),
+        "source_fps": float(config.source_fps),
+        "target_fps": float(config.target_fps),
         "elapsed_sec": round(elapsed, 2),
     }
     save_json(out_root / "summary.json", summary)

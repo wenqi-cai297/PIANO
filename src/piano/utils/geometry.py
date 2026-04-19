@@ -22,14 +22,19 @@ def load_mesh(path: str) -> trimesh.Trimesh:
     return mesh
 
 
-def sample_surface_fps(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
+def sample_surface_fps(
+    mesh: trimesh.Trimesh,
+    num_points: int,
+    seed: int | None = None,
+) -> np.ndarray:
     """Sample *num_points* on the mesh surface using farthest point sampling.
 
     Returns an array of shape ``(num_points, 3)``.
     """
-    # Oversample, then FPS down
-    oversampled, _ = trimesh.sample.sample_surface(mesh, num_points * 10)
-    indices = _farthest_point_sample(oversampled, num_points)
+    rng = np.random.default_rng(seed)
+    # Oversample, then FPS down. trimesh's sampler takes a seed directly.
+    oversampled, _ = trimesh.sample.sample_surface(mesh, num_points * 10, seed=seed)
+    indices = _farthest_point_sample(oversampled, num_points, rng=rng)
     return oversampled[indices]
 
 
@@ -81,14 +86,23 @@ def cluster_surface_patches(
     mesh: trimesh.Trimesh,
     num_patches: int,
     num_surface_samples: int = 4096,
+    seed: int | None = None,
 ) -> np.ndarray:
     """Cluster mesh surface into *num_patches* regions via FPS.
 
     Returns patch center positions of shape ``(num_patches, 3)``.
     These are used as contact target anchors for pseudo-label extraction.
+
+    Pass a ``seed`` to make patch ids deterministic — otherwise the FPS
+    random starting point produces a different ordering on every call,
+    breaking any downstream model that consumes ``contact_target`` as a
+    fixed categorical vector.
     """
-    surface_points, _ = trimesh.sample.sample_surface(mesh, num_surface_samples)
-    indices = _farthest_point_sample(surface_points, num_patches)
+    rng = np.random.default_rng(seed)
+    surface_points, _ = trimesh.sample.sample_surface(
+        mesh, num_surface_samples, seed=seed,
+    )
+    indices = _farthest_point_sample(surface_points, num_patches, rng=rng)
     return surface_points[indices]
 
 
@@ -120,18 +134,26 @@ def soft_patch_assignment(
 # Farthest Point Sampling (numpy, CPU)
 # ---------------------------------------------------------------------------
 
-def _farthest_point_sample(points: np.ndarray, num_samples: int) -> np.ndarray:
+def _farthest_point_sample(
+    points: np.ndarray,
+    num_samples: int,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
     """Greedy farthest point sampling on a (N, 3) point cloud.
 
-    Returns indices of shape ``(num_samples,)``.
+    Returns indices of shape ``(num_samples,)``. When ``rng`` is provided,
+    the starting index is drawn from that generator — use a seeded generator
+    (``np.random.default_rng(seed)``) for reproducible patch atlases.
     """
     n = len(points)
     if num_samples >= n:
         return np.arange(n)
 
+    if rng is None:
+        rng = np.random.default_rng()
+
     indices = np.zeros(num_samples, dtype=np.int64)
-    # Start from a random point
-    indices[0] = np.random.randint(n)
+    indices[0] = int(rng.integers(n))
     min_dists = np.full(n, np.inf)
 
     for i in range(1, num_samples):

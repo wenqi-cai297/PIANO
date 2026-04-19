@@ -18,6 +18,8 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
+import hashlib
+
 from piano.data.pseudo_labels.extract_contact import ContactConfig, extract_contact_state
 from piano.data.pseudo_labels.extract_phase import PhaseConfig, extract_interaction_phase
 from piano.data.pseudo_labels.extract_support import SupportConfig, extract_support_state
@@ -27,8 +29,60 @@ from piano.data.pseudo_labels.refine_phase_hmm import (
     build_phase_features,
     refine_phases_hmm,
 )
-from piano.utils.geometry import load_mesh
+from piano.utils.geometry import cluster_surface_patches, load_mesh
 from piano.utils.io_utils import ensure_dir, load_json, save_json, save_npz
+
+
+DEFAULT_FPS: float = 20.0  # PIANO preprocessed data rate
+
+
+def _object_patch_seed(obj_id: str) -> int:
+    """Deterministic 32-bit seed derived from object id.
+
+    Guarantees that the same object yields the same patch atlas across
+    re-runs and machines. Different objects get independent seeds.
+    """
+    h = hashlib.md5(obj_id.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+
+def _resolve_fps(data_dir: Path, fps_override: float | None) -> float:
+    """Find the fps of preprocessed motions.
+
+    Preference order:
+        1. Explicit ``fps_override`` from CLI.
+        2. ``target_fps`` in ``<data_dir>/summary.json`` (per-subset summary
+           written by newer preprocess_interact).
+        3. ``config.target_fps`` in ``<data_dir>/../summary.json`` (top-level
+           preprocess summary — covers datasets preprocessed before the
+           per-subset fps field was added).
+        4. ``DEFAULT_FPS`` with a warning.
+    """
+    if fps_override is not None:
+        return float(fps_override)
+
+    per_subset = data_dir / "summary.json"
+    if per_subset.exists():
+        try:
+            s = load_json(per_subset)
+            if "target_fps" in s:
+                return float(s["target_fps"])
+        except Exception:
+            pass
+
+    top_level = data_dir.parent / "summary.json"
+    if top_level.exists():
+        try:
+            s = load_json(top_level)
+            fps = s.get("config", {}).get("target_fps")
+            if fps is not None:
+                return float(fps)
+        except Exception:
+            pass
+
+    print(f"  [warn] fps not found in {per_subset} or {top_level}; "
+          f"defaulting to {DEFAULT_FPS}")
+    return DEFAULT_FPS
 
 
 def process_sequence(
@@ -36,6 +90,7 @@ def process_sequence(
     object_mesh: "trimesh.Trimesh | str | Path",
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
+    patch_centers: np.ndarray | None = None,
     contact_config: ContactConfig | None = None,
     target_config: TargetConfig | None = None,
     phase_config: PhaseConfig | None = None,
@@ -80,12 +135,15 @@ def process_sequence(
         config=contact_config,
     )
 
-    # Step 2: Contact target (depends on contact_state) — same transform
+    # Step 2: Contact target (depends on contact_state) — same transform.
+    # patch_centers is passed in from the caller's per-object atlas so that
+    # patch ids are stable across every sequence of the same object.
     contact_target, patch_centers = extract_contact_target(
         joints, mesh, contact_state,
         object_positions=object_positions,
         object_rotations=object_rotations,
         config=target_config,
+        patch_centers=patch_centers,
     )
 
     # Step 3: Interaction phase
@@ -120,6 +178,7 @@ def run_pipeline(
     metadata_path: Path | None = None,
     use_hmm: bool = True,
     mesh_suffixes: tuple[str, ...] = ("_cleaned_simplified", ""),
+    fps: float | None = None,
 ) -> None:
     """Batch pseudo-label extraction for all sequences.
 
@@ -146,21 +205,31 @@ def run_pipeline(
     data_dir = Path(data_dir)
     mesh_dir = Path(mesh_dir)
     output_dir = ensure_dir(output_dir)
+    atlas_dir = ensure_dir(output_dir / "patch_atlas")
 
     if metadata_path is None:
         metadata_path = data_dir / "metadata.json"
     metadata = load_json(metadata_path)
 
+    resolved_fps = _resolve_fps(data_dir, fps)
+    contact_cfg = ContactConfig(fps=resolved_fps)
+    phase_cfg = PhaseConfig(fps=resolved_fps)
+    target_cfg = TargetConfig()
+
     print(f"Extracting pseudo-labels for {len(metadata)} sequences")
     print(f"  Data:   {data_dir}")
     print(f"  Meshes: {mesh_dir}")
     print(f"  Output: {output_dir}")
+    print(f"  FPS:    {resolved_fps}  (used for velocity thresholds)")
 
     # Cache LOADED meshes (not just paths) so each object is loaded once
     # and its trimesh spatial index is reused across all sequences using
     # that object — critical for speed/memory on datasets with large meshes.
     import trimesh
     mesh_cache: dict[str, trimesh.Trimesh | None] = {}
+    # Per-object deterministic patch atlas, cached on disk so re-runs and
+    # separate machines produce identical patch ids.
+    atlas_cache: dict[str, np.ndarray | None] = {}
 
     n_ok = 0
     n_skip = 0
@@ -199,6 +268,23 @@ def run_pipeline(
             n_skip += 1
             continue
 
+        # Per-object deterministic patch atlas (shared across all sequences
+        # of this object). Disk-cached so re-runs stay consistent.
+        if obj_id not in atlas_cache:
+            atlas_path = atlas_dir / f"{obj_id}.npy"
+            if atlas_path.exists():
+                atlas_cache[obj_id] = np.load(atlas_path)
+            else:
+                atlas = cluster_surface_patches(
+                    mesh,
+                    num_patches=target_cfg.num_patches,
+                    num_surface_samples=target_cfg.num_surface_samples,
+                    seed=_object_patch_seed(obj_id),
+                )
+                np.save(atlas_path, atlas)
+                atlas_cache[obj_id] = atlas
+        patch_centers = atlas_cache[obj_id]
+
         # Object pose from preprocessing. object_rotations is only present
         # for data preprocessed with the updated preprocess_interact that
         # saves rotation. Older data will fall back to translation-only.
@@ -212,6 +298,10 @@ def run_pipeline(
                 object_mesh=mesh,
                 object_positions=object_positions,
                 object_rotations=object_rotations,
+                patch_centers=patch_centers,
+                contact_config=contact_cfg,
+                target_config=target_cfg,
+                phase_config=phase_cfg,
                 use_hmm_refinement=use_hmm,
             )
         except Exception as e:
@@ -233,8 +323,10 @@ def run_pipeline(
         "data_dir": str(data_dir),
         "mesh_dir": str(mesh_dir),
         "output_dir": str(output_dir),
+        "fps": resolved_fps,
         "use_hmm": use_hmm,
         "mesh_suffixes": list(mesh_suffixes),
+        "num_objects_with_atlas": len([k for k, v in atlas_cache.items() if v is not None]),
         "counts": {
             "num_in_metadata": len(metadata),
             "num_labels_written": n_ok,
@@ -304,6 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-hmm", action="store_true",
         help="Skip HMM refinement for phase labels",
     )
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="Override fps used for velocity thresholds. Default: read "
+             "target_fps from <data-dir>/summary.json, else 20.",
+    )
     return parser
 
 
@@ -317,6 +414,7 @@ def main() -> None:
         metadata_path=args.metadata,
         use_hmm=not args.no_hmm,
         mesh_suffixes=tuple(args.mesh_suffixes),
+        fps=args.fps,
     )
 
 

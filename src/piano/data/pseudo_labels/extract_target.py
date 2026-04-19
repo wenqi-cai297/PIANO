@@ -40,13 +40,14 @@ def extract_contact_target(
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
     config: TargetConfig | None = None,
+    patch_centers: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract per-frame contact target region on the object surface.
 
-    Patch centers are computed once in the object-local frame. For each
-    contact frame we inverse-transform the body-part world position into
-    the object-local frame before assigning to the nearest patch — exactly
-    the same correction as ``extract_contact_state``.
+    Patch centers are in the object-local frame. For each contact frame we
+    inverse-transform the body-part world position into the object-local
+    frame before assigning to the nearest patch — exactly the same
+    correction as ``extract_contact_state``.
 
     Parameters
     ----------
@@ -56,6 +57,11 @@ def extract_contact_target(
     object_positions : (T, 3) — per-frame object translation in world frame
     object_rotations : (T, 3) — per-frame object axis-angle rotation
     config : extraction parameters
+    patch_centers : (K, 3) or None — precomputed per-object patch atlas in
+        object-local frame. Pass a cached atlas to keep patch ids stable
+        across sequences of the same object (required for downstream
+        classification). If None, patches are recomputed from the mesh with
+        a non-deterministic FPS start — only use for one-off debugging.
 
     Returns
     -------
@@ -71,12 +77,20 @@ def extract_contact_target(
     K = config.num_patches
     target = np.zeros((T, NUM_BODY_PARTS, K), dtype=np.float32)
 
-    # Compute patch centers via FPS on object surface (object-local frame)
-    patch_centers = cluster_surface_patches(
-        object_mesh,
-        num_patches=K,
-        num_surface_samples=config.num_surface_samples,
-    )  # (K, 3)
+    if patch_centers is None:
+        # Fallback: recompute. Non-deterministic without a seed, so this
+        # path should only be used for single-sequence debugging.
+        patch_centers = cluster_surface_patches(
+            object_mesh,
+            num_patches=K,
+            num_surface_samples=config.num_surface_samples,
+        )  # (K, 3)
+    else:
+        if patch_centers.shape != (K, 3):
+            raise ValueError(
+                f"patch_centers shape {patch_centers.shape} does not match "
+                f"config.num_patches={K}; re-run patch atlas precomputation."
+            )
 
     for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
         bp_positions_world = joints[:, joint_idx, :]  # (T, 3)
