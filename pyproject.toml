@@ -41,6 +41,7 @@ piano-check-hoi-dataset = "piano.checks.hoi_dataset:main"
 piano-smoke-test = "piano.checks.inference_smoke_test:main"
 piano-visualize-motion = "piano.inference.visualize_motion:main"
 piano-visualize-pseudo-labels = "piano.inference.visualize_pseudo_labels:main"
+piano-sample-by-keyword = "piano.checks.sample_seq_by_keyword:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
