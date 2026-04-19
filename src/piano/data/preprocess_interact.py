@@ -137,10 +137,11 @@ def fk_and_downsample_interact(
     inputs: dict,
     smplx_models: dict[str, torch.nn.Module],
     config: InterActConfig,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Run SMPL-X FK on one InterAct sequence, downsample to target_fps.
 
-    Returns ``(joints_22_20fps, object_positions_20fps)`` or ``None`` on failure.
+    Returns ``(joints_22_20fps, object_positions_20fps, object_rotations_20fps)``
+    where object_rotations are axis-angle (T', 3). Returns ``None`` on failure.
     """
     gender = inputs["gender"]
     if gender not in smplx_models:
@@ -160,11 +161,16 @@ def fk_and_downsample_interact(
     )
     joints_22 = joints_smplx[:, :22, :]
 
-    # Temporal downsample
+    # Temporal downsample: joints + object translation + object rotation
     joints_22_ds = downsample_temporal(joints_22, config.source_fps, config.target_fps)
     obj_pos_ds = downsample_temporal(inputs["obj_trans"], config.source_fps, config.target_fps)
+    obj_rot_ds = downsample_temporal(inputs["obj_angles"], config.source_fps, config.target_fps)
 
-    return joints_22_ds.astype(np.float32), obj_pos_ds.astype(np.float32)
+    return (
+        joints_22_ds.astype(np.float32),
+        obj_pos_ds.astype(np.float32),
+        obj_rot_ds.astype(np.float32),
+    )
 
 
 def preprocess_sequence(
@@ -177,7 +183,7 @@ def preprocess_sequence(
     result = fk_and_downsample_interact(inputs, smplx_models, config)
     if result is None:
         return None
-    joints_raw, obj_pos_raw = result
+    joints_raw, obj_pos_raw, obj_rot_raw = result
 
     # MoMask-compatible encoding (HumanML3D canonical + uniform skeleton)
     features, _aligned_joints = encoder.encode(joints_raw)   # (T-1, 263)
@@ -186,11 +192,13 @@ def preprocess_sequence(
     T_minus_1 = features.shape[0]
     joints_raw = joints_raw[:T_minus_1]
     obj_pos_raw = obj_pos_raw[:T_minus_1]
+    obj_rot_raw = obj_rot_raw[:T_minus_1]
 
     return {
         "joints_22": joints_raw,
         "motion_263": features,
         "object_positions": obj_pos_raw,
+        "object_rotations": obj_rot_raw,     # axis-angle, (T', 3)
     }
 
 

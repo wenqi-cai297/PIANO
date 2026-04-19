@@ -38,8 +38,13 @@ def load_sample_with_labels(
     data_dir: Path,
     pseudo_label_dir: Path,
     seq_id: str,
+    metadata_by_seq: dict[str, dict] | None = None,
 ) -> dict | None:
     """Load one sequence's joints/object + pseudo-labels.
+
+    Also loads the per-object point cloud from ``<data_dir>/objects/<obj_id>.npy``
+    (via the metadata's ``object_id``) so the object can be rendered as a
+    point cloud, not just a single-point marker.
 
     Returns None if any required file is missing.
     """
@@ -56,14 +61,46 @@ def load_sample_with_labels(
     motion_data = np.load(motion_path)
     labels = np.load(labels_path)
 
+    # Load object point cloud if we can locate the object_id via metadata
+    object_pc: np.ndarray | None = None
+    object_rotations: np.ndarray | None = None
+    if metadata_by_seq is not None and seq_id in metadata_by_seq:
+        obj_id = metadata_by_seq[seq_id].get("object_id")
+        if obj_id:
+            obj_path = data_dir / "objects" / f"{obj_id}.npy"
+            if obj_path.exists():
+                object_pc = np.load(obj_path).astype(np.float32)  # (N, 3) object-local
+
+    # object_rotations may be present if preprocessing saved it (new preprocess runs)
+    if "object_rotations" in motion_data.files:
+        object_rotations = motion_data["object_rotations"].astype(np.float32)
+
     return {
         "seq_id": seq_id,
         "joints_22": motion_data["joints_22"].astype(np.float32),
         "object_positions": motion_data.get("object_positions", None),
+        "object_rotations": object_rotations,
+        "object_pc": object_pc,
         "contact_state": labels["contact_state"].astype(np.float32),
         "phase": labels["phase"].astype(np.int64),
         "support": labels["support"].astype(np.int64),
     }
+
+
+def _axis_angle_to_rotmat(aa: np.ndarray) -> np.ndarray:
+    """Rodrigues: (3,) axis-angle → (3, 3) rotation matrix."""
+    theta = np.linalg.norm(aa)
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    axis = aa / theta
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0],
+    ], dtype=np.float32)
+    return (np.eye(3, dtype=np.float32)
+            + np.sin(theta) * K
+            + (1 - np.cos(theta)) * K @ K)
 
 
 def render_with_labels(
@@ -73,6 +110,8 @@ def render_with_labels(
     support: np.ndarray,
     output_path: Path,
     object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
+    object_pc: np.ndarray | None = None,
     fps: float = 20.0,
     title: str = "",
     dpi: int = 80,
@@ -85,10 +124,14 @@ def render_with_labels(
     ----------
     joints : (T, 22, 3) — absolute joint positions
     contact_state : (T, 5) — soft contact per body part
-        indexed as [left_hand, right_hand, left_foot, right_foot, pelvis]
     phase : (T,) — integer phase label
     support : (T,) — integer support label
-    object_positions : (T, 3) — optional
+    object_positions : (T, 3) — per-frame object translation
+    object_rotations : (T, 3) — per-frame object axis-angle rotation (optional)
+    object_pc : (N, 3) — static object point cloud in object-local frame.
+        When provided together with object_positions, the cloud is transformed
+        (and optionally rotated) per frame and rendered as red dots,
+        giving a real shape instead of a single marker.
     """
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -98,9 +141,24 @@ def render_with_labels(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Axis limits (same strategy as visualize_motion)
+    # Pre-compute per-frame transformed object point cloud (if available)
+    obj_cloud_world: np.ndarray | None = None
+    if object_pc is not None and object_positions is not None:
+        T_obj = len(object_positions)
+        N = object_pc.shape[0]
+        obj_cloud_world = np.empty((T_obj, N, 3), dtype=np.float32)
+        for t in range(T_obj):
+            if object_rotations is not None:
+                R = _axis_angle_to_rotmat(object_rotations[t])
+                obj_cloud_world[t] = object_pc @ R.T + object_positions[t]
+            else:
+                obj_cloud_world[t] = object_pc + object_positions[t]
+
+    # Axis limits (include transformed object cloud)
     all_pos = [joints.reshape(-1, 3)]
-    if object_positions is not None:
+    if obj_cloud_world is not None:
+        all_pos.append(obj_cloud_world.reshape(-1, 3))
+    elif object_positions is not None:
         all_pos.append(object_positions)
     all_pos = np.concatenate(all_pos, axis=0)
     center = all_pos.mean(axis=0)
@@ -119,9 +177,11 @@ def render_with_labels(
     # Skeleton lines
     lines = [ax.plot([], [], [], c="gray", linewidth=1.5)[0] for _ in SKELETON_CONNECTIONS]
 
-    # Object marker
+    # Object marker: full point cloud if we have it, else single triangle
     object_scatter = None
-    if object_positions is not None:
+    if obj_cloud_world is not None:
+        object_scatter = ax.scatter([], [], [], c="red", s=2, marker="o", alpha=0.5)
+    elif object_positions is not None:
         object_scatter = ax.scatter([], [], [], c="red", s=50, marker="^")
 
     ax.set_xlim(center[0] - max_range, center[0] + max_range)
@@ -169,10 +229,14 @@ def render_with_labels(
             line.set_3d_properties([joints[t, i, 1], joints[t, j, 1]])
             artists.append(line)
 
-        # Object marker
+        # Object rendering: full transformed cloud if available, else single point
         if object_scatter is not None:
-            p = object_positions[t]
-            object_scatter._offsets3d = ([p[0]], [p[2]], [p[1]])
+            if obj_cloud_world is not None:
+                pts = obj_cloud_world[t]
+                object_scatter._offsets3d = (pts[:, 0], pts[:, 2], pts[:, 1])
+            elif object_positions is not None:
+                p = object_positions[t]
+                object_scatter._offsets3d = ([p[0]], [p[2]], [p[1]])
             artists.append(object_scatter)
 
         # Text: title + current labels
@@ -228,13 +292,17 @@ def run_visualization(
         joints = sample["joints_22"]
         T = len(joints)
 
-        # Truncate pseudo-labels + object_positions to motion length (should match)
+        # Truncate pseudo-labels + object arrays to motion length (should match)
         contact_state = sample["contact_state"][:T]
         phase = sample["phase"][:T]
         support = sample["support"][:T]
         obj_pos = sample["object_positions"]
+        obj_rot = sample.get("object_rotations")
+        obj_pc = sample.get("object_pc")
         if obj_pos is not None:
             obj_pos = obj_pos[:T]
+        if obj_rot is not None:
+            obj_rot = obj_rot[:T]
 
         out_path = output_dir / f"{seq_id}.mp4"
         print(f"\nRendering {seq_id} ({T} frames) → {out_path}")
@@ -244,6 +312,8 @@ def run_visualization(
             phase=phase,
             support=support,
             object_positions=obj_pos,
+            object_rotations=obj_rot,
+            object_pc=obj_pc,
             output_path=out_path,
             fps=fps,
             title=seq_id,
@@ -306,8 +376,9 @@ def main() -> None:
 
     pseudo_dir = args.pseudo_label_dir or (args.data_dir / "pseudo_labels")
 
-    # Resolve seq ids
+    # Resolve seq ids + build metadata lookup for object_id resolution
     metadata = load_json(args.data_dir / "metadata.json")
+    metadata_by_seq = {m["seq_id"]: m for m in metadata}
     if args.seq_ids:
         wanted = set(args.seq_ids)
         seq_ids = [m["seq_id"] for m in metadata if m["seq_id"] in wanted]
@@ -316,7 +387,7 @@ def main() -> None:
 
     samples: list[dict] = []
     for sid in seq_ids:
-        sample = load_sample_with_labels(args.data_dir, pseudo_dir, sid)
+        sample = load_sample_with_labels(args.data_dir, pseudo_dir, sid, metadata_by_seq)
         if sample is not None:
             samples.append(sample)
 
