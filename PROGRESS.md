@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-19 (InterAct full preprocessing complete: 8475/8478 seq across 4 subsets, 100% text coverage)
+**Last updated:** 2026-04-20 (Codex pseudo-label review: fps propagation + deterministic per-object patch atlas added; rerun script ready)
 
 ---
 
@@ -14,7 +14,7 @@ Updated after each significant code change.
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
 | **Data processing** | humanml3d_repr, preprocess_smplx, dataset | ✓ Done | SMPL-X → 22 joints → 263-dim conversion verified |
-| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ✓ Done | Phase + support unit tests passed |
+| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ✓ Done (v2, 2026-04-20) | Unit tests pass; fps now auto-resolved from preprocess summary; patch atlas deterministic per `object_id`, cached to disk |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
 | **Interaction Cross-Attention** | interaction_cross_attn.py | ✓ Done | Zero-init verified |
@@ -148,6 +148,8 @@ All other components are functionally complete.
 | `c115e30` | 2026-04-19 | Standardize: every script writes runs/<cat>/<ts>/summary.json |
 | `031333e` | 2026-04-19 | Switch to MoMask official HumanML3D encoder (process_file) |
 | `3250eb0` | 2026-04-19 | Add `--use-recovery` flag for encode→decode round-trip validation |
+| `40c703b` | 2026-04-19 | Fix pseudo-label geometry: inverse-transform joints to object-local frame |
+| `9d11f1a` | 2026-04-20 | Propagate fps + deterministic per-object patch atlas in pseudo-labels |
 
 ---
 

@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-19 (switched to InterAct-only data track, dropped CHOIS-OMOMO; rtree dep fix queued for the server)
+**Last updated:** 2026-04-20 (Codex review integrated; P0 fixes landed in `9d11f1a`; rerun + stats + qualitative inspection is the next gate before any P1/P2 work or Stage A)
 
 ---
 
@@ -40,13 +40,26 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
 - [x] **Full InterAct preprocessing done** (2026-04-19 08:25:12):
   8475 / 8478 sequences in 9.4 min on A6000, 100% text, 106 unique objects.
   See [analyses/interact_preprocessing_complete](analyses/2026-04-19_interact_preprocessing_complete.md).
-- [ ] **IN PROGRESS: extract pseudo-labels on all 4 subsets** (running in tmux)
-  - `bash scripts/data/extract_pseudo_labels_interact.sh`
-  - Expected: 1-3 hours CPU (trimesh + HMM across 8475 sequences)
-- [ ] Visualize 5-10 samples per subset after pseudo-label extraction
+- [x] **Pseudo-label pipeline P0 fixes** (2026-04-20, commit `9d11f1a`):
+  fps now auto-resolved from preprocess summary (data is 20 fps, configs
+  used to default to 30 → velocity thresholds were inflated 1.5×);
+  per-object patch atlas is now deterministic (`seed=md5(obj_id)`) and
+  disk-cached at `<output>/patch_atlas/<obj_id>.npy`.
+  See [codex_review_p0_fixes](analyses/2026-04-20_codex_review_p0_fixes.md)
+  and [`SUGGESTION.md`](SUGGESTION.md).
+- [ ] **NEXT: rerun pseudo-label extraction on server**
+  - `bash scripts/data/rerun_pseudo_labels_interact.sh` (kills old tmux,
+    backs up previous `pseudo_labels/` dirs, re-extracts all 4 subsets)
+  - Expected: ~1.5h CPU
+- [ ] **Write stats aggregator** (while rerun is running):
+  per-subset contact-rate per body part, phase/support histograms,
+  patch-id entropy, short-contact fraction, HMM non-convergence count.
+  Output to `runs/pseudo_labels_stats/<ts>/summary.json` + markdown.
+- [ ] Visualize 5-10 samples per subset after rerun completes
   - Tool ready: `bash scripts/server/visualize_pseudo_labels.sh`
-  - Overlays contact/phase/support on skeleton MP4; also writes stats
-    (contact rates per body part, phase/support histograms) to summary.json
+  - Overlays contact/phase/support on skeleton MP4
+- [ ] **Decide on P1/P2 scope** (only after stats + videos in hand).
+  See §3 for the deferred-until-validation list.
 - [ ] Update `configs/training/predictor.yaml` with multi-root InterAct paths
 
 **CHOIS-OMOMO path is retired but preserved:**
@@ -108,10 +121,27 @@ Open questions to resolve as we get experimental feedback:
    - If pseudo-labels for `manipulation` vs `stable-contact` are too noisy, merge them
 3. **Support state definition:** 4 states or more?
    - Current: both_feet, single_foot, sitting, hand_support
-   - May need to add: `airborne` for jumping actions
+   - May need to add: `airborne` for jumping actions, or `unknown` per Codex review
 4. **Block AttnRes block_size:** current 2 (5 blocks for 10 layers). Try 1 (Full AttnRes) if data permits?
 5. **LaMP vs CLIP text encoder:** start with CLIP (MoMask compatibility), consider LaMP as improvement
 6. **Residual Transformer:** currently frozen. Consider finetuning if contact details are lost?
+
+### 3.1 Pseudo-label P1/P2 items (gated on rerun stats + videos)
+
+From the Codex review, these are real but unvalidated concerns. Fix
+only if the rerun outputs fail the relevant sanity check. Don't
+prophylactically rewrite code.
+
+| Item | Gate condition (what would trigger the fix) |
+|---|---|
+| Contact velocity uses world frame instead of object-relative | Manipulation sequences show fragmented contact in videos, or contact-rate histograms for moving-object subsets (neuraldome, omomo_correct_v2) are materially lower than for static-object subsets (chairs) |
+| Rename `support` → `foot_support` + add `unknown` class | Sitting/lying sequences in `chairs` show the `sitting` label firing inconsistently, or `both_feet` dominates frames where no body part is near the object |
+| Replace `median_filter` on categorical labels with majority filter | Support/phase histograms show odd intermediate-class spikes (e.g. `single_foot` inflated at transitions) |
+| Soft-assignment kernel `-d / (2σ²)` → `-d² / (2σ²)` | Patch-id entropy is near zero across contact frames (effectively hard nearest-patch) |
+| Closest-surface-point for target (instead of joint position) | Target patch is visibly wrong at contact frames in videos (body joint is close but patch id is a far patch) |
+| Expand tracked joints (elbows/knees/hips/spine) | Visible contacts in chair/sofa sequences are missed by the 5-joint extractor |
+| HMM state → phase-name remapping | Phase histograms across subsets show a semantically incoherent state id dominating |
+| Hierarchical support redesign (foot_ground / body_object / support_type) | Long-term; only if v1 support supervision degrades generator output after Stage C |
 
 ---
 
@@ -120,8 +150,8 @@ Open questions to resolve as we get experimental feedback:
 | Week | Milestone | Status |
 |------|-----------|--------|
 | 1-2 | Environment + OMOMO prep on server | **Done** (2026-04-19) |
-| 2 | InterAct prep (unzip → inspect → preprocess) | **In progress** — downloaded, not yet unzipped |
-| 3 | Pseudo-labels extracted (OMOMO first, InterAct follows) | **Next up** |
+| 2 | InterAct prep (unzip → inspect → preprocess) | **Done** (2026-04-19) — 8475 seq across 4 subsets |
+| 3 | Pseudo-labels extracted + validated (rerun with P0 fixes) | **In progress** (2026-04-20, rerun queued) |
 | 4-5 | Interaction Predictor trained and evaluated | Not started |
 | 6-7 | Motion Generator finetuned with interaction conditioning | Not started |
 | 8 | Joint finetune complete | Not started |
