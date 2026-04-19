@@ -54,36 +54,61 @@ def _soft_sigmoid(x: np.ndarray, threshold: float, sigma: float) -> np.ndarray:
 def extract_contact_state(
     joints: np.ndarray,
     object_mesh: "trimesh.Trimesh",
+    object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
     config: ContactConfig | None = None,
 ) -> np.ndarray:
     """Extract per-frame, per-body-part contact state.
 
+    The object mesh is loaded in its *local frame* (template at origin).
+    Joints are in the world frame. To query correct distances we must
+    inverse-transform joints into the object's per-frame local frame:
+
+        joint_local[t] = R(obj_rot[t])^T @ (joint_world[t] - obj_pos[t])
+
+    If ``object_positions`` is None, we fall back to treating the object
+    as static at the origin — correct only if that's actually the case.
+
     Parameters
     ----------
-    joints : (T, 22, 3) — SMPL 22-joint positions
-    object_mesh : trimesh.Trimesh — object mesh (static or per-frame)
+    joints : (T, 22, 3) — world-frame SMPL 22-joint positions
+    object_mesh : trimesh.Trimesh — object mesh in object-local frame
+    object_positions : (T, 3) — per-frame object translation in world frame
+    object_rotations : (T, 3) — per-frame object axis-angle rotation
     config : extraction parameters
 
     Returns
     -------
     contact : (T, 5) — soft contact probability for each body part
     """
+    from piano.data.pseudo_labels._object_transform import world_to_object_local
+
     if config is None:
         config = ContactConfig()
 
     T = len(joints)
     contact = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
 
-    # Compute joint velocities for relative velocity check
+    # Compute joint velocities for relative velocity check (in world frame —
+    # velocity magnitude is frame-invariant for rigid translation; small
+    # approximation for rotating objects but fine for near-contact)
     joint_vel = compute_joint_velocities(joints, fps=config.fps)
 
     for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
-        bp_positions = joints[:, joint_idx, :]      # (T, 3)
-        bp_velocities = joint_vel[:, joint_idx, :]  # (T, 3)
-        bp_speed = np.linalg.norm(bp_velocities, axis=-1)  # (T,)
+        bp_positions_world = joints[:, joint_idx, :]      # (T, 3)
+        bp_velocities = joint_vel[:, joint_idx, :]        # (T, 3)
+        bp_speed = np.linalg.norm(bp_velocities, axis=-1) # (T,)
 
-        # Distance to object surface
-        distances, _ = points_to_mesh_distance(bp_positions, object_mesh)  # (T,)
+        # Inverse-transform joint positions into the object-local frame
+        if object_positions is not None:
+            bp_positions_local = world_to_object_local(
+                bp_positions_world, object_positions, object_rotations,
+            )
+        else:
+            bp_positions_local = bp_positions_world
+
+        # Distance to object surface (in object-local frame, matching mesh)
+        distances, _ = points_to_mesh_distance(bp_positions_local, object_mesh)
 
         # Soft contact: high when close AND slow
         dist_score = _soft_sigmoid(distances, config.distance_threshold, config.distance_sigma)

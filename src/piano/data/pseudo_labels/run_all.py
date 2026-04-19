@@ -35,6 +35,7 @@ def process_sequence(
     joints: np.ndarray,
     object_mesh: "trimesh.Trimesh | str | Path",
     object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
     contact_config: ContactConfig | None = None,
     target_config: TargetConfig | None = None,
     phase_config: PhaseConfig | None = None,
@@ -46,10 +47,14 @@ def process_sequence(
 
     Parameters
     ----------
-    joints : (T, 22, 3) — SMPL 22-joint positions
+    joints : (T, 22, 3) — world-frame SMPL 22-joint positions
     object_mesh : a pre-loaded ``trimesh.Trimesh`` (preferred, enables caching
-        across sequences with the same object) or a path to load
-    object_positions : (T, 3) or None — object center per frame
+        across sequences with the same object) or a path to load. Mesh
+        is in object-local frame.
+    object_positions : (T, 3) or None — per-frame object translation in world
+    object_rotations : (T, 3) or None — per-frame object axis-angle rotation.
+        Needed for geometrically correct contact / target extraction. If
+        None, rotation is treated as identity (still uses translation).
     *_config : per-stage configuration (uses defaults if None)
     use_hmm_refinement : whether to refine phase labels with HMM
 
@@ -67,12 +72,20 @@ def process_sequence(
     else:
         mesh = object_mesh
 
-    # Step 1: Contact state
-    contact_state = extract_contact_state(joints, mesh, contact_config)
+    # Step 1: Contact state — inverse-transforms joints to object-local
+    contact_state = extract_contact_state(
+        joints, mesh,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        config=contact_config,
+    )
 
-    # Step 2: Contact target (depends on contact_state)
+    # Step 2: Contact target (depends on contact_state) — same transform
     contact_target, patch_centers = extract_contact_target(
-        joints, mesh, contact_state, target_config,
+        joints, mesh, contact_state,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        config=target_config,
     )
 
     # Step 3: Interaction phase
@@ -186,14 +199,19 @@ def run_pipeline(
             n_skip += 1
             continue
 
-        # Object positions (from preprocessing)
-        object_positions = motion_data.get("object_positions", None)
+        # Object pose from preprocessing. object_rotations is only present
+        # for data preprocessed with the updated preprocess_interact that
+        # saves rotation. Older data will fall back to translation-only.
+        files = set(motion_data.files)
+        object_positions = motion_data["object_positions"] if "object_positions" in files else None
+        object_rotations = motion_data["object_rotations"] if "object_rotations" in files else None
 
         try:
             labels = process_sequence(
                 joints=joints,
                 object_mesh=mesh,
                 object_positions=object_positions,
+                object_rotations=object_rotations,
                 use_hmm_refinement=use_hmm,
             )
         except Exception as e:
