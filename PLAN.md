@@ -44,6 +44,9 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   - `bash scripts/data/extract_pseudo_labels_interact.sh`
   - Expected: 1-3 hours CPU (trimesh + HMM across 8475 sequences)
 - [ ] Visualize 5-10 samples per subset after pseudo-label extraction
+  - Tool ready: `bash scripts/server/visualize_pseudo_labels.sh`
+  - Overlays contact/phase/support on skeleton MP4; also writes stats
+    (contact rates per body part, phase/support histograms) to summary.json
 - [ ] Update `configs/training/predictor.yaml` with multi-root InterAct paths
 
 **CHOIS-OMOMO path is retired but preserved:**
