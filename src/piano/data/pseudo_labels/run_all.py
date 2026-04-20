@@ -29,6 +29,11 @@ from piano.data.pseudo_labels.refine_phase_hmm import (
     build_phase_features,
     refine_phases_hmm,
 )
+from piano.data.pseudo_labels.stats import (
+    aggregate_stats,
+    compute_seq_stats,
+    make_quality_flags,
+)
 from piano.utils.geometry import cluster_surface_patches, load_mesh
 from piano.utils.io_utils import ensure_dir, load_json, save_json, save_npz
 
@@ -234,6 +239,8 @@ def run_pipeline(
     n_ok = 0
     n_skip = 0
     n_resume = 0
+    skip_reasons: list[dict[str, str]] = []
+    per_seq_stats = []
     for entry in tqdm(metadata, desc="Pseudo-labels"):
         seq_id = entry["seq_id"]
         obj_id = entry["object_id"]
@@ -248,6 +255,7 @@ def run_pipeline(
         motion_path = data_dir / "motions" / f"{seq_id}.npz"
         if not motion_path.exists():
             n_skip += 1
+            skip_reasons.append({"seq_id": seq_id, "reason": "motion_file_missing"})
             continue
         motion_data = np.load(motion_path, allow_pickle=False)
         joints = motion_data["joints_22"]  # (T, 22, 3)
@@ -266,6 +274,10 @@ def run_pipeline(
         mesh = mesh_cache[obj_id]
         if mesh is None:
             n_skip += 1
+            skip_reasons.append({
+                "seq_id": seq_id,
+                "reason": f"mesh_not_found_or_failed_to_load (object_id={obj_id})",
+            })
             continue
 
         # Per-object deterministic patch atlas (shared across all sequences
@@ -307,15 +319,36 @@ def run_pipeline(
         except Exception as e:
             print(f"  [warn] {seq_id}: {e}")
             n_skip += 1
+            skip_reasons.append({"seq_id": seq_id, "reason": f"exception: {e}"})
             continue
 
         save_npz(out_path, **labels)
         n_ok += 1
 
+        # Accumulate quality stats for the summary. Uses the just-computed
+        # labels in memory — no extra disk I/O and one set of traversals
+        # per sequence (cheap compared to mesh distance queries).
+        try:
+            per_seq_stats.append(
+                compute_seq_stats(
+                    seq_id=seq_id,
+                    labels=labels,
+                    joints_22=joints,
+                    object_positions=object_positions,
+                )
+            )
+        except Exception as e:
+            print(f"  [warn] stats failed for {seq_id}: {e}")
+
     elapsed = time.time() - t_start
     print(f"Done. {n_ok} labels written, {n_resume} resumed (already existed), "
           f"{n_skip} skipped. Output: {output_dir}")
     print(f"Elapsed: {elapsed:.1f}s  ({n_ok / max(elapsed, 1e-6):.1f} seq/s)")
+
+    # --- Aggregate quality stats + derive readable flags ---
+    subset_hint = data_dir.name or None
+    stats_agg = aggregate_stats(per_seq_stats, num_patches=target_cfg.num_patches)
+    quality_flags = make_quality_flags(stats_agg, subset_hint=subset_hint)
 
     # Summary
     summary = {
@@ -323,6 +356,7 @@ def run_pipeline(
         "data_dir": str(data_dir),
         "mesh_dir": str(mesh_dir),
         "output_dir": str(output_dir),
+        "subset": subset_hint,
         "fps": resolved_fps,
         "use_hmm": use_hmm,
         "mesh_suffixes": list(mesh_suffixes),
@@ -335,8 +369,18 @@ def run_pipeline(
         },
         "elapsed_sec": round(elapsed, 2),
         "throughput_seq_per_sec": round(n_ok / max(elapsed, 1e-6), 2),
+        "skip_reasons": skip_reasons,
+        "quality_flags": quality_flags,
+        "stats": stats_agg,
     }
     save_json(output_dir / "summary.json", summary)
+
+    if quality_flags:
+        print(f"\nQuality flags ({len(quality_flags)}):")
+        for f in quality_flags:
+            print(f"  - {f}")
+    else:
+        print("\nQuality flags: none fired")
 
 
 def _find_mesh(
