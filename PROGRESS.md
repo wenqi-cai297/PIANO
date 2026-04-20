@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-20 (pseudo-label v1 stats revealed contact threshold + target kernel + velocity gate all miscalibrated; recalibrated in `d641732`, rerun pending)
+**Last updated:** 2026-04-20 (pseudo-label v1 stats revealed contact threshold + target kernel + velocity gate all miscalibrated; recalibrated in `d641732`. Threshold sweep tool + SMPL-X params preservation added; rerun pending)
 
 ---
 
@@ -13,7 +13,7 @@ Updated after each significant code change.
 |--------|-------|--------|--------------|
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
-| **Data processing** | humanml3d_repr, preprocess_smplx, dataset | ✓ Done | SMPL-X → 22 joints → 263-dim conversion verified |
+| **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-20) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. Re-run needed to populate new fields on existing data |
 | **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ Recalibrated (v3, 2026-04-20), rerun pending | v1 rerun produced unusable labels (81-99% zero-contact, 100% degenerate target). Fix in `d641732`: per-body-part distance thresholds (hand 0.08 / foot 0.12 / pelvis 0.20 m), velocity gating off by default, Gaussian target kernel. fps propagation + deterministic patch atlas unchanged from v2. |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
@@ -152,6 +152,8 @@ All other components are functionally complete.
 | `9d11f1a` | 2026-04-20 | Propagate fps + deterministic per-object patch atlas in pseudo-labels |
 | `34ccf3c` | 2026-04-20 | Rich pseudo-label stats: contact/phase/support/target/geometry + quality flags |
 | `d641732` | 2026-04-20 | Recalibrate contact + target for joint-to-skin offset and true soft assign |
+| `4252130` | 2026-04-20 | Add piano-threshold-sweep: cache distances once, re-score per threshold |
+| `c7e9272` | 2026-04-20 | Preserve full SMPL-X params in preprocess output (poses + trans + betas) |
 
 ---
 
