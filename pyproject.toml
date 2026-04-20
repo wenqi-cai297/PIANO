@@ -46,6 +46,7 @@ piano-check-object-convention = "piano.checks.object_convention:main"
 piano-pseudo-label-stats = "piano.checks.pseudo_label_stats:main"
 piano-threshold-sweep = "piano.checks.threshold_sweep:main"
 piano-action-segment-sweep = "piano.checks.action_segment_sweep:main"
+piano-probe-text-annotations = "piano.checks.probe_text_annotations:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
