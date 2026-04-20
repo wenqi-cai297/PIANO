@@ -3,7 +3,21 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-21 (full-dataset plain threshold sweep confirmed thresholds `d641732` + foot revision; stricter-prior validation via text.txt action windows abandoned after probe confirmed placeholder timestamps; v2 rerun is the immediate next step)
+**Last updated:** 2026-04-21 (v2 preprocess complete; v2 pseudo-label extraction started — see §0. thresholds locked in `127f675`; stricter-prior validation via text.txt action windows abandoned)
+
+---
+
+## 0. Active Long Runs
+
+Status of multi-hour jobs. Update when starting, finishing, or hitting a
+checkpoint, so a cold-started assistant (post-`/clear`) can tell what's
+currently executing versus what just landed. When a row goes stale
+(>1 week since completion, no follow-up), compact it out.
+
+| run | command | started | status | output / notes |
+|---|---|---|---|---|
+| v2 preprocess | `piano-preprocess-interact` | 2026-04-21 | ✓ done (7 min, 8475 seq) | each `<piano>/<subset>/motions/<seq>.npz` now has `smplx_poses` / `smplx_trans` / `smplx_betas` alongside existing fields |
+| v2 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 | 🔄 running (ETA ~5 h on server) | inline stats + quality_flags will land in `<piano>/<subset>/pseudo_labels/summary.json`. Pass bar in PLAN.md §1.2. |
 
 ---
 
@@ -13,8 +27,8 @@ Updated after each significant code change.
 |--------|-------|--------|--------------|
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
-| **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-20) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. Re-run needed to populate new fields on existing data |
-| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ Recalibrated (v3, 2026-04-20), rerun pending | v1 rerun produced unusable labels (81-99% zero-contact, 100% degenerate target). Fix in `d641732`: per-body-part distance thresholds (hand 0.08 / foot 0.12 / pelvis 0.20 m), velocity gating off by default, Gaussian target kernel. fps propagation + deterministic patch atlas unchanged from v2. |
+| **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-21) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. v2 re-run completed 2026-04-21 (8475 seq / 7 min) — new fields populated. |
+| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ Recalibrated (v3, 2026-04-21), v2 rerun in progress | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 rerun produced unusable labels (81-99% zero-contact, 100% degenerate target). Fixes: per-body-part distance thresholds, velocity gating off by default, Gaussian target kernel (`d641732`). fps propagation + deterministic patch atlas unchanged from v2. See §0 for run status. |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
 | **Interaction Cross-Attention** | interaction_cross_attn.py | ✓ Done | Zero-init verified |
@@ -156,6 +170,9 @@ All other components are functionally complete.
 | `c7e9272` | 2026-04-20 | Preserve full SMPL-X params in preprocess output (poses + trans + betas) |
 | `dde931c` | 2026-04-20 | Add piano-action-segment-sweep (skeleton kept; stricter-prior path later abandoned) |
 | `fd88445` | 2026-04-21 | Add piano-probe-text-annotations (format discovery probe) |
+| `3811873` | 2026-04-21 | Docs: record stricter-prior dead end + finalise thresholds for v2 rerun |
+| `127f675` | 2026-04-21 | Apply the foot-threshold fix (0.12 → 0.06) |
+| `1b7cee8` | 2026-04-21 | Don't auto-kill piano-labels tmux session by default |
 
 ---
 
