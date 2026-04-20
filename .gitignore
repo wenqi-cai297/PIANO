@@ -14,3 +14,6 @@ wandb/
 
 # Backbone repos (cloned, not tracked — clone on each machine)
 src/piano/models/backbones/momask/
+
+# Personal workflow helpers — kept locally, not part of the repo
+RESTART_PROMPT.md
