@@ -20,15 +20,20 @@ cd "$(dirname "$0")/../.."
 PIANO_ROOT="/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano"
 INTERACT_ROOT="/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/InterAct"
 SUBSETS=("chairs" "imhd" "neuraldome" "omomo_correct_v2")
-TMUX_SESSION="${TMUX_SESSION:-piano-labels}"
+# TMUX_SESSION is intentionally unset by default. If the user is running
+# this script from inside a tmux session, auto-killing "piano-labels"
+# would frequently be the same session hosting the script. Only clean
+# up a session when the caller explicitly names one to clean up, e.g.
+#   TMUX_SESSION=old-piano-labels bash scripts/data/rerun_pseudo_labels_interact.sh
+TMUX_SESSION="${TMUX_SESSION:-}"
 BACKUP_SUFFIX="$(date +%Y%m%d_%H%M%S)_pre_fps_fix"
 
 if [[ $# -gt 0 ]]; then
     SUBSETS=("$@")
 fi
 
-# --- Step 1: kill live tmux session if present ---
-if command -v tmux >/dev/null 2>&1; then
+# --- Step 1: kill a named tmux session if the caller asked us to ---
+if [[ -n "$TMUX_SESSION" ]] && command -v tmux >/dev/null 2>&1; then
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         echo "Killing tmux session: $TMUX_SESSION"
         tmux kill-session -t "$TMUX_SESSION"
