@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-20 (threshold sweep tool queued + preprocess now preserves SMPL-X params for future SDF loss / penetration eval; v2 rerun gated on sweep results)
+**Last updated:** 2026-04-21 (full-dataset plain threshold sweep done; stricter-prior path via text.txt / annotation CSVs abandoned — InterAct's text.txt timestamps are placeholder 0.0 and CSVs cover only 42% of data with non-trivial mapping. v2 rerun is the immediate next step.)
 
 ---
 
@@ -58,18 +58,25 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   soft-assign kernel corrected from `-d/(2σ²)` to `-d²/(2σ²)`, sigma
   raised 0.01 → 0.05. See
   [pseudo_label_stats_v1_diagnosis](analyses/2026-04-20_pseudo_label_stats_v1_diagnosis.md).
-- [ ] **NEXT: full-dataset threshold sweep**
-  - `bash scripts/server/threshold_sweep.sh` (`4252130`)
-  - Caches raw joint-to-mesh distances once per subset, then re-scores over
-    a threshold grid (0.02-0.40 m). Outputs `analysis.md` per subset —
-    I pick thresholds from the curves before committing to v2 rerun.
+- [x] **Full-dataset plain threshold sweep done** (2026-04-20, commit
+  `4252130`). Curves confirmed hand 0.08 / pelvis 0.20 were anatomically
+  right; foot threshold revised from 0.12 → 0.06 after seeing raw
+  distance distributions. ContactConfig already matches (`d641732`).
+- [x] **Stricter-prior validation via action window: abandoned**
+  (2026-04-21). text.txt `#start#end` timestamps are placeholder 0.0 on
+  every sampled file; real frame ranges live in per-dataset annotation
+  CSVs but omomo_correct_v2 (58% of data) has no such CSV, and chairs /
+  imhd / neuraldome would need non-trivial video_url → seq_id mapping.
+  See [text_annotation_probe_dead_end](analyses/2026-04-21_text_annotation_probe_dead_end.md).
+  Validation defers to quality_flags + visualization + Stage A
+  held-out accuracy.
 - [ ] **Re-run preprocess once to populate new SMPL-X fields** (`c7e9272`).
   - `piano-preprocess-interact` — adds `smplx_poses/trans/betas` to each
     `motions/<seq>.npz`. ~10 min on A6000. Required before Stage B if we
     want SDF penetration loss; harmless to defer until we need it.
-- [ ] **After sweep: v2 rerun pseudo-label extraction on server**
-  - Adjust ContactConfig thresholds if sweep curves suggest different
-    values from the anatomy-reasoned `d641732` defaults.
+- [ ] **NEXT: v2 rerun pseudo-label extraction on server**
+  - ContactConfig thresholds from `d641732` (hand 0.08 / foot 0.06 /
+    pelvis 0.20) are the finalised values; no further changes queued.
   - `bash scripts/data/rerun_pseudo_labels_interact.sh`
   - run_all.py now writes the rich stats inline — no separate stats step
     needed. Pass bar: chairs `sitting` frame rate > 25%; all subsets

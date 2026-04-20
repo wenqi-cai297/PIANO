@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-20 (pseudo-label v1 stats revealed contact threshold + target kernel + velocity gate all miscalibrated; recalibrated in `d641732`. Threshold sweep tool + SMPL-X params preservation added; rerun pending)
+**Last updated:** 2026-04-21 (full-dataset plain threshold sweep confirmed thresholds `d641732` + foot revision; stricter-prior validation via text.txt action windows abandoned after probe confirmed placeholder timestamps; v2 rerun is the immediate next step)
 
 ---
 
@@ -154,6 +154,8 @@ All other components are functionally complete.
 | `d641732` | 2026-04-20 | Recalibrate contact + target for joint-to-skin offset and true soft assign |
 | `4252130` | 2026-04-20 | Add piano-threshold-sweep: cache distances once, re-score per threshold |
 | `c7e9272` | 2026-04-20 | Preserve full SMPL-X params in preprocess output (poses + trans + betas) |
+| `dde931c` | 2026-04-20 | Add piano-action-segment-sweep (skeleton kept; stricter-prior path later abandoned) |
+| `fd88445` | 2026-04-21 | Add piano-probe-text-annotations (format discovery probe) |
 
 ---
 
