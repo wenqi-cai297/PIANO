@@ -42,19 +42,30 @@ from piano.utils.smpl_utils import (
 
 
 # Per-body-part joint-to-contact-surface offsets (meters), used as the
-# distance-threshold midpoints in the soft sigmoid. Derived from SMPL rest
-# pose geometry and human anatomy:
-#   * left/right_hand: wrist joint is inside the forearm, palm sits ~5-8 cm
-#     out; 0.08 m covers grip contact.
-#   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8), about
-#     8-10 cm above the sole; 0.12 m covers standing/floor contact.
+# distance-threshold midpoints in the soft sigmoid. Derived from anatomy
+# then verified (and adjusted) against the full-dataset sweep
+# (runs/threshold_sweep/2026-04-20_193818/):
+#   * left/right_hand: wrist joint sits inside the forearm; palm surface is
+#     5-8 cm out. Sweep confirmed 0.08 m gives frame_rate 19-34% /
+#     seq_reached 38-63% across the 4 subsets — sensible range for gripped
+#     objects.
+#   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8),
+#     ~8-10 cm above the sole. An anatomy-only guess of 0.12 was LOOSE
+#     here because our mesh is the OBJECT, not the ground: a foot on the
+#     floor next to a chair leg sits ~5-10 cm from the chair mesh without
+#     actually contacting it. Sweep showed chairs 0.12 gave 48%
+#     seq_reached (false positives) while 0.06 gave 12% (genuine
+#     foot-object contact rate expected for chairs). 0.06 is the tuned
+#     value.
 #   * pelvis: SMPL root is inside the hip; during sitting the ischium is
 #     ~15 cm below + buttock flesh ~5 cm, so 0.20 m covers seat contact.
+#     Sweep confirmed: chairs 0.20 gives 93% seq_reached, saturating at
+#     the elbow of the curve.
 DEFAULT_DISTANCE_THRESHOLDS: dict[str, float] = {
     "left_hand":  0.08,
     "right_hand": 0.08,
-    "left_foot":  0.12,
-    "right_foot": 0.12,
+    "left_foot":  0.06,
+    "right_foot": 0.06,
     "pelvis":     0.20,
 }
 
