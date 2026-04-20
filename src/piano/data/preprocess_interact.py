@@ -137,39 +137,61 @@ def fk_and_downsample_interact(
     inputs: dict,
     smplx_models: dict[str, torch.nn.Module],
     config: InterActConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Run SMPL-X FK on one InterAct sequence, downsample to target_fps.
 
-    Returns ``(joints_22_20fps, object_positions_20fps, object_rotations_20fps)``
-    where object_rotations are axis-angle (T', 3). Returns ``None`` on failure.
+    Returns ``(joints_22_ds, obj_pos_ds, obj_rot_ds, poses_ds, trans_ds, betas_padded)``:
+        joints_22_ds  : (T', 22, 3) world-frame body joints
+        obj_pos_ds    : (T', 3)    world-frame object translation
+        obj_rot_ds    : (T', 3)    axis-angle object rotation
+        poses_ds      : (T', 156)  full SMPL-X pose (root+body+hands+face) kept
+                                    verbatim from source; hands/face are not
+                                    used by our FK but preserved for later
+                                    mesh-based losses.
+        trans_ds      : (T', 3)    world-frame global translation.
+        betas_padded  : (num_betas,) body shape; constant over the sequence.
+
+    Returns ``None`` on failure.
     """
     gender = inputs["gender"]
     if gender not in smplx_models:
         gender = "male"
     model = smplx_models[gender]
 
-    # SMPL-X pose splitting
+    # SMPL-X pose splitting — FK uses root + body only; hands/face stay in
+    # the full `poses` array, which we save unmodified downstream.
     poses = inputs["poses"]
     root_orient = poses[:, POSE_ROOT_SLICE]
     pose_body = poses[:, POSE_BODY_SLICE]
     trans = inputs["trans"]
-    betas = _pad_betas(inputs["betas"], config.num_betas)
+    betas_padded = _pad_betas(inputs["betas"], config.num_betas).astype(np.float32)
+    # _pad_betas may return (1, num_betas) when given a 1D array; collapse
+    # back to a per-sequence (num_betas,) vector for storage clarity.
+    if betas_padded.ndim == 2:
+        betas_padded = betas_padded[0]
 
     # SMPL-X FK → 55 joints
     joints_smplx = run_smplx_fk(
-        model, betas, root_orient, pose_body, trans, device=config.device,
+        model, betas_padded[None, :], root_orient, pose_body, trans, device=config.device,
     )
     joints_22 = joints_smplx[:, :22, :]
 
-    # Temporal downsample: joints + object translation + object rotation
+    # Temporal downsample: joints + object pose + SMPL-X params.
+    # Keeping all signals at the same target fps avoids per-consumer
+    # re-alignment.
     joints_22_ds = downsample_temporal(joints_22, config.source_fps, config.target_fps)
     obj_pos_ds = downsample_temporal(inputs["obj_trans"], config.source_fps, config.target_fps)
     obj_rot_ds = downsample_temporal(inputs["obj_angles"], config.source_fps, config.target_fps)
+    poses_ds = downsample_temporal(poses, config.source_fps, config.target_fps)
+    trans_ds = downsample_temporal(trans, config.source_fps, config.target_fps)
 
     return (
         joints_22_ds.astype(np.float32),
         obj_pos_ds.astype(np.float32),
         obj_rot_ds.astype(np.float32),
+        poses_ds.astype(np.float32),
+        trans_ds.astype(np.float32),
+        betas_padded.astype(np.float32),
     )
 
 
@@ -179,26 +201,47 @@ def preprocess_sequence(
     encoder: HumanML3DEncoder,
     config: InterActConfig,
 ) -> dict[str, np.ndarray] | None:
-    """Convert one InterAct sequence to PIANO format (motion_263 + joints_22 + object_positions)."""
+    """Convert one InterAct sequence to PIANO format.
+
+    Saved fields (all aligned to target fps, length T' = encoder output len):
+        motion_263        : HumanML3D canonical 263-dim feature (VQ-VAE input)
+        joints_22         : world-frame 22-joint positions
+        object_positions  : world-frame object translation
+        object_rotations  : world-frame object axis-angle rotation
+        smplx_poses       : full SMPL-X pose (156 dim) — root+body+hands+face
+        smplx_trans       : world-frame global translation
+        smplx_betas       : per-sequence body shape (padded to num_betas)
+        smplx_gender      : gender string (for SMPL-X model selection)
+
+    SMPL-X fields let downstream stages reconstruct the body mesh on demand
+    (SDF penetration loss, body-vertex contact labels, post-hoc penetration
+    projection at inference). Without them the body geometry is irretrievably
+    reduced to 22 joint centers.
+    """
     result = fk_and_downsample_interact(inputs, smplx_models, config)
     if result is None:
         return None
-    joints_raw, obj_pos_raw, obj_rot_raw = result
+    joints_raw, obj_pos_raw, obj_rot_raw, poses_raw, trans_raw, betas = result
 
     # MoMask-compatible encoding (HumanML3D canonical + uniform skeleton)
     features, _aligned_joints = encoder.encode(joints_raw)   # (T-1, 263)
 
-    # process_file drops one frame; align all arrays to T-1
+    # process_file drops one frame; align all per-frame arrays to T-1
     T_minus_1 = features.shape[0]
     joints_raw = joints_raw[:T_minus_1]
     obj_pos_raw = obj_pos_raw[:T_minus_1]
     obj_rot_raw = obj_rot_raw[:T_minus_1]
+    poses_raw = poses_raw[:T_minus_1]
+    trans_raw = trans_raw[:T_minus_1]
 
     return {
         "joints_22": joints_raw,
         "motion_263": features,
         "object_positions": obj_pos_raw,
         "object_rotations": obj_rot_raw,     # axis-angle, (T', 3)
+        "smplx_poses": poses_raw,            # full SMPL-X (T', 156)
+        "smplx_trans": trans_raw,            # (T', 3)
+        "smplx_betas": betas,                # (num_betas,) — constant per seq
     }
 
 
