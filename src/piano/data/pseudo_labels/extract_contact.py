@@ -3,9 +3,22 @@
 For each frame, computes whether each tracked body part (left_hand, right_hand,
 left_foot, right_foot, pelvis) is in contact with the object surface.
 
-Contact is detected by combining:
-    1. Distance: body part joint is within ``distance_threshold`` of object surface
-    2. Velocity: relative velocity between joint and object is below ``velocity_threshold``
+Contact is detected from the distance between the body-part *joint* and the
+mesh surface, using per-part anatomy-calibrated thresholds:
+
+    SMPL joint centers sit inside the body, not on the skin. A wrist joint is
+    ~5-8 cm from the palm surface; an ankle joint is ~7-10 cm above the sole;
+    the SMPL pelvis root is ~15-20 cm from the seat surface during sitting.
+    A single tight threshold (e.g. 2 cm) measures joint penetration into the
+    mesh, which almost never happens, and suppresses nearly all real contact.
+    So thresholds are set per body part to reflect joint-to-skin offset.
+
+Velocity gating is off by default. Early runs with strict velocity gating
+(v < 0.1 m/s) erased the remaining contact signal during manipulation, and
+world-frame speed on a moving object is the wrong quantity anyway. Phase
+extraction (which does care about motion vs. rest) is the right place for
+the "stable vs. moving" distinction. Can be re-enabled via
+``use_velocity_gating=True`` for ablations.
 
 The raw contact signal is temporally smoothed and filtered to remove
 single-frame flickers.
@@ -14,7 +27,7 @@ Output: soft contact state array of shape ``(T, B)`` where B=5 body parts.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.ndimage import median_filter
@@ -22,21 +35,43 @@ from scipy.ndimage import median_filter
 from piano.utils.geometry import points_to_mesh_distance
 from piano.utils.smpl_utils import (
     BODY_PART_INDICES,
+    BODY_PART_NAMES,
     NUM_BODY_PARTS,
     compute_joint_velocities,
 )
+
+
+# Per-body-part joint-to-contact-surface offsets (meters), used as the
+# distance-threshold midpoints in the soft sigmoid. Derived from SMPL rest
+# pose geometry and human anatomy:
+#   * left/right_hand: wrist joint is inside the forearm, palm sits ~5-8 cm
+#     out; 0.08 m covers grip contact.
+#   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8), about
+#     8-10 cm above the sole; 0.12 m covers standing/floor contact.
+#   * pelvis: SMPL root is inside the hip; during sitting the ischium is
+#     ~15 cm below + buttock flesh ~5 cm, so 0.20 m covers seat contact.
+DEFAULT_DISTANCE_THRESHOLDS: dict[str, float] = {
+    "left_hand":  0.08,
+    "right_hand": 0.08,
+    "left_foot":  0.12,
+    "right_foot": 0.12,
+    "pelvis":     0.20,
+}
 
 
 @dataclass(slots=True)
 class ContactConfig:
     """Configuration for contact state extraction."""
 
-    distance_threshold: float = 0.02      # 2cm
-    distance_sigma: float = 0.005         # sigmoid sharpness for distance
-    velocity_threshold: float = 0.1       # 0.1 m/s
-    velocity_sigma: float = 0.02          # sigmoid sharpness for velocity
-    median_filter_size: int = 5           # temporal median filter window
-    min_contact_duration: int = 3         # minimum consecutive frames for valid contact
+    distance_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_DISTANCE_THRESHOLDS)
+    )
+    distance_sigma: float = 0.03            # sigmoid transition width (m)
+    use_velocity_gating: bool = False       # disabled by default; see module docstring
+    velocity_threshold: float = 0.5         # m/s — only used when gating is on
+    velocity_sigma: float = 0.2             # m/s
+    median_filter_size: int = 5             # temporal median filter window
+    min_contact_duration: int = 3           # minimum consecutive frames for valid contact
     fps: float = 30.0
 
 
@@ -89,15 +124,15 @@ def extract_contact_state(
     T = len(joints)
     contact = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
 
-    # Compute joint velocities for relative velocity check (in world frame —
-    # velocity magnitude is frame-invariant for rigid translation; small
-    # approximation for rotating objects but fine for near-contact)
-    joint_vel = compute_joint_velocities(joints, fps=config.fps)
+    # Velocities are only needed when the optional velocity gate is on
+    joint_vel = (
+        compute_joint_velocities(joints, fps=config.fps)
+        if config.use_velocity_gating else None
+    )
 
     for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
+        bp_name = BODY_PART_NAMES[bp_idx]
         bp_positions_world = joints[:, joint_idx, :]      # (T, 3)
-        bp_velocities = joint_vel[:, joint_idx, :]        # (T, 3)
-        bp_speed = np.linalg.norm(bp_velocities, axis=-1) # (T,)
 
         # Inverse-transform joint positions into the object-local frame
         if object_positions is not None:
@@ -110,10 +145,21 @@ def extract_contact_state(
         # Distance to object surface (in object-local frame, matching mesh)
         distances, _ = points_to_mesh_distance(bp_positions_local, object_mesh)
 
-        # Soft contact: high when close AND slow
-        dist_score = _soft_sigmoid(distances, config.distance_threshold, config.distance_sigma)
-        vel_score = _soft_sigmoid(bp_speed, config.velocity_threshold, config.velocity_sigma)
-        contact[:, bp_idx] = dist_score * vel_score
+        # Soft contact: per-part anatomy-calibrated distance threshold
+        threshold = config.distance_thresholds.get(
+            bp_name, DEFAULT_DISTANCE_THRESHOLDS[bp_name]
+        )
+        dist_score = _soft_sigmoid(distances, threshold, config.distance_sigma)
+
+        if joint_vel is not None:
+            bp_velocities = joint_vel[:, joint_idx, :]
+            bp_speed = np.linalg.norm(bp_velocities, axis=-1)
+            vel_score = _soft_sigmoid(
+                bp_speed, config.velocity_threshold, config.velocity_sigma,
+            )
+            contact[:, bp_idx] = dist_score * vel_score
+        else:
+            contact[:, bp_idx] = dist_score
 
     # Temporal smoothing
     for bp_idx in range(NUM_BODY_PARTS):

@@ -27,9 +27,9 @@ from piano.utils.smpl_utils import BODY_PART_INDICES, NUM_BODY_PARTS
 class TargetConfig:
     """Configuration for contact target extraction."""
 
-    num_patches: int = 16           # number of surface patches (K)
+    num_patches: int = 16            # number of surface patches (K)
     num_surface_samples: int = 4096  # points sampled for clustering
-    soft_sigma: float = 0.01        # temperature for soft assignment
+    soft_sigma: float = 0.05         # Gaussian bandwidth in meters
     contact_threshold: float = 0.5   # minimum contact score to assign target
 
 

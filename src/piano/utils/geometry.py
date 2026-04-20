@@ -109,22 +109,31 @@ def cluster_surface_patches(
 def soft_patch_assignment(
     query_point: np.ndarray,
     patch_centers: np.ndarray,
-    sigma: float = 0.01,
+    sigma: float = 0.05,
 ) -> np.ndarray:
     """Compute soft assignment of a point to patch centers.
+
+    Uses a Gaussian kernel over squared distances (``-d² / 2σ²``). The
+    earlier implementation used ``-d / 2σ²`` (linear distance in the
+    exponent); combined with ``sigma=0.01`` that collapsed the
+    distribution to nearly one-hot — target entropy across 8473 chairs
+    sequences measured 0.003 / 2.773 max, i.e. hard nearest-patch.
 
     Parameters
     ----------
     query_point : (3,) array
     patch_centers : (K, 3) array
-    sigma : temperature for softmax
+    sigma : Gaussian bandwidth in meters. With ``K=16`` patches on typical
+        InterAct mesh scales (bounding box diagonal ~0.5-1.0 m, so
+        neighbour spacing ~0.15-0.3 m) ``sigma=0.05`` gives a soft but
+        locally-concentrated distribution.
 
     Returns
     -------
     weights : (K,) array summing to 1
     """
     dists = np.linalg.norm(patch_centers - query_point[None, :], axis=-1)
-    logits = -dists / (2.0 * sigma ** 2)
+    logits = -(dists ** 2) / (2.0 * sigma ** 2)
     logits -= logits.max()  # numerical stability
     weights = np.exp(logits)
     return weights / weights.sum()
