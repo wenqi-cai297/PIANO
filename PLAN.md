@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-20 (Codex review integrated; P0 fixes landed in `9d11f1a`; rerun + stats + qualitative inspection is the next gate before any P1/P2 work or Stage A)
+**Last updated:** 2026-04-20 (v1 rerun stats exposed a deeper bug — contact thresholds were calibrated for joint penetration, not joint-to-skin offset; recalibrated in `d641732`; second rerun is the next gate)
 
 ---
 
@@ -47,19 +47,30 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   disk-cached at `<output>/patch_atlas/<obj_id>.npy`.
   See [codex_review_p0_fixes](analyses/2026-04-20_codex_review_p0_fixes.md)
   and [`SUGGESTION.md`](SUGGESTION.md).
-- [ ] **NEXT: rerun pseudo-label extraction on server**
-  - `bash scripts/data/rerun_pseudo_labels_interact.sh` (kills old tmux,
-    backs up previous `pseudo_labels/` dirs, re-extracts all 4 subsets)
-  - Expected: ~1.5h CPU
-- [ ] **Write stats aggregator** (while rerun is running):
-  per-subset contact-rate per body part, phase/support histograms,
-  patch-id entropy, short-contact fraction, HMM non-convergence count.
-  Output to `runs/pseudo_labels_stats/<ts>/summary.json` + markdown.
-- [ ] Visualize 5-10 samples per subset after rerun completes
-  - Tool ready: `bash scripts/server/visualize_pseudo_labels.sh`
-  - Overlays contact/phase/support on skeleton MP4
-- [ ] **Decide on P1/P2 scope** (only after stats + videos in hand).
-  See §3 for the deferred-until-validation list.
+- [x] **v1 rerun on server + stats** (2026-04-20, commits `34ccf3c`):
+  8473 / 8475 sequences extracted, rich stats tool written + run.
+- [x] **Stats exposed a deeper bug** (2026-04-20, commit `d641732`):
+  v1 labels were unusable (81-99% zero-contact, 100% degenerate target).
+  Three root causes recalibrated: (a) per-body-part distance thresholds
+  with anatomy-calibrated values (hand 0.08 / foot 0.12 / pelvis 0.20
+  meters; joint-to-skin offset, not joint penetration); (b) velocity
+  gating off by default (was multiplying contact to zero); (c) target
+  soft-assign kernel corrected from `-d/(2σ²)` to `-d²/(2σ²)`, sigma
+  raised 0.01 → 0.05. See
+  [pseudo_label_stats_v1_diagnosis](analyses/2026-04-20_pseudo_label_stats_v1_diagnosis.md).
+- [ ] **NEXT: v2 rerun pseudo-label extraction on server**
+  - `bash scripts/data/rerun_pseudo_labels_interact.sh`
+  - run_all.py now writes the rich stats inline — no separate stats step
+    needed. Pass bar: chairs `sitting` frame rate > 25%; all subsets
+    `manipulation` reached in > 30% of sequences; target entropy mean > 1.2.
+- [ ] If chairs `sitting` < 10% after v2 rerun, raise pelvis threshold
+  to 0.25 and re-check. If < 5%, the approach needs SMPL body vertices
+  instead of joint centers (not a threshold problem).
+- [ ] Visualize 5-10 samples per subset after v2 rerun
+  - `bash scripts/server/visualize_finished_subsets.sh`
+- [ ] **Decide on remaining P1/P2 scope** (only after v2 stats + videos).
+  See §3.1 for deferred-until-validation list. Velocity-in-world-frame and
+  degenerate-target items are now effectively addressed by this fix.
 - [ ] Update `configs/training/predictor.yaml` with multi-root InterAct paths
 
 **CHOIS-OMOMO path is retired but preserved:**
@@ -126,22 +137,23 @@ Open questions to resolve as we get experimental feedback:
 5. **LaMP vs CLIP text encoder:** start with CLIP (MoMask compatibility), consider LaMP as improvement
 6. **Residual Transformer:** currently frozen. Consider finetuning if contact details are lost?
 
-### 3.1 Pseudo-label P1/P2 items (gated on rerun stats + videos)
+### 3.1 Pseudo-label P1/P2 items (gated on v2 rerun stats + videos)
 
 From the Codex review, these are real but unvalidated concerns. Fix
-only if the rerun outputs fail the relevant sanity check. Don't
+only if the v2 rerun outputs fail the relevant sanity check. Don't
 prophylactically rewrite code.
 
-| Item | Gate condition (what would trigger the fix) |
-|---|---|
-| Contact velocity uses world frame instead of object-relative | Manipulation sequences show fragmented contact in videos, or contact-rate histograms for moving-object subsets (neuraldome, omomo_correct_v2) are materially lower than for static-object subsets (chairs) |
-| Rename `support` → `foot_support` + add `unknown` class | Sitting/lying sequences in `chairs` show the `sitting` label firing inconsistently, or `both_feet` dominates frames where no body part is near the object |
-| Replace `median_filter` on categorical labels with majority filter | Support/phase histograms show odd intermediate-class spikes (e.g. `single_foot` inflated at transitions) |
-| Soft-assignment kernel `-d / (2σ²)` → `-d² / (2σ²)` | Patch-id entropy is near zero across contact frames (effectively hard nearest-patch) |
-| Closest-surface-point for target (instead of joint position) | Target patch is visibly wrong at contact frames in videos (body joint is close but patch id is a far patch) |
-| Expand tracked joints (elbows/knees/hips/spine) | Visible contacts in chair/sofa sequences are missed by the 5-joint extractor |
-| HMM state → phase-name remapping | Phase histograms across subsets show a semantically incoherent state id dominating |
-| Hierarchical support redesign (foot_ground / body_object / support_type) | Long-term; only if v1 support supervision degrades generator output after Stage C |
+| Item | Status | Gate condition |
+|---|---|---|
+| Soft-assignment kernel `-d / (2σ²)` → `-d² / (2σ²)` | ✅ Fixed in `d641732` (v1 stats showed 100% degenerate target) | — |
+| Velocity gating on world-frame speed | ✅ Disabled by default in `d641732` (was killing contact; re-enable via `use_velocity_gating=True` for ablations) | Re-enable only for the ablation experiment |
+| Contact velocity uses world frame instead of object-relative | Deferred; partial fix by disabling gating. Full object-relative velocity is only relevant if phase needs it to distinguish manipulation vs. stable. | v2 phase distribution shows `manipulation` < 30% of reached sequences even after threshold fix |
+| Expand tracked joints (elbows/knees/hips/spine) | Deferred | v2 sitting is still < 10% for chairs even after raising `pelvis` threshold to 0.25; means joint proxies aren't enough |
+| Rename `support` → `foot_support` + add `unknown` class | Deferred | v2 `sitting` is still near-zero for chairs (confirms support is permanently foot-centric), or generator learns bad support behaviour in Stage C |
+| Replace `median_filter` on categorical labels with majority filter | Deferred | v2 histograms show intermediate-class spikes at transitions |
+| Closest-surface-point for target (instead of joint position) | Deferred | v2 videos show visibly-wrong patch ids at contact frames |
+| HMM state → phase-name remapping | Deferred | v2 phase histogram shows a dominant semantically-incoherent state id |
+| Hierarchical support redesign (foot_ground / body_object / support_type) | Long-term | Only if v1 support supervision degrades generator output after Stage C |
 
 ---
 
