@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-21 PM (v2 extraction complete + visualised + judged on 14 seq. 4 original P0 fixes validated; visualization exposed **5th P0 bug** — pelvis threshold caused `support=sitting` false positive on push/drag seq (neuraldome bigsofa_330 + chair_0 were 96%/63% sitting while the person never actually sat). Fixed with two conjunctive gates: pelvis XZ-velocity < 0.15 m/s AND object geometrically below pelvis. Also applied target sigma 0.05→0.12 (v2 entropy was 4/4 below pass bar) and HMM NaN fallback (v2 had 5/8475 exceptions). **7 local fixes, 13/13 regression tests green, pending commit → v3 rerun**. Hand threshold + mesh-missing-handle deferred to §3.1.)
+**Last updated:** 2026-04-21 PM post-v3 (v3 done + judged: 4/4 target entropy pass, 4/4 manipulation-reached pass, chairs sitting 64%→46% as predicted; prior 7 fixes in `a8f5c2e`. v3 visualization caught the "sitting with pelvis offset toward armrest" over-rejection in the below gate — rewritten to inspect upward-facing surface within a cylinder below pelvis instead of closest-point direction. **14/14 regression tests green, below-gate rewrite pending commit → v4 rerun**. Hand threshold + mesh-missing-handle still deferred in §3.1.)
 
 ---
 
@@ -74,32 +74,32 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   - `piano-preprocess-interact` — adds `smplx_poses/trans/betas` to each
     `motions/<seq>.npz`. ~10 min on A6000. Required before Stage B if we
     want SDF penetration loss; harmless to defer until we need it.
-- [x] **v2 pseudo-label extraction done** (2026-04-21, ~5 h on server)
-  - ContactConfig thresholds from `d641732` (hand 0.08 / foot 0.06 / pelvis 0.20).
-  - Contact pass: chairs 2.7% / imhd 13.5% / omomo 23.1% / neuraldome **49% ❌**
-    (neuraldome over pass bar — hand threshold issue, deferred to §3.1).
-  - Target entropy pass: **4/4 subsets below 1.2 threshold** → triggered sigma 0.05→0.12 local fix.
-  - Phase/support fields untrustworthy until v3 (need P0 fixes).
-- [x] **v2 visualization done + 14 seq spot-checked** (2026-04-21 PM)
-  - `bash scripts/server/visualize_finished_subsets.sh` → 4 subset dirs at `runs/visualizations/2026-04-21_*/`.
-  - Validated original 4 P0 fixes on representative seq.
-  - Exposed 5th P0 bug (pelvis false positive for push/drag) — now also fixed locally.
-  - Captured 4 zero-contact cases with real contact (bat/suitcase/box/pan) → hand-threshold issue deferred.
-- [x] **Local fixes ready (7 total)**: see [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md)
-  and §3.1 table. 11/11 regression tests pass (`tests/test_pseudo_labels.py`).
-- [ ] **NEXT: Commit 7 local fixes → start v3 rerun** (same command, ~5 h).
-- [ ] **v3 summary.json → phase/support pass bar**
-  - chairs `sitting` frame rate > 25% (expected to drop from 64% v2 because push/drag
-    false positives now go to hand_support instead — actual sitting content should still pass)
-  - all subsets `manipulation` reached in > 30% of sequences (P0-1 + P0-2 should raise this significantly)
-  - target entropy mean > 1.2 (σ=0.12 should get chairs from 0.26 to >1.0)
-  - neuraldome zero-contact < 40% (only addressed by P0 fixes if part of it was phase-side confusion;
-    if still > 40%, confirms hand-threshold issue — §3.1 deferred)
-  - no `quality_flags` fired on HMM-refined histogram
-- [ ] **Decide on remaining P1/P2 scope** (only after v3 stats + videos).
+- [x] **v2 pseudo-label extraction + visualization done** (2026-04-21 AM/PM)
+  - Verdict: contact pass (chairs / imhd / omomo); neuraldome 49% over bar (hand threshold).
+  - Target entropy: 4/4 below bar → sigma fix.
+  - Surfaced 5th P0 bug (sitting FP for push/drag) via visualization.
+- [x] **Commit 7 fixes + start v3 rerun** — `a8f5c2e` landed, v3 done (~5 h).
+- [x] **v3 summary.json judged** (2026-04-21 PM)
+  - chairs sitting 64%→46% ✓ (dual gate filtered the push/drag FPs).
+  - all 4 subsets `manipulation reached > 30%` ✓.
+  - all 4 subsets `target entropy mean > 1.2` ✓ (chairs 0.26→1.21).
+  - HMM NaN exceptions 5→0; 0 seqs skipped (was 5 in v2).
+  - neuraldome zero-contact still 49% → hand threshold issue confirmed, deferred.
+- [x] **v3 visualization + 14 clip spot-check** (2026-04-21 PM)
+  - Dirs under `runs/visualizations/2026-04-21_16*` / `17*`.
+  - Exposed below-gate over-rejection on sofa-edge sitting (3 clips where text says "sits"
+    got `sitting=0`). Gate rewritten from closest-point-direction to cylinder + upward
+    normal. 14/14 regression tests (+1 new test for sofa-edge).
+- [ ] **NEXT: Commit below-gate rewrite → start v4 rerun** (same command, ~5 h). Only
+  support labels will differ; phase/target/contact stats stay identical to v3.
+- [ ] **v4 summary.json → final support pass bar check**
+  - chairs `sitting` frame rate should rise back toward 50-55% (sofa-edge-style sits
+    recovered without reintroducing push/drag FPs).
+  - neuraldome/omomo sitting should stay near 0% (genuinely no sitting in those subsets).
+- [ ] **Decide on remaining P1/P2 scope** (only after v4 stats + videos).
   See §3.1 for deferred list (hand threshold, suitcase mesh, expanded joints, etc).
 - [ ] Update `configs/training/predictor.yaml` — multi-root InterAct paths,
-  `fps=20`, `support_weight=0.1` until v3 validates support labels.
+  `fps=20`, `support_weight=0.1` until v4 validates support labels.
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo
@@ -181,7 +181,7 @@ prophylactically rewrite code.
 | HMM state → phase-name remapping | ✅ Fixed locally 2026-04-21 (pending commit) via `GaussianHMM(params="")` — M-step frozen, state k stays bound to phase k. | — |
 | HMM NaN-fatal sequences | ✅ Fixed locally 2026-04-21 PM (pending commit). v2 aborted 5/8475 seq with "startprob_ must sum to 1 (got nan)". try/except around fit/predict now falls back to heuristic labels rather than dropping the sequence. | — |
 | Replace `median_filter` on categorical labels with majority filter | ✅ Fixed locally 2026-04-21 (pending commit). `_majority_filter` via `np.bincount.argmax`. | — |
-| **Support `sitting` false positive for push/drag seq** (new, found 2026-04-21 PM via vis) | ✅ Fixed locally 2026-04-21 PM (pending commit). v2 labelled `subject01_bigsofa_330` (all-push) 96% sitting and `subject01_chair_0` (all-pull) 63% sitting — pure pelvis-contact criterion couldn't tell standing-close from seated. Fix uses two conjunctive gates: (i) pelvis XZ-plane speed < 0.15 m/s (1 s moving average) — rejects moving-while-pushing; (ii) object-geometrically-below-pelvis — the pelvis→closest-point direction must have Y-component < -0.3 (at least 30% downward) — rejects standing-beside-object-stationary where pelvis is horizontally within threshold of a backrest but not above a seat. 4 new tests (2 per gate: reject + sanity). | — |
+| **Support `sitting` false positive for push/drag seq** (new, found 2026-04-21 PM via vis) | ✅ Fixed in `a8f5c2e` (velocity gate) + pending commit (below gate v2). v2 labelled `subject01_bigsofa_330` (all-push) 96% sitting and `subject01_chair_0` (all-pull) 63% sitting. Fix uses two conjunctive gates: (i) pelvis XZ-plane speed < 0.15 m/s (1 s moving average) — rejects moving-while-pushing; (ii) an upward-facing seat surface must sit within a cylinder below the pelvis (XZ radius 0.15 m, vertical gate 0.30 m, face normal.Y > 0.7) — rejects standing-beside-object-stationary while still accepting sofa-edge sitting where the closest mesh point is on the armrest. 5 new tests (velocity: push rejected / stationary preserved; below: beside-object rejected / above-object preserved / sofa-edge preserved). | — |
 | Contact velocity uses world frame instead of object-relative | Deferred; partial fix by disabling gating. Full object-relative velocity is only relevant if phase needs it to distinguish manipulation vs. stable. | v3 phase distribution shows `manipulation` < 30% of reached sequences even after rotation-aware fix |
 | **Hand threshold 0.08m too strict for irregular / large objects** (new, found 2026-04-21 PM via vis) | Deferred. Visualization caught 4 zero-contact seq that actually had contact: `bat_holdhead_hit` (holding bat by thick end — wrist farther from surface), `suitcase_lefthand_push` (handle possibly missing from mesh), `neuraldome/box_1565` (holding big box with arms outstretched), `neuraldome/pan_360` (holding pan, wrist far from pan surface). | v3 imhd zero-contact frac > 20% or specific seq types fail; then try hand threshold 0.10-0.12 or add elbow/palm tracked joints |
 | **InterAct `suitcase` mesh may omit the handle** (data-layer issue, found 2026-04-21 PM via vis) | Deferred, data-layer. `suitcase_lefthand_push` seq has user pushing the handle but object point cloud may not include it. Need to `mesh.bounds` vs `object_pc.bounds` comparison to verify. | Any suitcase-dependent training signal is suspect; if we depend on suitcase seq for Stage A support/target, check mesh completeness first |

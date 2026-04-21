@@ -295,12 +295,67 @@ Observed but not urgent:
 - [x] HMM NaN fallback — v2 had 5/8475 "startprob_ must sum to 1
       (got nan)" exceptions; the refine step now returns heuristic
       labels on failure instead of dropping the sequence
-- [ ] Commit all local fixes → start v3 rerun (same command, ~5 h)
-- [ ] v3 summary.json → phase / support pass bar (now meaningful)
-- [ ] If v3 chairs `sitting > 25%` still fails → check whether the
-      pelvis-velocity gate is rejecting valid sits (threshold 0.15
-      may need to be loosened to 0.20)
+- [x] Committed local fixes in `a8f5c2e` and started v3 rerun
+- [x] v3 summary.json judged — 4/4 target entropy pass, 4/4
+      manipulation-reached pass, chairs sitting 64% → 46% (FP dropped
+      as predicted). See §d below for v3 follow-up findings.
+- [ ] v4 rerun after the below-gate rewrite in §d
 - [ ] If v3 imhd zero-contact is still > 20% → revisit the hand
       threshold / tracked joints (Beyond-P0 #1 above)
 - [ ] Update `configs/training/predictor.yaml` support_weight to
-      0.1 until v3 validates support labels
+      0.1 until v4 validates support labels
+
+## (d) v3 visualization follow-up — below gate rewrite (2026-04-21 PM, post-v3)
+
+After v3 finished, the 14 clips were revisualised and spot-checked
+against their `text` annotations (which are now present in the
+visualization summary). Three clips exposed an over-rejection by the
+2026-04-21 PM "object below pelvis" gate:
+
+| Sequence | Text | v3 sitting | Pelvis contact | Issue |
+|---|---|---|---|---|
+| `neuraldome/subject02_bigsofa_0` | "walks to sofa, **sits down beside left armrest**, moves to right, places arms behind backrest, stands up" | 0% | 55% | Over-rejected |
+| `neuraldome/subject01_bigsofa_1310` | "pushes sofa on left side, walks around, **then sits on the couch**" | 0% | 76% | Over-rejected |
+| `chairs/Sub0284_Obj141_Seg0_339` | "pushing chair backward, **then sits on it**, puts right leg on chair and lies down" | 0% | 5% | Over-rejected (also pelvis contact rate low) |
+
+Root cause: the v3 below gate measured the direction from pelvis to
+the mesh's *closest* point and required it to be mostly downward.
+When the subject sits at the edge of a sofa with pelvis offset toward
+the armrest, the closest mesh point lies on the armrest side face
+(direction horizontal) even though a flat seat surface sits directly
+below the pelvis. The gate therefore rejected a legitimate sit.
+
+Fix (applied 2026-04-21 PM, supersedes the earlier closest-point
+direction gate): the below gate now inspects a thin vertical cylinder
+below the pelvis — XZ radius 0.15 m (pelvis-width-sized), extending
+0.30 m downward. The gate opens if **any mesh surface inside that
+cylinder is upward-facing** (face normal with Y-component > 0.7,
+i.e. within ~45° of +Y). Backrests, legs, and armrests have
+horizontal normals and get filtered out even when they happen to
+intersect the cylinder; only seat-like horizontal surfaces qualify.
+
+Implementation: `_pelvis_object_below_mask` now samples the mesh
+surface (up to 3000 points) with face normals, filters to upward-
+facing ones, and batch-checks cylinder membership per frame.
+SupportConfig replaces `sitting_min_downward_component` with three
+fields: `sitting_below_horz_radius=0.15`, `sitting_below_vert_gate=0.30`,
+`sitting_below_upward_normal_threshold=0.7`.
+
+One new regression test guarding this case:
+- `test_support_allows_sitting_when_pelvis_offset_toward_armrest` —
+  synthetic sofa = wide flat seat + tall thin left armrest; pelvis
+  positioned above the seat but horizontally offset toward the
+  armrest. Closest mesh point is on the armrest side face, but the
+  seat sits directly below. Gate must classify ≥80% of frames as
+  sitting.
+
+The two earlier below-gate tests were kept but re-grounded on the
+new mechanism:
+- `test_support_rejects_sitting_when_pelvis_beside_object` — pelvis
+  beside a tall box: side-face normal is horizontal, filtered out;
+  no qualifying surface in cylinder; gate closes.
+- `test_support_allows_sitting_when_object_below_pelvis` — pelvis
+  above a stool top face: upward normal, inside cylinder; gate opens.
+
+14/14 regression tests pass. v4 rerun (same command as v3) is queued
+behind this commit.

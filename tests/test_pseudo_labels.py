@@ -279,27 +279,24 @@ def test_support_stationary_sitting_still_classified_as_sitting() -> None:
 
 
 def test_support_rejects_sitting_when_pelvis_beside_object() -> None:
-    """Person standing stationary BESIDE a chair (pelvis at backrest
-    height): pelvis contact triggers because wrist-style 20 cm threshold
-    is permissive, but the closest point on the mesh is horizontally
-    next to the pelvis, not below. Without the object-below gate, this
-    would inflate sitting counts; with it, the frame goes to the next
-    branch (hand_support if hands also contacting, or both_feet otherwise).
+    """Person standing beside a tall box (chair backrest proxy): pelvis
+    joint is within the contact threshold, but the side face's normal
+    is horizontal — the cylinder-and-upward-normal gate rejects it.
+    Even though part of the side face is below the pelvis vertically,
+    its normal is not upward, so it can't be a seat.
     """
     import trimesh
 
     # Chair-like box: 0.5 m wide × 0.9 m tall × 0.5 m deep, centred on origin.
-    # Mesh bounds: (-0.25, -0.45, -0.25) to (0.25, 0.45, 0.25).
     mesh = trimesh.primitives.Box(extents=[0.5, 0.9, 0.5])
 
     T = 30
     joints = np.zeros((T, 22, 3), dtype=np.float32)
-    # Pelvis right next to the box's side face at backrest height — within
-    # the 0.20 m pelvis contact threshold, but purely horizontal proximity.
+    # Pelvis right next to the box's side face at backrest height.
     joints[:, 0] = [0.35, 0.3, 0.0]
 
     contact = np.zeros((T, 5), dtype=np.float32)
-    contact[:, 4] = 1.0                        # pelvis "contact"
+    contact[:, 4] = 1.0
 
     object_positions = np.zeros((T, 3), dtype=np.float32)
     object_rotations = np.zeros((T, 3), dtype=np.float32)
@@ -322,19 +319,16 @@ def test_support_rejects_sitting_when_pelvis_beside_object() -> None:
 
 
 def test_support_allows_sitting_when_object_below_pelvis() -> None:
-    """Sanity: pelvis directly above the seat surface of a stool-like
-    mesh must still classify as sitting after the geometric gate is
-    added.
+    """Pelvis above a stool: the box top face has upward normal and
+    lies inside the cylinder below pelvis. Gate opens → sitting.
     """
     import trimesh
 
-    # Low stool: 0.4 m × 0.4 m footprint, 0.5 m tall; top surface at y=0.25.
-    mesh = trimesh.primitives.Box(extents=[0.4, 0.5, 0.4])
+    mesh = trimesh.primitives.Box(extents=[0.4, 0.5, 0.4])  # top face at y=0.25
 
     T = 30
     joints = np.zeros((T, 22, 3), dtype=np.float32)
-    # Pelvis 10 cm above the stool top face and centred.
-    joints[:, 0] = [0.0, 0.35, 0.0]
+    joints[:, 0] = [0.0, 0.35, 0.0]   # 10cm above top face
 
     contact = np.zeros((T, 5), dtype=np.float32)
     contact[:, 4] = 1.0
@@ -353,6 +347,55 @@ def test_support_allows_sitting_when_object_below_pelvis() -> None:
     )
 
     assert (support == SUPPORT_SITTING).sum() > T * 0.8
+
+
+def test_support_allows_sitting_when_pelvis_offset_toward_armrest() -> None:
+    """Regression for neuraldome/subject01_bigsofa_1310 and
+    subject02_bigsofa_0: the person sits near one edge of a sofa seat
+    with pelvis offset toward the armrest. The closest mesh point is
+    on the armrest (horizontal direction), but the seat surface still
+    sits directly below the pelvis. The old closest-point-direction
+    gate rejected such frames; the new cylinder-and-normal gate must
+    keep them as sitting.
+    """
+    import trimesh
+
+    # Sofa proxy: wide flat seat + tall thin left armrest.
+    seat = trimesh.primitives.Box(extents=[1.5, 0.1, 0.5])
+    seat.apply_translation([0.0, 0.25, 0.0])        # seat top face at y=0.3
+    armrest = trimesh.primitives.Box(extents=[0.1, 0.5, 0.5])
+    armrest.apply_translation([-0.7, 0.55, 0.0])    # armrest left of seat, tall
+    sofa = trimesh.util.concatenate([seat, armrest])
+
+    T = 30
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    # Pelvis above seat but offset left toward the armrest. Closest mesh
+    # point is on the armrest side face (horizontal direction); seat is
+    # directly below pelvis at y=0.3.
+    joints[:, 0] = [-0.55, 0.35, 0.0]
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 4] = 1.0
+
+    object_positions = np.zeros((T, 3), dtype=np.float32)
+    object_rotations = np.zeros((T, 3), dtype=np.float32)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact,
+        joints=joints,
+        object_mesh=sofa,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        config=cfg,
+    )
+
+    sitting_frac = (support == SUPPORT_SITTING).sum() / T
+    assert sitting_frac > 0.8, (
+        f"offset-sitting mis-classified ({sitting_frac:.2%} sitting) — "
+        f"cylinder-and-normal gate should accept seat directly below pelvis "
+        f"even when armrest is horizontally closer"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +467,7 @@ if __name__ == "__main__":
         test_support_stationary_sitting_still_classified_as_sitting,
         test_support_rejects_sitting_when_pelvis_beside_object,
         test_support_allows_sitting_when_object_below_pelvis,
+        test_support_allows_sitting_when_pelvis_offset_toward_armrest,
         test_target_sigma_default_yields_soft_distribution,
         test_hmm_falls_back_to_initial_on_bad_features,
     ]

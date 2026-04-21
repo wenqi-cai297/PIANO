@@ -17,14 +17,18 @@ Support states:
    shuffles at 0.2-0.5 m/s. Rejects neuraldome `subject01_chair_0` style
    false positives where the user stands behind the chair and pushes it.
 
-2. **Object geometrically below pelvis** (direction from pelvis to the
-   mesh's closest point has a ≥30% downward component). The physical
-   signature of sitting is that the object surface is under the pelvis
-   (the seat takes the body's weight); a person standing beside a chair
-   back still triggers pelvis contact (joint within 20 cm of backrest),
-   but the closest point then points horizontally, not down. Rejects
-   neuraldome `subject01_bigsofa_330` style false positives where the
-   user stands in front of the sofa and pushes it.
+2. **Upward-facing mesh surface sits within a cylinder below the pelvis**
+   (XZ radius ~0.15 m, extending ~0.30 m downward; candidate surface
+   has a face normal within ~45° of +Y). The physical signature of
+   sitting is that a seat surface is directly under the pelvis and can
+   support body weight; a person standing beside a chair still
+   triggers pelvis contact (joint within 20 cm of backrest) but has no
+   seat-like surface beneath them. Rejects neuraldome
+   `subject01_bigsofa_330` (push) and keeps neuraldome
+   `subject01_bigsofa_1310` (sit on sofa edge with pelvis offset
+   toward the armrest — closest point lies on the armrest
+   horizontally, but the seat sits directly below pelvis so the
+   cylinder-and-normal test still opens).
 
 Both conditions are conjunctions — either being false rejects sitting.
 If ``joints`` or ``object_mesh`` is unavailable, the corresponding gate
@@ -67,12 +71,18 @@ class SupportConfig:
     # is 0.2-0.5 m/s; walking is >1 m/s.
     sitting_max_pelvis_horz_speed: float = 0.15
     sitting_velocity_window_sec: float = 1.0
-    # Minimum downward component of the pelvis→closest-point direction.
-    # 0.3 ≈ angle from -Y below ~72°, i.e., the object surface must be
-    # "under" the pelvis, not purely to one side. Typical values: sitting
-    # on a seat → Y ≈ -1; standing next to a backrest → Y ≈ 0; under a
-    # table reaching up → Y > 0.
-    sitting_min_downward_component: float = 0.3
+    # "Object below pelvis" gate parameters. Replaces the earlier
+    # closest-point-direction gate, which mis-fired for sitting-on-sofa-
+    # edge poses where the closest mesh point is on a nearby armrest
+    # (direction horizontal) even though a seat surface lies directly
+    # below the pelvis. The new gate inspects a thin cylinder below the
+    # pelvis and requires an upward-facing surface inside it.
+    sitting_below_horz_radius: float = 0.15     # cylinder radius (m)
+    sitting_below_vert_gate: float = 0.30       # cylinder height below pelvis (m)
+    # Minimum +Y component of face normal for a surface to count as
+    # "seat-like". 0.7 ≈ within 45° of vertical. Filters out backrest
+    # / leg / armrest side faces that happen to intersect the cylinder.
+    sitting_below_upward_normal_threshold: float = 0.7
 
 
 def _majority_filter(labels: np.ndarray, size: int) -> np.ndarray:
@@ -200,15 +210,20 @@ def _pelvis_object_below_mask(
     config: SupportConfig,
     T: int,
 ) -> np.ndarray:
-    """Per-frame boolean: object mesh's closest point to pelvis is
-    sufficiently downward (i.e., the body's weight could be borne by it).
+    """Per-frame boolean: an upward-facing mesh surface sits within a
+    thin vertical cylinder below the pelvis.
 
-    Standing beside a chair's backrest triggers pelvis contact because
-    the wrist-joint-style closeness threshold is permissive, but the
-    closest point then points *horizontally* rather than downward.
-    Sitting has the inverse signature — the closest point is almost
-    directly below pelvis. We require the pelvis→closest direction to
-    have at least ``sitting_min_downward_component`` negative Y.
+    Sitting requires a seat-like surface (upward-facing, i.e. normal
+    close to +Y) inside a pelvis-sized cylinder (XZ radius
+    ``sitting_below_horz_radius``) extending down by
+    ``sitting_below_vert_gate``. Backrests, chair legs, and armrests
+    have horizontal or downward normals and are filtered out even if
+    they happen to intersect the cylinder; they are not sittable.
+
+    This replaces a prior closest-point-direction gate that mis-fired
+    on sitting-at-sofa-edge, where the nearest mesh point is on the
+    armrest (direction horizontal) but a seat surface still lies
+    directly below pelvis.
 
     Returns all-True when inputs are unavailable (keeps legacy
     behaviour; the velocity gate is the only remaining disambiguator).
@@ -220,21 +235,39 @@ def _pelvis_object_below_mask(
     ):
         return np.ones(T, dtype=bool)
 
+    import trimesh
+
     from piano.data.pseudo_labels._object_transform import world_to_object_local
-    from piano.utils.geometry import points_to_mesh_distance
 
     pelvis_world = joints[:, 0, :]
     pelvis_local = world_to_object_local(
         pelvis_world, object_positions, object_rotations,
     )
-    _, closest_local = points_to_mesh_distance(pelvis_local, object_mesh)
 
-    direction = closest_local - pelvis_local                  # (T, 3)
-    norm = np.linalg.norm(direction, axis=-1, keepdims=True) + 1e-8
-    direction_normalized = direction / norm
+    # Sample surface points and keep only those on upward-facing faces.
+    # Raw mesh.vertices can be too sparse on low-poly meshes (a cube has
+    # only 8 corner vertices), so sampling the surface gives uniform
+    # coverage for the proximity test. Upward = face normal within ~45°
+    # of +Y in the object-local frame; the filter drops backrests,
+    # side faces, and inverted faces.
+    n_samples = min(3000, max(500, 4 * len(object_mesh.vertices)))
+    surface_pts, face_idx = trimesh.sample.sample_surface(object_mesh, n_samples)
+    surface_normals = object_mesh.face_normals[face_idx]
+    upward = surface_normals[:, 1] > config.sitting_below_upward_normal_threshold
+    seat_pts = surface_pts[upward].astype(np.float32)
 
-    # Local Y approximately equals world Y for upright objects (chairs,
-    # sofas, tables). For meshes authored with a different up-axis this
-    # gate would need the object-local "down" direction — out of scope
-    # for InterAct v1.
-    return direction_normalized[:, 1] < -config.sitting_min_downward_component
+    if len(seat_pts) == 0:
+        # No upward-facing surface → object cannot support a seated pose.
+        return np.zeros(T, dtype=bool)
+
+    # Check per-frame: does any seat-like point fall inside the cylinder
+    # below the pelvis? (T, V) broadcasting on a small number of points.
+    dx = pelvis_local[:, None, 0] - seat_pts[None, :, 0]
+    dz = pelvis_local[:, None, 2] - seat_pts[None, :, 2]
+    xz_dist2 = dx * dx + dz * dz
+    in_xz = xz_dist2 < config.sitting_below_horz_radius ** 2
+
+    dy = pelvis_local[:, None, 1] - seat_pts[None, :, 1]
+    y_below = (dy > 0) & (dy < config.sitting_below_vert_gate)
+
+    return (in_xz & y_below).any(axis=1)
