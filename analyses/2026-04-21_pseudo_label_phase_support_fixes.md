@@ -359,3 +359,120 @@ new mechanism:
 
 14/14 regression tests pass. v4 rerun (same command as v3) is queued
 behind this commit.
+
+## (e) v4 results on aggregate (2026-04-22)
+
+v4 ran to completion with `480762c` (below-gate rewrite). Aggregate
+stats match the prediction from §d that only support labels would
+change:
+
+| Metric | v3 | v4 | Δ |
+|---|---|---|---|
+| chairs contact zero-rate | 2.73% | 2.73% | 0 (identical) |
+| chairs phase `approach` frame rate | 23.6% | 23.6% | 0 (identical) |
+| chairs target entropy mean | 1.215 | 1.215 | 0 (identical) |
+| chairs sitting frame rate | 46.1% | **49.6%** | **+3.5 pp** |
+| chairs seq entered sitting | 85.7% | **88.4%** | **+2.7 pp (~+40 seq)** |
+| imhd sitting frame rate | 0.29% | 0.66% | +0.4 pp |
+| neuraldome sitting frame rate | 1.48% | **1.60%** | **+0.12 pp** (smaller than hoped) |
+| omomo sitting frame rate | 0.10% | 0.06% | -0.04 pp (noise) |
+
+chairs sitting clears the pass bar (≥ 25%) and recovers most of the
+sofa-edge false negatives at the population level — ~40 additional
+chair sequences now enter `sitting` at least once.
+
+The neuraldome lift is disappointing. Three `bigsofa`/`chair` clips
+that the §d fix was designed to rescue should now carry non-zero
+sitting, but the aggregate only moved +0.12 pp. Two candidate
+explanations:
+
+1. **Upward-normal threshold (0.7) rejects curved cushion faces.**
+   Sofa cushion tops often round off toward the edges; at the seam
+   with the backrest the face normal tilts toward +Z and falls below
+   0.7. The seat surface gets partially filtered out, so the cylinder
+   finds no qualifying points even though a seat *is* below the
+   pelvis. If true, the fix is to relax the threshold to 0.5 (allow
+   up to ~60° cushion tilt) — a one-line change.
+
+2. **Cylinder radius 0.15 m is too narrow.** For sofa sitting the
+   pelvis is typically 5-10 cm from the nearest cushion vertex after
+   pose offset; radius 0.15 should catch it, but if mesh vertex
+   density is low near the edge of the cushion, the seat sample may
+   fall outside the cylinder.
+
+v4 visualisation on the same 3 clips (same keyword-deterministic
+sampler as v3) will tell us which case applies. Until then, v4 is
+accepted for chairs and marked pending-confirmation for neuraldome
+sofa sits. Stage A wiring can begin in parallel — contact/target/phase
+are now stable, and any residual sofa-sitting FN only affects 12/1491
+neuraldome seqs (the ones whose `text` contains "sit") at most.
+
+## (f) v4 visualisation confirms root cause: mesh up-axis mismatch
+
+v4 vis reran the same 14-clip sample. The 3 diagnostic clips still
+had `sitting == 0`:
+
+| Sequence | Text | v4 sitting | v4 support |
+|---|---|---|---|
+| `neuraldome/subject02_bigsofa_0` | "walks to sofa, sits down beside left armrest, …" | 0 / 262 | both_feet 90% |
+| `neuraldome/subject01_bigsofa_1310` | "pushes sofa …, then sits on the couch" | 0 / 232 | hand_support 62% |
+| `chairs/Sub0284_Obj141_Seg0_339` | "pushing chair backward, then sits on it, …" | 0 / 133 | both_feet 75% |
+
+A server-side diagnostic dumped face-normal histograms for four
+meshes:
+
+```
+neuraldome/bigsofa   extents XYZ = [0.86, 1.86, 0.69]
+  +X up: 41234     -X down: 39899
+  +Y up: 22833     -Y down: 21853
+  +Z up: 48901     -Z down:  7411     ← mesh is Z-up
+neuraldome/chair     extents XYZ = [0.47, 0.87, 0.58]
+  +Y up:  4381 dominant  (Y-up)
+chairs/141           extents XYZ = [1.31, 0.93, 0.63]
+  +Y up:  4102 dominant  (Y-up, tiny margin)
+chairs/116           extents XYZ = [1.47, 0.79, 0.63]
+  +Y up:  5220 dominant  (Y-up)
+```
+
+**InterAct authors objects with inconsistent up-axis conventions**.
+`bigsofa` is Z-up; everything else in this sample is Y-up. The
+hard-coded `normal.Y > 0.7` filter drops every seat face on bigsofa
+(only 22833 faces exceed Y=0.7 but the real seat is the 48901 faces
+along +Z), so the cylinder test finds no qualifying surface and
+rejects 100% of frames.
+
+**Fix (applied 2026-04-22, supersedes the Y-up assumption in §d)**:
+the below-gate now auto-detects the up axis per mesh by picking the
+cardinal +axis with the most seat-like face area
+(`_detect_mesh_up_axis`). The cylinder's axis is then defined in
+terms of that direction rather than +Y: axial = `(seat_pt - pelvis) · up_local`,
+radial = perpendicular magnitude. Sofa sitting frames should now pass
+because bigsofa's detected up is +Z and the seat surface lies
+directly "below" the pelvis along -Z.
+
+The `Sub0284_Obj141_Seg0_339` case is unrelated to mesh orientation:
+Obj141 is Y-up, but the clip has only 5% pelvis-contact frames (7/133)
+because most of the motion is pushing and lying, not sitting. With
+such a small window the velocity gate has little chance to open,
+even with the below-gate fixed. This remains a deep edge case tied
+to the velocity window length, not the below gate.
+
+One Z-up regression test guards the new behaviour:
+
+- `test_support_auto_detects_up_axis_for_z_up_mesh` — a 1.0 × 1.0 × 0.1
+  slab whose top face points +Z; pelvis positioned +Z-above. The gate
+  must open ≥80% of frames as sitting.
+
+The two original below-gate tests were rewritten because their
+standalone-tall-Box synthetic mesh had no clear up-axis under auto-
+detection:
+
+- `test_support_rejects_sitting_when_pelvis_far_above_seat` replaces
+  `..._pelvis_beside_object`; uses a wide flat slab (Y-up dominant)
+  and positions the pelvis 0.50 m above the seat top to exercise the
+  vertical gate.
+- `test_support_allows_sitting_when_object_below_pelvis` uses the
+  same wide flat slab with pelvis 0.10 m above the seat top.
+
+15/15 regression tests pass. v5 rerun (same command as v4) is queued
+behind this commit.

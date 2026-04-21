@@ -17,18 +17,17 @@ Support states:
    shuffles at 0.2-0.5 m/s. Rejects neuraldome `subject01_chair_0` style
    false positives where the user stands behind the chair and pushes it.
 
-2. **Upward-facing mesh surface sits within a cylinder below the pelvis**
-   (XZ radius ~0.15 m, extending ~0.30 m downward; candidate surface
-   has a face normal within ~45° of +Y). The physical signature of
-   sitting is that a seat surface is directly under the pelvis and can
-   support body weight; a person standing beside a chair still
-   triggers pelvis contact (joint within 20 cm of backrest) but has no
-   seat-like surface beneath them. Rejects neuraldome
-   `subject01_bigsofa_330` (push) and keeps neuraldome
-   `subject01_bigsofa_1310` (sit on sofa edge with pelvis offset
-   toward the armrest — closest point lies on the armrest
-   horizontally, but the seat sits directly below pelvis so the
-   cylinder-and-normal test still opens).
+2. **Upward-facing mesh surface sits within a cylinder below the pelvis**.
+   The upward direction is auto-detected per mesh — InterAct is not
+   consistent (e.g. `neuraldome/bigsofa` is Z-up, `chairs/Obj116` is
+   Y-up). For each mesh we pick the cardinal +axis that carries the
+   most face area (`_detect_mesh_up_axis`), then treat any face whose
+   normal is within ~45° of that direction as a seat-candidate
+   surface. The gate opens if any such candidate falls inside a
+   cylinder (radius ~0.15 m, height ~0.30 m) extending opposite to
+   the up direction from the pelvis. Backrests, legs, and armrests
+   have off-axis normals and get filtered even when they intersect
+   the cylinder.
 
 Both conditions are conjunctions — either being false rejects sitting.
 If ``joints`` or ``object_mesh`` is unavailable, the corresponding gate
@@ -202,6 +201,33 @@ def _pelvis_stationary_mask(
     return smoothed < config.sitting_max_pelvis_horz_speed
 
 
+def _detect_mesh_up_axis(mesh, threshold: float = 0.7) -> np.ndarray:
+    """Pick the object-local +axis carrying the most seat-like face area.
+
+    InterAct meshes mix up-axis conventions — e.g. `neuraldome/bigsofa`
+    is Z-up (48901 faces with +Z normal vs 7411 with -Z), while
+    `chairs/Obj116` is Y-up (+Y 5220 / -Y 4824). Hard-coding Y-up makes
+    the below-gate reject every sitting frame on the Z-up meshes. Per-
+    mesh auto-detection by face-area-weighted +axis dominance recovers
+    the correct "up" regardless of authoring convention.
+
+    Returns a one-hot unit vector in object-local coordinates.
+    """
+    fa = mesh.area_faces
+    fn = mesh.face_normals
+    best_axis = 0
+    best_area = -1.0
+    for axis in range(3):
+        mask = fn[:, axis] > threshold
+        area = float(fa[mask].sum())
+        if area > best_area:
+            best_area = area
+            best_axis = axis
+    up = np.zeros(3, dtype=np.float32)
+    up[best_axis] = 1.0
+    return up
+
+
 def _pelvis_object_below_mask(
     joints: np.ndarray | None,
     object_mesh,
@@ -210,20 +236,14 @@ def _pelvis_object_below_mask(
     config: SupportConfig,
     T: int,
 ) -> np.ndarray:
-    """Per-frame boolean: an upward-facing mesh surface sits within a
-    thin vertical cylinder below the pelvis.
+    """Per-frame boolean: a seat-like mesh surface sits inside a
+    cylinder extending below the pelvis along the mesh's up axis.
 
-    Sitting requires a seat-like surface (upward-facing, i.e. normal
-    close to +Y) inside a pelvis-sized cylinder (XZ radius
-    ``sitting_below_horz_radius``) extending down by
-    ``sitting_below_vert_gate``. Backrests, chair legs, and armrests
-    have horizontal or downward normals and are filtered out even if
-    they happen to intersect the cylinder; they are not sittable.
-
-    This replaces a prior closest-point-direction gate that mis-fired
-    on sitting-at-sofa-edge, where the nearest mesh point is on the
-    armrest (direction horizontal) but a seat surface still lies
-    directly below pelvis.
+    The up axis is auto-detected per mesh (see ``_detect_mesh_up_axis``).
+    "Below" is measured along that axis, and the cylinder radius is the
+    perpendicular-to-up distance. Filtering by normal alignment with
+    the up axis drops backrests / legs / armrests whose normals point
+    sideways or downward.
 
     Returns all-True when inputs are unavailable (keeps legacy
     behaviour; the velocity gate is the only remaining disambiguator).
@@ -244,30 +264,34 @@ def _pelvis_object_below_mask(
         pelvis_world, object_positions, object_rotations,
     )
 
-    # Sample surface points and keep only those on upward-facing faces.
-    # Raw mesh.vertices can be too sparse on low-poly meshes (a cube has
-    # only 8 corner vertices), so sampling the surface gives uniform
-    # coverage for the proximity test. Upward = face normal within ~45°
-    # of +Y in the object-local frame; the filter drops backrests,
-    # side faces, and inverted faces.
+    up_local = _detect_mesh_up_axis(
+        object_mesh,
+        threshold=config.sitting_below_upward_normal_threshold,
+    )
+
+    # Sample surface points + face normals. Low-poly meshes (8-vertex
+    # primitive boxes) don't give uniform coverage via mesh.vertices,
+    # so sample_surface gives the cylinder test a fair density.
     n_samples = min(3000, max(500, 4 * len(object_mesh.vertices)))
     surface_pts, face_idx = trimesh.sample.sample_surface(object_mesh, n_samples)
     surface_normals = object_mesh.face_normals[face_idx]
-    upward = surface_normals[:, 1] > config.sitting_below_upward_normal_threshold
+
+    # "Seat-like" = normal aligned with the detected up axis.
+    alignment = surface_normals @ up_local
+    upward = alignment > config.sitting_below_upward_normal_threshold
     seat_pts = surface_pts[upward].astype(np.float32)
 
     if len(seat_pts) == 0:
-        # No upward-facing surface → object cannot support a seated pose.
+        # No upward-facing surface in this axis → cannot support a seated pose.
         return np.zeros(T, dtype=bool)
 
-    # Check per-frame: does any seat-like point fall inside the cylinder
-    # below the pelvis? (T, V) broadcasting on a small number of points.
-    dx = pelvis_local[:, None, 0] - seat_pts[None, :, 0]
-    dz = pelvis_local[:, None, 2] - seat_pts[None, :, 2]
-    xz_dist2 = dx * dx + dz * dz
-    in_xz = xz_dist2 < config.sitting_below_horz_radius ** 2
+    # Cylinder axis = up_local. Decompose offsets (seat − pelvis) into
+    # axial (along up) and radial (perpendicular) components.
+    offsets = seat_pts[None, :, :] - pelvis_local[:, None, :]  # (T, N, 3)
+    axial = (offsets * up_local).sum(axis=-1)                  # (T, N)
+    radial_sq = (offsets ** 2).sum(axis=-1) - axial ** 2       # (T, N)
 
-    dy = pelvis_local[:, None, 1] - seat_pts[None, :, 1]
-    y_below = (dy > 0) & (dy < config.sitting_below_vert_gate)
+    in_radius = radial_sq < config.sitting_below_horz_radius ** 2
+    below = (axial < 0) & (axial > -config.sitting_below_vert_gate)
 
-    return (in_xz & y_below).any(axis=1)
+    return (in_radius & below).any(axis=1)

@@ -17,3 +17,4 @@ src/piano/models/backbones/momask/
 
 # Personal workflow helpers — kept locally, not part of the repo
 RESTART_PROMPT.md
+SUGGESTION.md

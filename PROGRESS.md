@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-21 PM post-v3 (v3 extraction complete + visualised; 4/4 target entropy and 4/4 manipulation-reached pass bars met; chairs sitting dropped 64%→46% as predicted. v3 visualization caught an over-rejection in the "object below pelvis" gate — sitting on sofa edge with pelvis offset toward armrest was being rejected. Gate rewritten from "closest-point direction" to "upward-facing surface inside cylinder below pelvis". 14/14 regression tests green, v4 rerun queued behind this commit. `a8f5c2e` holds the earlier 7 fixes on origin/master.)
+**Last updated:** 2026-04-22 (v4 vis found the 3 diagnostic sit-on-sofa clips still at `sitting=0`; server-side face-normal diagnostic showed `neuraldome/bigsofa` is authored Z-up while the rest of InterAct is Y-up. Below-gate now auto-detects the mesh up axis per object (`_detect_mesh_up_axis`, face-area-weighted +axis argmax) and defines the cylinder along that axis. 15/15 regression tests green (new Z-up test). v5 rerun queued behind this commit.)
 
 ---
 
@@ -21,7 +21,9 @@ currently executing versus what just landed. When a row goes stale
 | v2 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-21 PM | ✓ done, 14 seq spot-checked | Videos at `runs/visualizations/2026-04-21_*/`. Validated 4 P0 fixes on chairs / imhd / neuraldome seq; exposed 5th bug (pelvis false positive for push/drag) — local fix applied. |
 | v3 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 (commit `a8f5c2e`) | ✓ done (~5 h); judged | 4/4 target entropy pass (chairs 0.26→1.21), 4/4 manipulation-reached pass (chairs 60%→76%), chairs sitting 64%→46% (FP removed by dual gate), 0 HMM NaN / skipped seq (was 5/8475 in v2). neuraldome zero-contact still 49% (hand-threshold issue, deferred). See [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §a-d. |
 | v3 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-21 PM post-v3 | ✓ done, 14 seq spot-checked | Videos under `runs/visualizations/2026-04-21_16*` / `17*`. Validated the 5 P0 fixes on v3 labels; exposed the "sitting with pelvis offset toward armrest" over-rejection — 3 clips where `text` says "sits" got `sitting=0`. Triggered below-gate rewrite. |
-| v4 pseudo-label extraction | (queued) | pending commit of below-gate rewrite | ⏸ queued | Same command. Only the support path changed, so phase/target/contact fields will be identical to v3; only sitting/hand_support distribution will shift. |
+| v4 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 PM (commit `480762c`) | ✓ done (~7 h on server); judged | Aggregate stats for phase/target/contact are byte-identical to v3 (only support path changed). chairs sitting 46%→49.6% (+3.5 pp, pass bar ≥25% met). neuraldome sitting 1.48%→1.60% (sofa-edge recovery smaller than hoped). See [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §e. |
+| v4 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-22 | ✓ done | Videos under `runs/visualizations/2026-04-22_02*`. 3 diagnostic clips (bigsofa sits, chair 141 sit) still had `sitting=0` despite text saying "sits". Server-side face-normal probe showed `neuraldome/bigsofa` is Z-up (+Z 48901 vs -Z 7411) while chairs/Obj116-141 are Y-up. Triggered auto-detect-up-axis rewrite (§f). |
+| v5 pseudo-label extraction | (queued) | pending commit of auto-detect up-axis | ⏸ queued | Same command. Only the support path changed again; phase/target/contact stay identical to v3/v4. |
 
 ---
 
@@ -32,7 +34,7 @@ currently executing versus what just landed. When a row goes stale
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
 | **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-21) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. v2 re-run completed 2026-04-21 (8475 seq / 7 min) — new fields populated. |
-| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ v3 done + visualised; below-gate rewrite pending commit → v4 | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 → d641732 recalibration → v2. 2026-04-21 AM code review surfaced 4 P0s (any-body-part contact, rotation-aware phase, frozen HMM, majority support filter); 2026-04-21 PM visualisation surfaced a 5th (push/drag mis-classified as sitting) + target-sigma under-softening + 5 HMM NaN seqs. All 7 committed in `a8f5c2e` (v3). v3 visualization surfaced one more: the "object below pelvis" gate was using closest-point direction, which rejects pelvis-offset-toward-armrest sits. Gate rewritten: sample mesh surface, keep upward-facing points (normal.Y > 0.7), require ≥1 point in a cylinder (XZ radius 0.15 m, vertical gate 0.30 m) below pelvis. 14/14 regression tests (`tests/test_pseudo_labels.py`). See §0 and [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §d. |
+| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ v4 vis done; auto-detect-up-axis rewrite pending commit → v5 | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 → d641732 recalibration → v2. 2026-04-21 AM review surfaced 4 P0s; v2 vis surfaced a 5th + target-sigma + HMM NaN — all 7 fixes in `a8f5c2e` (v3). v3 vis surfaced an 8th (sofa-edge sit over-rejected) — below-gate rewritten to "upward-facing surface inside cylinder" in `480762c` (v4). v4 vis surfaced a 9th: InterAct meshes use inconsistent up-axis conventions — `neuraldome/bigsofa` is Z-up, `chairs/Obj116-141` are Y-up. Below-gate now auto-detects the up axis per mesh by face-area-weighted +axis argmax (`_detect_mesh_up_axis`) and defines the cylinder along that axis. 15/15 regression tests (`tests/test_pseudo_labels.py`), including a Z-up regression test. See §0 and [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §a-f. |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
 | **Interaction Cross-Attention** | interaction_cross_attn.py | ✓ Done | Zero-init verified |
@@ -51,7 +53,7 @@ currently executing versus what just landed. When a row goes stale
 | **Evaluation: Controllability** | controllability.py | ✓ Done | ASS, ASC, latent sensitivity |
 | **Inference** | generate.py (PIANOPipeline) | ✓ Done (skeleton) | End-to-end text+object → motion |
 | **Inference: Viz** | visualize.py | ✓ Done | motion_263 → joints, skeleton frame rendering |
-| **Tests** | tests/test_pseudo_labels.py | ✓ 14/14 passing (2026-04-21 PM post-v3, local `piano` conda env) | Regression tests lock all 8 local fixes: any-body-part contact for phase (3 tests), rotation-aware obj motion, frozen HMM state ids, majority (not median) support filter, sitting velocity gate (push rejected + stationary preserved), below gate (beside-object rejected + above-object preserved + sofa-edge sit preserved), target sigma 0.12 gives soft distribution, HMM NaN fallback |
+| **Tests** | tests/test_pseudo_labels.py | ✓ 15/15 passing (2026-04-22, local `piano` conda env) | Regression tests lock all 9 local fixes: any-body-part contact for phase (3 tests), rotation-aware obj motion, frozen HMM state ids, majority (not median) support filter, sitting velocity gate (push rejected + stationary preserved), below gate (too-far-above rejected + above-above-seat accepted + sofa-edge sit accepted + Z-up mesh accepted), target sigma 0.12 gives soft distribution, HMM NaN fallback |
 
 **Total:** 38 Python files, ~5400 lines of code (excluding MoMask backbone).
 
@@ -178,6 +180,9 @@ All other components are functionally complete.
 | `3811873` | 2026-04-21 | Docs: record stricter-prior dead end + finalise thresholds for v2 rerun |
 | `127f675` | 2026-04-21 | Apply the foot-threshold fix (0.12 → 0.06) |
 | `1b7cee8` | 2026-04-21 | Don't auto-kill piano-labels tmux session by default |
+| `a8f5c2e` | 2026-04-21 | Fix 5 pseudo-label P0 bugs + retune target sigma + HMM NaN fallback |
+| `5055c8d` | 2026-04-21 | visualize_pseudo_labels: add text / object_id / target_entropy / phase_transitions to summary |
+| `480762c` | 2026-04-21 | Rewrite sitting below-gate: upward-facing surface inside cylinder below pelvis |
 
 ---
 

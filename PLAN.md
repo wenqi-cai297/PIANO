@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-21 PM post-v3 (v3 done + judged: 4/4 target entropy pass, 4/4 manipulation-reached pass, chairs sitting 64%→46% as predicted; prior 7 fixes in `a8f5c2e`. v3 visualization caught the "sitting with pelvis offset toward armrest" over-rejection in the below gate — rewritten to inspect upward-facing surface within a cylinder below pelvis instead of closest-point direction. **14/14 regression tests green, below-gate rewrite pending commit → v4 rerun**. Hand threshold + mesh-missing-handle still deferred in §3.1.)
+**Last updated:** 2026-04-22 (v4 vis confirmed the 3 diagnostic sit-on-sofa clips still have `sitting=0`. Server diagnostic showed `neuraldome/bigsofa` is authored Z-up while other InterAct objects are Y-up — the fixed `normal.Y > 0.7` filter drops every sofa seat face. Below-gate now auto-detects the mesh up axis per object. 15/15 regression tests green (new Z-up test). v5 rerun queued behind this commit.)
 
 ---
 
@@ -90,16 +90,34 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   - Exposed below-gate over-rejection on sofa-edge sitting (3 clips where text says "sits"
     got `sitting=0`). Gate rewritten from closest-point-direction to cylinder + upward
     normal. 14/14 regression tests (+1 new test for sofa-edge).
-- [ ] **NEXT: Commit below-gate rewrite → start v4 rerun** (same command, ~5 h). Only
-  support labels will differ; phase/target/contact stats stay identical to v3.
-- [ ] **v4 summary.json → final support pass bar check**
-  - chairs `sitting` frame rate should rise back toward 50-55% (sofa-edge-style sits
-    recovered without reintroducing push/drag FPs).
-  - neuraldome/omomo sitting should stay near 0% (genuinely no sitting in those subsets).
-- [ ] **Decide on remaining P1/P2 scope** (only after v4 stats + videos).
+- [x] **Below-gate rewrite committed** (`480762c`) → v4 rerun launched on server.
+- [x] **v4 pseudo-label extraction done + aggregate judged** (2026-04-21 PM)
+  - Phase/target/contact byte-identical to v3 (only support path changed) ✓ as designed.
+  - chairs sitting 46.1%→49.6% (+3.5 pp); sofa-edge sits partially recovered.
+  - neuraldome sitting 1.48%→1.60% (+0.12 pp) — small lift, likely the 0.7 upward-normal
+    threshold rejects curved sofa cushion surfaces. Will confirm with v4 vis.
+  - omomo sitting 0.10%→0.06% (noise level — omomo has no sitting content).
+- [x] **v4 visualization done** (2026-04-22 02:18-02:27). 3 diagnostic sit-on-sofa
+  clips still at `sitting=0`. Server face-normal probe on `bigsofa`, `neuraldome/chair`,
+  `chairs/141`, `chairs/116` confirmed: bigsofa is Z-up (+Z 48901 >> -Z 7411), others
+  Y-up. Hard-coded Y-up filter was the bug.
+- [x] **Below-gate auto-detects the mesh up axis** (this commit). `_detect_mesh_up_axis`
+  picks the cardinal +axis with the most seat-like face area; cylinder test is
+  expressed along that axis instead of +Y. New regression test
+  `test_support_auto_detects_up_axis_for_z_up_mesh` guards it.
+- [ ] **NEXT: Commit + start v5 rerun** (same command, ~7 h). Phase/target/contact
+  stay identical to v3/v4; only support (specifically sitting for Z-up meshes) changes.
+- [ ] **v5 summary.json → check bigsofa sitting recovers**
+  - Expect neuraldome sitting to rise from 1.60% (v4) toward 3-5% — all bigsofa
+    seqs with "sit" in their text should now record non-zero sitting frames.
+  - chairs sitting should stay ≈ 49.6% (chairs meshes were already Y-up, so
+    auto-detect is a no-op for them).
+- [ ] **If v5 still underperforms for bigsofa** → double-check mesh authoring or
+  relax `sitting_below_upward_normal_threshold` 0.7 → 0.5.
+- [ ] **Decide on remaining P1/P2 scope** (only after v5).
   See §3.1 for deferred list (hand threshold, suitcase mesh, expanded joints, etc).
 - [ ] Update `configs/training/predictor.yaml` — multi-root InterAct paths,
-  `fps=20`, `support_weight=0.1` until v4 validates support labels.
+  `fps=20`, `support_weight=0.1` until v5 confirms support labels.
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo
@@ -181,7 +199,7 @@ prophylactically rewrite code.
 | HMM state → phase-name remapping | ✅ Fixed locally 2026-04-21 (pending commit) via `GaussianHMM(params="")` — M-step frozen, state k stays bound to phase k. | — |
 | HMM NaN-fatal sequences | ✅ Fixed locally 2026-04-21 PM (pending commit). v2 aborted 5/8475 seq with "startprob_ must sum to 1 (got nan)". try/except around fit/predict now falls back to heuristic labels rather than dropping the sequence. | — |
 | Replace `median_filter` on categorical labels with majority filter | ✅ Fixed locally 2026-04-21 (pending commit). `_majority_filter` via `np.bincount.argmax`. | — |
-| **Support `sitting` false positive for push/drag seq** (new, found 2026-04-21 PM via vis) | ✅ Fixed in `a8f5c2e` (velocity gate) + pending commit (below gate v2). v2 labelled `subject01_bigsofa_330` (all-push) 96% sitting and `subject01_chair_0` (all-pull) 63% sitting. Fix uses two conjunctive gates: (i) pelvis XZ-plane speed < 0.15 m/s (1 s moving average) — rejects moving-while-pushing; (ii) an upward-facing seat surface must sit within a cylinder below the pelvis (XZ radius 0.15 m, vertical gate 0.30 m, face normal.Y > 0.7) — rejects standing-beside-object-stationary while still accepting sofa-edge sitting where the closest mesh point is on the armrest. 5 new tests (velocity: push rejected / stationary preserved; below: beside-object rejected / above-object preserved / sofa-edge preserved). | — |
+| **Support `sitting` false positive for push/drag seq** (new, found 2026-04-21 PM via vis) | ✅ Fixed in `a8f5c2e` (velocity gate) + `480762c` (below gate v2) + pending commit (auto-detect up axis). Two conjunctive gates: (i) pelvis XZ-plane speed < 0.15 m/s (1 s moving average) — rejects moving-while-pushing; (ii) an upward-facing seat surface must sit within a cylinder below the pelvis (XZ radius 0.15 m, vertical gate 0.30 m). The up direction is auto-detected per mesh because InterAct authors objects with mixed conventions (`neuraldome/bigsofa` is Z-up, chairs are Y-up). 6 new tests (velocity: push rejected / stationary preserved; below: too-far-above rejected / above-seat accepted / sofa-edge accepted / Z-up mesh accepted). | — |
 | Contact velocity uses world frame instead of object-relative | Deferred; partial fix by disabling gating. Full object-relative velocity is only relevant if phase needs it to distinguish manipulation vs. stable. | v3 phase distribution shows `manipulation` < 30% of reached sequences even after rotation-aware fix |
 | **Hand threshold 0.08m too strict for irregular / large objects** (new, found 2026-04-21 PM via vis) | Deferred. Visualization caught 4 zero-contact seq that actually had contact: `bat_holdhead_hit` (holding bat by thick end — wrist farther from surface), `suitcase_lefthand_push` (handle possibly missing from mesh), `neuraldome/box_1565` (holding big box with arms outstretched), `neuraldome/pan_360` (holding pan, wrist far from pan surface). | v3 imhd zero-contact frac > 20% or specific seq types fail; then try hand threshold 0.10-0.12 or add elbow/palm tracked joints |
 | **InterAct `suitcase` mesh may omit the handle** (data-layer issue, found 2026-04-21 PM via vis) | Deferred, data-layer. `suitcase_lefthand_push` seq has user pushing the handle but object point cloud may not include it. Need to `mesh.bounds` vs `object_pc.bounds` comparison to verify. | Any suitcase-dependent training signal is suspect; if we depend on suitcase seq for Stage A support/target, check mesh completeness first |

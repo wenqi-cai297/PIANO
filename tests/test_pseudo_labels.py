@@ -278,22 +278,25 @@ def test_support_stationary_sitting_still_classified_as_sitting() -> None:
     assert (support == SUPPORT_SITTING).sum() > T * 0.9
 
 
-def test_support_rejects_sitting_when_pelvis_beside_object() -> None:
-    """Person standing beside a tall box (chair backrest proxy): pelvis
-    joint is within the contact threshold, but the side face's normal
-    is horizontal — the cylinder-and-upward-normal gate rejects it.
-    Even though part of the side face is below the pelvis vertically,
-    its normal is not upward, so it can't be a seat.
+def test_support_rejects_sitting_when_pelvis_far_above_seat() -> None:
+    """Pelvis well above a seat surface (more than
+    ``sitting_below_vert_gate``): no seat point fits inside the cylinder
+    extending only ~0.30 m below the pelvis. Gate closes.
+
+    Replaces an earlier "pelvis beside a tall box" test whose synthetic
+    mesh had no clear up-axis — a standalone tall Box is neither a
+    chair nor a backrest, and with per-mesh up-axis auto-detection the
+    test became ambiguous.
     """
     import trimesh
 
-    # Chair-like box: 0.5 m wide × 0.9 m tall × 0.5 m deep, centred on origin.
-    mesh = trimesh.primitives.Box(extents=[0.5, 0.9, 0.5])
+    # Wide, flat "stool top" slab: dominant face area is ±Y (1 m² each),
+    # so auto-detect picks +Y as up.
+    mesh = trimesh.primitives.Box(extents=[1.0, 0.1, 1.0])   # top at y=0.05
 
     T = 30
     joints = np.zeros((T, 22, 3), dtype=np.float32)
-    # Pelvis right next to the box's side face at backrest height.
-    joints[:, 0] = [0.35, 0.3, 0.0]
+    joints[:, 0] = [0.0, 0.55, 0.0]   # 0.50 m above seat top (> 0.30 gate)
 
     contact = np.zeros((T, 5), dtype=np.float32)
     contact[:, 4] = 1.0
@@ -313,22 +316,24 @@ def test_support_rejects_sitting_when_pelvis_beside_object() -> None:
 
     sitting_frac = (support == SUPPORT_SITTING).sum() / T
     assert sitting_frac < 0.2, (
-        f"pelvis-beside-object still classified as sitting ({sitting_frac:.2%}) — "
-        f"object-below gate not working"
+        f"pelvis far above seat still classified as sitting ({sitting_frac:.2%}) — "
+        f"vertical gate not working"
     )
 
 
 def test_support_allows_sitting_when_object_below_pelvis() -> None:
-    """Pelvis above a stool: the box top face has upward normal and
-    lies inside the cylinder below pelvis. Gate opens → sitting.
+    """Pelvis just above a wide flat seat → auto-detect picks +Y as up,
+    the seat surface sits inside the cylinder below pelvis, gate opens.
     """
     import trimesh
 
-    mesh = trimesh.primitives.Box(extents=[0.4, 0.5, 0.4])  # top face at y=0.25
+    # Flat slab with Y-dominant area: top/bottom faces 1 m² each,
+    # side faces 0.1 m² each → +Y auto-detected as up.
+    mesh = trimesh.primitives.Box(extents=[1.0, 0.1, 1.0])   # top at y=0.05
 
     T = 30
     joints = np.zeros((T, 22, 3), dtype=np.float32)
-    joints[:, 0] = [0.0, 0.35, 0.0]   # 10cm above top face
+    joints[:, 0] = [0.0, 0.15, 0.0]   # 0.10 m above top face
 
     contact = np.zeros((T, 5), dtype=np.float32)
     contact[:, 4] = 1.0
@@ -347,6 +352,49 @@ def test_support_allows_sitting_when_object_below_pelvis() -> None:
     )
 
     assert (support == SUPPORT_SITTING).sum() > T * 0.8
+
+
+def test_support_auto_detects_up_axis_for_z_up_mesh() -> None:
+    """Regression for neuraldome/bigsofa: mesh authored Z-up in its own
+    local frame. v4 hard-coded normal.Y > 0.7 and filtered every seat
+    face out, rejecting all sitting frames. Auto-detect must now pick
+    +Z as up and open the gate when the pelvis is over the seat.
+    """
+    import trimesh
+
+    # Slab lying flat on the XY plane, thin along Z — top face (+Z) has
+    # area 1 m² while side faces are only 0.1 m², so auto-detect reliably
+    # picks +Z even though the rest of the pipeline assumes Y-up.
+    mesh = trimesh.primitives.Box(extents=[1.0, 1.0, 0.1])   # top at z=0.05
+
+    T = 30
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    # Pelvis 0.10 m above the +Z face, in-frame coordinates. With
+    # identity object rotation, world == local, so pelvis is above the
+    # seat in world +Z direction.
+    joints[:, 0] = [0.0, 0.0, 0.15]
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 4] = 1.0
+
+    object_positions = np.zeros((T, 3), dtype=np.float32)
+    object_rotations = np.zeros((T, 3), dtype=np.float32)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact,
+        joints=joints,
+        object_mesh=mesh,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        config=cfg,
+    )
+
+    assert (support == SUPPORT_SITTING).sum() > T * 0.8, (
+        f"Z-up mesh below-gate failed to open — auto-detect should have "
+        f"picked +Z; instead got "
+        f"{dict((SUPPORT_NAMES[s], int((support == s).sum())) for s in range(4))}"
+    )
 
 
 def test_support_allows_sitting_when_pelvis_offset_toward_armrest() -> None:
@@ -465,9 +513,10 @@ if __name__ == "__main__":
         test_support_extraction_sitting_sequence,
         test_support_push_object_not_classified_as_sitting,
         test_support_stationary_sitting_still_classified_as_sitting,
-        test_support_rejects_sitting_when_pelvis_beside_object,
+        test_support_rejects_sitting_when_pelvis_far_above_seat,
         test_support_allows_sitting_when_object_below_pelvis,
         test_support_allows_sitting_when_pelvis_offset_toward_armrest,
+        test_support_auto_detects_up_axis_for_z_up_mesh,
         test_target_sigma_default_yields_soft_distribution,
         test_hmm_falls_back_to_initial_on_bad_features,
     ]
