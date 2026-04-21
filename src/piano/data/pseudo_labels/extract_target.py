@@ -29,7 +29,12 @@ class TargetConfig:
 
     num_patches: int = 16            # number of surface patches (K)
     num_surface_samples: int = 4096  # points sampled for clustering
-    soft_sigma: float = 0.05         # Gaussian bandwidth in meters
+    # Gaussian bandwidth in meters. v2 extraction used sigma=0.05 and
+    # produced entropy_mean=0.26 / 2.77max on chairs (60% of sequences
+    # flagged as near-hard target). Raised to 0.12 so the exp(-d²/2σ²)
+    # kernel is actually "soft" at typical patch spacings (InterAct mesh
+    # BB diag ~0.5-1.0 m, K=16 patches → neighbour spacing ~0.15-0.3 m).
+    soft_sigma: float = 0.12
     contact_threshold: float = 0.5   # minimum contact score to assign target
 
 

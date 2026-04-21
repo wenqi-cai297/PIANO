@@ -109,7 +109,7 @@ def cluster_surface_patches(
 def soft_patch_assignment(
     query_point: np.ndarray,
     patch_centers: np.ndarray,
-    sigma: float = 0.05,
+    sigma: float = 0.12,
 ) -> np.ndarray:
     """Compute soft assignment of a point to patch centers.
 
@@ -123,10 +123,15 @@ def soft_patch_assignment(
     ----------
     query_point : (3,) array
     patch_centers : (K, 3) array
-    sigma : Gaussian bandwidth in meters. With ``K=16`` patches on typical
+    sigma : Gaussian bandwidth in meters. Default calibrated against
         InterAct mesh scales (bounding box diagonal ~0.5-1.0 m, so
-        neighbour spacing ~0.15-0.3 m) ``sigma=0.05`` gives a soft but
-        locally-concentrated distribution.
+        ``K=16`` patches → neighbour spacing ~0.15-0.3 m). v2 used
+        ``sigma=0.05`` and entropy stayed near 0.3 / 2.77 max — the
+        kernel value at a neighbouring patch (``d≈0.25 m``) was
+        ``exp(-(0.25)²/(2·0.05²)) ≈ 4e-6``, so softmax was still
+        effectively argmax. Raised to 0.12 so the same neighbour
+        contributes ``exp(-(0.25)²/(2·0.12²)) ≈ 0.1`` — a genuinely
+        soft distribution.
 
     Returns
     -------

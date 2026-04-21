@@ -151,21 +151,34 @@ def process_sequence(
         patch_centers=patch_centers,
     )
 
-    # Step 3: Interaction phase
+    # Step 3: Interaction phase — rotation-aware so that rotation-only
+    # manipulations (bat swing, chair rotate) reach manipulation instead
+    # of collapsing to stable-contact.
     phase = extract_interaction_phase(
-        joints, contact_state, object_positions, phase_config,
+        joints, contact_state, object_positions, object_rotations, phase_config,
     )
 
     # Optional: HMM refinement
     if use_hmm_refinement:
         features = build_phase_features(
-            joints, contact_state, object_positions,
+            joints, contact_state, object_positions, object_rotations,
             fps=(phase_config or PhaseConfig()).fps,
         )
         phase = refine_phases_hmm(features, phase, hmm_config)
 
-    # Step 4: Support state (depends on contact_state)
-    support = extract_support_state(contact_state, support_config)
+    # Step 4: Support state — two gates on `sitting` beyond pelvis contact:
+    #   (a) joints → pelvis XZ-speed < 0.15 m/s (rejects push/drag)
+    #   (b) object_mesh + positions + rotations → geometric "object below
+    #       pelvis" test (rejects standing-beside-object where the pelvis
+    #       joint is within 20 cm of a backrest/leg but not *above* a seat)
+    support = extract_support_state(
+        contact_state,
+        joints=joints,
+        object_mesh=mesh,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        config=support_config,
+    )
 
     return {
         "contact_state": contact_state,
@@ -220,6 +233,7 @@ def run_pipeline(
     contact_cfg = ContactConfig(fps=resolved_fps)
     phase_cfg = PhaseConfig(fps=resolved_fps)
     target_cfg = TargetConfig()
+    support_cfg = SupportConfig(fps=resolved_fps)
 
     print(f"Extracting pseudo-labels for {len(metadata)} sequences")
     print(f"  Data:   {data_dir}")
@@ -314,6 +328,7 @@ def run_pipeline(
                 contact_config=contact_cfg,
                 target_config=target_cfg,
                 phase_config=phase_cfg,
+                support_config=support_cfg,
                 use_hmm_refinement=use_hmm,
             )
         except Exception as e:

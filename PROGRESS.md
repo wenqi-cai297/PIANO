@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-21 (v2 preprocess complete; v2 pseudo-label extraction started — see §0. thresholds locked in `127f675`; stricter-prior validation via text.txt action windows abandoned)
+**Last updated:** 2026-04-21 PM (v2 extraction complete + visualization reviewed on 14 representative seq. 4 original P0 fixes validated; visualization exposed a 5th P0-class bug — pelvis threshold → `support=sitting` false positive on push/drag sequences; fixed with two conjunctive gates (pelvis XZ velocity + object geometrically below pelvis). Total **7 local fixes** now pending commit (4 P0 + support sitting dual gate + target sigma 0.05→0.12 + HMM NaN fallback), 13/13 regression tests green. Thresholds from `127f675`; stricter-prior via text.txt abandoned)
 
 ---
 
@@ -17,7 +17,9 @@ currently executing versus what just landed. When a row goes stale
 | run | command | started | status | output / notes |
 |---|---|---|---|---|
 | v2 preprocess | `piano-preprocess-interact` | 2026-04-21 | ✓ done (7 min, 8475 seq) | each `<piano>/<subset>/motions/<seq>.npz` now has `smplx_poses` / `smplx_trans` / `smplx_betas` alongside existing fields |
-| v2 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 | 🔄 running (ETA ~5 h on server) | inline stats + quality_flags will land in `<piano>/<subset>/pseudo_labels/summary.json`. Pass bar in PLAN.md §1.2. |
+| v2 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 | ✓ done (~5 h on server); judged | contact/target/phase/support stats + quality_flags in `<piano>/<subset>/pseudo_labels/summary.json`. Verdict: contact pass (except neuraldome 49% zero-contact — hand-threshold issue, deferred); target 4/4 below entropy pass bar → triggered sigma 0.05→0.12 local fix; phase/support fields untrustworthy until v3 (P0 fixes). See [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §a-c. |
+| v2 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-21 PM | ✓ done, 14 seq spot-checked | Videos at `runs/visualizations/2026-04-21_*/`. Validated 4 P0 fixes on chairs / imhd / neuraldome seq; exposed 5th bug (pelvis false positive for push/drag) — local fix applied. |
+| v3 pseudo-label extraction | (queued) | pending commit of 7 local fixes | ⏸ queued | Same command as v2. Phase/support fields will be trustworthy in v3 output. |
 
 ---
 
@@ -28,7 +30,7 @@ currently executing versus what just landed. When a row goes stale
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
 | **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-21) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. v2 re-run completed 2026-04-21 (8475 seq / 7 min) — new fields populated. |
-| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ Recalibrated (v3, 2026-04-21), v2 rerun in progress | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 rerun produced unusable labels (81-99% zero-contact, 100% degenerate target). Fixes: per-body-part distance thresholds, velocity gating off by default, Gaussian target kernel (`d641732`). fps propagation + deterministic patch atlas unchanged from v2. See §0 for run status. |
+| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ v2 done + visualised; **7 local fixes** pending commit → v3 | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 stats fixed 3 bugs in `d641732`. 2026-04-21 AM code review: 4 P0 design bugs (any-body-part contact, rotation-aware phase, frozen HMM, majority support filter). 2026-04-21 PM visualization validated those 4 on 14 seq + exposed **5th P0 bug**: pelvis threshold caused `support=sitting` false positive on push/drag seq (neuraldome bigsofa_330 / chair_0 standing & pushing were labelled sitting 96% / 63%). Fixed with two conjunctive gates on `sitting`: (i) pelvis XZ velocity < 0.15 m/s (1 s moving average) — rejects moving-while-pushing; (ii) object geometrically below pelvis — pelvis→closest-point direction has Y-component < -0.3 — rejects standing-beside-object-stationary. Also added target sigma 0.05→0.12 (v2 entropy 4/4 below pass bar) and HMM NaN fallback (v2 had 5/8475 exceptions). 13/13 regression tests (`tests/test_pseudo_labels.py`). fps propagation + deterministic patch atlas unchanged. See §0 and [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md). |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
 | **Interaction Cross-Attention** | interaction_cross_attn.py | ✓ Done | Zero-init verified |
@@ -47,6 +49,7 @@ currently executing versus what just landed. When a row goes stale
 | **Evaluation: Controllability** | controllability.py | ✓ Done | ASS, ASC, latent sensitivity |
 | **Inference** | generate.py (PIANOPipeline) | ✓ Done (skeleton) | End-to-end text+object → motion |
 | **Inference: Viz** | visualize.py | ✓ Done | motion_263 → joints, skeleton frame rendering |
+| **Tests** | tests/test_pseudo_labels.py | ✓ 13/13 passing (2026-04-21 PM, local `piano` conda env) | Regression tests locking all 7 local fixes: any-body-part contact for phase (3 tests), rotation-aware obj motion, frozen HMM state ids, majority (not median) support filter, sitting dual gate — velocity (push rejected + stationary preserved) AND object-below (beside-object rejected + above-object preserved), target sigma 0.12 gives soft distribution, HMM NaN fallback |
 
 **Total:** 38 Python files, ~5400 lines of code (excluding MoMask backbone).
 
@@ -185,3 +188,4 @@ All other components are functionally complete.
 - **Training framework:** HuggingFace Accelerate
 - **Logging:** wandb
 - **Config:** OmegaConf yaml files under `configs/`
+- **Local dev env** (Windows, Miniforge3): conda env `piano` built 2026-04-21 — python 3.10, rtree (conda-forge), numpy/scipy/scikit-learn/hmmlearn/pytest (pip), `piano` editable via `pip install -e . --no-deps`. Minimal for pseudo-label pytest runs; heavier deps (torch / trimesh / smplx / open3d / CLIP) are added on demand when other modules need smoke-testing locally.

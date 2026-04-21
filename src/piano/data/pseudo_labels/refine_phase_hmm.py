@@ -1,16 +1,22 @@
 """Refine interaction phase labels using a Hidden Markov Model.
 
-The heuristic phase labels from ``extract_phase`` can be noisy.  This
-module fits an HMM to smooth the phase sequence, encouraging temporally
-consistent transitions while respecting the observed features.
+The heuristic phase labels from ``extract_phase`` can be noisy. This
+module runs Viterbi decoding through an HMM whose parameters are frozen
+to the heuristic statistics — so the smoothing uses temporal prior
+structure without letting EM drift the state ↔ phase id correspondence.
 
 The HMM uses per-frame features:
     - hand-object distance
     - hand contact score (max of left/right)
-    - object velocity magnitude
+    - object translational velocity magnitude
+    - object angular velocity magnitude (0 when rotations are unavailable)
 
-and is initialized from the heuristic phase labels so it converges
-quickly to a refined labeling.
+Parameters are initialised from the heuristic labels and **not updated**
+during ``fit`` (``params=""``): state ``k`` remains the phase ``k`` it
+was initialised with. If we let EM update the means/covars, the state
+ids would permute on short or noisy clips — the summary histogram would
+still look fine, but a label written as ``phase=MANIPULATION`` could
+actually correspond to a different HMM cluster.
 """
 from __future__ import annotations
 
@@ -26,7 +32,7 @@ class HMMConfig:
     """Configuration for HMM phase refinement."""
 
     n_components: int = NUM_PHASES   # one state per phase
-    n_iter: int = 50                 # EM iterations
+    n_iter: int = 1                  # we freeze params — extra EM passes are wasted work
     covariance_type: str = "diag"
     random_state: int = 42
 
@@ -57,12 +63,17 @@ def refine_phases_hmm(
     T, D = features.shape
 
     # --- Initialize HMM parameters from heuristic labels ---
+    # ``params=""`` freezes all parameters during EM's M-step. fit() then
+    # runs forward-backward only (no updates), and predict() does Viterbi
+    # decoding over the fixed parameters. State id k stays bound to phase
+    # constant k as initialised below.
     hmm = GaussianHMM(
         n_components=config.n_components,
         covariance_type=config.covariance_type,
         n_iter=config.n_iter,
         random_state=config.random_state,
-        init_params="",  # we set all params manually
+        init_params="",   # no auto-initialisation
+        params="",        # no M-step updates — keeps state ↔ phase id bound
     )
 
     # Start probability: fraction of sequences starting in each phase
@@ -96,13 +107,25 @@ def refine_phases_hmm(
     # hmmlearn's ConvergenceMonitor prints "Model is not converging" to
     # stdout on some sequences (short clips, weak phase structure). It
     # still returns the best-so-far parameters, so the warning is noise.
+    #
+    # hmmlearn can also raise on degenerate inputs: v2 extraction saw 5
+    # sequences (out of 8475) abort with ``startprob_ must sum to 1 (got
+    # nan)`` — NaN-tainted features or a pathological initial state
+    # crashed fit()/predict(). Since this is a smoothing step, the right
+    # degradation is to keep the heuristic labels rather than drop the
+    # whole sequence, so we catch and fall back to ``initial_phases``.
     import logging
     hmmlearn_logger = logging.getLogger("hmmlearn")
     original_level = hmmlearn_logger.level
     hmmlearn_logger.setLevel(logging.ERROR)
     try:
-        hmm.fit(features)
-        refined_phases = hmm.predict(features)
+        try:
+            hmm.fit(features)
+            refined_phases = hmm.predict(features)
+        except (ValueError, RuntimeError) as e:
+            print(f"  [warn] HMM refinement failed ({type(e).__name__}: {e}); "
+                  f"keeping heuristic phase labels")
+            return initial_phases.astype(np.int64)
     finally:
         hmmlearn_logger.setLevel(original_level)
 
@@ -113,6 +136,7 @@ def build_phase_features(
     joints: np.ndarray,
     contact_state: np.ndarray,
     object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
     fps: float = 30.0,
 ) -> np.ndarray:
     """Build the feature matrix for HMM refinement.
@@ -122,11 +146,12 @@ def build_phase_features(
     joints : (T, 22, 3)
     contact_state : (T, 5)
     object_positions : (T, 3) or None — object center per frame
+    object_rotations : (T, 3) or None — axis-angle rotation per frame
     fps : frame rate
 
     Returns
     -------
-    features : (T, 3) — [hand_obj_dist, hand_contact, obj_velocity]
+    features : (T, 4) — [hand_obj_dist, hand_contact, trans_vel, ang_vel]
     """
     from piano.utils.smpl_utils import BODY_PART_INDICES
 
@@ -155,9 +180,16 @@ def build_phase_features(
     # Hand contact score (max of left/right)
     hand_contact = np.maximum(contact_state[:, 0], contact_state[:, 1])
 
-    # Object velocity
-    obj_vel = np.zeros(T)
-    obj_vel[1:] = np.linalg.norm(np.diff(object_positions, axis=0), axis=-1) * fps
+    # Object translational velocity
+    trans_vel = np.zeros(T)
+    if T > 1:
+        trans_vel[1:] = np.linalg.norm(np.diff(object_positions, axis=0), axis=-1) * fps
 
-    features = np.stack([hand_obj_dist, hand_contact, obj_vel], axis=-1)  # (T, 3)
+    # Object angular velocity (stays at 0 when rotations are unavailable —
+    # HMM state covars absorb the near-zero variance without trouble).
+    ang_vel = np.zeros(T)
+    if object_rotations is not None and T > 1:
+        ang_vel[1:] = np.linalg.norm(np.diff(object_rotations, axis=0), axis=-1) * fps
+
+    features = np.stack([hand_obj_dist, hand_contact, trans_vel, ang_vel], axis=-1)  # (T, 4)
     return features
