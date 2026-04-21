@@ -29,6 +29,7 @@ import numpy as np
 
 from piano.data.pseudo_labels.extract_phase import PHASE_NAMES
 from piano.data.pseudo_labels.extract_support import SUPPORT_NAMES
+from piano.data.pseudo_labels.stats import _target_entropy
 from piano.inference.visualize_motion import SKELETON_CONNECTIONS
 from piano.utils.io_utils import ensure_dir, load_json, save_json
 from piano.utils.smpl_utils import BODY_PART_INDICES, BODY_PART_NAMES
@@ -61,27 +62,45 @@ def load_sample_with_labels(
     motion_data = np.load(motion_path)
     labels = np.load(labels_path)
 
-    # Load object point cloud if we can locate the object_id via metadata
+    # Pull text + object_id from metadata so the summary record can describe
+    # what each video should contain without the reader having to cross-
+    # reference metadata.json manually.
+    text = ""
+    obj_id = ""
+    if metadata_by_seq is not None and seq_id in metadata_by_seq:
+        meta = metadata_by_seq[seq_id]
+        text = meta.get("text", "") or ""
+        obj_id = meta.get("object_id", "") or ""
+
+    # Load object point cloud via the same object_id.
     object_pc: np.ndarray | None = None
     object_rotations: np.ndarray | None = None
-    if metadata_by_seq is not None and seq_id in metadata_by_seq:
-        obj_id = metadata_by_seq[seq_id].get("object_id")
-        if obj_id:
-            obj_path = data_dir / "objects" / f"{obj_id}.npy"
-            if obj_path.exists():
-                object_pc = np.load(obj_path).astype(np.float32)  # (N, 3) object-local
+    if obj_id:
+        obj_path = data_dir / "objects" / f"{obj_id}.npy"
+        if obj_path.exists():
+            object_pc = np.load(obj_path).astype(np.float32)  # (N, 3) object-local
 
     # object_rotations may be present if preprocessing saved it (new preprocess runs)
     if "object_rotations" in motion_data.files:
         object_rotations = motion_data["object_rotations"].astype(np.float32)
 
+    # contact_target is optional in the npz (older runs may not have it) —
+    # load defensively so we can compute per-seq target entropy for the
+    # summary, but don't fail if it's missing.
+    contact_target: np.ndarray | None = None
+    if "contact_target" in labels.files:
+        contact_target = labels["contact_target"].astype(np.float32)
+
     return {
         "seq_id": seq_id,
+        "text": text,
+        "object_id": obj_id,
         "joints_22": motion_data["joints_22"].astype(np.float32),
         "object_positions": motion_data.get("object_positions", None),
         "object_rotations": object_rotations,
         "object_pc": object_pc,
         "contact_state": labels["contact_state"].astype(np.float32),
+        "contact_target": contact_target,
         "phase": labels["phase"].astype(np.int64),
         "support": labels["support"].astype(np.int64),
     }
@@ -296,6 +315,9 @@ def run_visualization(
         contact_state = sample["contact_state"][:T]
         phase = sample["phase"][:T]
         support = sample["support"][:T]
+        contact_target = sample.get("contact_target")
+        if contact_target is not None:
+            contact_target = contact_target[:T]
         obj_pos = sample["object_positions"]
         obj_rot = sample.get("object_rotations")
         obj_pc = sample.get("object_pc")
@@ -319,9 +341,30 @@ def run_visualization(
             title=seq_id,
         )
 
-        # Collect per-frame label stats for the summary
+        # ---- Per-seq summary stats ----
+        # Phase transitions: quickly distinguishes "active" (many transitions)
+        # from "saturated / stuck in one phase" (zero transitions, a v3 red flag).
+        num_phase_transitions = int((np.diff(phase) != 0).sum()) if T > 1 else 0
+
+        # Target entropy over contact frames: tells us per-seq whether the
+        # soft-assign kernel collapsed to near-argmax. Aggregate stats already
+        # flag degenerate seqs; surfacing it per-seq lets me tell at a glance
+        # which specific video has target issues.
+        target_entropy_mean: float | None = None
+        if contact_target is not None:
+            contact_binary = contact_state > 0.5
+            entropies: list[float] = []
+            for t, b in np.argwhere(contact_binary):
+                row = contact_target[t, b]
+                if float(row.sum()) > 1e-6:
+                    entropies.append(_target_entropy(row))
+            if entropies:
+                target_entropy_mean = float(np.mean(entropies))
+
         index.append({
             "seq_id": seq_id,
+            "text": sample.get("text", ""),
+            "object_id": sample.get("object_id", ""),
             "num_frames": T,
             "file": out_path.name,
             "contact_rates": {
@@ -332,10 +375,12 @@ def run_visualization(
                 PHASE_NAMES[p]: int((phase == p).sum())
                 for p in range(len(PHASE_NAMES))
             },
+            "num_phase_transitions": num_phase_transitions,
             "support_distribution": {
                 SUPPORT_NAMES[s]: int((support == s).sum())
                 for s in range(len(SUPPORT_NAMES))
             },
+            "target_entropy_mean": target_entropy_mean,
         })
 
     summary = {
