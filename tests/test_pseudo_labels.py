@@ -354,25 +354,26 @@ def test_support_allows_sitting_when_object_below_pelvis() -> None:
     assert (support == SUPPORT_SITTING).sum() > T * 0.8
 
 
-def test_support_auto_detects_up_axis_for_z_up_mesh() -> None:
+def test_support_up_axis_override_unlocks_z_up_mesh() -> None:
     """Regression for neuraldome/bigsofa: mesh authored Z-up in its own
     local frame. v4 hard-coded normal.Y > 0.7 and filtered every seat
-    face out, rejecting all sitting frames. Auto-detect must now pick
-    +Z as up and open the gate when the pelvis is over the seat.
+    face out, rejecting all sitting frames. v5's face-area argmax
+    auto-detect picked +Z for bigsofa but also mis-picked non-Y axes
+    for 21/60 chairs and 8/10 imhd objects (see
+    ``runs/checks/up_axis_probe/2026-04-22_101850/probe.json``).
+    The fix is a small whitelist: default +Y, override per object_id.
+
+    This test verifies the override branch — passing
+    ``object_id="bigsofa"`` unlocks a Z-up slab even though the
+    default would have said +Y.
     """
     import trimesh
 
-    # Slab lying flat on the XY plane, thin along Z — top face (+Z) has
-    # area 1 m² while side faces are only 0.1 m², so auto-detect reliably
-    # picks +Z even though the rest of the pipeline assumes Y-up.
     mesh = trimesh.primitives.Box(extents=[1.0, 1.0, 0.1])   # top at z=0.05
 
     T = 30
     joints = np.zeros((T, 22, 3), dtype=np.float32)
-    # Pelvis 0.10 m above the +Z face, in-frame coordinates. With
-    # identity object rotation, world == local, so pelvis is above the
-    # seat in world +Z direction.
-    joints[:, 0] = [0.0, 0.0, 0.15]
+    joints[:, 0] = [0.0, 0.0, 0.15]   # 0.10 m above the +Z face
 
     contact = np.zeros((T, 5), dtype=np.float32)
     contact[:, 4] = 1.0
@@ -387,13 +388,53 @@ def test_support_auto_detects_up_axis_for_z_up_mesh() -> None:
         object_mesh=mesh,
         object_positions=object_positions,
         object_rotations=object_rotations,
+        object_id="bigsofa",   # whitelisted as +Z-up
         config=cfg,
     )
 
     assert (support == SUPPORT_SITTING).sum() > T * 0.8, (
-        f"Z-up mesh below-gate failed to open — auto-detect should have "
-        f"picked +Z; instead got "
-        f"{dict((SUPPORT_NAMES[s], int((support == s).sum())) for s in range(4))}"
+        f"Z-up mesh below-gate failed to open under bigsofa override; "
+        f"got {dict((SUPPORT_NAMES[s], int((support == s).sum())) for s in range(4))}"
+    )
+
+
+def test_support_default_up_axis_rejects_z_up_mesh_without_override() -> None:
+    """Complement to the override test: the same Z-up slab must be
+    rejected when no ``object_id`` is supplied. This guards against a
+    regression where auto-detect gets re-enabled and starts picking
+    non-Y axes on meshes that should default to +Y (the imhd bat /
+    broom / kettlebell false-positive class from v5).
+    """
+    import trimesh
+
+    mesh = trimesh.primitives.Box(extents=[1.0, 1.0, 0.1])   # top at z=0.05
+
+    T = 30
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    joints[:, 0] = [0.0, 0.0, 0.15]   # above +Z face but default up=+Y
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 4] = 1.0
+
+    object_positions = np.zeros((T, 3), dtype=np.float32)
+    object_rotations = np.zeros((T, 3), dtype=np.float32)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact,
+        joints=joints,
+        object_mesh=mesh,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        # no object_id → default +Y → cylinder sampled along +Y, no
+        # seat face in that direction under the slab, gate stays shut.
+        config=cfg,
+    )
+
+    sitting_frac = (support == SUPPORT_SITTING).sum() / T
+    assert sitting_frac < 0.2, (
+        f"default +Y should reject Z-up mesh without override; "
+        f"sitting_frac={sitting_frac:.2%}"
     )
 
 
@@ -516,7 +557,8 @@ if __name__ == "__main__":
         test_support_rejects_sitting_when_pelvis_far_above_seat,
         test_support_allows_sitting_when_object_below_pelvis,
         test_support_allows_sitting_when_pelvis_offset_toward_armrest,
-        test_support_auto_detects_up_axis_for_z_up_mesh,
+        test_support_up_axis_override_unlocks_z_up_mesh,
+        test_support_default_up_axis_rejects_z_up_mesh_without_override,
         test_target_sigma_default_yields_soft_distribution,
         test_hmm_falls_back_to_initial_on_bad_features,
     ]

@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-22 (v4 vis confirmed the 3 diagnostic sit-on-sofa clips still have `sitting=0`. Server diagnostic showed `neuraldome/bigsofa` is authored Z-up while other InterAct objects are Y-up — the fixed `normal.Y > 0.7` filter drops every sofa seat face. Below-gate now auto-detects the mesh up axis per object. 15/15 regression tests green (new Z-up test). v5 rerun queued behind this commit.)
+**Last updated:** 2026-04-22 (v5 ran and regressed: chairs sitting 49.6%→39.5%, imhd sitting 0.66%→3.05% false positives. Probe on all 106 meshes showed face-area argmax mis-picks non-Y-up on 21/60 chairs and 8/10 imhd objects. Fix: hardcoded +Y default + `OBJECT_UP_AXIS_OVERRIDES = {"bigsofa": "+Z", "smallsofa": "+Z"}` whitelist. 16/16 regression tests green. v6 rerun queued.)
 
 ---
 
@@ -101,23 +101,29 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   clips still at `sitting=0`. Server face-normal probe on `bigsofa`, `neuraldome/chair`,
   `chairs/141`, `chairs/116` confirmed: bigsofa is Z-up (+Z 48901 >> -Z 7411), others
   Y-up. Hard-coded Y-up filter was the bug.
-- [x] **Below-gate auto-detects the mesh up axis** (this commit). `_detect_mesh_up_axis`
-  picks the cardinal +axis with the most seat-like face area; cylinder test is
-  expressed along that axis instead of +Y. New regression test
-  `test_support_auto_detects_up_axis_for_z_up_mesh` guards it.
-- [ ] **NEXT: Commit + start v5 rerun** (same command, ~7 h). Phase/target/contact
-  stay identical to v3/v4; only support (specifically sitting for Z-up meshes) changes.
-- [ ] **v5 summary.json → check bigsofa sitting recovers**
-  - Expect neuraldome sitting to rise from 1.60% (v4) toward 3-5% — all bigsofa
-    seqs with "sit" in their text should now record non-zero sitting frames.
-  - chairs sitting should stay ≈ 49.6% (chairs meshes were already Y-up, so
-    auto-detect is a no-op for them).
-- [ ] **If v5 still underperforms for bigsofa** → double-check mesh authoring or
-  relax `sitting_below_upward_normal_threshold` 0.7 → 0.5.
-- [ ] **Decide on remaining P1/P2 scope** (only after v5).
+- [x] **Below-gate auto-detects the mesh up axis** (`edf2bb3`). `_detect_mesh_up_axis`
+  picks the cardinal +axis with the most seat-like face area.
+- [x] **v5 rerun done (~6 h)** — commit `edf2bb3` regressed chairs sitting 49.6%→39.5%
+  and produced 9.5 pp false-positive sitting on imhd. Auto-detect picks non-Y on
+  21/60 chairs + 8/10 imhd objects. See
+  [analyses/v5_auto_detect_regression](analyses/2026-04-22_v5_auto_detect_regression.md).
+- [x] **Probe script + diagnosis** (`8aafde6`). `scripts/data/probe_mesh_up_axis.py`
+  enumerates all 106 InterAct meshes and reports detected axis + dominance.
+  Data at `runs/checks/up_axis_probe/2026-04-22_101850/probe.json`.
+- [x] **Fix: replace auto-detect with hardcoded +Y + `{bigsofa, smallsofa} → +Z`
+  whitelist** via `OBJECT_UP_AXIS_OVERRIDES`. `object_id` threaded through
+  `extract_support_state` / `process_sequence` / `run_pipeline`. 16/16 tests green.
+- [ ] **NEXT: Commit + start v6 rerun** (same command, ~6 h).
+- [ ] **v6 summary.json → verify regression reversal**
+  - chairs sitting should return to ≈ 49.6% (back to v4).
+  - imhd sitting should drop to ≈ 0% (all default to +Y, rejects bat/broom/dumbbell).
+  - neuraldome sitting: smallsofa newly unlocked; bigsofa unchanged from v5.
+- [ ] **If bigsofa vis still shows missing sit frames after v6** → relax
+  `sitting_below_upward_normal_threshold` 0.7 → 0.5 (separate commit, v7).
+- [ ] **Decide on remaining P1/P2 scope** (only after v6).
   See §3.1 for deferred list (hand threshold, suitcase mesh, expanded joints, etc).
 - [ ] Update `configs/training/predictor.yaml` — multi-root InterAct paths,
-  `fps=20`, `support_weight=0.1` until v5 confirms support labels.
+  `fps=20`, `support_weight=0.1` until v6 confirms support labels.
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo

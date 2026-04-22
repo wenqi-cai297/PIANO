@@ -3,7 +3,7 @@
 Tracks what has been built, tested, and merged into the repository.
 Updated after each significant code change.
 
-**Last updated:** 2026-04-22 (v4 vis found the 3 diagnostic sit-on-sofa clips still at `sitting=0`; server-side face-normal diagnostic showed `neuraldome/bigsofa` is authored Z-up while the rest of InterAct is Y-up. Below-gate now auto-detects the mesh up axis per object (`_detect_mesh_up_axis`, face-area-weighted +axis argmax) and defines the cylinder along that axis. 15/15 regression tests green (new Z-up test). v5 rerun queued behind this commit.)
+**Last updated:** 2026-04-22 (v5 rerun finished — face-area-argmax up-axis detection regressed chairs sitting 49.6% → 39.5% and produced 9.5 pp false-positive sitting on imhd. Probe on all 106 InterAct meshes showed 21/60 chairs and 8/10 imhd objects get mis-detected non-Y axes. Fix: hardcoded +Y default + explicit `OBJECT_UP_AXIS_OVERRIDES = {"bigsofa": "+Z", "smallsofa": "+Z"}` whitelist. 16/16 regression tests green. v6 rerun queued behind this commit.)
 
 ---
 
@@ -23,7 +23,8 @@ currently executing versus what just landed. When a row goes stale
 | v3 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-21 PM post-v3 | ✓ done, 14 seq spot-checked | Videos under `runs/visualizations/2026-04-21_16*` / `17*`. Validated the 5 P0 fixes on v3 labels; exposed the "sitting with pelvis offset toward armrest" over-rejection — 3 clips where `text` says "sits" got `sitting=0`. Triggered below-gate rewrite. |
 | v4 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-21 PM (commit `480762c`) | ✓ done (~7 h on server); judged | Aggregate stats for phase/target/contact are byte-identical to v3 (only support path changed). chairs sitting 46%→49.6% (+3.5 pp, pass bar ≥25% met). neuraldome sitting 1.48%→1.60% (sofa-edge recovery smaller than hoped). See [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §e. |
 | v4 visualization | `bash scripts/server/visualize_finished_subsets.sh` | 2026-04-22 | ✓ done | Videos under `runs/visualizations/2026-04-22_02*`. 3 diagnostic clips (bigsofa sits, chair 141 sit) still had `sitting=0` despite text saying "sits". Server-side face-normal probe showed `neuraldome/bigsofa` is Z-up (+Z 48901 vs -Z 7411) while chairs/Obj116-141 are Y-up. Triggered auto-detect-up-axis rewrite (§f). |
-| v5 pseudo-label extraction | (queued) | pending commit of auto-detect up-axis | ⏸ queued | Same command. Only the support path changed again; phase/target/contact stay identical to v3/v4. |
+| v5 pseudo-label extraction | `bash scripts/data/rerun_pseudo_labels_interact.sh` | 2026-04-22 (commit `edf2bb3`) | ✓ done (~6 h); judged | chairs sitting 49.6%→**39.5% (-10 pp regression)**, imhd sitting 0.66%→**3.05% (+2.4 pp false positive)**, neuraldome 1.60%→1.75% (+0.15 pp). phase/target/contact byte-identical to v3/v4 ✓. Mesh probe (`runs/checks/up_axis_probe/2026-04-22_101850/probe.json`) showed 21/60 chairs + 8/10 imhd objects mis-detected as non-Y-up. See [analyses/v5_auto_detect_regression](analyses/2026-04-22_v5_auto_detect_regression.md). |
+| v6 pseudo-label extraction | (queued) | pending commit of up-axis whitelist fix | ⏸ queued | Same command. Replaces face-area argmax with hardcoded +Y + `{bigsofa, smallsofa} → +Z` whitelist. Expected: chairs sitting recovers to ~49.6%, imhd sitting drops to ~0%, neuraldome gains smallsofa. |
 
 ---
 
@@ -34,7 +35,7 @@ currently executing versus what just landed. When a row goes stale
 | **Project scaffolding** | pyproject.toml, environment.yml, configs/ | ✓ Done | `pip install -e .` succeeds |
 | **Utils** | io_utils, geometry, smpl_utils | ✓ Done | Unit tests passed |
 | **Data processing** | humanml3d_repr, preprocess_smplx, preprocess_interact, dataset | ✓ Done (v2, 2026-04-21) | SMPL-X → 22 joints → 263-dim conversion verified; preprocess now also preserves full `smplx_poses` / `smplx_trans` / `smplx_betas` per sequence for downstream mesh-based losses. v2 re-run completed 2026-04-21 (8475 seq / 7 min) — new fields populated. |
-| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ v4 vis done; auto-detect-up-axis rewrite pending commit → v5 | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 → d641732 recalibration → v2. 2026-04-21 AM review surfaced 4 P0s; v2 vis surfaced a 5th + target-sigma + HMM NaN — all 7 fixes in `a8f5c2e` (v3). v3 vis surfaced an 8th (sofa-edge sit over-rejected) — below-gate rewritten to "upward-facing surface inside cylinder" in `480762c` (v4). v4 vis surfaced a 9th: InterAct meshes use inconsistent up-axis conventions — `neuraldome/bigsofa` is Z-up, `chairs/Obj116-141` are Y-up. Below-gate now auto-detects the up axis per mesh by face-area-weighted +axis argmax (`_detect_mesh_up_axis`) and defines the cylinder along that axis. 15/15 regression tests (`tests/test_pseudo_labels.py`), including a Z-up regression test. See §0 and [analyses/pseudo_label_phase_support_fixes](analyses/2026-04-21_pseudo_label_phase_support_fixes.md) §a-f. |
+| **Pseudo-label extraction** | extract_contact/target/phase/support, refine_hmm, run_all | ⚠ v5 done but auto-detect regression caught; whitelist fix pending commit → v6 | Post-sweep thresholds: hand 0.08 / foot 0.06 / pelvis 0.20 m (`127f675`). v1 → d641732 recalibration → v2. 2026-04-21 AM review surfaced 4 P0s; v2 vis surfaced a 5th + target-sigma + HMM NaN — all 7 fixes in `a8f5c2e` (v3). v3 vis surfaced an 8th (sofa-edge sit over-rejected) — below-gate rewritten to "upward-facing surface inside cylinder" in `480762c` (v4). v4 vis surfaced a 9th: mixed up-axis conventions — `edf2bb3` introduced face-area-argmax auto-detect (v5). v5 aggregates exposed a 10th: auto-detect is too brittle (mis-picks non-Y on 21/60 chairs + 8/10 imhd). Replaced with hardcoded +Y + `{bigsofa, smallsofa} → +Z` whitelist via `OBJECT_UP_AXIS_OVERRIDES`. 16/16 regression tests (`tests/test_pseudo_labels.py`), with a new test guarding the default-+Y behavior against auto-detect re-enablement. See §0 and [analyses/v5_auto_detect_regression](analyses/2026-04-22_v5_auto_detect_regression.md). |
 | **Object Encoder** | object_encoder.py (PointNet++) | ✓ Done | Forward pass OK, 0.3M params, feature_dim=384 |
 | **Interaction Predictor** | interaction_predictor.py | ✓ Done | 10 layers, d=384, Block AttnRes (5 blocks), 31.8M params |
 | **Interaction Cross-Attention** | interaction_cross_attn.py | ✓ Done | Zero-init verified |
@@ -53,7 +54,7 @@ currently executing versus what just landed. When a row goes stale
 | **Evaluation: Controllability** | controllability.py | ✓ Done | ASS, ASC, latent sensitivity |
 | **Inference** | generate.py (PIANOPipeline) | ✓ Done (skeleton) | End-to-end text+object → motion |
 | **Inference: Viz** | visualize.py | ✓ Done | motion_263 → joints, skeleton frame rendering |
-| **Tests** | tests/test_pseudo_labels.py | ✓ 15/15 passing (2026-04-22, local `piano` conda env) | Regression tests lock all 9 local fixes: any-body-part contact for phase (3 tests), rotation-aware obj motion, frozen HMM state ids, majority (not median) support filter, sitting velocity gate (push rejected + stationary preserved), below gate (too-far-above rejected + above-above-seat accepted + sofa-edge sit accepted + Z-up mesh accepted), target sigma 0.12 gives soft distribution, HMM NaN fallback |
+| **Tests** | tests/test_pseudo_labels.py | ✓ 16/16 passing (2026-04-22, local `piano` conda env) | Regression tests lock all 10 local fixes: any-body-part contact for phase (3 tests), rotation-aware obj motion, frozen HMM state ids, majority (not median) support filter, sitting velocity gate (push rejected + stationary preserved), below gate (too-far-above rejected + above-seat accepted + sofa-edge sit accepted), up-axis override unlocks Z-up mesh for whitelisted id + default +Y rejects Z-up mesh without override, target sigma 0.12 gives soft distribution, HMM NaN fallback |
 
 **Total:** 38 Python files, ~5400 lines of code (excluding MoMask backbone).
 
@@ -183,6 +184,9 @@ All other components are functionally complete.
 | `a8f5c2e` | 2026-04-21 | Fix 5 pseudo-label P0 bugs + retune target sigma + HMM NaN fallback |
 | `5055c8d` | 2026-04-21 | visualize_pseudo_labels: add text / object_id / target_entropy / phase_transitions to summary |
 | `480762c` | 2026-04-21 | Rewrite sitting below-gate: upward-facing surface inside cylinder below pelvis |
+| `edf2bb3` | 2026-04-22 | Auto-detect mesh up-axis for sitting below-gate (face-area argmax) |
+| `8aafde6` | 2026-04-22 | Add probe_mesh_up_axis: diagnose v5 auto-detect regression |
+| (pending) | 2026-04-22 | Replace auto-detect with +Y default + `{bigsofa, smallsofa} → +Z` whitelist (v5 regression fix) |
 
 ---
 

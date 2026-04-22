@@ -96,6 +96,7 @@ def process_sequence(
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
     patch_centers: np.ndarray | None = None,
+    object_id: str | None = None,
     contact_config: ContactConfig | None = None,
     target_config: TargetConfig | None = None,
     phase_config: PhaseConfig | None = None,
@@ -177,6 +178,7 @@ def process_sequence(
         object_mesh=mesh,
         object_positions=object_positions,
         object_rotations=object_rotations,
+        object_id=object_id,
         config=support_config,
     )
 
@@ -325,6 +327,7 @@ def run_pipeline(
                 object_positions=object_positions,
                 object_rotations=object_rotations,
                 patch_centers=patch_centers,
+                object_id=obj_id,
                 contact_config=contact_cfg,
                 target_config=target_cfg,
                 phase_config=phase_cfg,

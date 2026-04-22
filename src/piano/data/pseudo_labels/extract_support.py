@@ -112,6 +112,7 @@ def extract_support_state(
     object_mesh=None,
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
+    object_id: str | None = None,
     config: SupportConfig | None = None,
 ) -> np.ndarray:
     """Extract per-frame support state from contact pseudo-labels.
@@ -149,6 +150,7 @@ def extract_support_state(
     pelvis_stationary = _pelvis_stationary_mask(joints, config, T)
     pelvis_object_below = _pelvis_object_below_mask(
         joints, object_mesh, object_positions, object_rotations, config, T,
+        object_id=object_id,
     )
 
     support = np.full(T, SUPPORT_BOTH_FEET, dtype=np.int64)
@@ -201,30 +203,52 @@ def _pelvis_stationary_mask(
     return smoothed < config.sitting_max_pelvis_horz_speed
 
 
-def _detect_mesh_up_axis(mesh, threshold: float = 0.7) -> np.ndarray:
-    """Pick the object-local +axis carrying the most seat-like face area.
+# Object-local up axis per InterAct mesh. Default is +Y (the prevalent
+# authoring convention across chairs / imhd / omomo / most neuraldome
+# meshes); a small whitelist overrides this for known Z-up objects.
+#
+# The previous face-area-argmax heuristic was abandoned after the v5
+# probe (``runs/checks/up_axis_probe/2026-04-22_101850/probe.json``)
+# showed it picks a non-Y axis on 21/60 chairs and 8/10 imhd objects.
+# That drove v5 chairs sitting from 49.6% → 39.5% (-10 pp) and gave
+# imhd a 9.5 pp false-positive sitting (impossible on bats / brooms /
+# dumbbells). Chair meshes rarely have face-area dominance on the
+# true +Y: chair 116 has +Y 0.79 vs +Z 0.69 — ratio 1.15, well below
+# any usable dominance threshold. Hardcoded +Y with named exceptions
+# is the minimum-regression fix.
+OBJECT_UP_AXIS_OVERRIDES: dict[str, str] = {
+    # Confirmed Z-up by the 2026-04-22 probe and by the server-side
+    # face-normal dump that drove ``edf2bb3``:
+    #   bigsofa face normals +X 41234 / +Y 22833 / +Z 48901 (dominant)
+    "bigsofa": "+Z",
+    # smallsofa extents [0.89, 0.86, 0.71]: Z is the short/vertical
+    # axis (height), consistent with Z-up authoring. Face-area argmax
+    # mis-picked +X (big armrest faces), which is why we can't trust
+    # auto-detect here either.
+    "smallsofa": "+Z",
+}
 
-    InterAct meshes mix up-axis conventions — e.g. `neuraldome/bigsofa`
-    is Z-up (48901 faces with +Z normal vs 7411 with -Z), while
-    `chairs/Obj116` is Y-up (+Y 5220 / -Y 4824). Hard-coding Y-up makes
-    the below-gate reject every sitting frame on the Z-up meshes. Per-
-    mesh auto-detection by face-area-weighted +axis dominance recovers
-    the correct "up" regardless of authoring convention.
+_AXIS_TO_INDEX: dict[str, int] = {"+X": 0, "+Y": 1, "+Z": 2}
 
-    Returns a one-hot unit vector in object-local coordinates.
+
+def _detect_mesh_up_axis(
+    mesh,
+    object_id: str | None = None,
+    threshold: float = 0.7,  # noqa: ARG001  kept for call-site compat
+) -> np.ndarray:
+    """Return the object-local +axis that should be treated as "up".
+
+    Defaults to +Y. ``object_id`` is looked up in
+    ``OBJECT_UP_AXIS_OVERRIDES`` to opt specific meshes into a
+    non-default axis. The ``mesh`` and ``threshold`` arguments are kept
+    so existing call sites (including the ``probe_mesh_up_axis`` tool)
+    don't need to change, but neither is used anymore — face-area
+    auto-detection proved too unreliable on InterAct's mixed
+    authoring conventions.
     """
-    fa = mesh.area_faces
-    fn = mesh.face_normals
-    best_axis = 0
-    best_area = -1.0
-    for axis in range(3):
-        mask = fn[:, axis] > threshold
-        area = float(fa[mask].sum())
-        if area > best_area:
-            best_area = area
-            best_axis = axis
+    axis_name = OBJECT_UP_AXIS_OVERRIDES.get(object_id, "+Y") if object_id else "+Y"
     up = np.zeros(3, dtype=np.float32)
-    up[best_axis] = 1.0
+    up[_AXIS_TO_INDEX[axis_name]] = 1.0
     return up
 
 
@@ -235,15 +259,17 @@ def _pelvis_object_below_mask(
     object_rotations: np.ndarray | None,
     config: SupportConfig,
     T: int,
+    object_id: str | None = None,
 ) -> np.ndarray:
     """Per-frame boolean: a seat-like mesh surface sits inside a
     cylinder extending below the pelvis along the mesh's up axis.
 
-    The up axis is auto-detected per mesh (see ``_detect_mesh_up_axis``).
-    "Below" is measured along that axis, and the cylinder radius is the
-    perpendicular-to-up distance. Filtering by normal alignment with
-    the up axis drops backrests / legs / armrests whose normals point
-    sideways or downward.
+    The up axis defaults to +Y, with explicit overrides for known
+    Z-up meshes via ``OBJECT_UP_AXIS_OVERRIDES`` (see
+    ``_detect_mesh_up_axis``). "Below" is measured along that axis,
+    and the cylinder radius is the perpendicular-to-up distance.
+    Filtering by normal alignment with the up axis drops backrests /
+    legs / armrests whose normals point sideways or downward.
 
     Returns all-True when inputs are unavailable (keeps legacy
     behaviour; the velocity gate is the only remaining disambiguator).
@@ -266,6 +292,7 @@ def _pelvis_object_below_mask(
 
     up_local = _detect_mesh_up_axis(
         object_mesh,
+        object_id=object_id,
         threshold=config.sitting_below_upward_normal_threshold,
     )
 
