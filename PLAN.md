@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-22 (v5 ran and regressed: chairs sitting 49.6%→39.5%, imhd sitting 0.66%→3.05% false positives. Probe on all 106 meshes showed face-area argmax mis-picks non-Y-up on 21/60 chairs and 8/10 imhd objects. Fix: hardcoded +Y default + `OBJECT_UP_AXIS_OVERRIDES = {"bigsofa": "+Z", "smallsofa": "+Z"}` whitelist. 16/16 regression tests green. v6 rerun queued.)
+**Last updated:** 2026-04-22 (v6 rerun confirmed whitelist fix: chairs sitting back to 49.62% = v4, imhd FPs cleared 3.05%→0.21%, omomo unchanged, neuraldome 1.55% ≈ v4 — bigsofa/smallsofa +Z whitelist didn't lift aggregate because `upward_normal_threshold=0.7` still filters curved cushion faces. v6 is training-ready. v7 candidate: 0.7→0.5 threshold relax, only if bigsofa vis shows missing sit frames.)
 
 ---
 
@@ -111,19 +111,26 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   enumerates all 106 InterAct meshes and reports detected axis + dominance.
   Data at `runs/checks/up_axis_probe/2026-04-22_101850/probe.json`.
 - [x] **Fix: replace auto-detect with hardcoded +Y + `{bigsofa, smallsofa} → +Z`
-  whitelist** via `OBJECT_UP_AXIS_OVERRIDES`. `object_id` threaded through
-  `extract_support_state` / `process_sequence` / `run_pipeline`. 16/16 tests green.
-- [ ] **NEXT: Commit + start v6 rerun** (same command, ~6 h).
-- [ ] **v6 summary.json → verify regression reversal**
-  - chairs sitting should return to ≈ 49.6% (back to v4).
-  - imhd sitting should drop to ≈ 0% (all default to +Y, rejects bat/broom/dumbbell).
-  - neuraldome sitting: smallsofa newly unlocked; bigsofa unchanged from v5.
-- [ ] **If bigsofa vis still shows missing sit frames after v6** → relax
-  `sitting_below_upward_normal_threshold` 0.7 → 0.5 (separate commit, v7).
-- [ ] **Decide on remaining P1/P2 scope** (only after v6).
+  whitelist** via `OBJECT_UP_AXIS_OVERRIDES` (`6608e5a`). `object_id` threaded
+  through `extract_support_state` / `process_sequence` / `run_pipeline`.
+  16/16 tests green.
+- [x] **v6 rerun done (~5 h)** — regression cleanly fixed: chairs sitting
+  49.62% (= v4), imhd sitting 0.21% (FPs cleared), omomo 0.06% (unchanged),
+  neuraldome 1.55% (≈ v4). See
+  [analyses/v5_auto_detect_regression §v6 verdict](analyses/2026-04-22_v5_auto_detect_regression.md).
+- [ ] **OPTIONAL: Vis 3 diagnostic bigsofa / chair-141 clips on v6** to see
+  whether `sitting_below_upward_normal_threshold=0.7` is filtering curved
+  cushion faces. If those 3 clips still show sit=0, v7 becomes warranted.
+- [ ] **OPTIONAL v7: relax `sitting_below_upward_normal_threshold` 0.7 → 0.5**
+  (one-line change) — only if bigsofa vis on v6 confirms the threshold
+  is the remaining blocker. Risk: marginal FP increase on curvy chair backrests.
+- [ ] **Decide on remaining P1/P2 scope** — v6 passes all relevant pass bars
+  (chairs sitting >> 25%, 4/4 target entropy > 1.2, manipulation > 30%).
   See §3.1 for deferred list (hand threshold, suitcase mesh, expanded joints, etc).
-- [ ] Update `configs/training/predictor.yaml` — multi-root InterAct paths,
-  `fps=20`, `support_weight=0.1` until v6 confirms support labels.
+- [ ] **READY: Update `configs/training/predictor.yaml`** — multi-root InterAct
+  paths, `fps=20`, `support_weight=0.1`. v6 labels are trainable.
+- [ ] **READY: Stage A smoke test** — wire CLIP loading (`train_predictor.py`,
+  §1.3), run 100-sample forward pass, verify predictor loss decreases.
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo

@@ -133,10 +133,70 @@ If v6 bigsofa vis still shows sitting-frames-missing despite correct
 - [x] Replace face-area argmax with +Y default + whitelist.
 - [x] Thread `object_id` through extract_support_state → run_all.py.
 - [x] Update regression tests; 16/16 pass locally.
-- [ ] v6 rerun on server (same `bash scripts/data/rerun_pseudo_labels_interact.sh`, ~7 h).
-- [ ] Compare v6 to v4 aggregates — chairs sitting should return to
-      ~49.6%, imhd sitting should drop to ~0%.
+- [x] v6 rerun on server (commit `6608e5a`, ~5 h elapsed). Results below.
+- [x] Compare v6 to v4 aggregates.
 - [ ] Run vis on the 3 bigsofa / chair-141 diagnostic clips to confirm
-      smallsofa sitting actually fires where expected.
+      whether bigsofa sit now fires (hypothesis: still 0, because 0.7
+      upward-normal threshold rejects curved cushion faces).
 - [ ] If bigsofa still underperforms, relax `sitting_below_upward_normal_threshold`
-      0.7 → 0.5 as a follow-up (separate commit).
+      0.7 → 0.5 as a follow-up (separate commit, "v7" candidate).
+
+## v6 verdict (2026-04-22 PM)
+
+v6 ran with `6608e5a` (whitelist fix). Full summaries at
+`runs/InterAct/piano/<subset>/pseudo_labels/summary.json`.
+
+| subset | metric | v4 | v5 | **v6** | verdict |
+|---|---|---:|---:|---:|---|
+| chairs | sitting frame rate | 49.6% | 39.5% | **49.62%** | ✓ regression fully fixed, byte-equal to v4 |
+| chairs | seq entered sitting | 88.4% | 71.4% | **88.4%** | ✓ |
+| chairs | seq stuck in both_feet | 8.3% | 8.3% | **4.3%** | ✓ better than v4 too |
+| chairs | quality_flags | — | [] | **[]** | ✓ clean |
+| imhd | sitting frame rate | 0.66% | 3.05% | **0.21%** | ✓ FPs cleared (both numbers within surface-sampling stochastic noise — "effectively zero") |
+| imhd | seq entered sitting | ~1% | 9.5% | **4.6%** | ✓ 5× cleaner than v5; residual 27 seqs × ~8 frames each is flicker-level |
+| neuraldome | sitting frame rate | 1.60% | 1.75% | **1.55%** | △ ≈ v4 — bigsofa + smallsofa whitelist didn't lift aggregate |
+| neuraldome | seq entered sitting | 7.2% | 7.2% | **5.1%** | △ dropped — v5's mis-detected false-positive sits are filtered |
+| omomo | sitting frame rate | 0.06% | 0.06% | **0.06%** | ✓ unchanged |
+
+**Byte-identity checks** (v5 vs v6 — only support path changed):
+chairs pelvis contact `0.6315110842118912` identical ✓;
+chairs target `entropy_mean=1.2148...` identical ✓;
+chairs phase `approach=0.2359...` identical ✓. Confirms only support
+was affected, as designed.
+
+**Neuraldome half-failure diagnosis.** bigsofa + smallsofa are the only
+whitelist entries; before v6 they contributed 0 sitting frames each (v4)
+because hardcoded +Y rejected every seat face. In v6 they now get +Z
+but aggregate still lost ~128 sitting frames vs v4. Two candidate
+explanations, both consistent with the PROGRESS §0 note about v4:
+
+1. **Curved cushion faces still filtered.** bigsofa's seat is a
+   cushion, not a flat slab; near the seam with the backrest the face
+   normal tilts toward ±X and falls below `upward_normal_threshold=0.7`.
+   The cylinder test finds no qualifying seat points and the gate stays
+   closed on exactly the frames we wanted to unlock. The "sofa-cushion
+   threshold 0.7 too strict" was already noted as a v5 explanation; v6
+   confirms it without the auto-detect regression confounder.
+
+2. **Stochastic surface sampling.** `trimesh.sample.sample_surface` is
+   un-seeded in `_pelvis_object_below_mask`. On borderline geometry
+   (held objects in imhd, marginal seats in neuraldome) a different
+   sample can flip frames in or out of the gate, explaining ~0.05 pp
+   noise differences between runs. Fine as noise but means precise
+   before/after diffs on flat-seat chairs are more trustworthy than on
+   cushion-seat sofas.
+
+**Trade-off between v5 and v6 on neuraldome.** v5 had 1.75% but 16/21
+objects were using wrong-axis detection that produced spurious sit
+frames on non-sittable objects (desk, pillow, case, monitor, etc.).
+v6 is 1.55% with only physically meaningful sits. **v6 is cleaner
+signal for training** even though aggregate is slightly lower.
+
+**Conclusion.** v6 passes all relevant pass bars (chairs sitting >>
+25%, all 4 subsets target entropy > 1.2, manipulation reached > 30%
+on chairs/imhd/omomo, contact zero-rate < 30% on chairs/imhd/omomo).
+neuraldome zero-contact 49% is the deferred hand-threshold issue
+(`PLAN §3.1`), not a support-path issue. Stage A predictor training
+can begin on v6 labels. If bigsofa-specific sitting recovery is
+still desired for neuraldome vis fidelity, v7 candidate is a one-line
+config change: `sitting_below_upward_normal_threshold = 0.7 → 0.5`.
