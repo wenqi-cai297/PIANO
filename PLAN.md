@@ -2,7 +2,7 @@
 
 Current priorities and next steps. Updated after each experiment analysis cycle.
 
-**Last updated:** 2026-04-22 (v6 rerun confirmed whitelist fix: chairs sitting back to 49.62% = v4, imhd FPs cleared 3.05%→0.21%, omomo unchanged, neuraldome 1.55% ≈ v4 — bigsofa/smallsofa +Z whitelist didn't lift aggregate because `upward_normal_threshold=0.7` still filters curved cushion faces. v6 is training-ready. v7 candidate: 0.7→0.5 threshold relax, only if bigsofa vis shows missing sit frames.)
+**Last updated:** 2026-04-22 (v6 support clean, but hand seq_reached 38-63% exposed 0.08 hand threshold as too strict for gripping poses. Bumped hand 0.08→0.12 based on sweep elbow; expected v7 lift chairs/omomo/imhd hand coverage to 72-79%, neuraldome to 47-50%. v7 rerun queued behind hand-threshold commit.)
 
 ---
 
@@ -114,23 +114,42 @@ Total sequences: 8478 (vs 4919 from CHOIS-OMOMO alone).
   whitelist** via `OBJECT_UP_AXIS_OVERRIDES` (`6608e5a`). `object_id` threaded
   through `extract_support_state` / `process_sequence` / `run_pipeline`.
   16/16 tests green.
-- [x] **v6 rerun done (~5 h)** — regression cleanly fixed: chairs sitting
-  49.62% (= v4), imhd sitting 0.21% (FPs cleared), omomo 0.06% (unchanged),
-  neuraldome 1.55% (≈ v4). See
+- [x] **v6 rerun done (~5 h)** — support regression cleanly fixed: chairs
+  sitting 49.62% (= v4), imhd sitting 0.21% (FPs cleared), omomo 0.06%
+  (unchanged), neuraldome 1.55% (≈ v4). See
   [analyses/v5_auto_detect_regression §v6 verdict](analyses/2026-04-22_v5_auto_detect_regression.md).
-- [ ] **OPTIONAL: Vis 3 diagnostic bigsofa / chair-141 clips on v6** to see
-  whether `sitting_below_upward_normal_threshold=0.7` is filtering curved
-  cushion faces. If those 3 clips still show sit=0, v7 becomes warranted.
-- [ ] **OPTIONAL v7: relax `sitting_below_upward_normal_threshold` 0.7 → 0.5**
-  (one-line change) — only if bigsofa vis on v6 confirms the threshold
-  is the remaining blocker. Risk: marginal FP increase on curvy chair backrests.
-- [ ] **Decide on remaining P1/P2 scope** — v6 passes all relevant pass bars
+- [x] **v6 aggregate exposed hand under-firing** — hand seq_reached only
+  38-63% across subsets even though these are HOI datasets. 0.08
+  threshold catches only "palm just touching edge", misses every wrapped-
+  grip pose. See [analyses/hand_threshold_bump](analyses/2026-04-22_hand_threshold_bump.md).
+- [x] **Bump hand threshold 0.08 → 0.12** based on full-dataset sweep
+  (`runs/threshold_sweep/2026-04-20_193818/`). All 4 subsets show
+  seq_reached elbows at 0.12; gains 10-16 pp per hand; 0.12-0.14 gains
+  only 3-4 pp more and risks FPs. 16/16 tests pass.
+- [ ] **NEXT: Commit + start v7 rerun** (same command, ~5 h). Only contact
+  path changes; phase/target downstream will absorb more contact frames
+  (more `stable-contact` / `manipulation`, more target-assigned frames);
+  support is untouched.
+- [ ] **v7 summary.json → verify hand coverage lifts**
+  - chairs hand seq_reached L/R: 61/59% → ~75/73%
+  - imhd hand seq_reached L/R: 63/58% → ~75/69%
+  - neuraldome hand seq_reached L/R: 38/40% → ~47/50%
+  - omomo hand seq_reached L/R: 58/63% → ~74/79%
+  - imhd zero-contact seq: 13.5% → ~8% (quality flag may stop firing)
+  - neuraldome zero-contact seq: 49% → ~35% (residual due to mesh-layer handle completeness, see §3.1)
+- [ ] **OPTIONAL: Vis 3 diagnostic bigsofa / chair-141 clips on v7** to see
+  whether `sitting_below_upward_normal_threshold=0.7` is still filtering
+  curved cushion faces. If those 3 clips still show sit=0, v8 candidate
+  is 0.7 → 0.5 relax. Low priority vs opening Stage A.
+- [ ] **Decide on remaining P1/P2 scope** — v7 passes all relevant pass bars
   (chairs sitting >> 25%, 4/4 target entropy > 1.2, manipulation > 30%).
-  See §3.1 for deferred list (hand threshold, suitcase mesh, expanded joints, etc).
-- [ ] **READY: Update `configs/training/predictor.yaml`** — multi-root InterAct
-  paths, `fps=20`, `support_weight=0.1`. v6 labels are trainable.
-- [ ] **READY: Stage A smoke test** — wire CLIP loading (`train_predictor.py`,
-  §1.3), run 100-sample forward pass, verify predictor loss decreases.
+  See §3.1 for deferred list (suitcase mesh completeness, expanded joints, etc).
+- [ ] **READY after v7: Update `configs/training/predictor.yaml`** — multi-root
+  InterAct paths, `fps=20`, `support_weight=0.1`. v7 labels should be
+  the canonical training set.
+- [ ] **READY after v7: Stage A smoke test** — wire CLIP loading
+  (`train_predictor.py`, §1.3), run 100-sample forward pass, verify
+  predictor loss decreases.
 
 **CHOIS-OMOMO path is retired but preserved:**
 - `preprocess_omomo.py` + `extract_pseudo_labels_omomo.sh` kept in repo

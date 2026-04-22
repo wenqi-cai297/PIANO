@@ -45,10 +45,22 @@ from piano.utils.smpl_utils import (
 # distance-threshold midpoints in the soft sigmoid. Derived from anatomy
 # then verified (and adjusted) against the full-dataset sweep
 # (runs/threshold_sweep/2026-04-20_193818/):
-#   * left/right_hand: wrist joint sits inside the forearm; palm surface is
-#     5-8 cm out. Sweep confirmed 0.08 m gives frame_rate 19-34% /
-#     seq_reached 38-63% across the 4 subsets — sensible range for gripped
-#     objects.
+#   * left/right_hand: wrist joint sits inside the forearm; palm surface
+#     is 5-8 cm out, and when the hand *wraps* a handle / edge / bat
+#     grip the wrist ends up 10-15 cm from the mesh. v1-v6 used 0.08 m
+#     ("palm just touching edge"), which undercounted every gripping
+#     pose. v6 hand seq_reached was only 38-63% across subsets even
+#     though these datasets are explicitly hand-object interaction.
+#     Sweep shows seq_reached curves elbow at 0.12:
+#         chairs  L 61→75% / R 59→73% (at 0.08 → 0.12)
+#         imhd    L 63→75% / R 58→69%
+#         neural. L 38→47% / R 40→50%
+#         omomo   L 58→74% / R 63→79%
+#     Above 0.14 gains diminish to < 4 pp and risk "hand near but not
+#     touching" FPs. 0.12 is the tuned value. FP risk is tempered by
+#     min_contact_duration=3 and median_filter_size=5 — isolated
+#     approach frames don't register. See
+#     2026-04-22_hand_threshold_bump.md.
 #   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8),
 #     ~8-10 cm above the sole. An anatomy-only guess of 0.12 was LOOSE
 #     here because our mesh is the OBJECT, not the ground: a foot on the
@@ -62,8 +74,8 @@ from piano.utils.smpl_utils import (
 #     Sweep confirmed: chairs 0.20 gives 93% seq_reached, saturating at
 #     the elbow of the curve.
 DEFAULT_DISTANCE_THRESHOLDS: dict[str, float] = {
-    "left_hand":  0.08,
-    "right_hand": 0.08,
+    "left_hand":  0.12,
+    "right_hand": 0.12,
     "left_foot":  0.06,
     "right_foot": 0.06,
     "pelvis":     0.20,
