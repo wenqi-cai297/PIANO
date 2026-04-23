@@ -87,6 +87,27 @@ def motion_263_to_joints(
     return joints.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+def _axis_angle_to_rotmat(aa: np.ndarray) -> np.ndarray:
+    """Rodrigues: (3,) axis-angle to (3, 3) rotation matrix."""
+    theta = np.linalg.norm(aa)
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    axis = aa / theta
+    K = np.array(
+        [
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0],
+        ],
+        dtype=np.float32,
+    )
+    return (
+        np.eye(3, dtype=np.float32)
+        + np.sin(theta) * K
+        + (1 - np.cos(theta)) * K @ K
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -97,6 +118,7 @@ def render_motion_video(
     fps: float = 20.0,
     title: str = "",
     object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
     object_pc: np.ndarray | None = None,
     elev: float = 15.0,
     azim: float = -60.0,
@@ -111,8 +133,9 @@ def render_motion_video(
     fps : playback frame rate
     title : shown on the plot
     object_positions : (T, 3) — optional per-frame object center to overlay
+    object_rotations : (T, 3) — optional per-frame object axis-angle rotation
     object_pc : (N, 3) — optional object point cloud in object-local frame;
-        rendered at the object_positions location each frame.
+        rendered at object_positions each frame, with rotation if provided.
     elev, azim : initial camera angles
     dpi : output resolution
     """
@@ -124,9 +147,26 @@ def render_motion_video(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Precompute transformed object point cloud per frame (if available).
+    obj_cloud_world: np.ndarray | None = None
+    if object_pc is not None and object_positions is not None:
+        T_obj = min(T, len(object_positions))
+        if object_rotations is not None:
+            T_obj = min(T_obj, len(object_rotations))
+        N = object_pc.shape[0]
+        obj_cloud_world = np.empty((T_obj, N, 3), dtype=np.float32)
+        for t in range(T_obj):
+            if object_rotations is not None:
+                R = _axis_angle_to_rotmat(object_rotations[t])
+                obj_cloud_world[t] = object_pc @ R.T + object_positions[t]
+            else:
+                obj_cloud_world[t] = object_pc + object_positions[t]
+
     # Compute axis limits covering all frames
     all_pos = [joints.reshape(-1, 3)]
-    if object_positions is not None:
+    if obj_cloud_world is not None:
+        all_pos.append(obj_cloud_world.reshape(-1, 3))
+    elif object_positions is not None:
         all_pos.append(object_positions)
     all_pos = np.concatenate(all_pos, axis=0)
     center = all_pos.mean(axis=0)
@@ -138,7 +178,9 @@ def render_motion_video(
     joint_scatter = ax.scatter([], [], [], c="blue", s=20)
     lines = [ax.plot([], [], [], c="gray", linewidth=1.5)[0] for _ in SKELETON_CONNECTIONS]
     object_scatter = None
-    if object_positions is not None or object_pc is not None:
+    if obj_cloud_world is not None:
+        object_scatter = ax.scatter([], [], [], c="red", s=2, marker="o", alpha=0.5)
+    elif object_positions is not None:
         object_scatter = ax.scatter([], [], [], c="red", s=30, marker="^")
 
     ax.set_xlim(center[0] - max_range, center[0] + max_range)
@@ -166,13 +208,12 @@ def render_motion_video(
             )
             line.set_3d_properties([joints[t, i, 1], joints[t, j, 1]])
             artists.append(line)
-        # Object marker (single point at COM, or full point cloud)
+        # Object marker (single point at COM, or transformed full point cloud)
         if object_scatter is not None:
-            if object_pc is not None and object_positions is not None:
-                # Object pc in object-local frame, offset to world position
-                pos = object_pc + object_positions[t][None, :]
+            if obj_cloud_world is not None and t < len(obj_cloud_world):
+                pos = obj_cloud_world[t]
                 object_scatter._offsets3d = (pos[:, 0], pos[:, 2], pos[:, 1])
-            elif object_positions is not None:
+            elif object_positions is not None and t < len(object_positions):
                 p = object_positions[t]
                 object_scatter._offsets3d = ([p[0]], [p[2]], [p[1]])
             artists.append(object_scatter)
@@ -232,9 +273,16 @@ def load_real_samples(
         samples.append({
             "seq_id": meta["seq_id"],
             "text": meta.get("text", ""),
+            "object_id": meta.get("object_id", ""),
             "motion_263": data["motion_263"],
             "joints_22": data["joints_22"],        # absolute joints from preprocessing
             "object_positions": data.get("object_positions") if "object_positions" in data.files else None,
+            "object_rotations": data.get("object_rotations") if "object_rotations" in data.files else None,
+            "object_pc": (
+                np.load(data_dir / "objects" / f"{meta['object_id']}.npy").astype(np.float32)
+                if meta.get("object_id") and (data_dir / "objects" / f"{meta['object_id']}.npy").exists()
+                else None
+            ),
             "num_frames": int(data["motion_263"].shape[0]),
         })
     return samples
@@ -315,8 +363,12 @@ def run_visualization(
         joints = joints[:n_frames]
 
         obj_pos = sample.get("object_positions")
+        obj_rot = sample.get("object_rotations")
+        obj_pc = sample.get("object_pc")
         if obj_pos is not None:
             obj_pos = obj_pos[:n_frames]
+        if obj_rot is not None:
+            obj_rot = obj_rot[:n_frames]
 
         title = f"[{source}] {seq_id}\n{sample['text'][:70]}"
         out_path = output_dir / f"{seq_id}.mp4"
@@ -324,10 +376,13 @@ def run_visualization(
         render_motion_video(
             joints, out_path, fps=fps, title=title,
             object_positions=obj_pos,
+            object_rotations=obj_rot,
+            object_pc=obj_pc,
         )
         index.append({
             "seq_id": seq_id,
             "text": sample["text"],
+            "object_id": sample.get("object_id", ""),
             "num_frames": n_frames,
             "file": out_path.name,
             "source": source,
