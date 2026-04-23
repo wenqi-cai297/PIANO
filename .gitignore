@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 runs/
+docs/
+analyses/
 checkpoints/
 *.ckpt
 *.pt
@@ -18,3 +20,7 @@ src/piano/models/backbones/momask/
 # Personal workflow helpers — kept locally, not part of the repo
 RESTART_PROMPT.md
 SUGGESTION.md
+ANALYSIS.md
+PLAN.md
+PROGRESS.md
+SPEC.md
