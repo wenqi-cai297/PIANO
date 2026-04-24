@@ -3,8 +3,8 @@
 # Verifies file structure, keys, shapes — catches format drift before training.
 #
 # Usage:
-#   bash scripts/server/check_omomo_format.sh
-#   bash scripts/server/check_omomo_format.sh --data-dir data/omomo/processed_data
+#   bash scripts/checks/check_omomo_format.sh
+#   bash scripts/checks/check_omomo_format.sh --data-dir data/omomo/processed_data
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

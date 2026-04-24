@@ -8,8 +8,8 @@
 #   mesh source (per subset): /media/.../InterAct/InterAct/<subset>/objects
 #
 # Usage:
-#   bash scripts/data/extract_pseudo_labels_interact.sh              # all 4 subsets
-#   bash scripts/data/extract_pseudo_labels_interact.sh chairs       # one subset only
+#   bash scripts/stage1_pseudo_labels/extract_pseudo_labels_interact.sh              # all 4 subsets
+#   bash scripts/stage1_pseudo_labels/extract_pseudo_labels_interact.sh chairs       # one subset only
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

@@ -10,9 +10,9 @@
 # cheap (< 1 min).
 #
 # Usage:
-#   bash scripts/server/threshold_sweep.sh
-#   bash scripts/server/threshold_sweep.sh chairs           # one subset
-#   OUTPUT_ROOT=custom/path bash scripts/server/threshold_sweep.sh
+#   bash scripts/stage1_pseudo_labels/threshold_sweep.sh
+#   bash scripts/stage1_pseudo_labels/threshold_sweep.sh chairs           # one subset
+#   OUTPUT_ROOT=custom/path bash scripts/stage1_pseudo_labels/threshold_sweep.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

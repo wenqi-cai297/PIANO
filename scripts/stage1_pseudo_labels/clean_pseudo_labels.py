@@ -16,7 +16,7 @@ clearly unusable or contradicts the text. Borderline noisy sequences
 that class of noise.
 
 Usage:
-    python scripts/data/clean_pseudo_labels.py \\
+    python scripts/stage1_pseudo_labels/clean_pseudo_labels.py \\
         --data-dir /media/.../InterAct/piano \\
         --subsets chairs imhd neuraldome omomo_correct_v2
 

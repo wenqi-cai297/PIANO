@@ -4,14 +4,14 @@
 #
 # Usage:
 #   # 4 random samples from a subset (default: omomo_correct_v2)
-#   bash scripts/server/visualize_pseudo_labels.sh
+#   bash scripts/stage1_pseudo_labels/visualize_pseudo_labels.sh
 #
 #   # Specific subset
-#   bash scripts/server/visualize_pseudo_labels.sh \
+#   bash scripts/stage1_pseudo_labels/visualize_pseudo_labels.sh \
 #       --data-dir /media/.../InterAct/piano/chairs
 #
 #   # Specific sequences
-#   bash scripts/server/visualize_pseudo_labels.sh \
+#   bash scripts/stage1_pseudo_labels/visualize_pseudo_labels.sh \
 #       --seq-ids sub10_clothesstand_000 sub11_largebox_001
 set -euo pipefail
 

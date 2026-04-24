@@ -8,9 +8,9 @@
 #   Output:   /media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano
 #
 # Usage:
-#   bash scripts/data/preprocess_interact.sh                    # all 4 subsets
-#   bash scripts/data/preprocess_interact.sh --subset chairs    # one subset
-#   bash scripts/data/preprocess_interact.sh --num-samples-limit 10   # smoke test
+#   bash scripts/prep/preprocess_interact.sh                    # all 4 subsets
+#   bash scripts/prep/preprocess_interact.sh --subset chairs    # one subset
+#   bash scripts/prep/preprocess_interact.sh --num-samples-limit 10   # smoke test
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

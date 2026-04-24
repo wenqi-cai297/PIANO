@@ -12,7 +12,7 @@ see exactly which meshes regressed and how marginal each pick is.
 Output: JSON per-object + a console summary of non-+Y detections.
 
 Usage on the server:
-    python scripts/data/probe_mesh_up_axis.py \\
+    python scripts/stage1_pseudo_labels/probe_mesh_up_axis.py \\
         --interact-dir /media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/InterAct \\
         --output runs/checks/up_axis_probe/$(date +%Y-%m-%d_%H%M%S)
 """

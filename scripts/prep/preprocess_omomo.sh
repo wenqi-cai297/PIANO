@@ -7,7 +7,7 @@
 #   Output:    <repo>/data/omomo
 #
 # Override any of them on the command line, e.g.:
-#   bash scripts/data/preprocess_omomo.sh \
+#   bash scripts/prep/preprocess_omomo.sh \
 #       --omomo-dir /custom/path/processed_data \
 #       --smplx-dir /custom/path/smplx \
 #       --output-dir /custom/path/out \

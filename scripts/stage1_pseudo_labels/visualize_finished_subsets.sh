@@ -11,8 +11,8 @@
 # Outputs land under: runs/visualizations/<timestamp>_pseudo_labels_<subset>/
 #
 # Usage:
-#   bash scripts/server/visualize_finished_subsets.sh
-#   bash scripts/server/visualize_finished_subsets.sh chairs imhd   # subset selection
+#   bash scripts/stage1_pseudo_labels/visualize_finished_subsets.sh
+#   bash scripts/stage1_pseudo_labels/visualize_finished_subsets.sh chairs imhd   # subset selection
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

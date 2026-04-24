@@ -4,9 +4,9 @@
 # pseudo_labels/summary.json (summary.json itself is left untouched).
 #
 # Usage:
-#   bash scripts/server/pseudo_label_stats.sh                    # all 4 subsets
-#   bash scripts/server/pseudo_label_stats.sh chairs imhd        # selected
-#   PIANO_ROOT=/path/to/piano bash scripts/server/pseudo_label_stats.sh
+#   bash scripts/stage1_pseudo_labels/pseudo_label_stats.sh                    # all 4 subsets
+#   bash scripts/stage1_pseudo_labels/pseudo_label_stats.sh chairs imhd        # selected
+#   PIANO_ROOT=/path/to/piano bash scripts/stage1_pseudo_labels/pseudo_label_stats.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

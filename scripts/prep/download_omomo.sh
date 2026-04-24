@@ -12,7 +12,7 @@
 # The user must separately obtain SMPL-X model files (not redistributable).
 #
 # Usage:
-#   bash scripts/data/download_omomo.sh [--output-dir data/omomo]
+#   bash scripts/prep/download_omomo.sh [--output-dir data/omomo]
 set -euo pipefail
 
 OUTPUT_DIR="data/omomo"
@@ -67,4 +67,4 @@ echo "      Download SMPLX_MALE.npz / SMPLX_FEMALE.npz from https://smpl-x.is.tu
 echo "      and place them at: $OUTPUT_DIR/processed_data/smpl_all_models/smplx/"
 echo ""
 echo "Next step: run format inspection with:"
-echo "  bash scripts/server/check_omomo_format.sh --data-dir $OUTPUT_DIR/processed_data"
+echo "  bash scripts/checks/check_omomo_format.sh --data-dir $OUTPUT_DIR/processed_data"

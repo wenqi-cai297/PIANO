@@ -16,9 +16,9 @@
 #   6. neuraldome_bigsofa_sit_failing   — still-failing sofa sit diagnostics
 #
 # Usage (on server):
-#   bash scripts/data/vis_v9_pseudo_labels.sh                    # all 6 groups
-#   bash scripts/data/vis_v9_pseudo_labels.sh 1 3                # groups 1 + 3 only
-#   PIANO_ROOT=/other/path bash scripts/data/vis_v9_pseudo_labels.sh
+#   bash scripts/stage1_pseudo_labels/vis_v9_pseudo_labels.sh                    # all 6 groups
+#   bash scripts/stage1_pseudo_labels/vis_v9_pseudo_labels.sh 1 3                # groups 1 + 3 only
+#   PIANO_ROOT=/other/path bash scripts/stage1_pseudo_labels/vis_v9_pseudo_labels.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

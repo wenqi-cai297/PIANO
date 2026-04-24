@@ -23,7 +23,7 @@ Typical usage on the server::
         --mesh-dir /media/.../InterAct/InterAct/chairs/objects \
         --output-dir runs/threshold_sweep/$(date +%Y-%m-%d_%H%M%S)_chairs
 
-The shell wrapper ``scripts/server/threshold_sweep.sh`` runs this for
+The shell wrapper ``scripts/stage1_pseudo_labels/threshold_sweep.sh`` runs this for
 all 4 subsets back-to-back.
 """
 from __future__ import annotations

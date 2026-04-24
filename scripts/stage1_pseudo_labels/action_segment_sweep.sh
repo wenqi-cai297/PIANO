@@ -7,8 +7,8 @@
 # co-located with the plain sweep results.
 #
 # Usage:
-#   bash scripts/server/action_segment_sweep.sh 2026-04-20_193818
-#   bash scripts/server/action_segment_sweep.sh 2026-04-20_193818 chairs imhd
+#   bash scripts/stage1_pseudo_labels/action_segment_sweep.sh 2026-04-20_193818
+#   bash scripts/stage1_pseudo_labels/action_segment_sweep.sh 2026-04-20_193818 chairs imhd
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

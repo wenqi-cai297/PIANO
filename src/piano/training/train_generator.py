@@ -163,8 +163,13 @@ def run(config_path: str) -> None:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI entry point for ``piano-train-generator`` (Stage B)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/training/generator.yaml")
     args = parser.parse_args()
     run(args.config)
+
+
+if __name__ == "__main__":
+    main()

@@ -6,8 +6,8 @@
 # object_rotations and this check will refuse to run.
 #
 # Usage:
-#   bash scripts/server/check_object_convention.sh              # defaults to chairs
-#   bash scripts/server/check_object_convention.sh \
+#   bash scripts/checks/check_object_convention.sh              # defaults to chairs
+#   bash scripts/checks/check_object_convention.sh \
 #        --data-dir /media/.../InterAct/piano/imhd \
 #        --mesh-dir /media/.../InterAct/InterAct/imhd/objects
 set -euo pipefail

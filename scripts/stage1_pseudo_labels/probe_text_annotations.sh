@@ -5,7 +5,7 @@
 # Output: runs/checks/text_annotations/<ts>/{summary.json,preview.md}
 #
 # Usage:
-#   bash scripts/server/probe_text_annotations.sh
+#   bash scripts/stage1_pseudo_labels/probe_text_annotations.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

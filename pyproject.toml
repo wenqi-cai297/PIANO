@@ -28,21 +28,33 @@ viz = ["matplotlib", "open3d"]
 dev = ["pytest"]
 
 [project.scripts]
-piano-train = "piano.training.trainer:main"
-piano-eval = "piano.evaluation.motion_metrics:main"
+# --- Training (one per pipeline stage) ---
+piano-train = "piano.training.trainer:main"             # generic single-stage wrapper
+piano-train-predictor = "piano.training.train_predictor:main"   # Stage A
+piano-train-generator = "piano.training.train_generator:main"   # Stage B
+piano-train-joint = "piano.training.train_joint:main"           # Stage C
+
+# --- Inference / generation / visualisation ---
 piano-generate = "piano.inference.generate:main"
+piano-visualize-motion = "piano.inference.visualize_motion:main"
+piano-visualize-pseudo-labels = "piano.inference.visualize_pseudo_labels:main"
+
+# --- Evaluation ---
+piano-eval = "piano.evaluation.motion_metrics:main"
+
+# --- Data preprocessing + pseudo-label extraction ---
+piano-preprocess-omomo = "piano.data.preprocess_omomo:main"
+piano-preprocess-interact = "piano.data.preprocess_interact:main"
 piano-pseudo-labels = "piano.data.pseudo_labels.run_all:main"
+
+# --- Sanity checks / probes / sweeps ---
 piano-check-momask = "piano.checks.momask_weights:main"
 piano-check-omomo = "piano.checks.omomo_format:main"
 piano-check-interact = "piano.checks.interact_format:main"
-piano-preprocess-omomo = "piano.data.preprocess_omomo:main"
-piano-preprocess-interact = "piano.data.preprocess_interact:main"
 piano-check-hoi-dataset = "piano.checks.hoi_dataset:main"
-piano-smoke-test = "piano.checks.inference_smoke_test:main"
-piano-visualize-motion = "piano.inference.visualize_motion:main"
-piano-visualize-pseudo-labels = "piano.inference.visualize_pseudo_labels:main"
-piano-sample-by-keyword = "piano.checks.sample_seq_by_keyword:main"
 piano-check-object-convention = "piano.checks.object_convention:main"
+piano-smoke-test = "piano.checks.inference_smoke_test:main"
+piano-sample-by-keyword = "piano.checks.sample_seq_by_keyword:main"
 piano-pseudo-label-stats = "piano.checks.pseudo_label_stats:main"
 piano-threshold-sweep = "piano.checks.threshold_sweep:main"
 piano-action-segment-sweep = "piano.checks.action_segment_sweep:main"

@@ -3,8 +3,8 @@
 # Verifies the full generation pipeline runs cleanly before investing in training.
 #
 # Usage:
-#   bash scripts/server/inference_smoke_test.sh
-#   bash scripts/server/inference_smoke_test.sh --num-samples 8 --device cuda
+#   bash scripts/checks/inference_smoke_test.sh
+#   bash scripts/checks/inference_smoke_test.sh --num-samples 8 --device cuda
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

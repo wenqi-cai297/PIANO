@@ -67,7 +67,7 @@ class HOIDataset(Dataset):
     num_object_points : subsample object point cloud to this size
     use_clean_metadata : if True and ``root/metadata_clean.json`` exists,
         load that instead of ``root/metadata.json``. The cleaned version
-        is produced by ``scripts/data/clean_pseudo_labels.py`` and drops
+        is produced by ``scripts/stage1_pseudo_labels/clean_pseudo_labels.py`` and drops
         sequences whose pseudo-labels are unusable or contradict the
         text description. Default True so training naturally uses the
         filtered set once it exists; set False to train on the raw set.

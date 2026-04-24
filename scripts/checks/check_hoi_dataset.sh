@@ -2,8 +2,8 @@
 # Verify HOIDataset can load preprocessed OMOMO data.
 #
 # Usage:
-#   bash scripts/server/check_hoi_dataset.sh
-#   bash scripts/server/check_hoi_dataset.sh --data-dir /custom/path
+#   bash scripts/checks/check_hoi_dataset.sh
+#   bash scripts/checks/check_hoi_dataset.sh --data-dir /custom/path
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

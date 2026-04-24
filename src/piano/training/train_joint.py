@@ -249,8 +249,13 @@ def run(config_path: str) -> None:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI entry point for ``piano-train-joint`` (Stage C)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/training/joint_finetune.yaml")
     args = parser.parse_args()
     run(args.config)
+
+
+if __name__ == "__main__":
+    main()

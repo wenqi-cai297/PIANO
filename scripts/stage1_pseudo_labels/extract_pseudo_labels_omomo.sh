@@ -8,8 +8,8 @@
 #   output-dir:  /media/gpu-server-1/4TB_for_data/Cai/datasets/omomo/piano/pseudo_labels
 #
 # Usage:
-#   bash scripts/data/extract_pseudo_labels_omomo.sh
-#   bash scripts/data/extract_pseudo_labels_omomo.sh --data-dir X --mesh-dir Y --output-dir Z
+#   bash scripts/stage1_pseudo_labels/extract_pseudo_labels_omomo.sh
+#   bash scripts/stage1_pseudo_labels/extract_pseudo_labels_omomo.sh --data-dir X --mesh-dir Y --output-dir Z
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

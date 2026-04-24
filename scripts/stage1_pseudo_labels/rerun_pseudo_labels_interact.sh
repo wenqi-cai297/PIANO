@@ -10,9 +10,9 @@
 #   3. Run pseudo_labels.run_all fresh for every subset.
 #
 # Usage (on server):
-#   bash scripts/data/rerun_pseudo_labels_interact.sh
-#   bash scripts/data/rerun_pseudo_labels_interact.sh chairs       # one subset
-#   TMUX_SESSION=my-run bash scripts/data/rerun_pseudo_labels_interact.sh
+#   bash scripts/stage1_pseudo_labels/rerun_pseudo_labels_interact.sh
+#   bash scripts/stage1_pseudo_labels/rerun_pseudo_labels_interact.sh chairs       # one subset
+#   TMUX_SESSION=my-run bash scripts/stage1_pseudo_labels/rerun_pseudo_labels_interact.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -24,7 +24,7 @@ SUBSETS=("chairs" "imhd" "neuraldome" "omomo_correct_v2")
 # this script from inside a tmux session, auto-killing "piano-labels"
 # would frequently be the same session hosting the script. Only clean
 # up a session when the caller explicitly names one to clean up, e.g.
-#   TMUX_SESSION=old-piano-labels bash scripts/data/rerun_pseudo_labels_interact.sh
+#   TMUX_SESSION=old-piano-labels bash scripts/stage1_pseudo_labels/rerun_pseudo_labels_interact.sh
 TMUX_SESSION="${TMUX_SESSION:-}"
 BACKUP_SUFFIX="$(date +%Y%m%d_%H%M%S)_pre_fps_fix"
 
