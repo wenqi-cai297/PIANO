@@ -4,7 +4,9 @@ Trains the predictor to map (text, object, init_pose) → interaction latent,
 supervised by pseudo-labels extracted from HOI data.
 
 Usage:
-    accelerate launch -m piano.training.train_predictor --config configs/training/predictor.yaml
+    accelerate launch --config_file configs/accelerate_config.yaml \\
+        -m piano.training.train_predictor \\
+        --config configs/training/predictor.yaml
 """
 from __future__ import annotations
 
@@ -16,19 +18,108 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
-from piano.data.dataset import HOIDataset, collate_hoi
+from piano.data.dataset import (
+    AugmentConfig,
+    HOIDataset,
+    build_object_split,
+    collate_hoi,
+)
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.losses import PredictorLoss
 from piano.training.priors import PhysicalPriors
 from piano.training.trainer import (
-    build_optimizer,
+    build_optimizer_with_decay_groups,
     build_scheduler,
     run_training_loop,
 )
 from piano.utils.clip_utils import encode_text_per_token, load_clip_text_encoder
+from piano.utils.io_utils import load_json
+
+
+# ---------------------------------------------------------------------------
+# Dataset assembly
+# ---------------------------------------------------------------------------
+
+def _collect_object_ids(roots: list) -> list[str]:
+    """Collect the union of object_ids across all dataset roots.
+
+    Reads each root's ``metadata_clean.json`` (or ``metadata.json``
+    fallback — the clean variant is what HOIDataset prefers at train
+    time, so the split should be computed on the same universe). Returns
+    object_ids sorted for deterministic iteration across processes.
+    """
+    from pathlib import Path
+
+    seen: set[str] = set()
+    for entry in roots:
+        root = Path(entry.root)
+        meta_path = root / "metadata_clean.json"
+        if not meta_path.exists():
+            meta_path = root / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"metadata not found in {root}")
+        for m in load_json(meta_path):
+            obj_id = m.get("object_id")
+            if obj_id is not None:
+                seen.add(obj_id)
+    return sorted(seen)
+
+
+def _build_dataset(cfg) -> ConcatDataset:
+    """Build the Stage A training dataset from 4 InterAct subset roots.
+
+    Applies the object-id split (H5) so Stage A trains only on the
+    ``train`` bucket of objects; ``val`` / ``test`` objects are held
+    out for post-training evaluation.
+    """
+    # Object-id split — deterministic hash, identical across ranks.
+    split_cfg = cfg.data.object_split
+    allowed_object_ids: set[str] | None = None
+    if split_cfg.enabled:
+        object_ids = _collect_object_ids(cfg.data.datasets)
+        splits = build_object_split(
+            object_ids,
+            train_pct=split_cfg.train_pct,
+            val_pct=split_cfg.val_pct,
+            test_pct=split_cfg.test_pct,
+            seed=split_cfg.seed,
+        )
+        bucket = split_cfg.get("split", "train")
+        if bucket not in ("train", "val", "test", "all"):
+            raise ValueError(f"unknown object_split.split: {bucket!r}")
+        if bucket != "all":
+            allowed_object_ids = splits[bucket]
+
+    # Augmentation — mirror + Y-rotation + pc jitter (Stage A only).
+    aug_cfg = cfg.data.get("augmentation", None)
+    augment = None
+    if aug_cfg is not None and aug_cfg.get("enabled", False):
+        augment = AugmentConfig(
+            enabled=True,
+            mirror_prob=float(aug_cfg.get("mirror_prob", 0.0)),
+            rotate_around_y_prob=float(aug_cfg.get("rotate_around_y_prob", 0.0)),
+            pc_jitter_std=float(aug_cfg.get("pc_jitter_std", 0.0)),
+        )
+
+    # Per-subset HOIDataset instances, concatenated. pseudo_label_dir
+    # defaults to <root>/pseudo_labels inside HOIDataset when the top-
+    # level config leaves it null — matching the v9 per-subset layout.
+    pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    datasets = []
+    for entry in cfg.data.datasets:
+        ds = HOIDataset(
+            root=entry.root,
+            pseudo_label_dir=pseudo_label_dir,
+            max_seq_length=cfg.data.max_seq_length,
+            object_id_filter=allowed_object_ids,
+            augment=augment,
+        )
+        datasets.append(ds)
+
+    return ConcatDataset(datasets)
 
 
 # ---------------------------------------------------------------------------
@@ -42,14 +133,24 @@ def build_predictor_step_fn(
     criterion: PredictorLoss,
     priors: PhysicalPriors,
     device: torch.device,
+    prior_warmup_steps: int = 0,
 ):
     """Build the step function for predictor training.
 
-    Returns a callable(model_unused, batch) -> loss_dict. The actual
-    models are captured in the closure.
+    The returned callable takes (model, batch, global_step=...) and
+    returns a loss dict. ``global_step`` is the optimizer-step counter
+    fed in by ``run_training_loop`` — we use it to linearly ramp the
+    physical prior contribution from 0 to full weight over the first
+    ``prior_warmup_steps`` calls (PhysDiff / CG-HOI convention).
     """
-    def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
-        # Text: CLIP per-token features + padding mask
+    def step_fn(
+        _model: nn.Module,
+        batch: dict,
+        global_step: int = 0,
+    ) -> dict[str, Tensor]:
+        # Text: CLIP per-token features + padding mask. Returned in
+        # CLIP's native dtype (typically fp16 on GPU); the bf16 autocast
+        # context handles casting through the predictor's Linear layers.
         text_features, text_mask = encode_text_per_token(
             clip_model, batch["text"], device,
         )
@@ -90,11 +191,21 @@ def build_predictor_step_fn(
             mask=frame_mask,
         )
 
-        # Physical prior regularization
+        # Physical prior regularization, linearly warmed up from 0. On
+        # a random-init predictor, prior gradients would otherwise
+        # dominate the first few hundred steps and pull the model away
+        # from fitting the pseudo-labels. Ramping lets the data fit lead.
         joints = batch.get("joints")
         prior_dict = priors(pred, joints=joints, mask=frame_mask)
+        if prior_warmup_steps > 0:
+            prior_scale = min(1.0, float(global_step) / float(prior_warmup_steps))
+        else:
+            prior_scale = 1.0
         loss_dict["loss_priors"] = prior_dict["loss"]
-        loss_dict["loss"] = loss_dict["loss"] + prior_dict["loss"]
+        loss_dict["prior_scale"] = torch.tensor(
+            prior_scale, device=prior_dict["loss"].device,
+        )
+        loss_dict["loss"] = loss_dict["loss"] + prior_scale * prior_dict["loss"]
 
         return loss_dict
 
@@ -143,7 +254,17 @@ def run(config_path: str) -> None:
         feature_dim=obj_cfg.pointnet.feature_dim,
     )
 
-    # CLIP text encoder (frozen)
+    # SyncBatchNorm on the object encoder under multi-GPU DDP. The
+    # PointNet++ SA layers use BatchNorm1d; per-rank running stats
+    # would otherwise diverge across A6000 cards. Only valid when
+    # there is actually more than one process — the in-place conversion
+    # inserts collective comms that fail on single-GPU runs.
+    if accelerator.num_processes > 1:
+        object_encoder = nn.SyncBatchNorm.convert_sync_batchnorm(object_encoder)
+
+    # CLIP text encoder (frozen). Kept OUT of accelerator.prepare() so
+    # it doesn't get wrapped by DDP — it has no trainable parameters.
+    # HF Accelerate's recommended pattern for frozen sub-modules.
     clip_model = load_clip_text_encoder(
         device=device,
         model_name=cfg.model.get("text_encoder", "ViT-B/32"),
@@ -155,6 +276,7 @@ def run(config_path: str) -> None:
         target_weight=cfg.loss.target_weight,
         phase_weight=cfg.loss.phase_weight,
         support_weight=cfg.loss.support_weight,
+        label_smoothing=cfg.loss.get("label_smoothing", 0.0),
     )
     priors = PhysicalPriors(
         reachability_weight=cfg.priors.reachability_weight,
@@ -163,22 +285,35 @@ def run(config_path: str) -> None:
         phase_monotonicity_weight=cfg.priors.phase_monotonicity_weight,
     )
 
-    # Data
-    dataset = HOIDataset(
-        root=cfg.data.datasets[0].root,
-        pseudo_label_dir=cfg.data.pseudo_label_dir,
-        max_seq_length=cfg.data.max_seq_length,
+    # Data — multi-root ConcatDataset + object-id split + augmentation.
+    dataset = _build_dataset(cfg)
+    accelerator.print(
+        f"Dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
+        f"(split={cfg.data.object_split.get('split', 'train')})",
     )
     dataloader = DataLoader(
         dataset, batch_size=cfg.training.batch_size,
         shuffle=True, collate_fn=collate_hoi, num_workers=4,
+        pin_memory=True, drop_last=True,
     )
 
-    # Optimizer & scheduler (over trainable modules only — CLIP is frozen)
-    params = list(predictor.parameters()) + list(object_encoder.parameters())
-    optimizer = build_optimizer(params, lr=cfg.training.optimizer.lr)
-    total_steps = len(dataloader) * cfg.training.num_epochs
-    scheduler = build_scheduler(optimizer, cfg.training.scheduler.warmup_steps, total_steps)
+    # Optimizer: AdamW with ViT/T5-style weight-decay groups (no decay
+    # on biases, LayerNorm / BatchNorm weights, positional embeddings).
+    optimizer = build_optimizer_with_decay_groups(
+        modules=[predictor, object_encoder],
+        lr=cfg.training.optimizer.lr,
+        weight_decay=cfg.training.optimizer.weight_decay,
+        betas=tuple(cfg.training.optimizer.betas),
+    )
+    # Scheduler total_steps measured in optimizer steps — Accelerate's
+    # prepared scheduler handles the accumulation skip, so we feed it
+    # (len(dataloader) / accum) × epochs.
+    accum = cfg.training.gradient_accumulation_steps
+    steps_per_epoch = max(1, len(dataloader) // accum)
+    total_steps = steps_per_epoch * cfg.training.num_epochs
+    scheduler = build_scheduler(
+        optimizer, cfg.training.scheduler.warmup_steps, total_steps,
+    )
 
     # Prepare trainables with accelerator
     predictor, object_encoder, optimizer, dataloader, scheduler = accelerator.prepare(
@@ -187,6 +322,7 @@ def run(config_path: str) -> None:
 
     step_fn = build_predictor_step_fn(
         predictor, object_encoder, clip_model, criterion, priors, device,
+        prior_warmup_steps=cfg.priors.get("prior_warmup_steps", 0),
     )
 
     # Wandb (optional)

@@ -36,6 +36,7 @@ class PredictorLoss(nn.Module):
         phase_weight: float = 0.5,
         support_weight: float = 0.5,
         contact_threshold: float = 0.5,
+        label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -43,6 +44,13 @@ class PredictorLoss(nn.Module):
         self.phase_weight = phase_weight
         self.support_weight = support_weight
         self.contact_threshold = contact_threshold
+        # Label smoothing on phase / support CE (ViT / T5 / PointNeXt /
+        # MoMask convention). Pseudo-labels are ~10% noisy; smoothing
+        # stops the model from over-confidently fitting the noise.
+        # Applied only to the integer-label CE terms; contact BCE on
+        # soft labels and target KL on soft distributions are already
+        # "soft" and don't benefit from smoothing.
+        self.label_smoothing = label_smoothing
 
     def forward(
         self,
@@ -79,20 +87,22 @@ class PredictorLoss(nn.Module):
             pred_target_log, gt_target, reduction="none",
         ).sum(dim=-1)  # (B, T, 5)
 
-        # Phase: CE on integer labels
+        # Phase: CE on integer labels (with optional label smoothing)
         B, T, P = pred["phase_logits"].shape
         loss_phase = F.cross_entropy(
             pred["phase_logits"].reshape(-1, P),
             gt_phase.reshape(-1),
             reduction="none",
+            label_smoothing=self.label_smoothing,
         ).reshape(B, T)  # (B, T)
 
-        # Support: CE on integer labels
+        # Support: CE on integer labels (with optional label smoothing)
         S = pred["support_logits"].shape[-1]
         loss_support = F.cross_entropy(
             pred["support_logits"].reshape(-1, S),
             gt_support.reshape(-1),
             reduction="none",
+            label_smoothing=self.label_smoothing,
         ).reshape(B, T)  # (B, T)
 
         # Build frame mask and contact gate

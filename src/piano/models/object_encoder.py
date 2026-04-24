@@ -138,8 +138,12 @@ class SetAbstractionLayer(nn.Module):
         M = new_xyz.shape[1]
         S = min(self.num_samples, N)
 
-        # Pairwise distances: (B, M, N)
-        dists = torch.cdist(new_xyz, xyz)
+        # Pairwise distances: (B, M, N). ``torch.cdist`` is numerically
+        # unstable under bf16 — ball-query neighbor sets near the
+        # radius boundary get randomized when two close points differ
+        # by less than bf16's precision. Force fp32 for the distance
+        # computation and cast back for indexing / gathering.
+        dists = torch.cdist(new_xyz.float(), xyz.float()).to(new_xyz.dtype)
 
         dists_sorted, idx_sorted = dists.sort(dim=-1)
         idx_sorted = idx_sorted[:, :, :S]  # (B, M, S)

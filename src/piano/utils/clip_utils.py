@@ -37,8 +37,12 @@ def encode_text_per_token(
 
     Returns
     -------
-    features : (B, 77, D) float32 — per-token features. D is the CLIP
-        text transformer width (512 for ViT-B/32).
+    features : (B, 77, D) — per-token features in CLIP's native dtype
+        (typically fp16 on GPU). The downstream Linear layer in the
+        predictor runs under bf16 autocast, which casts inputs as
+        needed; forcing ``.float()`` here would have triggered an
+        unnecessary fp32 path and lost the autocast efficiency.
+        D is the CLIP text transformer width (512 for ViT-B/32).
     key_padding_mask : (B, 77) bool — True where the position is past
         each row's EOT (MultiheadAttention's ``key_padding_mask`` convention).
     """
@@ -59,7 +63,7 @@ def encode_text_per_token(
     positions = torch.arange(token_ids.shape[1], device=device)
     key_padding_mask = positions.unsqueeze(0) > eot_pos.unsqueeze(1)
 
-    return x.float(), key_padding_mask
+    return x, key_padding_mask
 
 
 def load_clip_text_encoder(

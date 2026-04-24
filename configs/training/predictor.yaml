@@ -1,24 +1,68 @@
-# Stage A: Interaction Predictor training config
+# Stage A: Interaction Predictor training config.
+#
+# Hardware target: 2 × NVIDIA A6000 (48 GB each), bf16, Accelerate DDP.
+# Effective batch per optimizer step = per_gpu (32) × num_gpu (2) × accum (2) = 128.
+# Dataset: v9 InterAct pseudo-labels, 4 subsets, 8108 clean clips.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_predictor --config configs/training/predictor.yaml
 
 model:
   config: configs/model/interaction_predictor.yaml
   object_encoder_config: configs/model/object_encoder.yaml
-  text_encoder: "ViT-B/32"  # matching MoMask's CLIP model
+  text_encoder: "ViT-B/32"     # matching MoMask's CLIP model
   freeze_text_encoder: true
 
 data:
+  # 4-subset InterAct roots. Each root holds metadata.json /
+  # metadata_clean.json / motions/ / objects/ / pseudo_labels/.
+  # Adjust paths when running on the server.
   datasets:
-    - name: "interact"
-      root: "data/interact"
-    - name: "omomo"
-      root: "data/omomo"
-  pseudo_label_dir: "runs/pseudo_labels"
-  motion_repr: "humanml3d"    # 263-dim (HumanML3D encoder output)
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  # Null ⇒ per-subset default <root>/pseudo_labels. HOIDataset auto-
+  # prefers <root>/metadata_clean.json (v9) over metadata.json.
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"       # 263-dim (HumanML3D encoder output)
   max_seq_length: 196
-  fps: 20                      # InterAct preprocessed data rate
+  fps: 20                        # InterAct preprocessed data rate
+
+  # Object-id split (H5). Deterministic hash on object_id assigns each
+  # of the 106 unique objects to train/val/test. Stage A trains on
+  # `train` only; `val`/`test` objects are held out for post-training
+  # evaluation (H4 val loop lands after Stage A completes).
+  object_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"               # train | val | test | all
+
+  # Data augmentation (Stage A only). Applied inside HOIDataset
+  # __getitem__ before returning. Each is independent; all three are
+  # pseudo-label-safe because labels were extracted in object-local
+  # frame and are therefore invariant to (a) human world-frame
+  # rotation around up-axis, (b) L/R mirror (with channel swap),
+  # (c) small object-point-cloud jitter.
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5             # left-right mirror via world-x flip
+    rotate_around_y_prob: 1.0    # random θ ∈ [-π, π] around world Y
+    pc_jitter_std: 0.005         # meters, Gaussian noise on object PC
 
 training:
-  batch_size: 64
+  # per-GPU batch size. A6000 48 GB has ample headroom for 32-64 at
+  # d=384, L=10, T=196 + 77 text tokens + 128 object tokens. Start
+  # conservative; can bump after a 10-step dry run confirms memory.
+  batch_size: 32
   num_epochs: 100
   optimizer:
     name: "adamw"
@@ -27,25 +71,45 @@ training:
     betas: [0.9, 0.999]
   scheduler:
     name: "cosine"
-    warmup_steps: 1000
+    # 200 steps ≈ 6% of total steps (8108 clips / effective-batch 128
+    # ≈ 63 steps per epoch × 100 epochs = ~6300 total; target 3-6%
+    # warmup per ViT / PointNeXt / MLD conventions).
+    warmup_steps: 200
   gradient_accumulation_steps: 2
   max_grad_norm: 1.0
 
 loss:
-  contact_weight: 1.0
-  target_weight: 0.5
-  phase_weight: 0.5
-  support_weight: 0.5
+  # Weights rebalanced by expected initial-loss magnitude so the
+  # contact signal (our most-informative supervision) dominates early
+  # training. Unweighted initial values: BCE(contact) ≈ 0.69,
+  # KL(target, K=16) ≈ 2.77, CE(phase, 5) ≈ 1.61, CE(support, 4) ≈ 1.39.
+  # Weighted: contact 1.38, target 0.55, phase 0.48, support 0.14.
+  contact_weight: 2.0
+  target_weight: 0.2
+  phase_weight: 0.3
+  support_weight: 0.1
+  # Label smoothing on phase + support CE. Pseudo-labels are ~10%
+  # noisy (v9 cleaning reason-counts); label_smoothing=0.1 is the
+  # ViT / T5 / PointNeXt / MoMask convention.
+  label_smoothing: 0.1
 
 priors:
-  reachability_weight: 0.1
+  # Physical prior weights. reachability is disabled until the loss
+  # is reimplemented correctly (current version measures arm length
+  # ‖wrist − shoulder‖ — rotation-invariant and nearly constant, so
+  # the violation term is ~always 0 and the prior is inert).
+  # Other three priors linearly ramp from 0 to full weight over
+  # `prior_warmup_steps` forward calls (≈ 250 optimizer steps at
+  # accumulation=2) per PhysDiff / CG-HOI convention.
+  reachability_weight: 0.0
   contact_persistence_weight: 0.1
   support_smoothness_weight: 0.05
   phase_monotonicity_weight: 0.05
+  prior_warmup_steps: 500
 
 logging:
   project: "piano"
-  run_name: "predictor"
+  run_name: "predictor_stageA_v9"
   log_every_n_steps: 50
   save_every_n_epochs: 10
 

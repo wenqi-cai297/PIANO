@@ -6,6 +6,10 @@ the interaction predictor and motion generator.
 """
 from __future__ import annotations
 
+import hashlib
+import math
+import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +40,94 @@ class HOISample:
     support: np.ndarray | None = None          # (T,) int
 
     seq_len: int = 0                # actual sequence length before padding
+
+
+# ---------------------------------------------------------------------------
+# SMPL-22 left/right joint pairs for mirror augmentation
+# ---------------------------------------------------------------------------
+
+# (left_idx, right_idx) pairs. Pelvis (0), spines (3/6/9), neck (12), head
+# (15) are midline and don't swap.
+_SMPL22_LR_PAIRS: tuple[tuple[int, int], ...] = (
+    (1, 2),   # hip
+    (4, 5),   # knee
+    (7, 8),   # ankle
+    (10, 11), # foot (mid-foot)
+    (13, 14), # collar
+    (16, 17), # shoulder
+    (18, 19), # elbow
+    (20, 21), # wrist
+)
+
+# Body-part indices in contact_state / contact_target (see
+# piano.utils.smpl_utils.INTERACTION_BODY_PARTS): 0=L_hand, 1=R_hand,
+# 2=L_foot, 3=R_foot, 4=pelvis. Mirror swaps 0↔1 and 2↔3.
+_BODY_PART_LR_PAIRS: tuple[tuple[int, int], ...] = ((0, 1), (2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Object-id split (H5)
+# ---------------------------------------------------------------------------
+
+def build_object_split(
+    object_ids: list[str],
+    train_pct: int = 85,
+    val_pct: int = 8,
+    test_pct: int = 7,
+    seed: int = 42,
+) -> dict[str, set[str]]:
+    """Deterministically assign each object_id to train / val / test.
+
+    Uses md5(seed || obj_id) % 100 so the split is reproducible across
+    processes (no global state), stable under object-id additions, and
+    does not require a pre-shuffled list. All processes in DDP end up
+    with the same split without having to broadcast it.
+
+    Parameters
+    ----------
+    object_ids : unique object ids across all subsets.
+    train_pct / val_pct / test_pct : must sum to 100.
+    seed : changes the hash salt, shuffles the assignment.
+
+    Returns
+    -------
+    dict with keys "train" / "val" / "test" → set of object_ids.
+    """
+    if train_pct + val_pct + test_pct != 100:
+        raise ValueError(
+            f"train_pct + val_pct + test_pct must sum to 100, "
+            f"got {train_pct + val_pct + test_pct}",
+        )
+
+    train: set[str] = set()
+    val: set[str] = set()
+    test: set[str] = set()
+    for obj_id in object_ids:
+        # Salted hash — seed=0 gives a different split than seed=42 etc.
+        h = hashlib.md5(f"{seed}::{obj_id}".encode("utf-8")).hexdigest()[:8]
+        bucket = int(h, 16) % 100
+        if bucket < train_pct:
+            train.add(obj_id)
+        elif bucket < train_pct + val_pct:
+            val.add(obj_id)
+        else:
+            test.add(obj_id)
+    return {"train": train, "val": val, "test": test}
+
+
+# ---------------------------------------------------------------------------
+# Augmentation config
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class AugmentConfig:
+    """Stage A data augmentation. All augmentations preserve the
+    pseudo-label validity — see design notes in predictor.yaml."""
+
+    enabled: bool = False
+    mirror_prob: float = 0.0
+    rotate_around_y_prob: float = 0.0
+    pc_jitter_std: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +163,13 @@ class HOIDataset(Dataset):
         sequences whose pseudo-labels are unusable or contradict the
         text description. Default True so training naturally uses the
         filtered set once it exists; set False to train on the raw set.
+    object_id_filter : optional set of object_ids. When provided, only
+        metadata entries whose object_id is in the set are retained —
+        used by the H5 train/val/test split.
+    augment : optional AugmentConfig. When ``augment.enabled`` is True,
+        each __getitem__ randomly applies (mirror, rotate around Y, pc
+        jitter) per the config probabilities. Disabled by default so
+        the dataset class is reusable for eval / inference.
     """
 
     def __init__(
@@ -80,10 +179,13 @@ class HOIDataset(Dataset):
         max_seq_length: int = 196,
         num_object_points: int = 1024,
         use_clean_metadata: bool = True,
+        object_id_filter: set[str] | None = None,
+        augment: AugmentConfig | None = None,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
         self.num_object_points = num_object_points
+        self.augment = augment or AugmentConfig()
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -99,7 +201,14 @@ class HOIDataset(Dataset):
             meta_path = self.root / "metadata.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"metadata not found in {self.root}")
-        self.metadata: list[dict] = load_json(meta_path)
+        metadata: list[dict] = load_json(meta_path)
+
+        # Object-id split filter (H5). Drops metadata entries whose
+        # object_id is not in the allowed set.
+        if object_id_filter is not None:
+            metadata = [m for m in metadata if m.get("object_id") in object_id_filter]
+
+        self.metadata = metadata
         self.metadata_source = meta_path.name
 
         # Pseudo-label directory
@@ -144,22 +253,31 @@ class HOIDataset(Dataset):
         if object_positions is not None:
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
 
+        padded_labels: dict[str, np.ndarray] = {}
+        for key in ("contact_state", "contact_target", "phase", "support"):
+            if labels.get(key) is not None:
+                padded_labels[key] = self._pad_or_truncate(labels[key], self.max_seq_length)
+
+        text = meta.get("text", "")
+
+        # --- Augment (training only; disabled by default) ---
+        if self.augment.enabled:
+            joints, object_pc, text, padded_labels = self._apply_augmentation(
+                joints, object_pc, text, padded_labels,
+            )
+
         # --- Build output dict ---
         result: dict[str, torch.Tensor] = {
             "motion": torch.from_numpy(motion),
             "joints": torch.from_numpy(joints),
             "object_pc": torch.from_numpy(object_pc),
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
-            "text": meta.get("text", ""),
+            "text": text,
         }
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
-
-        # Add pseudo-labels if present
-        for key in ("contact_state", "contact_target", "phase", "support"):
-            if labels.get(key) is not None:
-                padded = self._pad_or_truncate(labels[key], self.max_seq_length)
-                result[key] = torch.from_numpy(padded)
+        for key, arr in padded_labels.items():
+            result[key] = torch.from_numpy(arr)
 
         return result
 
@@ -205,6 +323,83 @@ class HOIDataset(Dataset):
 
         return result
 
+    # -------------------------------------------------------------------
+    # Augmentation
+    # -------------------------------------------------------------------
+
+    def _apply_augmentation(
+        self,
+        joints: np.ndarray,             # (T, 22, 3)
+        object_pc: np.ndarray,          # (N, 3)
+        text: str,
+        labels: dict[str, np.ndarray],  # may contain contact_state, contact_target, phase, support
+    ) -> tuple[np.ndarray, np.ndarray, str, dict[str, np.ndarray]]:
+        """Apply mirror / Y-rotation / pc-jitter augmentations.
+
+        All three are pseudo-label-safe because labels were extracted in
+        object-local frame (rotation-invariant w.r.t. world heading) and
+        mirror only swaps L/R channels on human-side arrays.
+        """
+        # 1. Left-right mirror. Flips world-x, swaps SMPL L/R joint
+        #    pairs, swaps L/R body-part channels in contact_state /
+        #    contact_target, swaps 'left' ↔ 'right' in text. Object
+        #    point cloud is in object-local frame (no L/R structure
+        #    the label space knows about), so we leave it alone.
+        #    Phase / support are L/R-agnostic.
+        if self.augment.mirror_prob > 0 and random.random() < self.augment.mirror_prob:
+            joints = joints.copy()
+            joints[:, :, 0] *= -1.0
+            # Swap L/R joint pairs
+            for li, ri in _SMPL22_LR_PAIRS:
+                tmp = joints[:, li, :].copy()
+                joints[:, li, :] = joints[:, ri, :]
+                joints[:, ri, :] = tmp
+
+            if "contact_state" in labels:
+                cs = labels["contact_state"].copy()
+                for li, ri in _BODY_PART_LR_PAIRS:
+                    tmp = cs[:, li].copy()
+                    cs[:, li] = cs[:, ri]
+                    cs[:, ri] = tmp
+                labels["contact_state"] = cs
+
+            if "contact_target" in labels:
+                ct = labels["contact_target"].copy()
+                for li, ri in _BODY_PART_LR_PAIRS:
+                    tmp = ct[:, li, :].copy()
+                    ct[:, li, :] = ct[:, ri, :]
+                    ct[:, ri, :] = tmp
+                labels["contact_target"] = ct
+
+            text = _swap_left_right_in_text(text)
+
+        # 2. Random rotation around world Y (up axis). Rotates every
+        #    joint frame by the same θ. Labels are rotation-invariant
+        #    (object-local frame). Object PC in object-local frame is
+        #    untouched.
+        if (
+            self.augment.rotate_around_y_prob > 0
+            and random.random() < self.augment.rotate_around_y_prob
+        ):
+            theta = random.uniform(-math.pi, math.pi)
+            c, s = math.cos(theta), math.sin(theta)
+            # R @ v for v = (x, y, z):  (c x + s z, y, -s x + c z)
+            x = joints[..., 0]
+            z = joints[..., 2]
+            new_x = c * x + s * z
+            new_z = -s * x + c * z
+            joints = joints.copy()
+            joints[..., 0] = new_x
+            joints[..., 2] = new_z
+
+        # 3. Small Gaussian jitter on the object point cloud. PointNeXt
+        #    training recipe. Label-independent.
+        if self.augment.pc_jitter_std > 0:
+            noise = np.random.randn(*object_pc.shape).astype(np.float32)
+            object_pc = object_pc + self.augment.pc_jitter_std * noise
+
+        return joints, object_pc, text, labels
+
 
 # ---------------------------------------------------------------------------
 # Collate function for DataLoader
@@ -224,3 +419,26 @@ def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
         result["text"] = [sample["text"] for sample in batch]
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Text L/R swap (helper for mirror augmentation)
+# ---------------------------------------------------------------------------
+
+_LEFT_RE = re.compile(r"\bleft\b", re.IGNORECASE)
+_RIGHT_RE = re.compile(r"\bright\b", re.IGNORECASE)
+_LEFT_PLACEHOLDER = "\x00LEFT\x00"
+
+
+def _swap_left_right_in_text(text: str) -> str:
+    """Case-insensitive word-level swap of 'left' ↔ 'right'.
+
+    Uses a NUL-byte placeholder to avoid the classic double-substitution
+    bug (``left → right → left`` in a single pass). Word boundaries stop
+    false positives on substrings like 'bright' or 'cleft'.
+    """
+    if not text:
+        return text
+    tmp = _LEFT_RE.sub(_LEFT_PLACEHOLDER, text)
+    tmp = _RIGHT_RE.sub("left", tmp)
+    return tmp.replace(_LEFT_PLACEHOLDER, "right")

@@ -9,6 +9,7 @@ Usage:
 """
 from __future__ import annotations
 
+import inspect
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -29,8 +30,66 @@ def build_optimizer(
     weight_decay: float = 0.01,
     betas: tuple[float, float] = (0.9, 0.999),
 ) -> AdamW:
-    """Build AdamW optimizer."""
+    """Build AdamW optimizer (single-group, decay applied uniformly).
+
+    Prefer ``build_optimizer_with_decay_groups`` when training a
+    Transformer: weight decay on LayerNorm / BatchNorm weights and
+    biases is empirically harmful (ViT, T5, GPT-2, MoMask, PointNeXt).
+    """
     return AdamW(params, lr=lr, weight_decay=weight_decay, betas=betas)
+
+
+def build_optimizer_with_decay_groups(
+    modules: list[torch.nn.Module],
+    lr: float = 1e-4,
+    weight_decay: float = 0.01,
+    betas: tuple[float, float] = (0.9, 0.999),
+) -> AdamW:
+    """AdamW with ViT/T5-style weight-decay exclusion.
+
+    Convention (Loshchilov & Hutter ICLR'19 + ViT / T5 / GPT-2 /
+    MoMask / PointNeXt): exclude LayerNorm / BatchNorm weights, biases,
+    and learned positional / time embeddings from weight decay — they
+    have no well-defined notion of magnitude-based regularisation.
+
+    We detect "no-decay" params by:
+      1. ``param.ndim <= 1`` — biases and norm weights (all 1-D).
+      2. Name ends in ``.bias``.
+      3. Name matches a positional / time / embedding convention
+         (``time_tokens``, ``pos_encoding``, ``.embed``).
+
+    Params are pooled across the provided modules (the predictor and
+    the object encoder share an optimizer).
+    """
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    def _is_no_decay(name: str, p: torch.nn.Parameter) -> bool:
+        if p.ndim <= 1:
+            return True
+        if name.endswith(".bias"):
+            return True
+        lname = name.lower()
+        if "time_tokens" in lname or "pos_encoding" in lname or ".embed" in lname:
+            return True
+        return False
+
+    for module in modules:
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            (no_decay if _is_no_decay(name, param) else decay).append(param)
+
+    param_groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return AdamW(param_groups, lr=lr, betas=betas)
 
 
 def build_scheduler(
@@ -78,6 +137,13 @@ def run_training_loop(
     output_dir = ensure_dir(output_dir)
     global_step = 0
 
+    # Backward-compatible hand-off of optimizer-step count to step_fn.
+    # New stage scripts (predictor) declare ``global_step`` so their
+    # step_fn can warm up physical priors; legacy skeletons keep the
+    # old (model, batch) signature and are invoked unchanged.
+    step_fn_params = inspect.signature(step_fn).parameters
+    pass_global_step = "global_step" in step_fn_params
+
     accelerator.print(f"Training for {num_epochs} epochs")
     accelerator.print(f"  Batches per epoch: {len(dataloader)}")
     accelerator.print(f"  Output: {output_dir}")
@@ -90,7 +156,10 @@ def run_training_loop(
         for batch in dataloader:
             with accelerator.accumulate(model):
                 # Forward + loss
-                loss_dict = step_fn(model, batch)
+                if pass_global_step:
+                    loss_dict = step_fn(model, batch, global_step=global_step)
+                else:
+                    loss_dict = step_fn(model, batch)
                 loss = loss_dict["loss"]
 
                 # Backward
