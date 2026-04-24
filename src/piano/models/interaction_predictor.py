@@ -55,6 +55,18 @@ Design notes (2026-04-25 rewrite — target head re-architected):
     * No AdaLN. With per-token text cross-attn + the [POSE] token +
       object cross-attn carrying all the conditioning, AdaLN on pooled
       summaries becomes redundant.
+
+    * **Temporal refinement** (2026-04-25, post v2 review): a
+      depthwise-separable 1D conv block applied between the
+      Transformer output and the per-frame heads. Adds explicit
+      temporal-locality inductive bias on top of full self-attention
+      — addresses the v2 failure where intra-clip predictions were
+      noisy frame-to-frame even though attention saw the full
+      sequence. Per the literature, "per-frame structured prediction
+      over long motion sequences" tasks (MS-TCN++ CVPR'20, ASFormer
+      BMVC'21, VideoPose3D CVPR'19) all use TCN or local attention
+      because pure full-self-attention lacks locality bias for
+      densely-labelled frame outputs.
 """
 from __future__ import annotations
 
@@ -155,6 +167,54 @@ class PredictorBlock(nn.Module):
 
 
 # ============================================================================
+# Temporal refinement — depthwise-separable 1D conv on the time axis
+# ============================================================================
+
+class TemporalRefineBlock(nn.Module):
+    """Pre-norm depthwise-separable 1D conv with residual.
+
+    Applied AFTER ``final_norm`` and AFTER the [POSE] token is stripped,
+    so the conv operates only on the per-frame sequence (B, T, d). The
+    output keeps shape (B, T, d) thanks to ``padding = kernel_size // 2``.
+
+    Depthwise-separable structure (Chollet, *Xception*, CVPR 2017;
+    used by VideoPose3D CVPR'19 for temporal pose refinement) splits
+    the d×d×k full conv into a (1×k) per-channel temporal pass plus
+    a (d×d×1) channel-mixing pass — same receptive field, ~k× fewer
+    params than a vanilla d×d×k conv.
+
+    For our config (d=384, k=5): depthwise has 384×5 = 1920 weights,
+    pointwise has 384×384 = 147 K. Total ~150 K params (~0.5% of the
+    main predictor), negligible.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 384,
+        kernel_size: int = 5,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.depthwise = nn.Conv1d(
+            d_model, d_model, kernel_size=kernel_size,
+            padding=kernel_size // 2, groups=d_model,
+        )
+        self.pointwise = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """x: (B, T, d) → (B, T, d). Pre-norm + residual."""
+        h = self.norm(x).transpose(1, 2)            # (B, d, T)
+        h = self.depthwise(h)
+        h = self.pointwise(h)
+        h = self.act(h)
+        h = self.drop(h)
+        return x + h.transpose(1, 2)                # (B, T, d)
+
+
+# ============================================================================
 # Full Interaction Predictor
 # ============================================================================
 
@@ -194,6 +254,10 @@ class InteractionPredictor(nn.Module):
         target_coord_dim: int = 3,
         num_phases: int = 5,
         num_support_states: int = 4,
+        # Temporal refinement (post-Transformer, pre-heads). Default on.
+        temporal_refine_enabled: bool = True,
+        temporal_refine_kernel_size: int = 5,
+        temporal_refine_dropout: float = 0.1,
         # Legacy alias: older configs pass ``num_object_patches=16``;
         # ignored since the target head is now an xyz regressor.
         num_object_patches: int | None = None,
@@ -233,6 +297,17 @@ class InteractionPredictor(nn.Module):
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
+
+        # Optional temporal refinement before the heads — gives the
+        # heads a smoothed per-frame embedding with explicit local
+        # bias. See TemporalRefineBlock docstring.
+        self.temporal_refine_enabled = temporal_refine_enabled
+        if temporal_refine_enabled:
+            self.temporal_refine = TemporalRefineBlock(
+                d_model=d_model,
+                kernel_size=temporal_refine_kernel_size,
+                dropout=temporal_refine_dropout,
+            )
 
         # Output heads — per-frame linear projections. The target head
         # regresses xyz in the object's local frame (see module docstring
@@ -303,6 +378,11 @@ class InteractionPredictor(nn.Module):
 
         # Drop [POSE] position before emitting per-frame predictions
         x = x[:, 1:, :]                                     # (B, T, d)
+
+        # Temporal refinement on the per-frame sequence (POSE token
+        # already stripped). Pre-norm + residual; preserves shape.
+        if self.temporal_refine_enabled:
+            x = self.temporal_refine(x)
 
         contact_logits = self.contact_head(x)               # (B, T, num_body_parts)
         target_xyz = self.target_head(x)                    # (B, T, num_body_parts * 3)

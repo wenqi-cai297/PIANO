@@ -164,6 +164,53 @@ def test_predictor_loss_target_gated_by_contact() -> None:
     assert out2["loss_target"].item() > 0.0
 
 
+def test_temporal_refine_present_and_changes_output() -> None:
+    """Temporal refinement (depthwise-separable 1D conv) should be wired
+    in by default and must materially change the head outputs vs the
+    no-refinement variant on the same input. Also: parameter count
+    should grow by ~150K with refinement enabled at d=64 (smaller
+    than prod's 384 but same ratio)."""
+    torch.manual_seed(0)
+    common_kwargs = dict(
+        d_model=D_MODEL, num_layers=N_LAYERS, num_heads=NUM_HEADS,
+        dim_feedforward=128, dropout=0.0, text_dim=TEXT_DIM,
+        pose_dim=66, max_seq_length=MAX_SEQ,
+        num_body_parts=N_BODY, target_coord_dim=TARGET_DIM,
+        num_phases=N_PHASE, num_support_states=N_SUPPORT,
+    )
+    pred_with = InteractionPredictor(**common_kwargs, temporal_refine_enabled=True).eval()
+    pred_without = InteractionPredictor(**common_kwargs, temporal_refine_enabled=False).eval()
+
+    assert hasattr(pred_with, "temporal_refine")
+    assert not hasattr(pred_without, "temporal_refine")
+
+    n_with = sum(p.numel() for p in pred_with.parameters())
+    n_without = sum(p.numel() for p in pred_without.parameters())
+    delta = n_with - n_without
+    # depthwise (D × k) + pointwise (D × D) + LayerNorm (2 × D)
+    expected = D_MODEL * 5 + D_MODEL * D_MODEL + D_MODEL * 2 + D_MODEL  # +bias
+    assert delta > 0, "temporal_refine must add parameters"
+    assert delta < 4 * expected, (
+        f"temporal_refine delta {delta} too large vs expected ~{expected}"
+    )
+
+    text_tokens, object_tokens, init_pose = _make_inputs(2, MAX_SEQ)
+    # Copy shared weights so the only difference is the refine block
+    with torch.no_grad():
+        pred_without.load_state_dict(
+            {k: v for k, v in pred_with.state_dict().items()
+             if not k.startswith("temporal_refine.")},
+            strict=False,
+        )
+    with torch.no_grad():
+        out_with = pred_with(text_tokens, object_tokens, init_pose, seq_length=MAX_SEQ)
+        out_without = pred_without(text_tokens, object_tokens, init_pose, seq_length=MAX_SEQ)
+    # Per-frame outputs must differ (refine is the only difference)
+    assert not torch.allclose(out_with["contact_logits"], out_without["contact_logits"]), \
+        "temporal_refine should change predictions"
+    assert not torch.allclose(out_with["contact_target_xyz"], out_without["contact_target_xyz"])
+
+
 def test_predictor_loss_focal_downweights_easy_examples() -> None:
     """Focal-weighted CE on phase/support should be ≤ naive CE when the
     model predicts confidently-correct; and should scale down the easy

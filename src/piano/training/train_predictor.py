@@ -246,6 +246,7 @@ def run(config_path: str) -> None:
     obj_cfg = OmegaConf.load(cfg.model.object_encoder_config)
 
     # Models
+    tr_cfg = model_cfg.get("temporal_refine", {})
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -259,6 +260,9 @@ def run(config_path: str) -> None:
         target_coord_dim=model_cfg.output.get("target_coord_dim", 3),
         num_phases=model_cfg.output.num_phases,
         num_support_states=model_cfg.output.num_support_states,
+        temporal_refine_enabled=bool(tr_cfg.get("enabled", True)),
+        temporal_refine_kernel_size=int(tr_cfg.get("kernel_size", 5)),
+        temporal_refine_dropout=float(tr_cfg.get("dropout", 0.1)),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,

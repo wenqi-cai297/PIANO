@@ -39,3 +39,15 @@ output:
 sequence:
   max_length: 196         # max frames (~9.8 s @ 20 fps)
   fps: 20                 # InterAct preprocessed data rate
+
+# Temporal refinement: depthwise-separable 1D conv (VideoPose3D
+# CVPR'19 style) inserted between the Transformer output and the
+# per-frame heads. Adds explicit temporal-locality inductive bias
+# on top of full self-attention. Pre-norm + residual, ~150 K params
+# at d=384 / k=5 (~0.5% of the predictor). Default on; set
+# enabled=false for ablation comparison vs the v2 architecture.
+# Reference: MS-TCN++ CVPR'20, ASFormer BMVC'21, VideoPose3D CVPR'19.
+temporal_refine:
+  enabled: true
+  kernel_size: 5          # ±2 frames = ±0.1 s @ 20 fps
+  dropout: 0.1
