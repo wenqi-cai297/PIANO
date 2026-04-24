@@ -6,10 +6,71 @@ Stage C (Joint):     predictor + generator + consistency loss
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+# ============================================================================
+# Kendall et al. CVPR 2018 — homoscedastic uncertainty multi-task weighting
+# ============================================================================
+
+class KendallTaskWeights(nn.Module):
+    """Learnable per-task log-variance weights (Kendall et al. CVPR 2018).
+
+    Total loss is::
+
+        L_total = Σ_i  exp(-s_i) · L_i  +  0.5 · s_i
+
+    where ``s_i = log σ_i^2`` is a learnable scalar per task. At
+    optimum ``∂L/∂s_i = 0`` gives ``exp(-s_i) · L_i = 0.5`` so each
+    task contributes 0.5 to the total — the optimiser automatically
+    rebalances tasks of very different scales (our problem: train
+    target loss ≈ 0.018 vs train contact loss ≈ 0.43, a 24× scale gap
+    that no fixed weight could compensate cleanly).
+
+    At init ``s_i = 0`` → all tasks are weighted ×1 (which is equal
+    to the manual unit-weight starting point). The optimiser learns
+    s_i over the first few epochs.
+
+    Reference: Kendall, Gal, Cipolla. "Multi-Task Learning Using
+    Uncertainty to Weigh Losses for Scene Geometry and Semantics."
+    CVPR 2018.
+    """
+
+    def __init__(self, task_names: tuple[str, ...]) -> None:
+        super().__init__()
+        self.task_names = tuple(task_names)
+        # One nn.Parameter per task. Stored as a flat ParameterDict so
+        # they're picked up by .parameters() and DDP synchronises them.
+        self.log_vars = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in task_names}
+        )
+
+    def forward(self, raw_losses: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor]]:
+        """Combine per-task losses with learned uncertainty weights.
+
+        Returns ``(total, log_dict)`` where log_dict carries the
+        learned weights and log-variances for wandb.
+        """
+        device = next(self.log_vars.values()).device
+        total = torch.zeros((), device=device)
+        log: dict[str, Tensor] = {}
+        for name in self.task_names:
+            if name not in raw_losses:
+                continue
+            s = self.log_vars[name]
+            li = raw_losses[name]
+            # Numerically more stable than literal exp(-s) for very
+            # negative s: clamp the exponent.
+            inv_var = torch.exp(-s.clamp(min=-10.0, max=10.0))
+            total = total + inv_var * li + 0.5 * s
+            log[f"weight_{name}"] = inv_var.detach()
+            log[f"log_var_{name}"] = s.detach()
+        return total, log
 
 
 # ============================================================================
@@ -46,6 +107,7 @@ class PredictorLoss(nn.Module):
         contact_threshold: float = 0.5,
         label_smoothing: float = 0.0,
         focal_gamma: float = 0.0,
+        use_kendall_weights: bool = False,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -59,6 +121,21 @@ class PredictorLoss(nn.Module):
         self.label_smoothing = label_smoothing
         # Focal loss gamma. 0 disables. RetinaNet default is 2.0.
         self.focal_gamma = focal_gamma
+        # Kendall et al. CVPR'18 multi-task uncertainty weighting.
+        # When True, the static {contact,target,phase,support}_weight
+        # values above are IGNORED and the optimiser learns per-task
+        # log-variances that auto-balance scale differences. v2 found
+        # that fixed weights left the target term contributing only
+        # ~2% of total gradient because target loss ≈ 0.018 while
+        # contact loss ≈ 0.43; Kendall weights remove that hand-tuning
+        # by construction.
+        self.use_kendall_weights = use_kendall_weights
+        if use_kendall_weights:
+            self.kendall = KendallTaskWeights(
+                task_names=("contact", "target", "phase", "support"),
+            )
+        else:
+            self.kendall = None
 
     @staticmethod
     def _focal_weight(logits: Tensor, gt: Tensor, gamma: float) -> Tensor:
@@ -166,12 +243,25 @@ class PredictorLoss(nn.Module):
         loss_phase = (loss_phase * frame_mask).sum() / n_frames
         loss_support = (loss_support * frame_mask).sum() / n_frames
 
-        total = (
-            self.contact_weight * loss_contact
-            + self.target_weight * loss_target
-            + self.phase_weight * loss_phase
-            + self.support_weight * loss_support
-        )
+        if self.kendall is not None:
+            # Kendall et al. CVPR'18 multi-task uncertainty weighting.
+            # Static *_weight values are ignored. The optimiser learns
+            # per-task log-variances; combined loss equalises gradient
+            # contribution by construction.
+            total, kendall_log = self.kendall({
+                "contact": loss_contact,
+                "target": loss_target,
+                "phase": loss_phase,
+                "support": loss_support,
+            })
+        else:
+            total = (
+                self.contact_weight * loss_contact
+                + self.target_weight * loss_target
+                + self.phase_weight * loss_phase
+                + self.support_weight * loss_support
+            )
+            kendall_log = {}
 
         return {
             "loss": total,
@@ -180,6 +270,7 @@ class PredictorLoss(nn.Module):
             "loss_phase": loss_phase,
             "loss_support": loss_support,
             "n_contact_frames": n_contact.detach(),
+            **kendall_log,
         }
 
 

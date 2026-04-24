@@ -64,7 +64,17 @@ class PhaseConfig:
     translational_velocity_eps: float = 0.02  # m/s
     rotational_velocity_eps: float = 0.3      # rad/s (~17 deg/s)
     contact_threshold: float = 0.5         # any body part contact score threshold
-    release_window: int = 10               # frames after contact loss to label "release"
+    # Maximum length of a single RELEASE segment, in frames. The
+    # extractor extends release from any contact-end up to either the
+    # next contact-start OR this many frames, whichever is shorter.
+    # Older v9 used 10 frames (0.5 s @ 20 fps), which produced a
+    # train-time `release` F1 ≈ 0 even after focal loss because the
+    # extractor flipped back to APPROACH after 10 frames — so the
+    # "person walking away" window was mislabelled as "approach to
+    # something". v10 raises to 9999 (effectively unbounded; release
+    # extends to next contact or end of clip), matching the GRAB
+    # ECCV'20 convention of physically-meaningful release windows.
+    release_window: int = 9999
     median_filter_size: int = 7            # temporal smoothing window
     fps: float = 30.0
 
@@ -179,12 +189,32 @@ def _mark_release(
     is_contact: np.ndarray,
     release_window: int,
 ) -> None:
-    """In-place: mark frames as RELEASE for *release_window* frames
-    after each contact→no-contact transition."""
+    """In-place: mark RELEASE from each contact-end until the next
+    contact-start (or ``release_window`` frames, whichever is shorter).
+
+    Old v9 behaviour was a fixed 10-frame window then flip-back to
+    APPROACH, which made `release` semantically incoherent: the actual
+    departure (the person walking away) was labelled as "approach to
+    something" past the 10-frame mark. The model could therefore not
+    learn `release` at all — F1 ≈ 0 even on the training set after
+    focal loss in v2.
+
+    With ``release_window`` set high (default 9999), this version
+    extends RELEASE to cover the entire post-contact period, matching
+    the GRAB ECCV'20 labelling convention of physically-meaningful
+    release windows. Multi-cycle clips lose some "approach to second
+    grab" annotation in exchange — accepted, single-cycle clips
+    dominate InterAct.
+    """
     T = len(phase)
-    contact_diff = np.diff(is_contact.astype(np.int8), prepend=0)
-    release_starts = np.where(contact_diff == -1)[0]  # contact just ended
+    contact_diff = np.diff(is_contact.astype(np.int8), prepend=0, append=0)
+    release_starts = np.where(contact_diff == -1)[0]    # contact just ended
+    contact_starts = np.where(contact_diff == 1)[0]     # contact about to start
 
     for start in release_starts:
-        end = min(start + release_window, T)
+        # Release until the next contact-start (a re-grab) or the
+        # release_window cap or end-of-clip — whichever is earliest.
+        following_contacts = contact_starts[contact_starts > start]
+        next_contact_start = following_contacts[0] if len(following_contacts) > 0 else T
+        end = min(start + release_window, next_contact_start, T)
         phase[start:end] = PHASE_RELEASE

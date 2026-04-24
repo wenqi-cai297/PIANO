@@ -1,12 +1,26 @@
 """Extract contact target pseudo-labels from HOI motion data.
 
-For each frame where a body part is in contact, identifies *which region*
-of the object surface is being contacted.  The object surface is divided
-into K patches via farthest point sampling, and each contact is assigned
-a soft distribution over these patches.
+For each frame where a body part is in contact, identifies *where on
+the object surface* the body part touches. Two outputs:
 
-Output: soft target array of shape ``(T, B, K)`` where B=5 body parts
-and K=num_patches.
+- ``contact_target_xyz_gt (T, B, 3)`` — closest point on the mesh
+  surface in object-local coordinates per body part per frame. This
+  is the ground truth for the predictor's xyz regression head
+  (HOI-Diff / CG-HOI / ContactGen convention). Computed via
+  ``trimesh.proximity.closest_point`` once per body part. New as of
+  the v10 pseudo-label pass.
+- ``contact_target (T, B, K)`` — legacy soft distribution over K FPS
+  patches. Kept for backward compatibility, downstream visualisation,
+  and entropy diagnostics. Not used by the predictor any more.
+
+The xyz GT replaces the previous "softmax-weighted patch centroid"
+approximation that HOIDataset computed at load time. That approximation
+introduced an estimated 5-10 cm bias against the true closest-surface-
+point — directly visible in the v2 Stage A train-target plateau at 18
+cm vs the model's actual capacity. Re-extracting with this exact GT
+removes that floor; train target should drop to ≤5 cm and val target
+should drop with it (Kendall et al. CVPR'18-style multi-task weighting
++ this xyz fix together attack the two main v2 failure modes).
 """
 from __future__ import annotations
 
@@ -17,6 +31,7 @@ import numpy as np
 from piano.utils.geometry import (
     build_kdtree,
     cluster_surface_patches,
+    points_to_mesh_distance,
     query_nearest,
     soft_patch_assignment,
 )
@@ -46,13 +61,26 @@ def extract_contact_target(
     object_rotations: np.ndarray | None = None,
     config: TargetConfig | None = None,
     patch_centers: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract per-frame contact target region on the object surface.
 
-    Patch centers are in the object-local frame. For each contact frame we
-    inverse-transform the body-part world position into the object-local
-    frame before assigning to the nearest patch — exactly the same
-    correction as ``extract_contact_state``.
+    Returns three arrays in the object-local frame:
+
+    1. ``target_xyz_gt (T, 5, 3)`` — closest point on the mesh surface
+       per body part per frame. Defined for every frame (the loss
+       contact-gates at training time, so non-contact rows still being
+       a "valid" closest-surface-point doesn't hurt). This is the
+       v2 → v3 fix that replaces the softmax-weighted patch-centroid
+       approximation HOIDataset used to compute at load time, which
+       carried an estimated 5-10 cm bias.
+    2. ``target (T, 5, K)`` — legacy soft K-way distribution over the
+       FPS patch atlas, contact-gated (zero rows where not in contact).
+       Kept for backward compat / visualisation / entropy diagnostics.
+    3. ``patch_centers (K, 3)`` — the per-object patch atlas itself.
+
+    Both spatial outputs use the same ``world_to_object_local`` correction
+    that ``extract_contact_state`` applies, so distances and patch IDs
+    agree across the pipeline.
 
     Parameters
     ----------
@@ -70,7 +98,8 @@ def extract_contact_target(
 
     Returns
     -------
-    target : (T, 5, K) — soft assignment over K patches per body part
+    target_xyz_gt : (T, 5, 3) — closest-surface-point xyz per body part
+    target : (T, 5, K) — soft K-way assignment per body part (legacy)
     patch_centers : (K, 3) — patch center positions in object-local frame
     """
     from piano.data.pseudo_labels._object_transform import world_to_object_local
@@ -81,6 +110,7 @@ def extract_contact_target(
     T = len(joints)
     K = config.num_patches
     target = np.zeros((T, NUM_BODY_PARTS, K), dtype=np.float32)
+    target_xyz_gt = np.zeros((T, NUM_BODY_PARTS, 3), dtype=np.float32)
 
     if patch_centers is None:
         # Fallback: recompute. Non-deterministic without a seed, so this
@@ -108,6 +138,14 @@ def extract_contact_target(
         else:
             bp_positions_local = bp_positions_world
 
+        # Closest-surface-point for the xyz GT (every frame, even when
+        # not in contact — the loss gates downstream so non-contact rows
+        # are masked out, but having the array fully populated keeps
+        # the npz schema clean).
+        _, closest_pts = points_to_mesh_distance(bp_positions_local, object_mesh)
+        target_xyz_gt[:, bp_idx, :] = closest_pts.astype(np.float32)
+
+        # Legacy soft K-way distribution, contact-gated.
         for t in range(T):
             if contact_state[t, bp_idx] < config.contact_threshold:
                 continue
@@ -117,4 +155,4 @@ def extract_contact_target(
                 sigma=config.soft_sigma,
             )
 
-    return target, patch_centers
+    return target_xyz_gt, target, patch_centers

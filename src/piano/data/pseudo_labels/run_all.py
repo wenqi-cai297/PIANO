@@ -141,10 +141,15 @@ def process_sequence(
         config=contact_config,
     )
 
-    # Step 2: Contact target (depends on contact_state) — same transform.
-    # patch_centers is passed in from the caller's per-object atlas so that
-    # patch ids are stable across every sequence of the same object.
-    contact_target, patch_centers = extract_contact_target(
+    # Step 2: Contact target. Now returns three arrays:
+    # - contact_target_xyz_gt (T, 5, 3): closest-surface-point per body
+    #   part in object-local frame — the v3 GT for the predictor's xyz
+    #   regression head (replaces the previous softmax-weighted patch
+    #   centroid approximation, which had ~5-10 cm bias).
+    # - contact_target (T, 5, K): legacy soft K-way distribution, kept
+    #   for visualisation + backward compat.
+    # - patch_centers (K, 3): per-object FPS atlas (stable across reruns).
+    contact_target_xyz_gt, contact_target, patch_centers = extract_contact_target(
         joints, mesh, contact_state,
         object_positions=object_positions,
         object_rotations=object_rotations,
@@ -191,6 +196,7 @@ def process_sequence(
     return {
         "contact_state": contact_state,
         "contact_target": contact_target,
+        "contact_target_xyz_gt": contact_target_xyz_gt,
         "patch_centers": patch_centers,
         "phase": phase,
         "support": support,

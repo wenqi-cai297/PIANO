@@ -305,20 +305,25 @@ class HOIDataset(Dataset):
     def _load_pseudo_labels(
         self, path: Path, seq_len: int,
     ) -> dict[str, np.ndarray | None]:
-        """Load pseudo-labels + derive the xyz target from patch centers.
+        """Load pseudo-labels and surface the xyz target the predictor uses.
 
-        Adds ``contact_target_xyz`` to the return dict — the body-part
-        xyz in the object-local frame, computed as the softmax-weighted
-        sum of per-object patch centers (Σ_k soft_target[t,b,k] ×
-        patch_centers[k]). This is a smoothed approximation of "where
-        on the object surface does body-part b touch at time t" and is
-        what the xyz-regression target head supervises against. See
-        ``interaction_predictor.py`` docstring for why we replaced
-        per-object patch classification with xyz regression.
+        ``contact_target_xyz`` source priority:
 
-        ``contact_target`` (the original soft K-way distribution) is
-        kept in the return dict for backward compat / visualisation —
-        the predictor doesn't consume it any more.
+        1. ``contact_target_xyz_gt`` field if present in the npz —
+           **closest-surface-point on the mesh** in object-local frame
+           (v10 / v3 extraction). Use this when available; it has zero
+           GT bias and is the right ground-truth for the predictor's
+           xyz regression head.
+        2. Fallback: derive at load time from the legacy
+           ``contact_target (T, 5, K)`` soft distribution and the per-
+           object ``patch_centers (K, 3)`` via softmax-weighted
+           centroid Σ_k soft[t,b,k] × patch_centers[k]. This carries
+           an estimated 5-10 cm bias against the true closest-surface
+           point — only used when the npz pre-dates the v10 extractor.
+
+        ``contact_target`` (original soft K-way distribution) is kept
+        for backward compat / visualisation; the predictor doesn't
+        consume it any more.
         """
         result: dict[str, np.ndarray | None] = {
             "contact_state": None,
@@ -336,18 +341,19 @@ class HOIDataset(Dataset):
                 arr = data[key].astype(np.float32) if key not in ("phase", "support") else data[key]
                 result[key] = arr[:seq_len]
 
-        # Derive contact_target_xyz from the stored soft distribution
-        # over K patch centres. The pseudo-label extraction writes
-        # ``patch_centers (K, 3)`` alongside the (T, 5, K) distribution;
-        # we collapse over K at load time so downstream code sees a
-        # clean (T, 5, 3) xyz target in object-local frame.
-        if (
+        # 1. Preferred path: exact closest-surface-point GT from the
+        # extractor. Always use this when the npz has it.
+        if "contact_target_xyz_gt" in data.files:
+            result["contact_target_xyz"] = (
+                data["contact_target_xyz_gt"].astype(np.float32)[:seq_len]
+            )
+        # 2. Fallback: softmax-weighted centroid (legacy, biased).
+        elif (
             result["contact_target"] is not None
             and "patch_centers" in data.files
         ):
             patch_centers = data["patch_centers"].astype(np.float32)   # (K, 3)
             soft = result["contact_target"]                             # (T, 5, K)
-            # einsum: for each (t, b), weighted centroid of patches
             result["contact_target_xyz"] = np.einsum(
                 "tbk,kd->tbd", soft, patch_centers,
             ).astype(np.float32)

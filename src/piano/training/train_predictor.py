@@ -282,7 +282,10 @@ def run(config_path: str) -> None:
         model_name=cfg.model.get("text_encoder", "ViT-B/32"),
     )
 
-    # Loss and priors
+    # Loss and priors. With Kendall multi-task weights enabled, the
+    # static contact/target/phase/support weights are ignored and the
+    # optimiser learns per-task log-variances (one extra scalar param
+    # per task) that auto-balance loss-scale differences.
     criterion = PredictorLoss(
         contact_weight=cfg.loss.contact_weight,
         target_weight=cfg.loss.target_weight,
@@ -290,7 +293,9 @@ def run(config_path: str) -> None:
         support_weight=cfg.loss.support_weight,
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
         focal_gamma=cfg.loss.get("focal_gamma", 0.0),
+        use_kendall_weights=cfg.loss.get("use_kendall_weights", False),
     )
+    criterion = criterion.to(device)
     priors = PhysicalPriors(
         reachability_weight=cfg.priors.reachability_weight,
         contact_persistence_weight=cfg.priors.contact_persistence_weight,
@@ -331,8 +336,15 @@ def run(config_path: str) -> None:
 
     # Optimizer: AdamW with ViT/T5-style weight-decay groups (no decay
     # on biases, LayerNorm / BatchNorm weights, positional embeddings).
+    # When Kendall multi-task weights are active, criterion holds 4
+    # learnable scalars — include it in the optimised modules so they
+    # actually update (otherwise they sit at 0 forever, equivalent to
+    # all-ones static weights).
+    optim_modules = [predictor, object_encoder]
+    if criterion.use_kendall_weights:
+        optim_modules.append(criterion)
     optimizer = build_optimizer_with_decay_groups(
-        modules=[predictor, object_encoder],
+        modules=optim_modules,
         lr=cfg.training.optimizer.lr,
         weight_decay=cfg.training.optimizer.weight_decay,
         betas=tuple(cfg.training.optimizer.betas),
@@ -347,10 +359,20 @@ def run(config_path: str) -> None:
         optimizer, cfg.training.scheduler.warmup_steps, total_steps,
     )
 
-    # Prepare trainables with accelerator
-    predictor, object_encoder, optimizer, dataloader, scheduler = accelerator.prepare(
-        predictor, object_encoder, optimizer, dataloader, scheduler,
-    )
+    # Prepare trainables with accelerator. When Kendall is on, the
+    # criterion holds 4 learnable scalars; under DDP these need grad
+    # sync across ranks (otherwise each rank drifts to a different
+    # value and the loss formula on rank 0 ≠ rank 1, breaking gradient
+    # consistency on the predictor itself). prepare() wraps the
+    # criterion in DDP so its parameter grads are all-reduced.
+    if criterion.use_kendall_weights:
+        predictor, object_encoder, criterion, optimizer, dataloader, scheduler = accelerator.prepare(
+            predictor, object_encoder, criterion, optimizer, dataloader, scheduler,
+        )
+    else:
+        predictor, object_encoder, optimizer, dataloader, scheduler = accelerator.prepare(
+            predictor, object_encoder, optimizer, dataloader, scheduler,
+        )
     if val_dataloader is not None:
         val_dataloader = accelerator.prepare(val_dataloader)
 
