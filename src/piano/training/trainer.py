@@ -116,6 +116,7 @@ def run_training_loop(
     save_every_epochs: int = 10,
     max_grad_norm: float = 1.0,
     wandb_run: Any = None,
+    extra_modules: dict[str, torch.nn.Module] | None = None,
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -133,6 +134,12 @@ def run_training_loop(
     save_every_epochs : save checkpoint every N epochs
     max_grad_norm : gradient clipping norm
     wandb_run : optional wandb run for logging
+    extra_modules : optional ``{name: nn.Module}`` dict of additional
+        trainable modules to persist into each checkpoint alongside the
+        main ``model``. Example: ``{"object_encoder": object_encoder}``
+        for Stage A, where the main ``model`` is the predictor and the
+        encoder is a peer module whose weights are just as critical
+        for inference.
     """
     output_dir = ensure_dir(output_dir)
     global_step = 0
@@ -216,10 +223,16 @@ def run_training_loop(
 
         # Save checkpoint
         if (epoch + 1) % save_every_epochs == 0:
-            _save_checkpoint(accelerator, model, optimizer, epoch, global_step, output_dir)
+            _save_checkpoint(
+                accelerator, model, optimizer, epoch, global_step, output_dir,
+                extra_modules=extra_modules,
+            )
 
     # Final save
-    _save_checkpoint(accelerator, model, optimizer, num_epochs - 1, global_step, output_dir, name="final")
+    _save_checkpoint(
+        accelerator, model, optimizer, num_epochs - 1, global_step, output_dir,
+        name="final", extra_modules=extra_modules,
+    )
     accelerator.print("Training complete.")
 
 
@@ -231,8 +244,16 @@ def _save_checkpoint(
     global_step: int,
     output_dir: Path,
     name: str | None = None,
+    extra_modules: dict[str, torch.nn.Module] | None = None,
 ) -> None:
-    """Save model checkpoint (main process only)."""
+    """Save model checkpoint (main process only).
+
+    ``extra_modules`` is a flat ``{name: nn.Module}`` mapping — each
+    entry's unwrapped state_dict is stored under its name as a
+    top-level key alongside ``model``. Required for any stage whose
+    inference path needs more than just the main ``model`` (Stage A:
+    predictor + object_encoder).
+    """
     if not accelerator.is_main_process:
         return
 
@@ -240,15 +261,17 @@ def _save_checkpoint(
     ckpt_path = output_dir / f"{ckpt_name}.pt"
 
     unwrapped = accelerator.unwrap_model(model)
-    torch.save(
-        {
-            "model": unwrapped.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-        },
-        ckpt_path,
-    )
+    payload: dict[str, Any] = {
+        "model": unwrapped.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+    }
+    if extra_modules:
+        for mod_name, mod in extra_modules.items():
+            payload[mod_name] = accelerator.unwrap_model(mod).state_dict()
+
+    torch.save(payload, ckpt_path)
     accelerator.print(f"  Saved checkpoint: {ckpt_path}")
 
 

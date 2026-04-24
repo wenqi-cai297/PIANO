@@ -347,6 +347,11 @@ def run(config_path: str) -> None:
         save_every_epochs=cfg.logging.save_every_n_epochs,
         max_grad_norm=cfg.training.max_grad_norm,
         wandb_run=wandb_run,
+        # Persist the object encoder's weights into every checkpoint
+        # — predictor alone can't run inference; the object cross-
+        # attention KV tokens come from this encoder and its weights
+        # are trained from scratch (no pretrained fallback exists).
+        extra_modules={"object_encoder": object_encoder},
     )
 
 
