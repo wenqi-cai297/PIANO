@@ -33,13 +33,14 @@ from piano.training.trainer import (
     build_scheduler,
     run_training_loop,
 )
+from piano.utils.clip_utils import encode_text_per_token
 
 
 def build_joint_step_fn(
     predictor: InteractionPredictor,
     object_encoder: ObjectEncoder,
     transformer: InteractionMaskTransformer,
-    vq_vae: RVQVAE,
+    vq_vae: "RVQVAE",  # forward ref — RVQVAE lives in MoMask adapter
     interaction_tokenizer: InteractionTokenizer,
     extractor: InteractionExtractor,
     clip_model: torch.nn.Module,
@@ -47,24 +48,35 @@ def build_joint_step_fn(
     gen_criterion: GeneratorLoss,
     cons_criterion: ConsistencyLoss,
     priors: PhysicalPriors,
+    device: torch.device,
     consistency_weight: float = 0.5,
 ):
     """Build step function for joint finetuning."""
 
     def step_fn(_model: torch.nn.Module, batch: dict) -> dict[str, torch.Tensor]:
-        # Encode text
+        # Per-token CLIP features for the predictor, pooled vector for
+        # the MaskTransformer (which still consumes pooled CLIP — that's
+        # MoMask's native interface and we don't touch it).
+        text_features, text_mask = encode_text_per_token(
+            clip_model, batch["text"], device,
+        )
         with torch.no_grad():
-            text_emb = clip_model.encode_text(batch["text"])
+            # MoMask's encode_text tokenises + pools internally
+            text_pooled = transformer.encode_text(batch["text"])
 
         # Encode object
         obj_tokens = object_encoder(batch["object_pc"])
-        init_pose = batch["motion"][:, 0, :]
+        B = batch["joints"].shape[0]
+        init_pose = batch["joints"][:, 0, :, :].reshape(B, -1)   # (B, 66)
         max_T = batch["motion"].shape[1]
         seq_len = batch["seq_len"]
         frame_mask = torch.arange(max_T, device=seq_len.device).unsqueeze(0) < seq_len.unsqueeze(1)
 
         # --- Predictor forward ---
-        pred = predictor(text_emb, obj_tokens, init_pose, seq_length=max_T)
+        pred = predictor(
+            text_features, obj_tokens, init_pose,
+            seq_length=max_T, text_key_padding_mask=text_mask,
+        )
 
         pred_loss = pred_criterion(
             pred,
@@ -91,7 +103,7 @@ def build_joint_step_fn(
         token_lens = (seq_len / 4).long().clamp(min=1)
 
         mask_pred_loss, pred_ids, accuracy = transformer(
-            ids=base_tokens, cond=text_emb, m_lens=token_lens,
+            ids=base_tokens, cond=text_pooled, m_lens=token_lens,
             interaction_tokens=interaction_tokens,
         )
         gen_loss = gen_criterion(mask_pred_loss)
@@ -138,8 +150,11 @@ def run(config_path: str) -> None:
     )
 
     # --- Build models ---
-    predictor = InteractionPredictor(d_model=384, num_layers=10, num_heads=6, dim_feedforward=1024, text_dim=512, pose_dim=263, block_size=2)
-    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=384)
+    predictor = InteractionPredictor(
+        d_model=384, num_layers=10, num_heads=6,
+        dim_feedforward=1024, text_dim=512, pose_dim=66,
+    )
+    object_encoder = ObjectEncoder(num_output_tokens=128, feature_dim=384)
 
     # Load MoMask VQ-VAE (frozen) and MaskTransformer (with interaction layers)
     vq_vae = load_momask_vqvae(cfg.model.vq_vae_checkpoint, device="cpu")
@@ -147,11 +162,15 @@ def run(config_path: str) -> None:
         cfg.model.generator_checkpoint, device="cpu",
     )
     extractor = InteractionExtractor(motion_dim=263, d_model=256, num_layers=3)
+    interaction_tokenizer = InteractionTokenizer(d_model=384, temporal_stride=4)
 
     # Load Stage A/B checkpoints for predictor and object_encoder
     # TODO: load from cfg.model.predictor_checkpoint / cfg.model.object_encoder_checkpoint
 
-    # CLIP is already loaded inside transformer.mask_transformer
+    # Reuse CLIP loaded inside MoMask's MaskTransformer — same OpenAI CLIP,
+    # no need for a second copy. Used for per-token text features consumed
+    # by the InteractionPredictor's new text cross-attention.
+    clip_model = transformer.mask_transformer.clip_model
 
     # --- Losses ---
     pred_criterion = PredictorLoss(
@@ -201,7 +220,8 @@ def run(config_path: str) -> None:
     step_fn = build_joint_step_fn(
         predictor, object_encoder, transformer, vq_vae, interaction_tokenizer,
         extractor, clip_model, pred_criterion, gen_criterion, cons_criterion,
-        priors, consistency_weight=cfg.loss.consistency_weight,
+        priors, device=accelerator.device,
+        consistency_weight=cfg.loss.consistency_weight,
     )
 
     # Wandb

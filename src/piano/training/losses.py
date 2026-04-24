@@ -21,6 +21,12 @@ class PredictorLoss(nn.Module):
 
     Supervises contact state, contact target, interaction phase, and
     support state against pseudo-labels.
+
+    The contact_target KL loss is **gated by the contact pseudo-label**:
+    for (t, body_part) pairs where GT contact is below threshold, the
+    target distribution carries no signal (the pseudo-label pipeline
+    writes ~uniform softmax there), so supervising it just adds noise.
+    We only compute target CE where ``gt_contact[t, b] > contact_threshold``.
     """
 
     def __init__(
@@ -29,12 +35,14 @@ class PredictorLoss(nn.Module):
         target_weight: float = 0.5,
         phase_weight: float = 0.5,
         support_weight: float = 0.5,
+        contact_threshold: float = 0.5,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
         self.target_weight = target_weight
         self.phase_weight = phase_weight
         self.support_weight = support_weight
+        self.contact_threshold = contact_threshold
 
     def forward(
         self,
@@ -65,7 +73,7 @@ class PredictorLoss(nn.Module):
             pred["contact_logits"], gt_contact, reduction="none",
         )  # (B, T, 5)
 
-        # Target: CE on soft labels (use KL divergence for soft targets)
+        # Target: KL on soft labels (summed over K, per body part)
         pred_target_log = F.log_softmax(pred["target_logits"], dim=-1)  # (B, T, 5, K)
         loss_target = F.kl_div(
             pred_target_log, gt_target, reduction="none",
@@ -87,18 +95,33 @@ class PredictorLoss(nn.Module):
             reduction="none",
         ).reshape(B, T)  # (B, T)
 
-        # Apply frame mask (ignore padded frames)
+        # Build frame mask and contact gate
         if mask is not None:
-            frame_mask = mask.float()  # (B, T)
-            loss_contact = (loss_contact * frame_mask.unsqueeze(-1)).sum() / (frame_mask.sum() * 5 + 1e-8)
-            loss_target = (loss_target * frame_mask.unsqueeze(-1)).sum() / (frame_mask.sum() * 5 + 1e-8)
-            loss_phase = (loss_phase * frame_mask).sum() / (frame_mask.sum() + 1e-8)
-            loss_support = (loss_support * frame_mask).sum() / (frame_mask.sum() + 1e-8)
+            frame_mask = mask.float()                             # (B, T)
         else:
-            loss_contact = loss_contact.mean()
-            loss_target = loss_target.mean()
-            loss_phase = loss_phase.mean()
-            loss_support = loss_support.mean()
+            frame_mask = torch.ones(
+                gt_contact.shape[:2],
+                device=gt_contact.device, dtype=torch.float32,
+            )
+        # Contact gate: only supervise contact_target where the GT
+        # contact label crosses threshold — outside contact the pseudo-
+        # target is uninformative.
+        contact_gate = (
+            (gt_contact > self.contact_threshold).float()
+            * frame_mask.unsqueeze(-1)
+        )                                                         # (B, T, 5)
+
+        n_frames = frame_mask.sum() + 1e-8
+        n_contact = contact_gate.sum() + 1e-8
+        num_parts = gt_contact.shape[-1]
+
+        loss_contact = (
+            (loss_contact * frame_mask.unsqueeze(-1)).sum()
+            / (n_frames * num_parts)
+        )
+        loss_target = (loss_target * contact_gate).sum() / n_contact
+        loss_phase = (loss_phase * frame_mask).sum() / n_frames
+        loss_support = (loss_support * frame_mask).sum() / n_frames
 
         total = (
             self.contact_weight * loss_contact
@@ -113,6 +136,7 @@ class PredictorLoss(nn.Module):
             "loss_target": loss_target,
             "loss_phase": loss_phase,
             "loss_support": loss_support,
+            "n_contact_frames": n_contact.detach(),
         }
 
 

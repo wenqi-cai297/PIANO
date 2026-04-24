@@ -39,6 +39,7 @@ from piano.models.interaction_cross_attn import InteractionTokenizer
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.object_encoder import ObjectEncoder
+from piano.utils.clip_utils import encode_text_per_token
 from piano.utils.io_utils import ensure_dir, save_json, save_npz
 
 
@@ -105,13 +106,13 @@ def run_smoke_test(
     print("=" * 72)
 
     object_encoder = ObjectEncoder(
-        num_input_points=1024, num_output_tokens=16, feature_dim=384,
+        num_input_points=1024, num_output_tokens=128, feature_dim=384,
     ).to(device).eval()
 
     predictor = InteractionPredictor(
         d_model=384, num_layers=10, num_heads=6,
-        dim_feedforward=1024, text_dim=512, pose_dim=263,
-        max_seq_length=max_seq_length, block_size=2,
+        dim_feedforward=1024, text_dim=512, pose_dim=66,
+        max_seq_length=max_seq_length,
     ).to(device).eval()
 
     print(f"  ObjectEncoder:       {sum(p.numel() for p in object_encoder.parameters())/1e6:.2f}M")
@@ -146,19 +147,33 @@ def run_smoke_test(
     print("=" * 72)
 
     object_pc = batch["object_pc"].to(device)
-    init_pose = batch["motion"][:, 0, :].to(device)           # first-frame features
+    # Init pose from SMPL-22 joint positions (66-d). HumanML3D 263-d
+    # frame 0 has undefined velocities, so the predictor now takes
+    # joint xyz instead.
+    B = batch["joints"].shape[0]
+    init_pose = batch["joints"][:, 0, :, :].reshape(B, -1).to(device)   # (B, 66)
 
-    # Text encoding via MoMask's CLIP
+    # Text encoding: per-token features (for predictor's text cross-attn)
+    # + pooled features (for the MaskTransformer, which still uses pooled).
+    # Both use MoMask's bundled CLIP — no need for a second copy.
+    clip_model = mask_trans.mask_transformer.clip_model
     with torch.no_grad():
-        text_emb = mask_trans.encode_text(batch["text"])       # (B, 512)
-        print(f"\n  CLIP text_emb:        {tuple(text_emb.shape)}")
+        text_features, text_mask = encode_text_per_token(
+            clip_model, batch["text"], torch.device(device),
+        )
+        text_pooled = mask_trans.encode_text(batch["text"])    # (B, 512)
+        print(f"\n  CLIP per-token:       {tuple(text_features.shape)}")
+        print(f"  CLIP pooled:          {tuple(text_pooled.shape)}")
 
         # Object encoding
-        obj_tokens = object_encoder(object_pc)                 # (B, 16, 384)
+        obj_tokens = object_encoder(object_pc)                 # (B, 128, 384)
         print(f"  Object tokens:        {tuple(obj_tokens.shape)}")
 
         # Interaction prediction (untrained — random output)
-        pred = predictor(text_emb, obj_tokens, init_pose, seq_length=max_seq_length)
+        pred = predictor(
+            text_features, obj_tokens, init_pose,
+            seq_length=max_seq_length, text_key_padding_mask=text_mask,
+        )
         print(f"  z_int contact_state:  {tuple(pred['contact_state'].shape)}")
         print(f"  z_int phase:          {tuple(pred['phase'].shape)}")
         print(f"  z_int support:        {tuple(pred['support'].shape)}")
@@ -177,7 +192,7 @@ def run_smoke_test(
         token_len = max_seq_length // 4
         m_lens = torch.full((len(samples),), token_len, dtype=torch.long, device=device)
         gen_token_ids = mask_trans.generate(
-            cond=text_emb,
+            cond=text_pooled,
             m_lens=m_lens,
             interaction_tokens=interaction_tokens,
             timesteps=10,
@@ -245,7 +260,8 @@ def run_smoke_test(
         "texts": batch["text"],
         "seq_lens": batch["seq_len"].tolist(),
         "shapes": {
-            "text_emb": list(text_emb.shape),
+            "text_per_token": list(text_features.shape),
+            "text_pooled": list(text_pooled.shape),
             "obj_tokens": list(obj_tokens.shape),
             "interaction_tokens": list(interaction_tokens.shape),
             "gen_token_ids": list(gen_token_ids.shape),

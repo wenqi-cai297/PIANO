@@ -9,12 +9,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import torch
+import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 from piano.data.dataset import HOIDataset, collate_hoi
@@ -27,38 +28,57 @@ from piano.training.trainer import (
     build_scheduler,
     run_training_loop,
 )
+from piano.utils.clip_utils import encode_text_per_token, load_clip_text_encoder
 
+
+# ---------------------------------------------------------------------------
+# Step function
+# ---------------------------------------------------------------------------
 
 def build_predictor_step_fn(
     predictor: InteractionPredictor,
     object_encoder: ObjectEncoder,
-    clip_model: torch.nn.Module,
+    clip_model: nn.Module,
     criterion: PredictorLoss,
     priors: PhysicalPriors,
+    device: torch.device,
 ):
     """Build the step function for predictor training.
 
-    Returns a callable(model_unused, batch) -> loss_dict.
-    The actual models are captured in the closure.
+    Returns a callable(model_unused, batch) -> loss_dict. The actual
+    models are captured in the closure.
     """
-    def step_fn(_model: torch.nn.Module, batch: dict) -> dict[str, torch.Tensor]:
-        # Encode text
-        with torch.no_grad():
-            text_emb = clip_model.encode_text(batch["text"])  # (B, clip_dim)
+    def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
+        # Text: CLIP per-token features + padding mask
+        text_features, text_mask = encode_text_per_token(
+            clip_model, batch["text"], device,
+        )
 
-        # Encode object
-        obj_tokens = object_encoder(batch["object_pc"])  # (B, M, d)
+        # Object tokens
+        obj_tokens = object_encoder(batch["object_pc"])         # (B, M, d)
 
-        # Initial pose (first frame of motion)
-        init_pose = batch["motion"][:, 0, :]  # (B, 263)
+        # Initial pose: first-frame SMPL-22 joint positions (66-d).
+        # HumanML3D 263-d frame 0 has undefined velocities (process_file
+        # drops the first frame for velocity computation), so we use
+        # the raw joint positions instead.
+        B = batch["joints"].shape[0]
+        init_pose = batch["joints"][:, 0, :, :].reshape(B, -1)  # (B, 66)
+
         seq_len = batch["seq_len"]
+        max_T = batch["motion"].shape[1]
 
         # Predict interaction latent
-        pred = predictor(text_emb, obj_tokens, init_pose, seq_length=batch["motion"].shape[1])
+        pred = predictor(
+            text_features, obj_tokens, init_pose,
+            seq_length=max_T,
+            text_key_padding_mask=text_mask,
+        )
 
         # Frame mask (True for valid, non-padded frames)
-        max_T = batch["motion"].shape[1]
-        frame_mask = torch.arange(max_T, device=seq_len.device).unsqueeze(0) < seq_len.unsqueeze(1)
+        frame_mask = (
+            torch.arange(max_T, device=seq_len.device).unsqueeze(0)
+            < seq_len.unsqueeze(1)
+        )
 
         # Supervision loss
         loss_dict = criterion(
@@ -81,6 +101,10 @@ def build_predictor_step_fn(
     return step_fn
 
 
+# ---------------------------------------------------------------------------
+# Training entrypoint
+# ---------------------------------------------------------------------------
+
 def run(config_path: str) -> None:
     """Run Stage A training."""
     cfg = OmegaConf.load(config_path)
@@ -90,19 +114,40 @@ def run(config_path: str) -> None:
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         mixed_precision="bf16",
     )
+    device = accelerator.device
+
+    # Sub-configs. These are the *model* configs referenced by the
+    # training yaml; we read them explicitly so all hyperparameters are
+    # auditable from the top-level config tree.
+    model_cfg = OmegaConf.load(cfg.model.config)
+    obj_cfg = OmegaConf.load(cfg.model.object_encoder_config)
 
     # Models
     predictor = InteractionPredictor(
-        d_model=384, num_layers=10, num_heads=6,
-        dim_feedforward=1024, text_dim=512, pose_dim=263,
-        block_size=2,
+        d_model=model_cfg.encoder.d_model,
+        num_layers=model_cfg.encoder.num_layers,
+        num_heads=model_cfg.encoder.num_heads,
+        dim_feedforward=model_cfg.encoder.dim_feedforward,
+        dropout=model_cfg.encoder.dropout,
+        text_dim=model_cfg.input.text_dim,
+        pose_dim=model_cfg.input.pose_dim,
+        max_seq_length=model_cfg.sequence.max_length,
+        num_body_parts=model_cfg.output.num_body_parts,
+        num_object_patches=model_cfg.output.num_object_patches,
+        num_phases=model_cfg.output.num_phases,
+        num_support_states=model_cfg.output.num_support_states,
     )
-    object_encoder = ObjectEncoder(num_output_tokens=16, feature_dim=384)
+    object_encoder = ObjectEncoder(
+        num_input_points=obj_cfg.pointnet.num_input_points,
+        num_output_tokens=obj_cfg.pointnet.num_output_tokens,
+        feature_dim=obj_cfg.pointnet.feature_dim,
+    )
 
-    # CLIP text encoder (frozen) — loaded via OpenAI CLIP
-    # In practice: clip.load("ViT-B/32") → clip_model
-    # Placeholder: will be initialized properly when CLIP is available
-    clip_model = None  # TODO: load CLIP model on server
+    # CLIP text encoder (frozen)
+    clip_model = load_clip_text_encoder(
+        device=device,
+        model_name=cfg.model.get("text_encoder", "ViT-B/32"),
+    )
 
     # Loss and priors
     criterion = PredictorLoss(
@@ -129,20 +174,20 @@ def run(config_path: str) -> None:
         shuffle=True, collate_fn=collate_hoi, num_workers=4,
     )
 
-    # Optimizer & scheduler
+    # Optimizer & scheduler (over trainable modules only — CLIP is frozen)
     params = list(predictor.parameters()) + list(object_encoder.parameters())
     optimizer = build_optimizer(params, lr=cfg.training.optimizer.lr)
     total_steps = len(dataloader) * cfg.training.num_epochs
     scheduler = build_scheduler(optimizer, cfg.training.scheduler.warmup_steps, total_steps)
 
-    # Prepare with accelerator
+    # Prepare trainables with accelerator
     predictor, object_encoder, optimizer, dataloader, scheduler = accelerator.prepare(
         predictor, object_encoder, optimizer, dataloader, scheduler,
     )
 
-    # Wrap models into a single module for the training loop
-    # (the step_fn closure captures the individual models)
-    step_fn = build_predictor_step_fn(predictor, object_encoder, clip_model, criterion, priors)
+    step_fn = build_predictor_step_fn(
+        predictor, object_encoder, clip_model, criterion, priors, device,
+    )
 
     # Wandb (optional)
     wandb_run = None

@@ -1,19 +1,49 @@
 """Interaction Predictor: predicts structured interaction latents from text + object + pose.
 
-A Temporal Transformer Decoder that takes text, object geometry, and initial
-body pose as input, and outputs per-frame interaction labels:
+A Transformer stack that maps (text, object_tokens, init_pose) to per-frame
+interaction labels:
+
     - contact_state  (T, B)    — which body parts contact the object
     - contact_target (T, B, K) — which object surface patch is contacted
     - phase          (T, P)    — interaction phase (approach/pre-contact/...)
     - support        (T, S)    — body support configuration
 
-The architecture uses:
-    - Learnable time tokens with positional encoding (query)
-    - Cross-attention to object tokens from PointNet++ (geometry awareness)
-    - AdaLN conditioning on text embedding (semantic guidance)
-    - Initial pose injection on the first time token
-    - Block Attention Residuals (Block AttnRes) from MoonshotAI/Attention-Residuals
-      for selective depth-wise information aggregation
+Each transformer block has four sublayers, each pre-norm + residual:
+
+    self-attn          — over time tokens (incl. a prepended [POSE] token)
+    text-cross-attn    — over CLIP per-token features (77 tokens)
+    object-cross-attn  — over PointNet++ object tokens (128 tokens)
+    FFN                — standard 2-layer MLP
+
+Design notes (2026-04-24 rewrite):
+
+    * CLIP conditioning uses the **per-token** sequence (B, 77, d_text),
+      not just the pooled CLS/EOT vector. Pooled-only AdaLN discards the
+      verb/noun/modifier structure that disambiguates "push" / "pull" /
+      "sit on" / "lift" on the same object (see SALAD CVPR'25 ablation).
+      This matches MoMask (our Stage B backbone), which also conditions
+      via per-token CLIP cross-attention.
+
+    * Initial pose is a **dedicated [POSE] token** prepended to the time
+      tokens, not injected only at t=0. Self-attention then propagates
+      pose information to every frame without depth-dilution. Input is
+      SMPL-22 joint positions (66-d), not HumanML3D 263-d — frame-0
+      velocities in 263-d are undefined after MoMask's process_file
+      drops the first frame.
+
+    * **Object tokens** are 128 per sequence (from PointNet++), up from
+      the earlier 16. Contact-target classification head stays at K=16
+      FPS patches; the token count is decoupled from the label count.
+
+    * No Block Attention Residuals. MoonshotAI's block-AttnRes was
+      validated on 3B-48B LLMs; at 10 layers / ~30M params the depth-
+      dilution it targets doesn't exist, and the added state machine
+      complicated debugging without measurable benefit.
+
+    * No AdaLN. With per-token text cross-attn + the [POSE] token +
+      object cross-attn carrying all the conditioning, AdaLN on pooled
+      summaries becomes redundant. (DiT uses AdaLN-Zero for a single
+      class/timestep token — that regime doesn't apply here.)
 """
 from __future__ import annotations
 
@@ -25,96 +55,15 @@ from torch import Tensor
 
 
 # ============================================================================
-# RMSNorm (used by AttnRes for key normalization)
-# ============================================================================
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
-
-    def __init__(self, d_model: int, eps: float = 1e-8) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x / rms * self.weight
-
-
-# ============================================================================
-# Block Attention Residuals — faithful implementation from
-# https://github.com/MoonshotAI/Attention-Residuals
-# ============================================================================
-
-def block_attn_res(
-    blocks: list[Tensor],
-    partial_block: Tensor,
-    proj: nn.Linear,
-    norm: RMSNorm,
-) -> Tensor:
-    """Compute Block Attention Residuals.
-
-    Attends over completed block representations + current partial block
-    using a learned pseudo-query vector, with softmax over the depth axis.
-
-    Follows the official implementation exactly:
-        V = stack(blocks + [partial_block])      # [N+1, B, T, D]
-        K = norm(V)                               # RMSNorm over D
-        logits = einsum('d, n b t d -> n b t', proj.weight, K)
-        h = einsum('n b t, n b t d -> b t d', softmax(logits, dim=0), V)
-
-    Parameters
-    ----------
-    blocks : list of (B, T, D) tensors — completed block representations
-    partial_block : (B, T, D) — current intra-block partial sum
-    proj : nn.Linear — pseudo-query, only .weight (shape [1, D]) is used
-    norm : RMSNorm — applied to keys before attention
-
-    Returns
-    -------
-    h : (B, T, D) — selectively aggregated representation
-    """
-    V = torch.stack(blocks + [partial_block])  # (N+1, B, T, D)
-    K = norm(V)
-    logits = torch.einsum("d, n b t d -> n b t", proj.weight.squeeze(), K)
-    h = torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), V)
-    return h
-
-
-# ============================================================================
-# AdaLN (Adaptive Layer Norm) — conditions norm on a global vector
-# ============================================================================
-
-class AdaLN(nn.Module):
-    """Adaptive Layer Normalization conditioned on a global vector."""
-
-    def __init__(self, d_model: int, cond_dim: int) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.scale_shift = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, 2 * d_model),
-        )
-
-    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
-        """x: (B, T, d), cond: (B, d_cond)."""
-        scale_shift = self.scale_shift(cond).unsqueeze(1)  # (B, 1, 2*d)
-        scale, shift = scale_shift.chunk(2, dim=-1)
-        return self.norm(x) * (1 + scale) + shift
-
-
-# ============================================================================
-# Transformer Block with object cross-attention, AdaLN, and Block AttnRes
+# Transformer block: self-attn → text-xattn → object-xattn → FFN
 # ============================================================================
 
 class PredictorBlock(nn.Module):
     """Single Transformer layer of the Interaction Predictor.
 
-    Each layer has 3 sublayers: self-attention, object cross-attention, FFN.
-    Each sublayer has its own Block AttnRes components (proj + norm).
-
-    The block boundary logic (when to seal a block and start a new one)
-    is handled by the parent ``InteractionPredictor``, not by this module.
+    Standard pre-norm + residual around each of four sublayers. No AdaLN,
+    no depth-wise AttnRes — the earlier design added both without an
+    empirical win at this scale.
     """
 
     def __init__(
@@ -123,30 +72,29 @@ class PredictorBlock(nn.Module):
         num_heads: int = 6,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
-        text_dim: int = 512,
     ) -> None:
         super().__init__()
 
-        # --- Self-attention sublayer ---
-        self.adaln_sa = AdaLN(d_model, text_dim)
+        # Self-attention over (time tokens + [POSE] token)
+        self.norm_sa = nn.LayerNorm(d_model)
         self.self_attn = nn.MultiheadAttention(
             d_model, num_heads, dropout=dropout, batch_first=True,
         )
-        # AttnRes for self-attention sublayer
-        self.sa_attn_res_proj = nn.Linear(d_model, 1, bias=False)
-        self.sa_attn_res_norm = RMSNorm(d_model)
 
-        # --- Cross-attention sublayer (to object tokens) ---
-        self.adaln_ca = AdaLN(d_model, text_dim)
-        self.cross_attn = nn.MultiheadAttention(
+        # Cross-attention to CLIP per-token features
+        self.norm_tx = nn.LayerNorm(d_model)
+        self.text_attn = nn.MultiheadAttention(
             d_model, num_heads, dropout=dropout, batch_first=True,
         )
-        # AttnRes for cross-attention sublayer
-        self.ca_attn_res_proj = nn.Linear(d_model, 1, bias=False)
-        self.ca_attn_res_norm = RMSNorm(d_model)
 
-        # --- FFN sublayer ---
-        self.adaln_ff = AdaLN(d_model, text_dim)
+        # Cross-attention to PointNet++ object tokens
+        self.norm_ox = nn.LayerNorm(d_model)
+        self.object_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True,
+        )
+
+        # Feedforward
+        self.norm_ff = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
@@ -154,67 +102,45 @@ class PredictorBlock(nn.Module):
             nn.Linear(dim_feedforward, d_model),
             nn.Dropout(dropout),
         )
-        # AttnRes for FFN sublayer
-        self.ff_attn_res_proj = nn.Linear(d_model, 1, bias=False)
-        self.ff_attn_res_norm = RMSNorm(d_model)
 
     def forward(
         self,
-        blocks: list[Tensor],
-        partial_block: Tensor,
-        object_tokens: Tensor,
-        text_emb: Tensor,
-        is_block_boundary: bool = False,
-    ) -> tuple[list[Tensor], Tensor]:
-        """Forward pass with Block AttnRes.
+        x: Tensor,
+        text_kv: Tensor,
+        object_kv: Tensor,
+        text_key_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Apply one predictor block.
 
         Parameters
         ----------
-        blocks : list of (B, T, d) — sealed block representations
-        partial_block : (B, T, d) — current intra-block partial sum
-        object_tokens : (B, M, d) — object feature tokens
-        text_emb : (B, d_text) — global text embedding
-        is_block_boundary : if True, seal partial_block before this layer
+        x : (B, T+1, d) — [POSE] token at index 0 + time tokens
+        text_kv : (B, 77, d) — projected CLIP per-token features
+        object_kv : (B, M, d) — object tokens
+        text_key_padding_mask : (B, 77) — True for padded CLIP positions
 
         Returns
         -------
-        blocks : updated list (may have new entry if boundary)
-        partial_block : updated intra-block partial sum
+        x : (B, T+1, d)
         """
-        # --- Block boundary: seal completed block ---
-        if is_block_boundary and partial_block is not None:
-            blocks = blocks + [partial_block]
-            partial_block = None
+        h = self.norm_sa(x)
+        sa_out, _ = self.self_attn(h, h, h, need_weights=False)
+        x = x + sa_out
 
-        # --- Self-attention sublayer ---
-        # When partial_block is None (start of a new block), use the last
-        # sealed block as the AttnRes target. The sublayer output then
-        # becomes the new partial_block (no additive residual from prior).
-        if partial_block is not None:
-            h = block_attn_res(blocks, partial_block,
-                               self.sa_attn_res_proj, self.sa_attn_res_norm)
-        else:
-            h = block_attn_res(blocks[:-1], blocks[-1],
-                               self.sa_attn_res_proj, self.sa_attn_res_norm) if len(blocks) > 1 else blocks[-1]
-        h_norm = self.adaln_sa(h, text_emb)
-        sa_out, _ = self.self_attn(h_norm, h_norm, h_norm)
-        partial_block = partial_block + sa_out if partial_block is not None else sa_out
+        h = self.norm_tx(x)
+        tx_out, _ = self.text_attn(
+            h, text_kv, text_kv,
+            key_padding_mask=text_key_padding_mask, need_weights=False,
+        )
+        x = x + tx_out
 
-        # --- Cross-attention sublayer ---
-        h = block_attn_res(blocks, partial_block,
-                           self.ca_attn_res_proj, self.ca_attn_res_norm)
-        h_norm = self.adaln_ca(h, text_emb)
-        ca_out, _ = self.cross_attn(h_norm, object_tokens, object_tokens)
-        partial_block = partial_block + ca_out
+        h = self.norm_ox(x)
+        ox_out, _ = self.object_attn(h, object_kv, object_kv, need_weights=False)
+        x = x + ox_out
 
-        # --- FFN sublayer ---
-        h = block_attn_res(blocks, partial_block,
-                           self.ff_attn_res_proj, self.ff_attn_res_norm)
-        h_norm = self.adaln_ff(h, text_emb)
-        ff_out = self.ffn(h_norm)
-        partial_block = partial_block + ff_out
-
-        return blocks, partial_block
+        h = self.norm_ff(x)
+        x = x + self.ffn(h)
+        return x
 
 
 # ============================================================================
@@ -224,24 +150,18 @@ class PredictorBlock(nn.Module):
 class InteractionPredictor(nn.Module):
     """Predicts structured interaction latents from text + object + initial pose.
 
-    Scaled architecture with Block AttnRes:
-        - 10 layers, d_model=384, heads=6, ffn=1024 (~30M params)
-        - Block AttnRes with block_size=2 (5 blocks for 10 layers)
-        - Deeper but narrower than the original 6-layer d=512 design
-
     Parameters
     ----------
-    d_model : hidden dimension (384 to match MoMask latent_dim)
-    num_layers : number of transformer blocks (10 for deeper temporal/geometric reasoning)
+    d_model : hidden dimension (384 matches MoMask's latent_dim)
+    num_layers : number of transformer blocks
     num_heads : attention heads per block
     dim_feedforward : FFN hidden dimension
     dropout : dropout rate
     text_dim : CLIP text embedding dimension (512 for ViT-B/32)
-    pose_dim : initial pose feature dimension (HumanML3D 263-dim)
+    pose_dim : initial pose feature dimension (66 = 22 joints × 3)
     max_seq_length : maximum number of output frames
-    block_size : number of layers per AttnRes block
     num_body_parts : B — number of tracked body parts
-    num_object_patches : K — number of object surface patches
+    num_object_patches : K — number of object surface patches (label space)
     num_phases : P — number of interaction phases
     num_support_states : S — number of support states
     """
@@ -254,9 +174,8 @@ class InteractionPredictor(nn.Module):
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
         text_dim: int = 512,
-        pose_dim: int = 263,
+        pose_dim: int = 66,
         max_seq_length: int = 196,
-        block_size: int = 2,
         num_body_parts: int = 5,
         num_object_patches: int = 16,
         num_phases: int = 5,
@@ -268,22 +187,35 @@ class InteractionPredictor(nn.Module):
         self.num_body_parts = num_body_parts
         self.num_object_patches = num_object_patches
         self.num_layers = num_layers
-        self.block_size = block_size
 
-        # Learnable time tokens
+        # Learnable time-token bank + fixed sinusoidal positions
         self.time_tokens = nn.Parameter(torch.randn(1, max_seq_length, d_model) * 0.02)
-        self.pos_encoding = self._sinusoidal_encoding(max_seq_length, d_model)
+        self.register_buffer(
+            "pos_encoding",
+            self._sinusoidal_encoding(max_seq_length, d_model),
+            persistent=False,
+        )
 
-        # Initial pose projection
+        # [POSE] token: pose projected into model space, carries initial
+        # body state as its own sequence position (index 0)
         self.pose_proj = nn.Linear(pose_dim, d_model)
 
-        # Transformer layers
+        # Project CLIP per-token features (512) into model space once.
+        # All blocks share this projection — saves compute vs. each MHA
+        # re-projecting (B, 77, 512) → (B, 77, d_model) with its own K/V
+        # weights.
+        self.text_proj = nn.Linear(text_dim, d_model)
+
+        # Transformer stack
         self.layers = nn.ModuleList([
-            PredictorBlock(d_model, num_heads, dim_feedforward, dropout, text_dim)
+            PredictorBlock(d_model, num_heads, dim_feedforward, dropout)
             for _ in range(num_layers)
         ])
+        self.final_norm = nn.LayerNorm(d_model)
 
-        # Output heads
+        # Output heads — per-frame linear projections. contact_target is
+        # masked by contact_state at loss time (see PredictorLoss) so the
+        # K-way softmax is only supervised where contact is active.
         self.contact_head = nn.Linear(d_model, num_body_parts)
         self.target_head = nn.Linear(d_model, num_body_parts * num_object_patches)
         self.phase_head = nn.Linear(d_model, num_phases)
@@ -291,67 +223,68 @@ class InteractionPredictor(nn.Module):
 
     def forward(
         self,
-        text_emb: Tensor,
+        text_tokens: Tensor,
         object_tokens: Tensor,
         init_pose: Tensor,
         seq_length: int | None = None,
+        text_key_padding_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Predict interaction latents.
 
         Parameters
         ----------
-        text_emb : (B, text_dim) — CLIP text embedding
+        text_tokens : (B, 77, text_dim) — CLIP per-token features.
+            Use the output of ``encode_text`` up to and including
+            ``ln_final`` — i.e. before the pooled EOT projection.
         object_tokens : (B, M, d_model) — from ObjectEncoder
-        init_pose : (B, pose_dim) — initial pose features
+        init_pose : (B, pose_dim) — initial pose features (joint xyz)
         seq_length : output length (defaults to max_seq_length)
+        text_key_padding_mask : (B, 77) — True for padded positions. Safe
+            to leave None for CLIP ViT-B/32 — its fixed context length
+            and learned padding usually don't poison cross-attention,
+            but pass the mask when available (use tokenizer's attention
+            mask: True where padded).
 
         Returns
         -------
-        Dictionary with keys:
-            contact_state : (B, T, num_body_parts) — sigmoid probabilities
+        Dictionary with keys (all on time positions, [POSE] stripped):
+            contact_state  : (B, T, num_body_parts) — sigmoid probs
             contact_target : (B, T, num_body_parts, num_object_patches) — softmax
-            phase : (B, T, num_phases) — softmax
-            support : (B, T, num_support_states) — softmax
+            phase          : (B, T, num_phases) — softmax
+            support        : (B, T, num_support_states) — softmax
+            contact_logits, target_logits, phase_logits, support_logits
+                — raw logits for loss computation
         """
-        B = text_emb.shape[0]
+        B = text_tokens.shape[0]
         T = seq_length or self.max_seq_length
-        device = text_emb.device
 
-        # Initialize time tokens with positional encoding
-        x = self.time_tokens[:, :T, :].expand(B, -1, -1).clone()  # (B, T, d)
-        pos_enc = self.pos_encoding[:T, :].unsqueeze(0).to(device)
-        x = x + pos_enc
+        # Time tokens with sinusoidal positional encoding
+        time_x = self.time_tokens[:, :T, :].expand(B, -1, -1).contiguous()
+        time_x = time_x + self.pos_encoding[:T, :].unsqueeze(0)
 
-        # Inject initial pose into first token
-        pose_emb = self.pose_proj(init_pose)  # (B, d)
-        x[:, 0, :] = x[:, 0, :] + pose_emb
+        # [POSE] token at index 0 — gets no positional offset (it's not a
+        # frame). Self-attn propagates pose info to all time tokens.
+        pose_emb = self.pose_proj(init_pose).unsqueeze(1)   # (B, 1, d)
+        x = torch.cat([pose_emb, time_x], dim=1)            # (B, T+1, d)
 
-        # --- Block AttnRes forward ---
-        # blocks[0] = token embedding (before any transformer layer)
-        # partial_block starts as None — the first sublayer output begins a new block
-        blocks: list[Tensor] = [x]
-        partial_block: Tensor | None = None
+        # Project CLIP text features once
+        text_kv = self.text_proj(text_tokens)               # (B, 77, d)
 
-        for layer_idx, layer in enumerate(self.layers):
-            # Block boundary: every block_size layers (except layer 0)
-            # At boundary, seal partial_block into blocks and reset
-            is_boundary = (layer_idx > 0) and (layer_idx % self.block_size == 0)
-
-            blocks, partial_block = layer(
-                blocks, partial_block, object_tokens, text_emb,
-                is_block_boundary=is_boundary,
+        for layer in self.layers:
+            x = layer(
+                x, text_kv, object_tokens,
+                text_key_padding_mask=text_key_padding_mask,
             )
+        x = self.final_norm(x)
 
-        # Final output is the last partial_block
-        x = partial_block
+        # Drop [POSE] position before emitting per-frame predictions
+        x = x[:, 1:, :]                                     # (B, T, d)
 
-        # Output heads
-        contact_logits = self.contact_head(x)           # (B, T, B_parts)
-        target_logits = self.target_head(x)             # (B, T, B_parts * K)
-        phase_logits = self.phase_head(x)               # (B, T, P)
-        support_logits = self.support_head(x)           # (B, T, S)
+        contact_logits = self.contact_head(x)               # (B, T, num_body_parts)
+        target_logits = self.target_head(x)                 # (B, T, num_body_parts * K)
+        phase_logits = self.phase_head(x)                   # (B, T, P)
+        support_logits = self.support_head(x)               # (B, T, S)
 
-        # Reshape target: (B, T, B_parts*K) -> (B, T, B_parts, K)
         target_logits = target_logits.reshape(
             B, T, self.num_body_parts, self.num_object_patches,
         )
@@ -361,7 +294,6 @@ class InteractionPredictor(nn.Module):
             "contact_target": torch.softmax(target_logits, dim=-1),
             "phase": torch.softmax(phase_logits, dim=-1),
             "support": torch.softmax(support_logits, dim=-1),
-            # Raw logits for loss computation
             "contact_logits": contact_logits,
             "target_logits": target_logits,
             "phase_logits": phase_logits,
@@ -370,10 +302,12 @@ class InteractionPredictor(nn.Module):
 
     @staticmethod
     def _sinusoidal_encoding(length: int, d_model: int) -> Tensor:
-        """Generate sinusoidal positional encoding (not learnable)."""
+        """Standard sinusoidal positional encoding (not learnable)."""
         pe = torch.zeros(length, d_model)
         position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe

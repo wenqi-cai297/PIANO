@@ -13,9 +13,9 @@ data:
     - name: "omomo"
       root: "data/omomo"
   pseudo_label_dir: "runs/pseudo_labels"
-  motion_repr: "humanml3d"    # 263-dim
+  motion_repr: "humanml3d"    # 263-dim (HumanML3D encoder output)
   max_seq_length: 196
-  fps: 30
+  fps: 20                      # InterAct preprocessed data rate
 
 training:
   batch_size: 64

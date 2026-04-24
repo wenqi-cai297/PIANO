@@ -28,6 +28,7 @@ from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.backbones.momask_adapter import load_momask_vqvae
 from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.object_encoder import ObjectEncoder
+from piano.utils.clip_utils import encode_text_per_token
 from piano.utils.io_utils import save_npz
 
 
@@ -37,7 +38,7 @@ class GenerationConfig:
 
     # Generation parameters
     num_frames: int = 196
-    fps: float = 30.0
+    fps: float = 20.0                     # InterAct preprocessed data rate
     num_unmasking_steps: int = 10
     temperature: float = 1.0
     topk_filter_thres: float = 0.9
@@ -46,6 +47,9 @@ class GenerationConfig:
 
     # Object
     num_object_points: int = 1024
+
+    # Initial pose dimension (66 = 22 SMPL joints × 3)
+    init_pose_dim: int = 66
 
 
 class PIANOPipeline:
@@ -90,7 +94,8 @@ class PIANOPipeline:
         ----------
         text : text description of the action
         object_pc : (N, 3) object point cloud
-        init_pose : (263,) initial pose features, or None for zeros
+        init_pose : (66,) initial pose — SMPL-22 joint positions
+            flattened (xyz per joint). Pass None for zeros.
         config : generation configuration
 
         Returns
@@ -107,7 +112,12 @@ class PIANOPipeline:
             config = GenerationConfig()
 
         # --- Encode text ---
-        text_emb = self._encode_text(text)  # (1, clip_dim)
+        # Per-token features for the predictor's text cross-attn, pooled
+        # features for the MaskTransformer.
+        text_features, text_mask = encode_text_per_token(
+            self.clip_model, [text], torch.device(self.device),
+        )
+        text_pooled = self._encode_text_pooled(text)   # (1, clip_dim)
 
         # --- Encode object ---
         obj_pc_tensor = torch.from_numpy(object_pc).float().unsqueeze(0).to(self.device)
@@ -116,14 +126,18 @@ class PIANOPipeline:
             obj_pc_tensor = torch.from_numpy(object_pc[indices]).float().unsqueeze(0).to(self.device)
         obj_tokens = self.object_encoder(obj_pc_tensor)  # (1, M, d)
 
-        # --- Initial pose ---
+        # --- Initial pose (66-d: SMPL-22 joint xyz) ---
         if init_pose is not None:
             pose_tensor = torch.from_numpy(init_pose).float().unsqueeze(0).to(self.device)
         else:
-            pose_tensor = torch.zeros(1, 263, device=self.device)
+            pose_tensor = torch.zeros(1, config.init_pose_dim, device=self.device)
 
         # --- Predict interaction latent ---
-        pred = self.predictor(text_emb, obj_tokens, pose_tensor, seq_length=config.num_frames)
+        pred = self.predictor(
+            text_features, obj_tokens, pose_tensor,
+            seq_length=config.num_frames,
+            text_key_padding_mask=text_mask,
+        )
 
         # --- Build interaction tokens ---
         interaction_tokens = self.interaction_tokenizer(
@@ -138,7 +152,7 @@ class PIANOPipeline:
         m_lens = torch.tensor([token_len], device=self.device)
 
         token_ids = self.transformer.generate(
-            cond=text_emb,
+            cond=text_pooled,
             m_lens=m_lens,
             interaction_tokens=interaction_tokens,
             timesteps=config.num_unmasking_steps,
@@ -172,13 +186,11 @@ class PIANOPipeline:
             "token_ids": token_ids[0].cpu().numpy(),
         }
 
-    def _encode_text(self, text: str) -> Tensor:
-        """Encode text using CLIP."""
-        # This will use the CLIP model's tokenizer and encoder
-        # Implementation depends on how CLIP is loaded (OpenAI CLIP vs HuggingFace)
+    def _encode_text_pooled(self, text: str) -> Tensor:
+        """Encode text to the pooled CLIP vector (used by the MaskTransformer)."""
         import clip
 
-        tokens = clip.tokenize([text]).to(self.device)
+        tokens = clip.tokenize([text], truncate=True).to(self.device)
         text_emb = self.clip_model.encode_text(tokens).float()
         return text_emb  # (1, clip_dim)
 

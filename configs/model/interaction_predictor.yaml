@@ -1,8 +1,10 @@
-# Interaction Predictor architecture config
-# Temporal Transformer with Block AttnRes (from MoonshotAI/Attention-Residuals)
+# Interaction Predictor architecture config.
 #
-# Scaled design: deeper but narrower than the original, with AttnRes for
-# selective depth-wise aggregation. d_model=384 matches MoMask's latent_dim.
+# Standard pre-norm Transformer with per-token CLIP text cross-attention,
+# PointNet++ object cross-attention, and a prepended [POSE] token.
+# See src/piano/models/interaction_predictor.py for rationale behind the
+# 2026-04-24 rewrite (Block AttnRes removed, AdaLN removed, text cross-attn
+# added, [POSE] token added).
 
 encoder:
   num_layers: 10
@@ -11,27 +13,24 @@ encoder:
   dim_feedforward: 1024
   dropout: 0.1
 
-block_attn_res:
-  block_size: 2         # layers per block (10 layers / 2 = 5 blocks)
-  # Each sublayer (self-attn, cross-attn, FFN) has its own proj + RMSNorm
-  # Total AttnRes params: 10 layers × 3 sublayers × (384 + 384) ≈ 23K (negligible)
-
 object_encoder:
-  # PointNet++ config
+  # See configs/model/object_encoder.yaml for the full PointNet++ spec.
+  # 128 tokens (up from 16) gives the object cross-attention enough
+  # geometric granularity to discriminate chair seat / armrest / backrest.
   num_input_points: 1024
-  num_output_tokens: 16
-  feature_dim: 384      # matches d_model
+  num_output_tokens: 128
+  feature_dim: 384      # matches encoder.d_model
 
 input:
-  text_dim: 512           # CLIP ViT-B/32 output dim (matching MoMask)
-  pose_dim: 263           # HumanML3D representation dim
+  text_dim: 512           # CLIP ViT-B/32 per-token feature dim
+  pose_dim: 66            # SMPL-22 joint positions (22 × 3)
 
 output:
   num_body_parts: 5       # left_hand, right_hand, left_foot, right_foot, pelvis
-  num_object_patches: 16  # FPS-sampled surface patches
+  num_object_patches: 16  # FPS-sampled classification patches (label space)
   num_phases: 5           # approach, pre-contact, stable-contact, manipulation, release
   num_support_states: 4   # both_feet, single_foot, sitting, hand_support
 
 sequence:
-  max_length: 196         # max frames (~6.5 sec @ 30fps)
-  fps: 30
+  max_length: 196         # max frames (~9.8 s @ 20 fps)
+  fps: 20                 # InterAct preprocessed data rate
