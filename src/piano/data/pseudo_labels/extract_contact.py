@@ -49,18 +49,27 @@ from piano.utils.smpl_utils import (
 #     is 5-8 cm out, and when the hand *wraps* a handle / edge / bat
 #     grip the wrist ends up 10-15 cm from the mesh. v1-v6 used 0.08 m
 #     ("palm just touching edge"), which undercounted every gripping
-#     pose. v6 hand seq_reached was only 38-63% across subsets even
-#     though these datasets are explicitly hand-object interaction.
-#     Sweep shows seq_reached curves elbow at 0.12:
-#         chairs  L 61→75% / R 59→73% (at 0.08 → 0.12)
-#         imhd    L 63→75% / R 58→69%
-#         neural. L 38→47% / R 40→50%
-#         omomo   L 58→74% / R 63→79%
-#     Above 0.14 gains diminish to < 4 pp and risk "hand near but not
-#     touching" FPs. 0.12 is the tuned value. FP risk is tempered by
-#     min_contact_duration=3 and median_filter_size=5 — isolated
-#     approach frames don't register. See
-#     2026-04-22_hand_threshold_bump.md.
+#     pose. v7 bumped to 0.12 based on sweep elbow; v7 vis then showed
+#     two residual issues: (a) several bat / baseball clips have
+#     genuinely 0 contact for the full sequence ("dead clips"), and
+#     (b) contact in surviving clips flickers frame-to-frame, driving
+#     phase transitions every 10 frames on some imhd clips (e.g.
+#     bat_holdhandle_hit_0_0: 16 transitions in 164 frames) — bad for
+#     Stage A because the model ends up chasing phase noise rather
+#     than learning stable phase boundaries.
+#     v8 raises the threshold to 0.16 to stabilise contact at the
+#     cost of a small "hand near but not touching" FP class. Sweep
+#     deltas from 0.12 → 0.16:
+#         chairs  L 74.8→82.5% / R 73.3→82.5%
+#         imhd    L 74.5→79.2% / R 68.6→72.3%
+#         neural. L 47.4→55.7% / R 50.0→58.6%
+#         omomo   L 74.1→76.1% / R 79.0→80.4%
+#     0.12 → 0.16 buys the most on neuraldome (+8 pp, the subset where
+#     arms wrap around large objects at arm's length). Above 0.18 we
+#     hit the saturation point and risk mislabelling reaching frames
+#     as contact. FP risk is tempered by min_contact_duration=3 and
+#     median_filter_size (raised to 7 — see ContactConfig).
+#     See 2026-04-23_hand_threshold_bump_to_016.md.
 #   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8),
 #     ~8-10 cm above the sole. An anatomy-only guess of 0.12 was LOOSE
 #     here because our mesh is the OBJECT, not the ground: a foot on the
@@ -74,8 +83,8 @@ from piano.utils.smpl_utils import (
 #     Sweep confirmed: chairs 0.20 gives 93% seq_reached, saturating at
 #     the elbow of the curve.
 DEFAULT_DISTANCE_THRESHOLDS: dict[str, float] = {
-    "left_hand":  0.12,
-    "right_hand": 0.12,
+    "left_hand":  0.16,
+    "right_hand": 0.16,
     "left_foot":  0.06,
     "right_foot": 0.06,
     "pelvis":     0.20,
@@ -93,7 +102,14 @@ class ContactConfig:
     use_velocity_gating: bool = False       # disabled by default; see module docstring
     velocity_threshold: float = 0.5         # m/s — only used when gating is on
     velocity_sigma: float = 0.2             # m/s
-    median_filter_size: int = 5             # temporal median filter window
+    # Temporal median filter window, in frames. v1-v7 used 5 (0.25s at
+    # 20fps). v7 vis surfaced heavy frame-to-frame contact flicker that
+    # drove phase transitions every 10 frames on some imhd clips. v8
+    # widens the smoothing window to 7 (0.35s) so that single borderline
+    # frames are out-voted by neighbours. Cost: phase boundaries drift
+    # by at most 2 frames (~0.1s) — well below what the HMM refinement
+    # would capture anyway.
+    median_filter_size: int = 7
     min_contact_duration: int = 3           # minimum consecutive frames for valid contact
     fps: float = 30.0
 
