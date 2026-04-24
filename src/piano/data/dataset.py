@@ -65,6 +65,12 @@ class HOIDataset(Dataset):
     pseudo_label_dir : path to pseudo-label directory (overrides root/pseudo_labels)
     max_seq_length : pad/truncate to this length
     num_object_points : subsample object point cloud to this size
+    use_clean_metadata : if True and ``root/metadata_clean.json`` exists,
+        load that instead of ``root/metadata.json``. The cleaned version
+        is produced by ``scripts/data/clean_pseudo_labels.py`` and drops
+        sequences whose pseudo-labels are unusable or contradict the
+        text description. Default True so training naturally uses the
+        filtered set once it exists; set False to train on the raw set.
     """
 
     def __init__(
@@ -73,16 +79,28 @@ class HOIDataset(Dataset):
         pseudo_label_dir: str | Path | None = None,
         max_seq_length: int = 196,
         num_object_points: int = 1024,
+        use_clean_metadata: bool = True,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
         self.num_object_points = num_object_points
 
-        # Load metadata
-        meta_path = self.root / "metadata.json"
+        # Load metadata — prefer metadata_clean.json when it exists so
+        # training skips sequences the cleaning tool flagged as bad
+        # (zero contact, text-label contradictions, garbled text, etc).
+        # Fall back to metadata.json for datasets that haven't been
+        # cleaned yet.
+        meta_path: Path | None = None
+        if use_clean_metadata:
+            candidate = self.root / "metadata_clean.json"
+            if candidate.exists():
+                meta_path = candidate
+        if meta_path is None:
+            meta_path = self.root / "metadata.json"
         if not meta_path.exists():
-            raise FileNotFoundError(f"metadata.json not found in {self.root}")
+            raise FileNotFoundError(f"metadata not found in {self.root}")
         self.metadata: list[dict] = load_json(meta_path)
+        self.metadata_source = meta_path.name
 
         # Pseudo-label directory
         if pseudo_label_dir is not None:
