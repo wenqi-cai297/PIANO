@@ -3,15 +3,32 @@
 For each frame, computes whether each tracked body part (left_hand, right_hand,
 left_foot, right_foot, pelvis) is in contact with the object surface.
 
-Contact is detected from the distance between the body-part *joint* and the
-mesh surface, using per-part anatomy-calibrated thresholds:
+Two orthogonal contact signals are OR-combined:
 
-    SMPL joint centers sit inside the body, not on the skin. A wrist joint is
-    ~5-8 cm from the palm surface; an ankle joint is ~7-10 cm above the sole;
-    the SMPL pelvis root is ~15-20 cm from the seat surface during sitting.
-    A single tight threshold (e.g. 2 cm) measures joint penetration into the
-    mesh, which almost never happens, and suppresses nearly all real contact.
-    So thresholds are set per body part to reflect joint-to-skin offset.
+    1. **Distance signal**: per-part anatomy-calibrated threshold on the
+       joint-to-mesh distance in the object-local frame. Catches static
+       contact (holding a stationary cup, sitting, etc.). SMPL joint
+       centers sit inside the body, not on the skin — wrist ~5-8 cm from
+       palm surface, foot joint ~4-5 cm above sole, pelvis root ~15-20 cm
+       from seat surface during sitting. Thresholds reflect the joint-
+       to-skin offset.
+
+    2. **Kinematic coupling signal** (v9, 2026-04-24): per-part soft score
+       that fires when the body part's position in the *object-local
+       frame* is stable over a ~0.5 s window AND the object is translating
+       or rotating in the world. This is the standard rigid-coupling
+       test — a hand wrapping a bat / carrying a case / holding a flower
+       in a walking subject is geometrically "attached" to the object
+       even if the wrist joint is 18-22 cm from the mesh surface (too far
+       for the distance threshold). The v8 cleaning pass showed this is
+       the dominant failure mode on neuraldome (large wrap-grip objects:
+       cases, flowers, boxes, rackets — 500+ dropped clips of 624 total
+       drops).
+
+       The "object must be moving" gate is essential: a stationary scene
+       trivially has every body part stationary in the object frame, so
+       without it the signal would fire on everything. See
+       ``analyses/2026-04-24_v9_kin_coupling.md``.
 
 Velocity gating is off by default. Early runs with strict velocity gating
 (v < 0.1 m/s) erased the remaining contact signal during manipulation, and
@@ -45,46 +62,38 @@ from piano.utils.smpl_utils import (
 # distance-threshold midpoints in the soft sigmoid. Derived from anatomy
 # then verified (and adjusted) against the full-dataset sweep
 # (runs/threshold_sweep/2026-04-20_193818/):
+#
 #   * left/right_hand: wrist joint sits inside the forearm; palm surface
-#     is 5-8 cm out, and when the hand *wraps* a handle / edge / bat
-#     grip the wrist ends up 10-15 cm from the mesh. v1-v6 used 0.08 m
-#     ("palm just touching edge"), which undercounted every gripping
-#     pose. v7 bumped to 0.12 based on sweep elbow; v7 vis then showed
-#     two residual issues: (a) several bat / baseball clips have
-#     genuinely 0 contact for the full sequence ("dead clips"), and
-#     (b) contact in surviving clips flickers frame-to-frame, driving
-#     phase transitions every 10 frames on some imhd clips (e.g.
-#     bat_holdhandle_hit_0_0: 16 transitions in 164 frames) — bad for
-#     Stage A because the model ends up chasing phase noise rather
-#     than learning stable phase boundaries.
-#     v8 raises the threshold to 0.16 to stabilise contact at the
-#     cost of a small "hand near but not touching" FP class. Sweep
-#     deltas from 0.12 → 0.16:
-#         chairs  L 74.8→82.5% / R 73.3→82.5%
-#         imhd    L 74.5→79.2% / R 68.6→72.3%
-#         neural. L 47.4→55.7% / R 50.0→58.6%
-#         omomo   L 74.1→76.1% / R 79.0→80.4%
-#     0.12 → 0.16 buys the most on neuraldome (+8 pp, the subset where
-#     arms wrap around large objects at arm's length). Above 0.18 we
-#     hit the saturation point and risk mislabelling reaching frames
-#     as contact. FP risk is tempered by min_contact_duration=3 and
-#     median_filter_size (raised to 7 — see ContactConfig).
-#     See 2026-04-23_hand_threshold_bump_to_016.md.
-#   * left/right_foot: the tracked joint is the ankle (SMPL idx 7/8),
-#     ~8-10 cm above the sole. An anatomy-only guess of 0.12 was LOOSE
-#     here because our mesh is the OBJECT, not the ground: a foot on the
-#     floor next to a chair leg sits ~5-10 cm from the chair mesh without
-#     actually contacting it. Sweep showed chairs 0.12 gave 48%
-#     seq_reached (false positives) while 0.06 gave 12% (genuine
-#     foot-object contact rate expected for chairs). 0.06 is the tuned
-#     value.
+#     is 5-8 cm out. v1-v6 used 0.08 (too tight); v7 bumped to 0.12 at
+#     sweep elbow. v8 pushed to 0.16 to catch wrap-grip cases where wrist
+#     is 10-15 cm from mesh — but data showed (a) v8 0.16 still missed
+#     the 18-22 cm wrap-grip cases (neuraldome 45% left-hand
+#     seq_without_contact) and (b) 0.16 was at the edge of "hand reaching
+#     toward object" FPs per pipeline doc.
+#     v9 rolls back to 0.12 and delegates the wrap-grip class to the
+#     **kinematic coupling signal** (see ContactConfig). Wrap-grip is
+#     always rigid coupling (hand moves with object), so kin signal
+#     handles it; 0.12 keeps the distance signal tight and avoids FP.
+#     See ``analyses/2026-04-24_v9_kin_coupling.md``.
+#
+#   * left/right_foot: tracked joint is now SMPL idx 10/11 (mid-foot),
+#     NOT 7/8 (ankle). v1-v8 used ankle which is 8-10 cm above sole;
+#     threshold 0.06 = "ankle inside mesh" which essentially never
+#     happens. Result: ~99% feet-seq-without-contact on imhd/neural/
+#     omomo, and every "Kick the X" / "scoot with foot" clip on omomo
+#     dropped by cleaning (394/398 of omomo drops).
+#     Foot joint at mid-foot sits ~4-5 cm above sole; threshold 0.06
+#     now means "sole within 1-2 cm of mesh", a genuine foot-on-object
+#     contact test. Threshold stays at 0.06 — the joint swap closes
+#     the 4-5 cm gap implicitly.
+#
 #   * pelvis: SMPL root is inside the hip; during sitting the ischium is
 #     ~15 cm below + buttock flesh ~5 cm, so 0.20 m covers seat contact.
 #     Sweep confirmed: chairs 0.20 gives 93% seq_reached, saturating at
 #     the elbow of the curve.
 DEFAULT_DISTANCE_THRESHOLDS: dict[str, float] = {
-    "left_hand":  0.16,
-    "right_hand": 0.16,
+    "left_hand":  0.12,
+    "right_hand": 0.12,
     "left_foot":  0.06,
     "right_foot": 0.06,
     "pelvis":     0.20,
@@ -113,6 +122,20 @@ class ContactConfig:
     min_contact_duration: int = 3           # minimum consecutive frames for valid contact
     fps: float = 30.0
 
+    # --- Kinematic coupling signal (v9) ---
+    # Detects contact via rigid attachment to a moving object. Soft-ORs
+    # with the distance signal above. See module docstring for rationale.
+    use_kinematic_coupling: bool = True
+    kin_window_sec: float = 0.5             # rolling window for local-frame std (s)
+    kin_local_sigma: float = 0.03           # m — "rigid" if per-axis local std < this
+    kin_local_transition: float = 0.015     # m — softness of the "rigid" sigmoid
+    kin_world_eps: float = 0.15             # m/s — object-world speed gate midpoint
+    kin_world_sigma: float = 0.04           # m/s — softness of world gate. Tight so
+                                            # a static object (speed ≈ 0) gives
+                                            # world_score ≈ 0.02 (cleanly off) and
+                                            # moving object (>= 0.3 m/s) saturates.
+    kin_radius_proxy: float = 0.3           # m — converts ang_vel (rad/s) to surface speed
+
 
 def _soft_sigmoid(x: np.ndarray, threshold: float, sigma: float) -> np.ndarray:
     """Smooth step function: 1 when x < threshold, 0 when x >> threshold.
@@ -123,6 +146,95 @@ def _soft_sigmoid(x: np.ndarray, threshold: float, sigma: float) -> np.ndarray:
     """
     from scipy.special import expit
     return expit(-(x - threshold) / sigma)
+
+
+def _kinematic_contact_score(
+    part_world: np.ndarray,
+    object_positions: np.ndarray | None,
+    object_rotations: np.ndarray | None,
+    config: ContactConfig,
+) -> np.ndarray:
+    """Per-frame soft score for rigid-coupling-based contact detection.
+
+    High when:
+        (a) the body part's position in the object-local frame has low
+            variance over a ~``kin_window_sec`` window (= the part is
+            rigidly attached to the object over that window), AND
+        (b) the object is actually translating or rotating in world
+            (otherwise "stationary in object frame" is trivially true
+            for any body part and the signal is meaningless).
+
+    Returns a zero array when inputs are insufficient (no object pose,
+    T < 2, or kinematic gating disabled by config).
+
+    Parameters
+    ----------
+    part_world : (T, 3) — body part world position per frame.
+    object_positions : (T, 3) or None — per-frame object translation.
+    object_rotations : (T, 3) or None — per-frame axis-angle rotation.
+        If None, rotation is treated as identity and only translation
+        contributes to object motion + local transformation.
+    config : contact extraction parameters (kin_* fields).
+
+    Returns
+    -------
+    score : (T,) float32 in [0, 1].
+    """
+    from scipy.ndimage import uniform_filter1d
+    from scipy.special import expit
+
+    from piano.data.pseudo_labels._object_transform import world_to_object_local
+
+    T = len(part_world)
+    if (
+        not config.use_kinematic_coupling
+        or object_positions is None
+        or T < 2
+    ):
+        return np.zeros(T, dtype=np.float32)
+
+    # --- Stability in object-local frame ---
+    part_local = world_to_object_local(
+        part_world, object_positions, object_rotations,
+    )                                                     # (T, 3)
+
+    window = max(3, int(round(config.kin_window_sec * config.fps)))
+    # Rolling variance per xyz axis via the identity Var[X] = E[X^2] - E[X]^2,
+    # both taken over the ``window``-frame neighbourhood. DO NOT filter
+    # ``(x - rolling_mean)^2`` directly — that measures deviation from
+    # the LOCAL rolling mean (a low-pass signal that tracks x), which is
+    # near-zero for any slowly-varying signal including a wide orbit.
+    # We want "does x stay near some constant over the window" = true
+    # window variance.
+    mean_x = uniform_filter1d(part_local, size=window, axis=0, mode="nearest")
+    mean_x_sq = uniform_filter1d(part_local ** 2, size=window, axis=0, mode="nearest")
+    rolling_var = np.maximum(mean_x_sq - mean_x ** 2, 0.0)   # clip numerical neg
+    local_std = np.sqrt(rolling_var + 1e-12).max(axis=-1)     # (T,)  worst-axis std
+
+    # Low local std => rigid coupling. Sigmoid centred at ``kin_local_sigma``.
+    local_score = expit(
+        (config.kin_local_sigma - local_std) / max(config.kin_local_transition, 1e-6)
+    )                                                     # (T,)
+
+    # --- Object world speed (translational + angular surface proxy) ---
+    trans_vel = np.zeros(T)
+    trans_vel[1:] = np.linalg.norm(
+        np.diff(object_positions, axis=0), axis=-1
+    ) * config.fps
+
+    ang_vel = np.zeros(T)
+    if object_rotations is not None:
+        ang_vel[1:] = np.linalg.norm(
+            np.diff(object_rotations, axis=0), axis=-1
+        ) * config.fps
+
+    obj_speed = trans_vel + config.kin_radius_proxy * ang_vel   # (T,)  m/s proxy
+
+    world_score = expit(
+        (obj_speed - config.kin_world_eps) / max(config.kin_world_sigma, 1e-6)
+    )                                                     # (T,)
+
+    return (local_score * world_score).astype(np.float32)
 
 
 def extract_contact_state(
@@ -190,15 +302,25 @@ def extract_contact_state(
         )
         dist_score = _soft_sigmoid(distances, threshold, config.distance_sigma)
 
+        # v9 kinematic coupling: OR-combine with the rigid-coupling
+        # signal. Catches wrap-grip cases where the wrist joint is
+        # 18-22 cm from the mesh surface (too far for the distance
+        # threshold) but the hand is clearly "attached" to a moving
+        # object. See module docstring.
+        kin_score = _kinematic_contact_score(
+            bp_positions_world, object_positions, object_rotations, config,
+        )
+        score = np.maximum(dist_score, kin_score)
+
         if joint_vel is not None:
             bp_velocities = joint_vel[:, joint_idx, :]
             bp_speed = np.linalg.norm(bp_velocities, axis=-1)
             vel_score = _soft_sigmoid(
                 bp_speed, config.velocity_threshold, config.velocity_sigma,
             )
-            contact[:, bp_idx] = dist_score * vel_score
+            contact[:, bp_idx] = score * vel_score
         else:
-            contact[:, bp_idx] = dist_score
+            contact[:, bp_idx] = score
 
     # Temporal smoothing
     for bp_idx in range(NUM_BODY_PARTS):

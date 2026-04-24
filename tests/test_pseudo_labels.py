@@ -23,6 +23,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from piano.data.pseudo_labels.extract_contact import (
+    ContactConfig,
+    _kinematic_contact_score,
+    extract_contact_state,
+)
 from piano.data.pseudo_labels.extract_phase import (
     PHASE_MANIPULATION,
     PHASE_STABLE_CONTACT,
@@ -611,6 +616,139 @@ def test_target_sigma_default_yields_soft_distribution() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v9 — Kinematic coupling contact signal
+# ---------------------------------------------------------------------------
+
+def test_kin_coupling_fires_when_rigidly_attached_to_moving_object() -> None:
+    """Hand's position in the object's local frame is constant while the
+    object translates in world — the textbook rigid-coupling setup that
+    distance thresholds miss on wrap-grip. kin score must approach 1.
+    """
+    T = 40
+    fps = 20.0
+    # Object translates at 0.5 m/s along +x (>> kin_world_eps=0.15).
+    obj_pos = np.zeros((T, 3), dtype=np.float32)
+    obj_pos[:, 0] = np.linspace(0.0, 1.0, T)
+    obj_rot = np.zeros((T, 3), dtype=np.float32)
+
+    # Hand is rigidly attached at local offset (0.2, 0, 0) — so in world
+    # it moves identically with the object. Distance to mesh would be 20 cm,
+    # beyond any sensible threshold, but kin signal should fire.
+    hand_world = obj_pos + np.array([0.2, 0.0, 0.0], dtype=np.float32)
+
+    cfg = ContactConfig(fps=fps)
+    score = _kinematic_contact_score(hand_world, obj_pos, obj_rot, cfg)
+
+    # Middle of the window (avoid edges with boundary padding bias) must
+    # be well above the downstream binarization threshold (0.5). Perfect
+    # rigid + fully-moving product saturates at ~0.86 because each sigmoid
+    # factor is < 1 individually — that's the design (leave headroom so
+    # partial signal still scores below full).
+    mid = T // 2
+    assert score[mid] > 0.7, (
+        f"rigid-coupled + moving object should fire kin contact; "
+        f"got score[{mid}]={score[mid]:.3f}, full={score.tolist()}"
+    )
+
+
+def test_kin_coupling_silent_in_static_scene() -> None:
+    """Object not moving in world → kin signal must NOT fire (otherwise
+    it would flag every static frame as contact, which is the whole
+    reason for the world-speed gate). Hand itself is also stationary here,
+    which is a realistic "hand resting at rest" scenario.
+    """
+    T = 40
+    fps = 20.0
+    obj_pos = np.zeros((T, 3), dtype=np.float32)
+    obj_rot = np.zeros((T, 3), dtype=np.float32)
+    hand_world = np.tile(np.array([0.2, 0.0, 0.0], dtype=np.float32), (T, 1))
+
+    cfg = ContactConfig(fps=fps)
+    score = _kinematic_contact_score(hand_world, obj_pos, obj_rot, cfg)
+
+    assert score.max() < 0.05, (
+        f"static scene must not fire kin contact; got max={score.max():.3f}"
+    )
+
+
+def test_kin_coupling_silent_when_hand_orbits_moving_object() -> None:
+    """Hand circles the object while the object translates. Object-local
+    hand position varies large-amplitude → local_score near 0 → kin silent.
+    This guards against the "hand near but not attached" FP class.
+    """
+    T = 40
+    fps = 20.0
+    # Object translates +x at 0.5 m/s
+    obj_pos = np.zeros((T, 3), dtype=np.float32)
+    obj_pos[:, 0] = np.linspace(0.0, 1.0, T)
+    obj_rot = np.zeros((T, 3), dtype=np.float32)
+
+    # Hand follows the object but also orbits at radius 0.3 m in xz plane.
+    theta = np.linspace(0, 2 * np.pi, T)
+    hand_world = obj_pos.copy()
+    hand_world[:, 0] += 0.3 * np.cos(theta)
+    hand_world[:, 2] += 0.3 * np.sin(theta)
+
+    cfg = ContactConfig(fps=fps)
+    score = _kinematic_contact_score(hand_world, obj_pos, obj_rot, cfg)
+
+    # The local xyz std over a 0.5s window is ~0.15 m (well above 0.03),
+    # so local_score ≈ 0 even though world_score ≈ 1.
+    assert score.max() < 0.2, (
+        f"orbiting hand must not fire kin contact; got max={score.max():.3f}"
+    )
+
+
+def test_kin_coupling_recovers_wrap_grip_in_extract_contact_state() -> None:
+    """End-to-end: a hand 18 cm from the mesh surface (too far for the
+    0.12 m distance threshold) but rigidly attached to a moving object
+    must still be labelled as contact after v9. This is the neuraldome
+    wrap-grip class that dominated v8's 624 drops.
+    """
+    import trimesh
+
+    # Small box mesh: 10 cm cube, so distance from a point 18 cm away
+    # is ~13 cm — well beyond hand threshold 0.12 m.
+    mesh = trimesh.primitives.Box(extents=[0.1, 0.1, 0.1])
+
+    T = 40
+    fps = 20.0
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    obj_pos = np.zeros((T, 3), dtype=np.float32)
+    obj_pos[:, 0] = np.linspace(0.0, 1.0, T)   # box translates +x at 0.5 m/s
+    obj_rot = np.zeros((T, 3), dtype=np.float32)
+
+    # Right wrist (idx 21) rigidly offset 18 cm from object centre.
+    joints[:, 21, :] = obj_pos + np.array([0.18, 0.0, 0.0], dtype=np.float32)
+
+    cfg = ContactConfig(fps=fps, median_filter_size=3)
+    contact = extract_contact_state(joints, mesh, obj_pos, obj_rot, cfg)
+    # Body part 1 = right_hand. Middle window must be labelled contact.
+    right_hand_contact = contact[:, 1]
+    mid = T // 2
+    assert right_hand_contact[mid] > 0.5, (
+        f"wrap-grip at 18 cm not recovered by kin coupling; "
+        f"contact[{mid}]={right_hand_contact[mid]:.3f}"
+    )
+
+
+def test_kin_coupling_disabled_flag_switches_off() -> None:
+    """``use_kinematic_coupling=False`` must restore v8 pure-distance
+    behaviour — kin score returns all zeros regardless of input."""
+    T = 20
+    fps = 20.0
+    obj_pos = np.zeros((T, 3), dtype=np.float32)
+    obj_pos[:, 0] = np.linspace(0.0, 1.0, T)
+    obj_rot = np.zeros((T, 3), dtype=np.float32)
+    hand_world = obj_pos + np.array([0.2, 0.0, 0.0], dtype=np.float32)
+
+    cfg = ContactConfig(fps=fps, use_kinematic_coupling=False)
+    score = _kinematic_contact_score(hand_world, obj_pos, obj_rot, cfg)
+
+    assert (score == 0).all()
+
+
+# ---------------------------------------------------------------------------
 # HMM fallback on degenerate input
 # ---------------------------------------------------------------------------
 
@@ -657,6 +795,11 @@ if __name__ == "__main__":
         test_support_leaning_on_stationary_object_is_hand_support,
         test_support_manipulation_phase_blocks_hand_support,
         test_target_sigma_default_yields_soft_distribution,
+        test_kin_coupling_fires_when_rigidly_attached_to_moving_object,
+        test_kin_coupling_silent_in_static_scene,
+        test_kin_coupling_silent_when_hand_orbits_moving_object,
+        test_kin_coupling_recovers_wrap_grip_in_extract_contact_state,
+        test_kin_coupling_disabled_flag_switches_off,
         test_hmm_falls_back_to_initial_on_bad_features,
     ]
     failures = 0

@@ -96,10 +96,16 @@ class SupportConfig:
     # pelvis and requires an upward-facing surface inside it.
     sitting_below_horz_radius: float = 0.15     # cylinder radius (m)
     sitting_below_vert_gate: float = 0.30       # cylinder height below pelvis (m)
-    # Minimum +Y component of face normal for a surface to count as
-    # "seat-like". 0.7 ≈ within 45° of vertical. Filters out backrest
-    # / leg / armrest side faces that happen to intersect the cylinder.
-    sitting_below_upward_normal_threshold: float = 0.7
+    # Minimum alignment of face normal with the up axis for a surface
+    # to count as "seat-like". v1-v8 used 0.7 (within ~45° of vertical),
+    # which filtered out backrests/legs/armrests — but also filtered out
+    # slightly-angled cushion faces on bigsofa and on several neuraldome
+    # chairs (Obj98, Obj162, etc.), causing 168 chair sit clips to be
+    # dropped by cleaning even though they contain legitimate sitting.
+    # v9 relaxes to 0.5 (within ~60° of vertical). Legs and backrests
+    # still have normals well below 0.5 against the up axis, so the
+    # FP risk stays low, but angled cushion tops now qualify as seats.
+    sitting_below_upward_normal_threshold: float = 0.5
 
 
 def _majority_filter(labels: np.ndarray, size: int) -> np.ndarray:

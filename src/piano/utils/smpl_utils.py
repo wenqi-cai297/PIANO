@@ -38,12 +38,24 @@ SMPL_22_JOINT_NAMES: list[str] = [
     "right_wrist",      # 21
 ]
 
-# Body parts tracked for interaction pseudo-labels
+# Body parts tracked for interaction pseudo-labels.
+#
+# Foot joints use SMPL idx 10/11 (left_foot/right_foot — mid-foot), NOT
+# 7/8 (ankles). v1-v8 used ankles, which sit 8-10 cm above the sole. With
+# threshold 0.06 that meant "ankle joint within 6 cm of mesh", which is
+# only satisfied when the foot has penetrated the mesh — essentially
+# never. The result was that ~99% of imhd/neuraldome/omomo clips had
+# zero foot contact, and every "kick" / "use the foot to scoot" clip
+# on omomo was dropped by cleaning (394/398 of omomo drops in v8 were
+# foot-based actions). foot joints at idx 10/11 sit ~4-5 cm above sole,
+# so threshold 0.06 becomes "sole within 1-2 cm of mesh" = a physically
+# meaningful "foot-on-object" test. See
+# analyses/2026-04-24_v9_kin_coupling.md for the data-driven evidence.
 INTERACTION_BODY_PARTS: dict[str, int] = {
     "left_hand": 20,    # left_wrist joint index
     "right_hand": 21,   # right_wrist joint index
-    "left_foot": 7,     # left_ankle joint index
-    "right_foot": 8,    # right_ankle joint index
+    "left_foot": 10,    # left_foot (mid-foot) — idx 7 is ankle, too far above sole
+    "right_foot": 11,   # right_foot (mid-foot)
     "pelvis": 0,        # pelvis joint index
 }
 
