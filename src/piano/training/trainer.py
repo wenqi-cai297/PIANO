@@ -178,7 +178,11 @@ def run_training_loop(
 
             global_step += 1
 
-            # Logging
+            # Per-step console logging (live monitoring only — not
+            # pushed to wandb: per-step values are too noisy to read a
+            # trend from. wandb gets the epoch-averaged values at the
+            # end of each epoch below, matching the terminal "Epoch
+            # N/M" summary line.
             if global_step % log_every == 0 and accelerator.is_main_process:
                 lr = optimizer.param_groups[0]["lr"]
                 msg = f"  step {global_step} | lr={lr:.2e}"
@@ -187,21 +191,28 @@ def run_training_loop(
                     msg += f" | {key}={v:.4f}"
                 accelerator.print(msg)
 
-                if wandb_run is not None:
-                    log_dict = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in loss_dict.items()}
-                    log_dict["lr"] = lr
-                    log_dict["epoch"] = epoch
-                    wandb_run.log(log_dict, step=global_step)
-
-        # Epoch summary
+        # Epoch summary — printed to console AND pushed to wandb as one
+        # data point per epoch (x-axis = epoch number). ``epoch_losses``
+        # was accumulated per batch during the epoch loop; averaging by
+        # ``n_batches`` gives the same smoothed curve the terminal
+        # prints, which is the right granularity for trend reading on
+        # a small-dataset training run.
         epoch_time = time.time() - epoch_start
         n_batches = len(dataloader)
         if accelerator.is_main_process:
             avg = {k: v / n_batches for k, v in epoch_losses.items()}
+            lr = optimizer.param_groups[0]["lr"]
             msg = f"Epoch {epoch+1}/{num_epochs} ({epoch_time:.0f}s)"
             for key, val in avg.items():
                 msg += f" | {key}={val:.4f}"
             accelerator.print(msg)
+
+            if wandb_run is not None:
+                log_dict = dict(avg)
+                log_dict["lr"] = lr
+                log_dict["epoch"] = epoch + 1
+                log_dict["epoch_time_sec"] = epoch_time
+                wandb_run.log(log_dict, step=epoch + 1)
 
         # Save checkpoint
         if (epoch + 1) % save_every_epochs == 0:
