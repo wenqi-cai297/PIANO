@@ -77,6 +77,16 @@ training:
     warmup_steps: 200
   gradient_accumulation_steps: 2
   max_grad_norm: 1.0
+  # Keep-best-val: every N epochs, re-run the training step on the
+  # val+test object split with grads disabled; write best_val.pt
+  # whenever val total loss improves. Does NOT interrupt training;
+  # final.pt is still saved at the end. 0 disables the val loop.
+  # Community evidence (ContactGen ICCV'23, PointNeXt NeurIPS'22,
+  # ViT, T5, HOI-Diff APDM) supports best-val selection for
+  # supervised regression / classification heads even though motion
+  # diffusion papers (MDM / MoMask / MLD) don't use it — our
+  # Stage A predictor is in the supervised-regression family.
+  val_every_epochs: 5
 
 loss:
   # Contact: BCE on soft [0,1] pseudo-labels.

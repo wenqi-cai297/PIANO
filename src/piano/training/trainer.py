@@ -117,6 +117,9 @@ def run_training_loop(
     max_grad_norm: float = 1.0,
     wandb_run: Any = None,
     extra_modules: dict[str, torch.nn.Module] | None = None,
+    val_dataloader: DataLoader | None = None,
+    val_every_epochs: int = 0,
+    val_best_key: str = "loss",
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -140,9 +143,23 @@ def run_training_loop(
         for Stage A, where the main ``model`` is the predictor and the
         encoder is a peer module whose weights are just as critical
         for inference.
+    val_dataloader : optional DataLoader of held-out clips. When
+        provided together with ``val_every_epochs > 0``, the same
+        ``step_fn`` is re-run on this loader every N epochs (with
+        grads disabled and model.eval()) to measure val loss. A
+        ``best_val.pt`` checkpoint is written whenever the total val
+        loss improves. Does NOT interrupt training — run_training_loop
+        always goes to ``num_epochs`` so the final checkpoint is also
+        saved.
+    val_every_epochs : how often (in epochs) to evaluate val. 0 or
+        negative disables val entirely.
+    val_best_key : which key from step_fn's loss_dict to minimise
+        for best-val selection. Defaults to ``"loss"`` (total). Use
+        e.g. ``"loss_target"`` to select on a specific component.
     """
     output_dir = ensure_dir(output_dir)
     global_step = 0
+    best_val_loss: float = float("inf")
 
     # Backward-compatible hand-off of optimizer-step count to step_fn.
     # New stage scripts (predictor) declare ``global_step`` so their
@@ -151,8 +168,15 @@ def run_training_loop(
     step_fn_params = inspect.signature(step_fn).parameters
     pass_global_step = "global_step" in step_fn_params
 
+    val_enabled = val_dataloader is not None and val_every_epochs > 0
+
     accelerator.print(f"Training for {num_epochs} epochs")
     accelerator.print(f"  Batches per epoch: {len(dataloader)}")
+    if val_enabled:
+        accelerator.print(
+            f"  Val every {val_every_epochs} epochs on {len(val_dataloader)} batches; "
+            f"best-ckpt key = {val_best_key!r}",
+        )
     accelerator.print(f"  Output: {output_dir}")
 
     for epoch in range(num_epochs):
@@ -221,6 +245,42 @@ def run_training_loop(
                 log_dict["epoch_time_sec"] = epoch_time
                 wandb_run.log(log_dict, step=epoch + 1)
 
+        # Val pass + best-val checkpoint. Runs on all ranks (Accelerate
+        # splits the val dataloader across them); losses are reduced
+        # across ranks so the comparison is deterministic.
+        if val_enabled and (epoch + 1) % val_every_epochs == 0:
+            val_means = _run_validation(
+                accelerator=accelerator,
+                model=model,
+                val_dataloader=val_dataloader,
+                step_fn=step_fn,
+                pass_global_step=pass_global_step,
+                global_step=global_step,
+            )
+            if accelerator.is_main_process:
+                msg = f"  Val @ epoch {epoch+1}"
+                for key, val in val_means.items():
+                    msg += f" | val_{key}={val:.4f}"
+                accelerator.print(msg)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {f"val_{k}": v for k, v in val_means.items()},
+                        step=epoch + 1,
+                    )
+
+            cur_val = val_means.get(val_best_key, float("inf"))
+            if cur_val < best_val_loss:
+                best_val_loss = cur_val
+                _save_checkpoint(
+                    accelerator, model, optimizer, epoch, global_step, output_dir,
+                    name="best_val", extra_modules=extra_modules,
+                )
+                if accelerator.is_main_process:
+                    accelerator.print(
+                        f"  ↑ new best val {val_best_key}={cur_val:.4f} "
+                        f"(epoch {epoch+1})",
+                    )
+
         # Save checkpoint
         if (epoch + 1) % save_every_epochs == 0:
             _save_checkpoint(
@@ -234,6 +294,58 @@ def run_training_loop(
         name="final", extra_modules=extra_modules,
     )
     accelerator.print("Training complete.")
+
+
+@torch.no_grad()
+def _run_validation(
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    val_dataloader: DataLoader,
+    step_fn: Callable[..., dict[str, torch.Tensor]],
+    pass_global_step: bool,
+    global_step: int,
+) -> dict[str, float]:
+    """Run one full pass over val_dataloader, returning mean losses.
+
+    Reuses the training ``step_fn`` (no special val path). ``model.eval()``
+    is set on entry and restored to ``train()`` on exit so dropout etc.
+    behave correctly for val. Priors are passed ``global_step`` from the
+    current training state so the val total is apples-to-apples with the
+    corresponding train iteration.
+
+    Under DDP, Accelerate prepared the val loader to shard batches
+    across ranks. We accumulate sums per rank and reduce with mean at
+    the end so each reported number is the global mean.
+    """
+    model.eval()
+    sums: dict[str, torch.Tensor] = {}
+    n_batches = 0
+    device = accelerator.device
+    try:
+        for batch in val_dataloader:
+            if pass_global_step:
+                ld = step_fn(model, batch, global_step=global_step)
+            else:
+                ld = step_fn(model, batch)
+            for k, v in ld.items():
+                if isinstance(v, torch.Tensor):
+                    # Detach + float so the running sum is a scalar tensor
+                    # on-device; avoids CPU syncs per batch.
+                    s = sums.get(k)
+                    if s is None:
+                        sums[k] = v.detach().float().mean()
+                    else:
+                        sums[k] = s + v.detach().float().mean()
+            n_batches += 1
+    finally:
+        model.train()
+
+    means: dict[str, float] = {}
+    for k, total in sums.items():
+        local_mean = total / max(n_batches, 1)
+        global_mean = accelerator.reduce(local_mean, reduction="mean")
+        means[k] = float(global_mean.item())
+    return means
 
 
 def _save_checkpoint(

@@ -68,12 +68,18 @@ def _collect_object_ids(roots: list) -> list[str]:
     return sorted(seen)
 
 
-def _build_dataset(cfg) -> ConcatDataset:
-    """Build the Stage A training dataset from 4 InterAct subset roots.
+def _build_dataset(
+    cfg,
+    split_override: str | None = None,
+    enable_augment: bool = True,
+) -> ConcatDataset:
+    """Build a Stage A dataset from the 4 InterAct subset roots.
 
-    Applies the object-id split (H5) so Stage A trains only on the
-    ``train`` bucket of objects; ``val`` / ``test`` objects are held
-    out for post-training evaluation.
+    Applies the object-id split (H5). Caller decides which bucket via
+    ``split_override`` (``train`` / ``val`` / ``test`` / ``val+test``
+    / ``all``) or lets the config default take effect. Augmentation is
+    toggleable independent of the split so the val loader can share
+    this builder with augmentation disabled.
     """
     # Object-id split — deterministic hash, identical across ranks.
     split_cfg = cfg.data.object_split
@@ -87,16 +93,20 @@ def _build_dataset(cfg) -> ConcatDataset:
             test_pct=split_cfg.test_pct,
             seed=split_cfg.seed,
         )
-        bucket = split_cfg.get("split", "train")
-        if bucket not in ("train", "val", "test", "all"):
-            raise ValueError(f"unknown object_split.split: {bucket!r}")
-        if bucket != "all":
+        bucket = split_override or split_cfg.get("split", "train")
+        if bucket == "val+test":
+            allowed_object_ids = splits["val"] | splits["test"]
+        elif bucket == "all":
+            allowed_object_ids = None   # no filter
+        elif bucket in splits:
             allowed_object_ids = splits[bucket]
+        else:
+            raise ValueError(f"unknown object_split bucket: {bucket!r}")
 
-    # Augmentation — mirror + Y-rotation + pc jitter (Stage A only).
+    # Augmentation — mirror + Y-rotation + pc jitter (train only by default).
     aug_cfg = cfg.data.get("augmentation", None)
     augment = None
-    if aug_cfg is not None and aug_cfg.get("enabled", False):
+    if enable_augment and aug_cfg is not None and aug_cfg.get("enabled", False):
         augment = AugmentConfig(
             enabled=True,
             mirror_prob=float(aug_cfg.get("mirror_prob", 0.0)),
@@ -291,7 +301,7 @@ def run(config_path: str) -> None:
     # Data — multi-root ConcatDataset + object-id split + augmentation.
     dataset = _build_dataset(cfg)
     accelerator.print(
-        f"Dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
+        f"Train dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
         f"(split={cfg.data.object_split.get('split', 'train')})",
     )
     dataloader = DataLoader(
@@ -299,6 +309,25 @@ def run(config_path: str) -> None:
         shuffle=True, collate_fn=collate_hoi, num_workers=4,
         pin_memory=True, drop_last=True,
     )
+
+    # Val dataloader — same builder with split=val+test, augmentation
+    # disabled. Used by the in-training keep-best-val loop in
+    # run_training_loop. Skipped when val_every_epochs <= 0.
+    val_dataloader = None
+    val_every_epochs = int(cfg.training.get("val_every_epochs", 0))
+    if val_every_epochs > 0:
+        val_dataset = _build_dataset(
+            cfg, split_override="val+test", enable_augment=False,
+        )
+        accelerator.print(
+            f"Val dataset:   {len(val_dataset)} clips "
+            f"(split=val+test, augmentation disabled)",
+        )
+        val_dataloader = DataLoader(
+            val_dataset, batch_size=cfg.training.batch_size,
+            shuffle=False, collate_fn=collate_hoi, num_workers=4,
+            pin_memory=True, drop_last=False,
+        )
 
     # Optimizer: AdamW with ViT/T5-style weight-decay groups (no decay
     # on biases, LayerNorm / BatchNorm weights, positional embeddings).
@@ -322,6 +351,8 @@ def run(config_path: str) -> None:
     predictor, object_encoder, optimizer, dataloader, scheduler = accelerator.prepare(
         predictor, object_encoder, optimizer, dataloader, scheduler,
     )
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
 
     step_fn = build_predictor_step_fn(
         predictor, object_encoder, clip_model, criterion, priors, device,
@@ -355,6 +386,12 @@ def run(config_path: str) -> None:
         # attention KV tokens come from this encoder and its weights
         # are trained from scratch (no pretrained fallback exists).
         extra_modules={"object_encoder": object_encoder},
+        # Keep-best-val: re-run the step_fn on val_dataloader every N
+        # epochs, save a best_val.pt when total val loss improves.
+        # Does not interrupt training — best checkpoint is kept in
+        # parallel to the final one.
+        val_dataloader=val_dataloader,
+        val_every_epochs=val_every_epochs,
     )
 
 
