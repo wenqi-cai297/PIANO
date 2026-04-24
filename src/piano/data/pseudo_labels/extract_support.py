@@ -1,14 +1,15 @@
 """Extract support state pseudo-labels from HOI motion data.
 
 Classifies each frame into one of four body support configurations
-based on foot and pelvis contact patterns.
+based on foot / pelvis / hand contact patterns.
 
 Support states:
-    0 = both_feet    — both feet on ground
-    1 = single_foot  — only one foot on ground
+    0 = both_feet    — both feet on ground (default when no other signal fires)
+    1 = single_foot  — only one foot on the object (rare: step stool pose)
     2 = sitting      — pelvis contacts object, body is stationary, AND
                        the object is below the pelvis (geometric test)
-    3 = hand_support — hands providing primary support (e.g., leaning)
+    3 = hand_support — body supported by hand (leaning on table etc.);
+                       NOT "hand carrying an object"
 
 ``sitting`` uses two disambiguating conditions on top of pelvis contact:
 
@@ -18,20 +19,35 @@ Support states:
    false positives where the user stands behind the chair and pushes it.
 
 2. **Upward-facing mesh surface sits within a cylinder below the pelvis**.
-   The upward direction is auto-detected per mesh — InterAct is not
-   consistent (e.g. `neuraldome/bigsofa` is Z-up, `chairs/Obj116` is
-   Y-up). For each mesh we pick the cardinal +axis that carries the
-   most face area (`_detect_mesh_up_axis`), then treat any face whose
-   normal is within ~45° of that direction as a seat-candidate
-   surface. The gate opens if any such candidate falls inside a
-   cylinder (radius ~0.15 m, height ~0.30 m) extending opposite to
-   the up direction from the pelvis. Backrests, legs, and armrests
-   have off-axis normals and get filtered even when they intersect
-   the cylinder.
+   The upward direction defaults to +Y, with an explicit whitelist for
+   known Z-up objects (`bigsofa`, `smallsofa`; see
+   ``OBJECT_UP_AXIS_OVERRIDES``). The gate opens if any seat-candidate
+   face (normal within ~45° of the up axis) falls inside a cylinder
+   (radius 0.15 m, height 0.30 m) extending opposite to the up
+   direction from the pelvis. Backrests / legs / armrests have
+   off-axis normals and get filtered out even when they intersect the
+   cylinder.
 
-Both conditions are conjunctions — either being false rejects sitting.
-If ``joints`` or ``object_mesh`` is unavailable, the corresponding gate
-defaults to open, preserving legacy behaviour at the cost of more FP.
+``hand_support`` is narrowly defined as body-on-hand (leaning, bracing),
+NOT hand-on-object-carrying. Requires a conjunction of:
+
+1. **Hand contact with object** (one or both).
+2. **Pelvis stationary** — walking while holding an object is foot-
+   supported, not hand-supported.
+3. **phase == stable-contact** — object is not moving relative to the
+   scene. Manipulation / approach / release frames mean the hand is
+   applying force to the object, not the other way round.
+
+Without gates 2+3, the v1-v7 pipeline mislabelled every "carry object
+while walking" sequence as hand_support: omomo clothesstand / largebox
+/ whitechair clips hit 61-89% hand_support, imhd bat-swing / bat-hit
+clips hit 42-86%. The gates eliminate the FP class while preserving
+genuine leaning poses (static body + static object + hand contact).
+
+If ``joints``, ``phase``, or ``object_mesh`` is unavailable, the
+corresponding gate defaults to open, preserving legacy behaviour at
+the cost of more FP. In the real extraction pipeline all three are
+always provided.
 
 Output: integer support array of shape ``(T,)``.
 """
@@ -40,6 +56,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+
+from piano.data.pseudo_labels.extract_phase import PHASE_STABLE_CONTACT
 
 
 # Support state constants
@@ -113,6 +131,7 @@ def extract_support_state(
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
     object_id: str | None = None,
+    phase: np.ndarray | None = None,
     config: SupportConfig | None = None,
 ) -> np.ndarray:
     """Extract per-frame support state from contact pseudo-labels.
@@ -153,20 +172,38 @@ def extract_support_state(
         object_id=object_id,
     )
 
+    # Phase gate for hand_support: only stable-contact frames qualify
+    # (carrying / manipulating object is NOT body supported by hand).
+    # If phase is unavailable, default the gate open for back-compat.
+    if phase is not None:
+        phase_stable = (phase == PHASE_STABLE_CONTACT)
+    else:
+        phase_stable = np.ones(T, dtype=bool)
+
     support = np.full(T, SUPPORT_BOTH_FEET, dtype=np.int64)
 
     for t in range(T):
         if pelvis[t] and pelvis_stationary[t] and pelvis_object_below[t]:
             support[t] = SUPPORT_SITTING
-        elif (left_hand[t] or right_hand[t]) and not (left_foot[t] and right_foot[t]):
-            # Hands active, not both feet grounded → hand support
+        elif (
+            (left_hand[t] or right_hand[t])
+            and pelvis_stationary[t]
+            and phase_stable[t]
+        ):
+            # Hand on object + body static + object static → plausibly
+            # body-on-hand support (leaning). Walking while holding
+            # (pelvis not stationary) and manipulating (object moving →
+            # phase != stable-contact) are filtered to both_feet.
             support[t] = SUPPORT_HAND
         elif left_foot[t] and right_foot[t]:
+            # Rare: both feet on the object (step stool / standing on chair).
             support[t] = SUPPORT_BOTH_FEET
         elif left_foot[t] or right_foot[t]:
             support[t] = SUPPORT_SINGLE_FOOT
         else:
-            # Airborne or ambiguous — default to both_feet (most common)
+            # Default: person standing on floor. We have no direct
+            # floor-contact signal so this covers walking / standing /
+            # carrying objects / airborne — all collapsed to both_feet.
             support[t] = SUPPORT_BOTH_FEET
 
     # Temporal smoothing — majority (mode), not median: support ids are

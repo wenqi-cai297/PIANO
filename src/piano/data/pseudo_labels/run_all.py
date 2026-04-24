@@ -167,11 +167,16 @@ def process_sequence(
         )
         phase = refine_phases_hmm(features, phase, hmm_config)
 
-    # Step 4: Support state — two gates on `sitting` beyond pelvis contact:
+    # Step 4: Support state. `sitting` has two gates beyond pelvis contact:
     #   (a) joints → pelvis XZ-speed < 0.15 m/s (rejects push/drag)
     #   (b) object_mesh + positions + rotations → geometric "object below
     #       pelvis" test (rejects standing-beside-object where the pelvis
     #       joint is within 20 cm of a backrest/leg but not *above* a seat)
+    # `hand_support` has two gates beyond hand contact:
+    #   (c) pelvis stationary (rejects carry-while-walking)
+    #   (d) phase == stable-contact (rejects carrying / manipulating /
+    #       approach / release — hand applying force to object, not the
+    #       other way round)
     support = extract_support_state(
         contact_state,
         joints=joints,
@@ -179,6 +184,7 @@ def process_sequence(
         object_positions=object_positions,
         object_rotations=object_rotations,
         object_id=object_id,
+        phase=phase,
         config=support_config,
     )
 

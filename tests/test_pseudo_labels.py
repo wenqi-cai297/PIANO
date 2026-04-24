@@ -31,6 +31,7 @@ from piano.data.pseudo_labels.extract_phase import (
 )
 from piano.data.pseudo_labels.extract_support import (
     SUPPORT_BOTH_FEET,
+    SUPPORT_HAND,
     SUPPORT_SINGLE_FOOT,
     SUPPORT_SITTING,
     SupportConfig,
@@ -235,8 +236,9 @@ def test_support_push_object_not_classified_as_sitting() -> None:
     while their pelvis joint is often within 20cm of the object mesh
     (standing right next to it). Pure pelvis-contact → sitting put
     bigsofa_330 (push) and chair_0 (pull) under the sitting label in v2.
-    After the fix, the pelvis-horizontal-velocity gate sends these
-    frames to hand_support instead.
+    After the pelvis-velocity gate, these frames must not be sitting.
+    Under the v8 hand_support tightening, they also cannot be
+    hand_support (pelvis is moving) — they collapse to both_feet.
     """
     T = 60
     # Pelvis walks 3 m over 3 seconds → 1 m/s horizontal speed (>> 0.15)
@@ -253,7 +255,7 @@ def test_support_push_object_not_classified_as_sitting() -> None:
     support = extract_support_state(contact, joints=joints, config=cfg)
 
     # Sitting must not dominate — the whole sequence is walking with hands
-    # on the object, which is hand_support, not sitting.
+    # on the object, which collapses to both_feet under the v8 logic.
     sitting_frac = (support == SUPPORT_SITTING).sum() / T
     assert sitting_frac < 0.2, (
         f"push/drag sequence still mostly sitting ({sitting_frac:.2%}) — "
@@ -438,6 +440,98 @@ def test_support_default_up_axis_rejects_z_up_mesh_without_override() -> None:
     )
 
 
+def test_support_carrying_object_while_walking_is_both_feet() -> None:
+    """A person walking while holding an object with their hand must
+    classify as both_feet, NOT hand_support. In v1-v7 any hand-object
+    contact with feet off the object collapsed to hand_support,
+    including all lift/carry/push-while-walking patterns — this
+    flooded imhd (60-86% FP hand_support), omomo (61-89%) and neuraldome
+    with the wrong body-support label. The v8 tightening requires
+    pelvis stationary AND phase == stable-contact before hand_support
+    can fire; walking obviously fails the stationarity gate.
+    """
+    T = 60
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    # Pelvis walks 3 m over 3 seconds → 1 m/s XZ speed (>> 0.15 gate)
+    joints[:, 0, 0] = np.linspace(0.0, 3.0, T)
+    joints[:, 0, 1] = 1.0
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 1] = 1.0   # right hand holding a carried object
+
+    # Phase = manipulation (object translating with the person while held)
+    phase = np.full(T, PHASE_MANIPULATION, dtype=np.int64)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact, joints=joints, phase=phase, config=cfg,
+    )
+
+    both_feet_frac = (support == SUPPORT_BOTH_FEET).sum() / T
+    hand_frac = (support == SUPPORT_HAND).sum() / T
+    assert both_feet_frac > 0.8, (
+        f"walking-carry should collapse to both_feet; got "
+        f"both_feet={both_feet_frac:.2%}, hand={hand_frac:.2%}"
+    )
+    assert hand_frac < 0.05
+
+
+def test_support_leaning_on_stationary_object_is_hand_support() -> None:
+    """Complement to the carry test: a static person with hand on a
+    static object (leaning on a table / bracing against a wall / using
+    a chair to stand up) must still classify as hand_support. This is
+    the genuine "body supported by hand" semantics we want to preserve
+    after the v8 tightening.
+    """
+    T = 30
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    joints[:, 0] = [0.0, 1.0, 0.0]   # pelvis stationary at standing height
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 0] = 1.0   # left hand contact (leaning)
+
+    # Phase = stable-contact (object isn't moving; hand is just resting)
+    phase = np.full(T, PHASE_STABLE_CONTACT, dtype=np.int64)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact, joints=joints, phase=phase, config=cfg,
+    )
+
+    hand_frac = (support == SUPPORT_HAND).sum() / T
+    assert hand_frac > 0.8, (
+        f"static leaning should classify as hand_support; got hand={hand_frac:.2%}"
+    )
+
+
+def test_support_manipulation_phase_blocks_hand_support() -> None:
+    """Even when pelvis is stationary, if the object is moving
+    (phase == manipulation) the hand is applying force to the object
+    — not the other way round. This is the bat-swing-in-place case:
+    user rooted in one spot, swinging a bat. Not hand_support.
+    """
+    T = 30
+    joints = np.zeros((T, 22, 3), dtype=np.float32)
+    joints[:, 0] = [0.0, 1.0, 0.0]   # pelvis planted
+
+    contact = np.zeros((T, 5), dtype=np.float32)
+    contact[:, 1] = 1.0   # right hand on bat
+
+    phase = np.full(T, PHASE_MANIPULATION, dtype=np.int64)
+
+    cfg = SupportConfig(fps=20.0, smoothing_window=3)
+    support = extract_support_state(
+        contact, joints=joints, phase=phase, config=cfg,
+    )
+
+    hand_frac = (support == SUPPORT_HAND).sum() / T
+    both_feet_frac = (support == SUPPORT_BOTH_FEET).sum() / T
+    assert hand_frac < 0.05 and both_feet_frac > 0.8, (
+        f"stationary-user in manipulation phase must be both_feet, "
+        f"not hand_support; got hand={hand_frac:.2%}, both_feet={both_feet_frac:.2%}"
+    )
+
+
 def test_support_allows_sitting_when_pelvis_offset_toward_armrest() -> None:
     """Regression for neuraldome/subject01_bigsofa_1310 and
     subject02_bigsofa_0: the person sits near one edge of a sofa seat
@@ -559,6 +653,9 @@ if __name__ == "__main__":
         test_support_allows_sitting_when_pelvis_offset_toward_armrest,
         test_support_up_axis_override_unlocks_z_up_mesh,
         test_support_default_up_axis_rejects_z_up_mesh_without_override,
+        test_support_carrying_object_while_walking_is_both_feet,
+        test_support_leaning_on_stationary_object_is_hand_support,
+        test_support_manipulation_phase_blocks_hand_support,
         test_target_sigma_default_yields_soft_distribution,
         test_hmm_falls_back_to_initial_on_bad_features,
     ]
