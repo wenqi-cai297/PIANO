@@ -94,17 +94,32 @@ loss:
   label_smoothing: 0.1
 
 priors:
-  # Physical prior weights. reachability is disabled until the loss
-  # is reimplemented correctly (current version measures arm length
-  # ‖wrist − shoulder‖ — rotation-invariant and nearly constant, so
-  # the violation term is ~always 0 and the prior is inert).
-  # Other three priors linearly ramp from 0 to full weight over
-  # `prior_warmup_steps` forward calls (≈ 250 optimizer steps at
-  # accumulation=2) per PhysDiff / CG-HOI convention.
+  # Physical prior weights. Two disabled:
+  #
+  # * reachability: current implementation measures ‖wrist − shoulder‖
+  #   (essentially arm-length, a near-constant rotation-invariant
+  #   quantity) rather than "hand-to-contact-target distance" as the
+  #   docstring claims. Inert until rewritten.
+  #
+  # * phase_monotonicity: the extract_phase labelling sends the clip
+  #   back to APPROACH after the 10-frame RELEASE window ends (person
+  #   walking away from the object), so label-defined trajectories
+  #   contain a release(4) → approach(0) backward jump. The soft-
+  #   expected-phase monotonicity prior penalises exactly that
+  #   transition → it contradicts the labels at episode boundaries,
+  #   with boundary-frame prior-loss and CE-loss roughly equal in
+  #   magnitude (~0.2). Disabled pending either (a) a label-aware
+  #   transition-matrix version or (b) a v10 labelling pass that
+  #   introduces a post-release / departing state.
+  #
+  # Remaining two priors (contact_persistence, support_smoothness)
+  # linearly ramp from 0 to full weight over `prior_warmup_steps`
+  # forward calls (≈ 250 optimizer steps at accumulation=2) per
+  # PhysDiff / CG-HOI convention.
   reachability_weight: 0.0
   contact_persistence_weight: 0.1
   support_smoothness_weight: 0.05
-  phase_monotonicity_weight: 0.05
+  phase_monotonicity_weight: 0.0
   prior_warmup_steps: 500
 
 logging:
