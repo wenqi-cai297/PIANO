@@ -181,11 +181,13 @@ def build_predictor_step_fn(
             < seq_len.unsqueeze(1)
         )
 
-        # Supervision loss
+        # Supervision loss. Target is now xyz regression in object-
+        # local frame (not patch-softmax), fed from HOIDataset's
+        # contact_target_xyz = softmax-weighted patch-centroid.
         loss_dict = criterion(
             pred,
             gt_contact=batch["contact_state"],
-            gt_target=batch["contact_target"],
+            gt_target=batch["contact_target_xyz"],
             gt_phase=batch["phase"].long(),
             gt_support=batch["support"].long(),
             mask=frame_mask,
@@ -244,7 +246,7 @@ def run(config_path: str) -> None:
         pose_dim=model_cfg.input.pose_dim,
         max_seq_length=model_cfg.sequence.max_length,
         num_body_parts=model_cfg.output.num_body_parts,
-        num_object_patches=model_cfg.output.num_object_patches,
+        target_coord_dim=model_cfg.output.get("target_coord_dim", 3),
         num_phases=model_cfg.output.num_phases,
         num_support_states=model_cfg.output.num_support_states,
     )
@@ -277,6 +279,7 @@ def run(config_path: str) -> None:
         phase_weight=cfg.loss.phase_weight,
         support_weight=cfg.loss.support_weight,
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
+        focal_gamma=cfg.loss.get("focal_gamma", 0.0),
     )
     priors = PhysicalPriors(
         reachability_weight=cfg.priors.reachability_weight,

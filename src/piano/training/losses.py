@@ -19,14 +19,22 @@ from torch import Tensor
 class PredictorLoss(nn.Module):
     """Combined loss for the Interaction Predictor.
 
-    Supervises contact state, contact target, interaction phase, and
-    support state against pseudo-labels.
+    Supervises contact state, contact target (xyz), interaction phase,
+    and support state against pseudo-labels.
 
-    The contact_target KL loss is **gated by the contact pseudo-label**:
-    for (t, body_part) pairs where GT contact is below threshold, the
-    target distribution carries no signal (the pseudo-label pipeline
-    writes ~uniform softmax there), so supervising it just adds noise.
-    We only compute target CE where ``gt_contact[t, b] > contact_threshold``.
+    **Target head is xyz regression, not patch classification.** The
+    contact-gate is still applied: for (t, body_part) cells where GT
+    contact < threshold, the body part isn't touching anything and the
+    regression target is undefined — we zero out the per-cell loss and
+    normalise by the count of gated cells.
+
+    **Focal loss** on the phase + support CE heads (Lin et al.,
+    RetinaNet / ICCV 2017). Our pseudo-label class frequencies are
+    severely skewed — phase `pre_contact` is 0.4% of frames, support
+    `hand_support` 3%. With naive CE the model ignored rare classes
+    entirely (F1 = 0 even on the training set). The focal factor
+    ``(1 - p_t)^γ`` down-weights confident / easy frames so gradient
+    mass stays on the hard / rare-class ones.
     """
 
     def __init__(
@@ -37,6 +45,7 @@ class PredictorLoss(nn.Module):
         support_weight: float = 0.5,
         contact_threshold: float = 0.5,
         label_smoothing: float = 0.0,
+        focal_gamma: float = 0.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -45,12 +54,20 @@ class PredictorLoss(nn.Module):
         self.support_weight = support_weight
         self.contact_threshold = contact_threshold
         # Label smoothing on phase / support CE (ViT / T5 / PointNeXt /
-        # MoMask convention). Pseudo-labels are ~10% noisy; smoothing
-        # stops the model from over-confidently fitting the noise.
-        # Applied only to the integer-label CE terms; contact BCE on
-        # soft labels and target KL on soft distributions are already
-        # "soft" and don't benefit from smoothing.
+        # MoMask convention). Stops the model from over-confidently
+        # fitting ~10%-noisy pseudo-labels.
         self.label_smoothing = label_smoothing
+        # Focal loss gamma. 0 disables. RetinaNet default is 2.0.
+        self.focal_gamma = focal_gamma
+
+    @staticmethod
+    def _focal_weight(logits: Tensor, gt: Tensor, gamma: float) -> Tensor:
+        """(1 - p_t)^gamma per-element, where p_t is the predicted
+        probability of the true class. logits shape (N, C), gt shape (N,)."""
+        with torch.no_grad():
+            p = F.softmax(logits, dim=-1)                            # (N, C)
+            p_t = p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)         # (N,)
+            return (1.0 - p_t).clamp(min=0.0).pow(gamma)
 
     def forward(
         self,
@@ -65,9 +82,12 @@ class PredictorLoss(nn.Module):
 
         Parameters
         ----------
-        pred : output dict from InteractionPredictor (contains *_logits keys)
-        gt_contact : (B, T, 5) — soft contact pseudo-labels
-        gt_target : (B, T, 5, K) — soft target pseudo-labels
+        pred : output dict from InteractionPredictor. Must contain
+            ``contact_logits``, ``contact_target_xyz``, ``phase_logits``,
+            ``support_logits``.
+        gt_contact : (B, T, 5) — soft contact pseudo-labels in [0, 1]
+        gt_target : (B, T, 5, 3) — xyz target in object-local frame
+            (zero / arbitrary where gt_contact < threshold — gated out)
         gt_phase : (B, T) — integer phase labels
         gt_support : (B, T) — integer support labels
         mask : (B, T) — True for valid (non-padded) frames
@@ -81,29 +101,42 @@ class PredictorLoss(nn.Module):
             pred["contact_logits"], gt_contact, reduction="none",
         )  # (B, T, 5)
 
-        # Target: KL on soft labels (summed over K, per body part)
-        pred_target_log = F.log_softmax(pred["target_logits"], dim=-1)  # (B, T, 5, K)
-        loss_target = F.kl_div(
-            pred_target_log, gt_target, reduction="none",
+        # Target: smooth-L1 (Huber) on xyz in object-local frame. Summed
+        # over the coord dim so loss scales like a single L1 distance,
+        # which is more interpretable than an L2 squared-distance.
+        loss_target = F.smooth_l1_loss(
+            pred["contact_target_xyz"], gt_target, reduction="none",
         ).sum(dim=-1)  # (B, T, 5)
 
-        # Phase: CE on integer labels (with optional label smoothing)
+        # Phase: CE on integer labels + label smoothing + optional focal
         B, T, P = pred["phase_logits"].shape
-        loss_phase = F.cross_entropy(
-            pred["phase_logits"].reshape(-1, P),
-            gt_phase.reshape(-1),
+        phase_logits_flat = pred["phase_logits"].reshape(-1, P)
+        phase_gt_flat = gt_phase.reshape(-1)
+        loss_phase_flat = F.cross_entropy(
+            phase_logits_flat, phase_gt_flat,
             reduction="none",
             label_smoothing=self.label_smoothing,
-        ).reshape(B, T)  # (B, T)
+        )
+        if self.focal_gamma > 0:
+            loss_phase_flat = loss_phase_flat * self._focal_weight(
+                phase_logits_flat, phase_gt_flat, self.focal_gamma,
+            )
+        loss_phase = loss_phase_flat.reshape(B, T)  # (B, T)
 
-        # Support: CE on integer labels (with optional label smoothing)
+        # Support: CE on integer labels + label smoothing + optional focal
         S = pred["support_logits"].shape[-1]
-        loss_support = F.cross_entropy(
-            pred["support_logits"].reshape(-1, S),
-            gt_support.reshape(-1),
+        support_logits_flat = pred["support_logits"].reshape(-1, S)
+        support_gt_flat = gt_support.reshape(-1)
+        loss_support_flat = F.cross_entropy(
+            support_logits_flat, support_gt_flat,
             reduction="none",
             label_smoothing=self.label_smoothing,
-        ).reshape(B, T)  # (B, T)
+        )
+        if self.focal_gamma > 0:
+            loss_support_flat = loss_support_flat * self._focal_weight(
+                support_logits_flat, support_gt_flat, self.focal_gamma,
+            )
+        loss_support = loss_support_flat.reshape(B, T)  # (B, T)
 
         # Build frame mask and contact gate
         if mask is not None:

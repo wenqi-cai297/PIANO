@@ -20,9 +20,9 @@ NUM_HEADS = 4
 N_LAYERS = 2
 MAX_SEQ = 32
 N_BODY = 5
-N_PATCH = 16
 N_PHASE = 5
 N_SUPPORT = 4
+TARGET_DIM = 3     # xyz regression
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ def predictor() -> InteractionPredictor:
         pose_dim=66,
         max_seq_length=MAX_SEQ,
         num_body_parts=N_BODY,
-        num_object_patches=N_PATCH,
+        target_coord_dim=TARGET_DIM,
         num_phases=N_PHASE,
         num_support_states=N_SUPPORT,
     )
@@ -59,16 +59,18 @@ def test_predictor_forward_shapes(predictor: InteractionPredictor) -> None:
     out = predictor(text_tokens, object_tokens, init_pose, seq_length=T)
 
     assert out["contact_state"].shape == (B, T, N_BODY)
-    assert out["contact_target"].shape == (B, T, N_BODY, N_PATCH)
+    assert out["contact_target_xyz"].shape == (B, T, N_BODY, TARGET_DIM)
     assert out["phase"].shape == (B, T, N_PHASE)
     assert out["support"].shape == (B, T, N_SUPPORT)
-    # Softmax rows sum to 1
+    # Softmax rows sum to 1 where we still use softmax (phase, support)
     assert torch.allclose(
         out["phase"].sum(-1), torch.ones(B, T), atol=1e-5,
     )
     assert torch.allclose(
-        out["contact_target"].sum(-1), torch.ones(B, T, N_BODY), atol=1e-5,
+        out["support"].sum(-1), torch.ones(B, T), atol=1e-5,
     )
+    # contact_target_xyz is a regression — no softmax, values can be any real
+    assert torch.isfinite(out["contact_target_xyz"]).all()
 
 
 def test_predictor_variable_seq_length(predictor: InteractionPredictor) -> None:
@@ -133,29 +135,62 @@ def test_object_encoder_shapes() -> None:
 
 
 def test_predictor_loss_target_gated_by_contact() -> None:
-    """When every GT contact is below threshold, the target KL loss
-    contributes nothing — verifying the new gating."""
+    """When every GT contact is below threshold, the target regression
+    loss contributes nothing — verifying the contact gate still works
+    under the new xyz regression head."""
     B, T = 2, 8
     torch.manual_seed(0)
 
     pred = {
         "contact_logits": torch.randn(B, T, N_BODY, requires_grad=True),
-        "target_logits": torch.randn(B, T, N_BODY, N_PATCH, requires_grad=True),
+        "contact_target_xyz": torch.randn(B, T, N_BODY, TARGET_DIM, requires_grad=True),
         "phase_logits":  torch.randn(B, T, N_PHASE, requires_grad=True),
         "support_logits": torch.randn(B, T, N_SUPPORT, requires_grad=True),
     }
     gt_contact_zero = torch.zeros(B, T, N_BODY)
-    gt_target = torch.full((B, T, N_BODY, N_PATCH), 1.0 / N_PATCH)
+    gt_target_xyz = torch.randn(B, T, N_BODY, TARGET_DIM)
     gt_phase = torch.randint(0, N_PHASE, (B, T))
     gt_support = torch.randint(0, N_SUPPORT, (B, T))
 
     loss = PredictorLoss(contact_weight=0.0, target_weight=1.0,
                          phase_weight=0.0, support_weight=0.0)
-    out = loss(pred, gt_contact_zero, gt_target, gt_phase, gt_support, mask=None)
+    out = loss(pred, gt_contact_zero, gt_target_xyz, gt_phase, gt_support, mask=None)
 
     # No active contact anywhere → target loss averaged over ~0 → ~0
     assert out["loss_target"].abs().item() < 1e-4
     # With active contact, the target loss is non-trivial
     gt_contact_on = torch.ones(B, T, N_BODY)
-    out2 = loss(pred, gt_contact_on, gt_target, gt_phase, gt_support, mask=None)
+    out2 = loss(pred, gt_contact_on, gt_target_xyz, gt_phase, gt_support, mask=None)
     assert out2["loss_target"].item() > 0.0
+
+
+def test_predictor_loss_focal_downweights_easy_examples() -> None:
+    """Focal-weighted CE on phase/support should be ≤ naive CE when the
+    model predicts confidently-correct; and should scale down the easy
+    cases more than the hard ones."""
+    B, T = 2, 8
+    torch.manual_seed(0)
+
+    # Build logits that are very confident-correct on half the frames
+    gt_phase = torch.zeros(B, T, dtype=torch.long)
+    phase_logits = torch.full((B, T, N_PHASE), -10.0)
+    phase_logits[..., 0] = 10.0   # strong preference for class 0 = GT
+    pred = {
+        "contact_logits": torch.zeros(B, T, N_BODY),
+        "contact_target_xyz": torch.zeros(B, T, N_BODY, TARGET_DIM),
+        "phase_logits": phase_logits,
+        "support_logits": torch.zeros(B, T, N_SUPPORT),
+    }
+    gt_contact = torch.zeros(B, T, N_BODY)
+    gt_target_xyz = torch.zeros(B, T, N_BODY, TARGET_DIM)
+    gt_support = torch.zeros(B, T, dtype=torch.long)
+
+    naive = PredictorLoss(contact_weight=0, target_weight=0,
+                          phase_weight=1.0, support_weight=0, focal_gamma=0.0)
+    focal = PredictorLoss(contact_weight=0, target_weight=0,
+                          phase_weight=1.0, support_weight=0, focal_gamma=2.0)
+
+    out_naive = naive(pred, gt_contact, gt_target_xyz, gt_phase, gt_support, mask=None)
+    out_focal = focal(pred, gt_contact, gt_target_xyz, gt_phase, gt_support, mask=None)
+    assert out_focal["loss_phase"].item() < out_naive["loss_phase"].item(), \
+        "focal weighting should reduce loss on confident-correct predictions"

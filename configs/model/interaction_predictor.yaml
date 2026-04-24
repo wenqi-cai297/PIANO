@@ -27,7 +27,12 @@ input:
 
 output:
   num_body_parts: 5       # left_hand, right_hand, left_foot, right_foot, pelvis
-  num_object_patches: 16  # FPS-sampled classification patches (label space)
+  # Contact target is xyz regression in object-local metres (see
+  # interaction_predictor.py docstring on why this replaced the K-way
+  # patch softmax). num_object_patches is still accepted at load time
+  # for back-compat but is a no-op; the head output is 3 regardless.
+  num_object_patches: 16
+  target_coord_dim: 3
   num_phases: 5           # approach, pre-contact, stable-contact, manipulation, release
   num_support_states: 4   # both_feet, single_foot, sitting, hand_support
 

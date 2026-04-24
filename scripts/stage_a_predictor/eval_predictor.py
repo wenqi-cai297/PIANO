@@ -8,7 +8,9 @@ object-id split, and reports:
       included) — comparable to the train-time final values so you can
       quantify the overfitting gap.
     - Contact F1 per body part (sigmoid > 0.5 threshold).
-    - Target top-1 accuracy conditional on gt_contact > 0.5.
+    - Target xyz regression: mean L2 error (cm) and
+      percent-within-threshold (5cm / 10cm / 20cm), gated by
+      gt_contact > 0.5. Per body part.
     - Phase accuracy, macro-F1, per-class precision/recall/F1, and the
       full confusion matrix.
     - Support same as phase.
@@ -262,13 +264,14 @@ def run_eval(
         phase_weight=cfg.loss.phase_weight,
         support_weight=cfg.loss.support_weight,
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
+        focal_gamma=cfg.loss.get("focal_gamma", 0.0),
     )
 
     # Accumulators
     all_pred_contact: list[np.ndarray] = []
     all_gt_contact: list[np.ndarray] = []
-    all_pred_target_argmax: list[np.ndarray] = []
-    all_gt_target_argmax: list[np.ndarray] = []
+    all_pred_target_xyz: list[np.ndarray] = []
+    all_gt_target_xyz: list[np.ndarray] = []
     all_contact_gate: list[np.ndarray] = []              # where to evaluate target
     all_pred_phase: list[np.ndarray] = []
     all_gt_phase: list[np.ndarray] = []
@@ -314,7 +317,7 @@ def run_eval(
         loss_dict = criterion(
             pred_fp32,
             gt_contact=batch["contact_state"],
-            gt_target=batch["contact_target"],
+            gt_target=batch["contact_target_xyz"],
             gt_phase=batch["phase"].long(),
             gt_support=batch["support"].long(),
             mask=frame_mask,
@@ -335,14 +338,13 @@ def run_eval(
         all_pred_contact.append(pred_contact_v)
         all_gt_contact.append(gt_contact_v)
 
-        # Target top-1 (argmax over K=16 per body part)
-        pred_target_argmax = pred_fp32["target_logits"].argmax(dim=-1).cpu().numpy()   # (B, T, 5)
-        gt_target_argmax = batch["contact_target"].argmax(dim=-1).cpu().numpy()        # (B, T, 5)
-        pta = pred_target_argmax.reshape(-1, 5)[valid]
-        gta = gt_target_argmax.reshape(-1, 5)[valid]
-        all_pred_target_argmax.append(pta)
-        all_gt_target_argmax.append(gta)
-        # Gate: evaluate target only where gt contact > 0.5
+        # Target xyz regression (in object-local metres). Predicted vs
+        # GT are (B, T, 5, 3); we flatten to (B*T, 5, 3) and gate by
+        # gt_contact > 0.5 in the metrics step.
+        pred_txyz = pred_fp32["contact_target_xyz"].cpu().numpy()                 # (B, T, 5, 3)
+        gt_txyz = batch["contact_target_xyz"].float().cpu().numpy()               # (B, T, 5, 3)
+        all_pred_target_xyz.append(pred_txyz.reshape(-1, 5, 3)[valid])
+        all_gt_target_xyz.append(gt_txyz.reshape(-1, 5, 3)[valid])
         all_contact_gate.append(gt_contact_v > 0.5)
 
         # Phase
@@ -381,21 +383,43 @@ def run_eval(
     contact_macro_f1 = float(np.mean([contact_per_part[b]["f1"] for b in body_parts]))
     contact_any_f1 = _binary_f1(pred_bin.any(-1), gt_bin.any(-1))
 
-    # Target top-1 (gated by gt_contact > 0.5)
-    pta = np.concatenate(all_pred_target_argmax, axis=0)
-    gta = np.concatenate(all_gt_target_argmax, axis=0)
-    gate = np.concatenate(all_contact_gate, axis=0)
+    # Target xyz regression, gated by gt_contact > 0.5. L2 error in
+    # metres of predicted xyz vs GT xyz (both in object-local frame).
+    # Also % within 5 / 10 / 20 cm thresholds.
+    pt_xyz = np.concatenate(all_pred_target_xyz, axis=0)    # (N, 5, 3)
+    gt_xyz = np.concatenate(all_gt_target_xyz, axis=0)      # (N, 5, 3)
+    gate = np.concatenate(all_contact_gate, axis=0)         # (N, 5)
+    err = np.linalg.norm(pt_xyz - gt_xyz, axis=-1)          # (N, 5)
     total_gated = int(gate.sum())
-    target_top1 = float(((pta == gta) & gate).sum() / total_gated) if total_gated else 0.0
-    target_per_part_top1 = {}
+    if total_gated > 0:
+        err_gated = err[gate]
+        target_mean_l2_m = float(err_gated.mean())
+        target_pct_5cm = float((err_gated < 0.05).mean())
+        target_pct_10cm = float((err_gated < 0.10).mean())
+        target_pct_20cm = float((err_gated < 0.20).mean())
+    else:
+        target_mean_l2_m = None
+        target_pct_5cm = target_pct_10cm = target_pct_20cm = None
+    target_per_part_xyz = {}
     for b, name in enumerate(body_parts):
         g = gate[:, b]
         n_g = int(g.sum())
         if n_g > 0:
-            acc = float(((pta[:, b] == gta[:, b]) & g).sum() / n_g)
+            eb = err[g, b]
+            target_per_part_xyz[name] = {
+                "mean_l2_m": float(eb.mean()),
+                "median_l2_m": float(np.median(eb)),
+                "pct_within_5cm": float((eb < 0.05).mean()),
+                "pct_within_10cm": float((eb < 0.10).mean()),
+                "pct_within_20cm": float((eb < 0.20).mean()),
+                "support": n_g,
+            }
         else:
-            acc = None
-        target_per_part_top1[name] = {"top1": acc, "support": n_g}
+            target_per_part_xyz[name] = {
+                "mean_l2_m": None, "median_l2_m": None,
+                "pct_within_5cm": None, "pct_within_10cm": None,
+                "pct_within_20cm": None, "support": 0,
+            }
 
     # Phase
     ph_pred = np.concatenate(all_pred_phase, axis=0)
@@ -438,9 +462,12 @@ def run_eval(
             "per_body_part": contact_per_part,
         },
         "target": {
-            "top1_overall_gated": target_top1,
+            "mean_l2_m_overall_gated": target_mean_l2_m,
+            "pct_within_5cm_overall_gated": target_pct_5cm,
+            "pct_within_10cm_overall_gated": target_pct_10cm,
+            "pct_within_20cm_overall_gated": target_pct_20cm,
             "total_gated_frames_x_parts": total_gated,
-            "per_body_part": target_per_part_top1,
+            "per_body_part": target_per_part_xyz,
         },
         "phase": phase_metrics,
         "support": support_metrics,
@@ -476,15 +503,25 @@ def _print_report(r: dict) -> None:
         print(f"  {bp:<14s} {m['precision']:>7.4f} {m['recall']:>7.4f} {m['f1']:>7.4f} "
               f"{m['tp']+m['fn']:>8d} {m['tp']+m['fp']:>8d}")
 
-    print("\n[target — top-1 (gated by gt_contact > 0.5)]")
-    print(f"  overall: {r['target']['top1_overall_gated']:.4f}  "
-          f"({r['target']['total_gated_frames_x_parts']} gated cells)")
-    for bp, m in r["target"]["per_body_part"].items():
-        top1 = m["top1"]
-        if top1 is None:
+    print("\n[target — xyz regression in object-local frame (gated by gt_contact > 0.5)]")
+    t = r["target"]
+    if t["mean_l2_m_overall_gated"] is None:
+        print(f"  (no gated frames — nothing to evaluate)")
+    else:
+        print(f"  overall:  mean L2 = {t['mean_l2_m_overall_gated']*100:.1f} cm   "
+              f"(<5cm {t['pct_within_5cm_overall_gated']*100:.1f}%, "
+              f"<10cm {t['pct_within_10cm_overall_gated']*100:.1f}%, "
+              f"<20cm {t['pct_within_20cm_overall_gated']*100:.1f}%)"
+              f"   gated cells = {t['total_gated_frames_x_parts']}")
+    header = f"  {'body part':<14s} {'L2_mean_cm':>12s} {'L2_med_cm':>11s} {'<5cm':>8s} {'<10cm':>8s} {'<20cm':>8s} {'support':>8s}"
+    print(header)
+    for bp, m in t["per_body_part"].items():
+        if m["mean_l2_m"] is None:
             print(f"  {bp:<14s}  (no gated frames)")
-        else:
-            print(f"  {bp:<14s} top1={top1:.4f}  support={m['support']}")
+            continue
+        print(f"  {bp:<14s} {m['mean_l2_m']*100:>12.2f} {m['median_l2_m']*100:>11.2f} "
+              f"{m['pct_within_5cm']*100:>7.1f}% {m['pct_within_10cm']*100:>7.1f}% "
+              f"{m['pct_within_20cm']*100:>7.1f}% {m['support']:>8d}")
 
     for section_name, section in [("phase", r["phase"]), ("support", r["support"])]:
         print(f"\n[{section_name}]")

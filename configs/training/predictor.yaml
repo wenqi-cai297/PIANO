@@ -79,19 +79,35 @@ training:
   max_grad_norm: 1.0
 
 loss:
-  # Weights rebalanced by expected initial-loss magnitude so the
-  # contact signal (our most-informative supervision) dominates early
-  # training. Unweighted initial values: BCE(contact) ≈ 0.69,
-  # KL(target, K=16) ≈ 2.77, CE(phase, 5) ≈ 1.61, CE(support, 4) ≈ 1.39.
-  # Weighted: contact 1.38, target 0.55, phase 0.48, support 0.14.
+  # Contact: BCE on soft [0,1] pseudo-labels.
+  # Target:  smooth-L1 on xyz in object-local metres, gated by
+  #          gt_contact > 0.5. Summed over the 3 coord dims, so its
+  #          magnitude is comparable to a single L1 distance in metres
+  #          (typical gated sample ~0.1-0.3 m at init).
+  # Phase / support: CE on integer labels + label_smoothing + focal.
+  #
+  # First training run (target as 16-way softmax) produced val target
+  # top-1 = 7.6% (chance = 6.25%); root-cause fix is the head
+  # architecture change, not weight retuning. Weights below keep
+  # contact as the dominant signal (most reliable supervision) and
+  # downweight the now-regression target so a few far-outlier gated
+  # frames don't blow the total loss apart.
   contact_weight: 2.0
-  target_weight: 0.2
+  target_weight: 1.0
   phase_weight: 0.3
   support_weight: 0.1
   # Label smoothing on phase + support CE. Pseudo-labels are ~10%
   # noisy (v9 cleaning reason-counts); label_smoothing=0.1 is the
   # ViT / T5 / PointNeXt / MoMask convention.
   label_smoothing: 0.1
+  # Focal loss gamma for phase + support CE (Lin et al., RetinaNet
+  # ICCV 2017). Downweights easy/confident samples so rare-class
+  # gradient is not swamped. Our pseudo-label class frequencies are
+  # skewed (phase pre_contact 0.4%, support hand_support 3%); with
+  # naive CE the model ignored rare classes entirely (F1 = 0 even on
+  # train). γ=2.0 is the RetinaNet default and what most subsequent
+  # long-tail work uses. 0.0 disables.
+  focal_gamma: 2.0
 
 priors:
   # Physical prior weights. Two disabled:

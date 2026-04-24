@@ -254,7 +254,7 @@ class HOIDataset(Dataset):
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
 
         padded_labels: dict[str, np.ndarray] = {}
-        for key in ("contact_state", "contact_target", "phase", "support"):
+        for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
             if labels.get(key) is not None:
                 padded_labels[key] = self._pad_or_truncate(labels[key], self.max_seq_length)
 
@@ -305,10 +305,25 @@ class HOIDataset(Dataset):
     def _load_pseudo_labels(
         self, path: Path, seq_len: int,
     ) -> dict[str, np.ndarray | None]:
-        """Load pseudo-labels if they exist, otherwise return Nones."""
+        """Load pseudo-labels + derive the xyz target from patch centers.
+
+        Adds ``contact_target_xyz`` to the return dict — the body-part
+        xyz in the object-local frame, computed as the softmax-weighted
+        sum of per-object patch centers (Σ_k soft_target[t,b,k] ×
+        patch_centers[k]). This is a smoothed approximation of "where
+        on the object surface does body-part b touch at time t" and is
+        what the xyz-regression target head supervises against. See
+        ``interaction_predictor.py`` docstring for why we replaced
+        per-object patch classification with xyz regression.
+
+        ``contact_target`` (the original soft K-way distribution) is
+        kept in the return dict for backward compat / visualisation —
+        the predictor doesn't consume it any more.
+        """
         result: dict[str, np.ndarray | None] = {
             "contact_state": None,
             "contact_target": None,
+            "contact_target_xyz": None,
             "phase": None,
             "support": None,
         }
@@ -316,10 +331,26 @@ class HOIDataset(Dataset):
             return result
 
         data = np.load(path, allow_pickle=False)
-        for key in result:
+        for key in ("contact_state", "contact_target", "phase", "support"):
             if key in data:
-                arr = data[key].astype(np.float32) if key != "phase" and key != "support" else data[key]
+                arr = data[key].astype(np.float32) if key not in ("phase", "support") else data[key]
                 result[key] = arr[:seq_len]
+
+        # Derive contact_target_xyz from the stored soft distribution
+        # over K patch centres. The pseudo-label extraction writes
+        # ``patch_centers (K, 3)`` alongside the (T, 5, K) distribution;
+        # we collapse over K at load time so downstream code sees a
+        # clean (T, 5, 3) xyz target in object-local frame.
+        if (
+            result["contact_target"] is not None
+            and "patch_centers" in data.files
+        ):
+            patch_centers = data["patch_centers"].astype(np.float32)   # (K, 3)
+            soft = result["contact_target"]                             # (T, 5, K)
+            # einsum: for each (t, b), weighted centroid of patches
+            result["contact_target_xyz"] = np.einsum(
+                "tbk,kd->tbd", soft, patch_centers,
+            ).astype(np.float32)
 
         return result
 
@@ -370,6 +401,20 @@ class HOIDataset(Dataset):
                     ct[:, li, :] = ct[:, ri, :]
                     ct[:, ri, :] = tmp
                 labels["contact_target"] = ct
+
+            if "contact_target_xyz" in labels:
+                # Swap L/R body-part channels. The xyz values themselves
+                # stay in the object-local frame (which doesn't flip
+                # under human-side mirror). For an object roughly
+                # symmetric about the human's sagittal plane this is
+                # exact; for asymmetric objects it's an approximation
+                # that the community treats as a regularisation benefit.
+                ctx = labels["contact_target_xyz"].copy()
+                for li, ri in _BODY_PART_LR_PAIRS:
+                    tmp = ctx[:, li, :].copy()
+                    ctx[:, li, :] = ctx[:, ri, :]
+                    ctx[:, ri, :] = tmp
+                labels["contact_target_xyz"] = ctx
 
             text = _swap_left_right_in_text(text)
 

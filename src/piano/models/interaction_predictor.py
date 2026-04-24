@@ -3,10 +3,11 @@
 A Transformer stack that maps (text, object_tokens, init_pose) to per-frame
 interaction labels:
 
-    - contact_state  (T, B)    — which body parts contact the object
-    - contact_target (T, B, K) — which object surface patch is contacted
-    - phase          (T, P)    — interaction phase (approach/pre-contact/...)
-    - support        (T, S)    — body support configuration
+    - contact_state      (T, B)    — which body parts contact the object
+    - contact_target_xyz (T, B, 3) — where on the object surface, in
+                                     object-local coords (regression)
+    - phase              (T, P)    — interaction phase (approach/.../release)
+    - support            (T, S)    — body support configuration
 
 Each transformer block has four sublayers, each pre-norm + residual:
 
@@ -15,7 +16,20 @@ Each transformer block has four sublayers, each pre-norm + residual:
     object-cross-attn  — over PointNet++ object tokens (128 tokens)
     FFN                — standard 2-layer MLP
 
-Design notes (2026-04-24 rewrite):
+Design notes (2026-04-25 rewrite — target head re-architected):
+
+    * Target is **continuous xyz regression** in the object's local
+      frame, not a softmax over K per-object FPS patches. The earlier
+      16-way classification assigned patch IDs independently per object
+      (hash-seeded FPS per ``object_id``), so "patch 3" on chair A and
+      "patch 3" on chair B referred to different surface locations.
+      This made train↔val patch semantics incompatible: the first Stage
+      A training had val target top-1 = 7.6% (chance is 1/16 = 6.25%).
+      All major HOI-generation papers (ContactGen ICCV'23, HOI-Diff,
+      CG-HOI CVPR'24, Text2HOI CVPR'24, CHOIS ECCV'24, GenHOI 2025)
+      avoid per-object fixed indices — they use either per-point
+      heatmaps over the object PC, or continuous xyz regression.
+      HOI-Diff ``y^o ∈ R^{8×3}`` is the closest precedent for ours.
 
     * CLIP conditioning uses the **per-token** sequence (B, 77, d_text),
       not just the pooled CLS/EOT vector. Pooled-only AdaLN discards the
@@ -32,18 +46,15 @@ Design notes (2026-04-24 rewrite):
       drops the first frame.
 
     * **Object tokens** are 128 per sequence (from PointNet++), up from
-      the earlier 16. Contact-target classification head stays at K=16
-      FPS patches; the token count is decoupled from the label count.
+      the earlier 16. KV count is decoupled from any label-space count.
 
     * No Block Attention Residuals. MoonshotAI's block-AttnRes was
       validated on 3B-48B LLMs; at 10 layers / ~30M params the depth-
-      dilution it targets doesn't exist, and the added state machine
-      complicated debugging without measurable benefit.
+      dilution it targets doesn't exist.
 
     * No AdaLN. With per-token text cross-attn + the [POSE] token +
       object cross-attn carrying all the conditioning, AdaLN on pooled
-      summaries becomes redundant. (DiT uses AdaLN-Zero for a single
-      class/timestep token — that regime doesn't apply here.)
+      summaries becomes redundant.
 """
 from __future__ import annotations
 
@@ -161,7 +172,10 @@ class InteractionPredictor(nn.Module):
     pose_dim : initial pose feature dimension (66 = 22 joints × 3)
     max_seq_length : maximum number of output frames
     num_body_parts : B — number of tracked body parts
-    num_object_patches : K — number of object surface patches (label space)
+    target_coord_dim : output dim of the contact-target regression head
+        (3 for xyz in object-local frame). ``num_object_patches`` (legacy
+        name for the discarded K-way classification head) is still
+        accepted for config back-compat but silently remapped to 3.
     num_phases : P — number of interaction phases
     num_support_states : S — number of support states
     """
@@ -177,16 +191,23 @@ class InteractionPredictor(nn.Module):
         pose_dim: int = 66,
         max_seq_length: int = 196,
         num_body_parts: int = 5,
-        num_object_patches: int = 16,
+        target_coord_dim: int = 3,
         num_phases: int = 5,
         num_support_states: int = 4,
+        # Legacy alias: older configs pass ``num_object_patches=16``;
+        # ignored since the target head is now an xyz regressor.
+        num_object_patches: int | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.max_seq_length = max_seq_length
         self.num_body_parts = num_body_parts
-        self.num_object_patches = num_object_patches
+        self.target_coord_dim = target_coord_dim
         self.num_layers = num_layers
+        if num_object_patches is not None and num_object_patches != target_coord_dim:
+            # Back-compat: don't crash older configs, but don't honour
+            # the discarded classification shape.
+            pass
 
         # Learnable time-token bank + fixed sinusoidal positions
         self.time_tokens = nn.Parameter(torch.randn(1, max_seq_length, d_model) * 0.02)
@@ -213,11 +234,13 @@ class InteractionPredictor(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-        # Output heads — per-frame linear projections. contact_target is
-        # masked by contact_state at loss time (see PredictorLoss) so the
-        # K-way softmax is only supervised where contact is active.
+        # Output heads — per-frame linear projections. The target head
+        # regresses xyz in the object's local frame (see module docstring
+        # on why this replaced the earlier K-way patch softmax). Loss is
+        # smooth-L1 gated by contact_state, so the xyz is only supervised
+        # where the body part is actually touching.
         self.contact_head = nn.Linear(d_model, num_body_parts)
-        self.target_head = nn.Linear(d_model, num_body_parts * num_object_patches)
+        self.target_head = nn.Linear(d_model, num_body_parts * target_coord_dim)
         self.phase_head = nn.Linear(d_model, num_phases)
         self.support_head = nn.Linear(d_model, num_support_states)
 
@@ -248,11 +271,12 @@ class InteractionPredictor(nn.Module):
         Returns
         -------
         Dictionary with keys (all on time positions, [POSE] stripped):
-            contact_state  : (B, T, num_body_parts) — sigmoid probs
-            contact_target : (B, T, num_body_parts, num_object_patches) — softmax
-            phase          : (B, T, num_phases) — softmax
-            support        : (B, T, num_support_states) — softmax
-            contact_logits, target_logits, phase_logits, support_logits
+            contact_state      : (B, T, num_body_parts) — sigmoid probs
+            contact_target_xyz : (B, T, num_body_parts, 3) — xyz in
+                object-local frame (regression, no activation)
+            phase              : (B, T, num_phases) — softmax
+            support            : (B, T, num_support_states) — softmax
+            contact_logits, phase_logits, support_logits
                 — raw logits for loss computation
         """
         B = text_tokens.shape[0]
@@ -281,21 +305,20 @@ class InteractionPredictor(nn.Module):
         x = x[:, 1:, :]                                     # (B, T, d)
 
         contact_logits = self.contact_head(x)               # (B, T, num_body_parts)
-        target_logits = self.target_head(x)                 # (B, T, num_body_parts * K)
+        target_xyz = self.target_head(x)                    # (B, T, num_body_parts * 3)
         phase_logits = self.phase_head(x)                   # (B, T, P)
         support_logits = self.support_head(x)               # (B, T, S)
 
-        target_logits = target_logits.reshape(
-            B, T, self.num_body_parts, self.num_object_patches,
+        target_xyz = target_xyz.reshape(
+            B, T, self.num_body_parts, self.target_coord_dim,
         )
 
         return {
             "contact_state": torch.sigmoid(contact_logits),
-            "contact_target": torch.softmax(target_logits, dim=-1),
+            "contact_target_xyz": target_xyz,
             "phase": torch.softmax(phase_logits, dim=-1),
             "support": torch.softmax(support_logits, dim=-1),
             "contact_logits": contact_logits,
-            "target_logits": target_logits,
             "phase_logits": phase_logits,
             "support_logits": support_logits,
         }
