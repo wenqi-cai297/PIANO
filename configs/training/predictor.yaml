@@ -69,6 +69,13 @@ training:
     lr: 1.0e-4
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    # v3 finding: Kendall log-var scalars need ~100× the main lr to
+    # converge in 100 epochs. At main lr=1e-4 they crawled 0→-0.25
+    # in 6300 steps vs equilibrium ≈ -3.3 → multi-task weighting
+    # was effectively inactive. Route them to a separate param group
+    # with this lr (no weight_decay). Only used when
+    # loss.use_kendall_weights=true.
+    kendall_lr: 1.0e-2
   scheduler:
     name: "cosine"
     # 200 steps ≈ 6% of total steps (8108 clips / effective-batch 128
@@ -117,11 +124,20 @@ loss:
   # Focal loss gamma for phase + support CE (Lin et al., RetinaNet
   # ICCV 2017). Downweights easy/confident samples so rare-class
   # gradient is not swamped. γ=2.0 is the RetinaNet default. 0.0
-  # disables. Note: at <1% class frequency, focal alone is known
-  # to underperform Class-Balanced (Cui CVPR'19) or Logit-Adjustment
-  # (Menon ICLR'21) — flagged for follow-up if rare-class F1 stays
-  # at zero after Kendall + GT fix.
+  # disables. v3 found focal alone left `pre_contact` (0.4%) F1=0
+  # and `single_foot` (5%) F1=0 even on train — too weak at extreme
+  # imbalance. v4 stacks Logit Adjustment on top.
   focal_gamma: 2.0
+
+  # Logit Adjustment (Menon et al. ICLR 2021) — train-time logit
+  # offset by `tau × log π_y` per class. Bayes-optimal under known
+  # class priors at extreme imbalance. Computes per-task class
+  # frequencies once at train startup from the training dataset
+  # (~30s scan over 6400 clips). Applied to phase + support heads.
+  # tau=1.0 is the original paper default; lower values approach
+  # plain CE, higher values bias more toward rare classes.
+  use_logit_adjustment: true
+  logit_adjust_tau: 1.0
 
 priors:
   # Physical prior weights. Two disabled:

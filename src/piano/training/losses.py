@@ -108,6 +108,9 @@ class PredictorLoss(nn.Module):
         label_smoothing: float = 0.0,
         focal_gamma: float = 0.0,
         use_kendall_weights: bool = False,
+        logit_adjust_phase: Tensor | None = None,
+        logit_adjust_support: Tensor | None = None,
+        logit_adjust_tau: float = 1.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -136,6 +139,25 @@ class PredictorLoss(nn.Module):
             )
         else:
             self.kendall = None
+        # Logit Adjustment (Menon et al. ICLR'21) for long-tailed
+        # categorical heads — Bayes-optimal under a known class prior
+        # at extreme imbalance. v3 with focal γ=2 alone left
+        # `pre_contact` (0.4%) F1 = 0 and `single_foot` (5%) F1 = 0
+        # even on train; LDAM (Cao NeurIPS'19) and Menon ICLR'21
+        # both show focal underperforms margin/logit-based methods
+        # at ratios >100:1. Add ``τ × log π_y`` to the logits at
+        # train time only — at inference the raw logits are used.
+        # ``logit_adjust_*`` is a 1D tensor of class log-priors
+        # (== log(N_y / Σ N_y)). Pass None to disable per-head.
+        self.logit_adjust_tau = float(logit_adjust_tau)
+        if logit_adjust_phase is not None:
+            self.register_buffer("logit_adjust_phase", logit_adjust_phase.float())
+        else:
+            self.logit_adjust_phase = None  # type: ignore[assignment]
+        if logit_adjust_support is not None:
+            self.register_buffer("logit_adjust_support", logit_adjust_support.float())
+        else:
+            self.logit_adjust_support = None  # type: ignore[assignment]
 
     @staticmethod
     def _focal_weight(logits: Tensor, gt: Tensor, gamma: float) -> Tensor:
@@ -185,10 +207,15 @@ class PredictorLoss(nn.Module):
             pred["contact_target_xyz"], gt_target, reduction="none",
         ).sum(dim=-1)  # (B, T, 5)
 
-        # Phase: CE on integer labels + label smoothing + optional focal
+        # Phase: CE on integer labels + label smoothing + optional
+        # logit-adjustment (Menon ICLR'21) + optional focal.
         B, T, P = pred["phase_logits"].shape
         phase_logits_flat = pred["phase_logits"].reshape(-1, P)
         phase_gt_flat = gt_phase.reshape(-1)
+        if self.logit_adjust_phase is not None:
+            phase_logits_flat = phase_logits_flat + (
+                self.logit_adjust_tau * self.logit_adjust_phase
+            )
         loss_phase_flat = F.cross_entropy(
             phase_logits_flat, phase_gt_flat,
             reduction="none",
@@ -200,10 +227,15 @@ class PredictorLoss(nn.Module):
             )
         loss_phase = loss_phase_flat.reshape(B, T)  # (B, T)
 
-        # Support: CE on integer labels + label smoothing + optional focal
+        # Support: CE on integer labels + label smoothing + optional
+        # logit-adjustment + optional focal.
         S = pred["support_logits"].shape[-1]
         support_logits_flat = pred["support_logits"].reshape(-1, S)
         support_gt_flat = gt_support.reshape(-1)
+        if self.logit_adjust_support is not None:
+            support_logits_flat = support_logits_flat + (
+                self.logit_adjust_tau * self.logit_adjust_support
+            )
         loss_support_flat = F.cross_entropy(
             support_logits_flat, support_gt_flat,
             reduction="none",

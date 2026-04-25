@@ -25,6 +25,7 @@ from piano.data.dataset import (
     HOIDataset,
     build_object_split,
     collate_hoi,
+    compute_class_priors,
 )
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.object_encoder import ObjectEncoder
@@ -286,6 +287,37 @@ def run(config_path: str) -> None:
         model_name=cfg.model.get("text_encoder", "ViT-B/32"),
     )
 
+    # Build the train dataset early — Logit Adjustment class priors
+    # are computed from it before the criterion is built. (The
+    # dataloader is constructed later, after the criterion + optimizer
+    # + scheduler so all four can share one accelerator.prepare call.)
+    dataset = _build_dataset(cfg)
+    accelerator.print(
+        f"Train dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
+        f"(split={cfg.data.object_split.get('split', 'train')})",
+    )
+
+    # Logit Adjustment class priors (Menon ICLR'21) — needed before
+    # building the criterion. Scan the training-only dataset once to
+    # tally per-class frequencies for phase + support, then pass
+    # ``log π_y`` as a buffer into the loss. Cheap (~30 s for
+    # 6400 clips × 196 frames). Only computed when enabled.
+    logit_adjust_phase = None
+    logit_adjust_support = None
+    if cfg.loss.get("use_logit_adjustment", False):
+        accelerator.print("Computing class priors for Logit Adjustment...")
+        phase_freq, support_freq = compute_class_priors(
+            dataset,
+            num_phases=model_cfg.output.num_phases,
+            num_support=model_cfg.output.num_support_states,
+        )
+        accelerator.print(f"  phase freq:   {phase_freq.round(4).tolist()}")
+        accelerator.print(f"  support freq: {support_freq.round(4).tolist()}")
+        # log(p + eps) so empty bins don't blow up to -inf
+        eps = 1e-12
+        logit_adjust_phase = torch.log(torch.from_numpy(phase_freq) + eps)
+        logit_adjust_support = torch.log(torch.from_numpy(support_freq) + eps)
+
     # Loss and priors. With Kendall multi-task weights enabled, the
     # static contact/target/phase/support weights are ignored and the
     # optimiser learns per-task log-variances (one extra scalar param
@@ -298,6 +330,9 @@ def run(config_path: str) -> None:
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
         focal_gamma=cfg.loss.get("focal_gamma", 0.0),
         use_kendall_weights=cfg.loss.get("use_kendall_weights", False),
+        logit_adjust_phase=logit_adjust_phase,
+        logit_adjust_support=logit_adjust_support,
+        logit_adjust_tau=float(cfg.loss.get("logit_adjust_tau", 1.0)),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(
@@ -307,12 +342,8 @@ def run(config_path: str) -> None:
         phase_monotonicity_weight=cfg.priors.phase_monotonicity_weight,
     )
 
-    # Data — multi-root ConcatDataset + object-id split + augmentation.
-    dataset = _build_dataset(cfg)
-    accelerator.print(
-        f"Train dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
-        f"(split={cfg.data.object_split.get('split', 'train')})",
-    )
+    # Train dataloader — dataset already built above (so logit-adjust
+    # priors could be computed first).
     dataloader = DataLoader(
         dataset, batch_size=cfg.training.batch_size,
         shuffle=True, collate_fn=collate_hoi, num_workers=4,
@@ -343,15 +374,22 @@ def run(config_path: str) -> None:
     # When Kendall multi-task weights are active, criterion holds 4
     # learnable scalars — include it in the optimised modules so they
     # actually update (otherwise they sit at 0 forever, equivalent to
-    # all-ones static weights).
+    # all-ones static weights). v4 fix: route the Kendall log-var
+    # scalars to a separate param group at ~100× higher lr; v3 found
+    # that with the main lr=1e-4 the log-vars only crawled 0→-0.25
+    # over 6300 steps vs the predicted equilibrium of ~-3.3, so the
+    # auto-balancing was functionally inactive.
     optim_modules = [predictor, object_encoder]
+    kendall_lr = None
     if criterion.use_kendall_weights:
         optim_modules.append(criterion)
+        kendall_lr = float(cfg.training.optimizer.get("kendall_lr", 1e-2))
     optimizer = build_optimizer_with_decay_groups(
         modules=optim_modules,
         lr=cfg.training.optimizer.lr,
         weight_decay=cfg.training.optimizer.weight_decay,
         betas=tuple(cfg.training.optimizer.betas),
+        kendall_lr=kendall_lr,
     )
     # Scheduler total_steps measured in optimizer steps — Accelerate's
     # prepared scheduler handles the accumulation skip, so we feed it

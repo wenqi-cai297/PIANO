@@ -456,6 +456,68 @@ class HOIDataset(Dataset):
 # Collate function for DataLoader
 # ---------------------------------------------------------------------------
 
+def compute_class_priors(
+    dataset,
+    num_phases: int,
+    num_support: int,
+    sample_limit: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tally per-class frequencies for phase + support over a dataset.
+
+    Used by Logit Adjustment (Menon ICLR'21) — needs ``log π_y`` for
+    each class, computed from the training-set marginal frequency.
+    Iterates the dataset's underlying npzs directly (cheap — phase
+    and support are int arrays with no augmentation needed).
+
+    Parameters
+    ----------
+    dataset : ConcatDataset of HOIDataset, or a single HOIDataset
+    num_phases : expected number of phase classes (defines vector length)
+    num_support : expected number of support classes
+    sample_limit : if set, stop after this many sequences (for fast smoke).
+        Default None = scan the whole dataset.
+
+    Returns
+    -------
+    phase_freq : (num_phases,) float32 — sums to 1
+    support_freq : (num_support,) float32 — sums to 1
+    """
+    from torch.utils.data import ConcatDataset as _ConcatDataset
+
+    if isinstance(dataset, _ConcatDataset):
+        sub_datasets = list(dataset.datasets)
+    else:
+        sub_datasets = [dataset]
+
+    phase_counts = np.zeros(num_phases, dtype=np.int64)
+    support_counts = np.zeros(num_support, dtype=np.int64)
+    n_seq = 0
+    for sub in sub_datasets:
+        if not isinstance(sub, HOIDataset):
+            continue
+        for entry in sub.metadata:
+            if sample_limit is not None and n_seq >= sample_limit:
+                break
+            seq_id = entry["seq_id"]
+            label_path = sub.pseudo_label_dir / f"{seq_id}.npz"
+            if not label_path.exists():
+                continue
+            data = np.load(label_path, allow_pickle=False)
+            if "phase" in data.files:
+                ph = data["phase"]
+                phase_counts += np.bincount(ph, minlength=num_phases)[:num_phases]
+            if "support" in data.files:
+                su = data["support"]
+                support_counts += np.bincount(su, minlength=num_support)[:num_support]
+            n_seq += 1
+        if sample_limit is not None and n_seq >= sample_limit:
+            break
+
+    phase_freq = phase_counts.astype(np.float32) / max(phase_counts.sum(), 1)
+    support_freq = support_counts.astype(np.float32) / max(support_counts.sum(), 1)
+    return phase_freq, support_freq
+
+
 def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
     """Custom collate that handles variable-presence pseudo-labels and text strings."""
     result: dict[str, torch.Tensor | list[str]] = {}

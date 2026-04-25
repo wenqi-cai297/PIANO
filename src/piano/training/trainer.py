@@ -44,8 +44,10 @@ def build_optimizer_with_decay_groups(
     lr: float = 1e-4,
     weight_decay: float = 0.01,
     betas: tuple[float, float] = (0.9, 0.999),
+    kendall_lr: float | None = None,
 ) -> AdamW:
-    """AdamW with ViT/T5-style weight-decay exclusion.
+    """AdamW with ViT/T5-style weight-decay exclusion + optional
+    Kendall-log-var fast lr group.
 
     Convention (Loshchilov & Hutter ICLR'19 + ViT / T5 / GPT-2 /
     MoMask / PointNeXt): exclude LayerNorm / BatchNorm weights, biases,
@@ -58,11 +60,21 @@ def build_optimizer_with_decay_groups(
       3. Name matches a positional / time / embedding convention
          (``time_tokens``, ``pos_encoding``, ``.embed``).
 
-    Params are pooled across the provided modules (the predictor and
-    the object encoder share an optimizer).
+    **Kendall log-var fast group** (when ``kendall_lr`` is set):
+    parameters whose name contains ``kendall.log_vars`` are routed to
+    a separate group with the supplied higher lr. v3 found that
+    Kendall's per-task log-variance scalars need ~100× the main lr to
+    converge in a 100-epoch run — at lr=1e-4 they crawled from 0 to
+    -0.25 over 6300 steps, vs the predicted equilibrium of ≈ -3.3 for
+    the target task. Without this fix the multi-task auto-balancing
+    is functionally inactive.
+
+    Params are pooled across the provided modules (the predictor +
+    the object encoder + the criterion when Kendall is on).
     """
     decay: list[torch.nn.Parameter] = []
     no_decay: list[torch.nn.Parameter] = []
+    kendall_logvars: list[torch.nn.Parameter] = []
     seen: set[int] = set()
 
     def _is_no_decay(name: str, p: torch.nn.Parameter) -> bool:
@@ -75,6 +87,9 @@ def build_optimizer_with_decay_groups(
             return True
         return False
 
+    def _is_kendall_logvar(name: str) -> bool:
+        return "kendall.log_vars" in name
+
     for module in modules:
         for name, param in module.named_parameters():
             if not param.requires_grad:
@@ -83,13 +98,24 @@ def build_optimizer_with_decay_groups(
             if pid in seen:
                 continue
             seen.add(pid)
-            (no_decay if _is_no_decay(name, param) else decay).append(param)
+            if kendall_lr is not None and _is_kendall_logvar(name):
+                kendall_logvars.append(param)
+            elif _is_no_decay(name, param):
+                no_decay.append(param)
+            else:
+                decay.append(param)
 
     param_groups = [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": weight_decay, "lr": lr},
+        {"params": no_decay, "weight_decay": 0.0, "lr": lr},
     ]
-    return AdamW(param_groups, lr=lr, betas=betas)
+    if kendall_logvars:
+        param_groups.append({
+            "params": kendall_logvars,
+            "weight_decay": 0.0,
+            "lr": kendall_lr,
+        })
+    return AdamW(param_groups, betas=betas)
 
 
 def build_scheduler(
