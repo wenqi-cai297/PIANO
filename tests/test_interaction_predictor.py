@@ -20,7 +20,7 @@ NUM_HEADS = 4
 N_LAYERS = 2
 MAX_SEQ = 32
 N_BODY = 5
-N_PHASE = 5
+N_PHASE = 3        # v5: non_contact / stable_contact / manipulation
 N_SUPPORT = 4
 TARGET_DIM = 3     # xyz regression
 

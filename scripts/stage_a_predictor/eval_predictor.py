@@ -46,6 +46,7 @@ from piano.data.dataset import (
     build_object_split,
     collate_hoi,
 )
+from piano.data.pseudo_labels.extract_phase import PHASE_NAMES
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.losses import PredictorLoss
@@ -421,12 +422,14 @@ def run_eval(
                 "pct_within_20cm": None, "support": 0,
             }
 
-    # Phase
+    # Phase. Pull class names from the canonical PHASE_NAMES so the
+    # eval is consistent with whatever extract_phase.py defines (3
+    # classes as of v5; was 5 in v3-v4).
     ph_pred = np.concatenate(all_pred_phase, axis=0)
     ph_gt = np.concatenate(all_gt_phase, axis=0)
     phase_metrics = _multiclass_metrics(
-        ph_pred, ph_gt, num_classes=5,
-        class_names=["approach", "pre_contact", "stable_contact", "manipulation", "release"],
+        ph_pred, ph_gt, num_classes=len(PHASE_NAMES),
+        class_names=list(PHASE_NAMES),
     )
 
     # Support

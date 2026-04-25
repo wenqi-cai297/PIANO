@@ -1,22 +1,48 @@
 """Extract interaction phase pseudo-labels from HOI motion data.
 
 Assigns each frame a coarse interaction phase based on heuristic rules
-derived from hand-object distance, any-body-part contact, and object
-motion (translation + rotation).
+derived from any-body-part contact and object motion (translation +
+rotation).
 
-Phases:
-    0 = approach       — moving toward object, no contact
-    1 = pre-contact    — close to object, about to make contact
-    2 = stable-contact — in contact, object stationary
-    3 = manipulation   — in contact, object moving (translation OR rotation)
-    4 = release        — contact just ended or ending
+Phases (3-class as of v5 / 2026-04-25 redesign):
+    0 = non_contact     — body parts not in contact with object
+                          (covers approach, transition, release —
+                           spatially indistinguishable, temporal order
+                           is implicit in text)
+    1 = stable_contact  — in contact, object stationary
+    2 = manipulation    — in contact, object moving (translation OR rotation)
+
+Why 3 classes (and not the 5 used through v4):
+
+* Approach + pre_contact + release all label "person not in contact"
+  configurations. The spatial signal is identical across them; only
+  temporal ordering differs (before / between / after contact). That
+  ordering is already implicit in the text prompt, so a phase head
+  encoding it is redundant with the generator's text conditioning.
+* `pre_contact` (5-class id 1) was 0.51% of frames, structurally narrow
+  by the `near_threshold=0.1m AND not in contact` definition — a
+  labelling artifact, not a semantic class. v4 with Logit Adjustment
+  (Menon ICLR'21) catastrophically over-corrected on this class:
+  predicted pre_contact for ~95% of frames at inference because raw
+  logits couldn't be calibrated down to the 0.5% prior on a small
+  dataset.
+* All HOI generation papers in the field (CG-HOI CVPR'24, HOI-Diff,
+  Text2HOI CVPR'24, Move-as-You-Say CVPR'24, ContactGen ICCV'23) use
+  binary contact + spatial contact map only — no multi-class phase head.
+  The 5-class scheme came from analysis datasets like GRAB ECCV'20
+  where humans annotate phases for behavioural analysis, not generation.
+
+The 3-class scheme keeps the genuinely-useful temporal signal
+(`stable_contact` vs `manipulation`, i.e. "is the object moving while
+in contact"), which is information neither contact_state nor text
+reliably carries.
 
 Two design choices worth calling out:
 
     * ``is_contact`` uses the max over all tracked body parts, not just
       hands. Chair sitting sequences have pelvis contact with hands idle;
       an earlier hand-only definition kept every sitting frame stuck in
-      ``approach``.
+      ``non_contact``.
 
     * Object motion combines translational and rotational velocity. An
       in-place bat swing or rotating a chair leaves ``object_positions``
@@ -35,22 +61,16 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.ndimage import median_filter
 
-from piano.utils.smpl_utils import BODY_PART_INDICES
 
-
-# Phase label constants
-PHASE_APPROACH = 0
-PHASE_PRE_CONTACT = 1
-PHASE_STABLE_CONTACT = 2
-PHASE_MANIPULATION = 3
-PHASE_RELEASE = 4
+# Phase label constants (3-class)
+PHASE_NON_CONTACT = 0
+PHASE_STABLE_CONTACT = 1
+PHASE_MANIPULATION = 2
 
 PHASE_NAMES: list[str] = [
-    "approach",
-    "pre-contact",
-    "stable-contact",
+    "non_contact",
+    "stable_contact",
     "manipulation",
-    "release",
 ]
 NUM_PHASES: int = len(PHASE_NAMES)
 
@@ -59,22 +79,9 @@ NUM_PHASES: int = len(PHASE_NAMES)
 class PhaseConfig:
     """Configuration for interaction phase extraction."""
 
-    far_threshold: float = 0.5             # meters — beyond this is "approach"
-    near_threshold: float = 0.1            # meters — within this is "pre-contact"
     translational_velocity_eps: float = 0.02  # m/s
     rotational_velocity_eps: float = 0.3      # rad/s (~17 deg/s)
     contact_threshold: float = 0.5         # any body part contact score threshold
-    # Maximum length of a single RELEASE segment, in frames. The
-    # extractor extends release from any contact-end up to either the
-    # next contact-start OR this many frames, whichever is shorter.
-    # Older v9 used 10 frames (0.5 s @ 20 fps), which produced a
-    # train-time `release` F1 ≈ 0 even after focal loss because the
-    # extractor flipped back to APPROACH after 10 frames — so the
-    # "person walking away" window was mislabelled as "approach to
-    # something". v10 raises to 9999 (effectively unbounded; release
-    # extends to next contact or end of clip), matching the GRAB
-    # ECCV'20 convention of physically-meaningful release windows.
-    release_window: int = 9999
     median_filter_size: int = 7            # temporal smoothing window
     fps: float = 30.0
 
@@ -102,22 +109,17 @@ def extract_interaction_phase(
 
     Returns
     -------
-    phase : (T,) — integer phase label per frame
+    phase : (T,) — integer phase label per frame, values in {0, 1, 2}
     """
     if config is None:
         config = PhaseConfig()
 
     T = len(joints)
-    phase = np.full(T, PHASE_APPROACH, dtype=np.int64)
-
-    # Hand joint positions — used only for the approach/pre-contact hand-
-    # leading proxy. The contact decision itself comes from all tracked parts.
-    left_hand = joints[:, BODY_PART_INDICES[0], :]   # (T, 3)
-    right_hand = joints[:, BODY_PART_INDICES[1], :]   # (T, 3)
+    phase = np.full(T, PHASE_NON_CONTACT, dtype=np.int64)
 
     # Any-body-part contact — drives stable/manipulation branches.
     # Hand-only was wrong for sitting: pelvis contacts chair but hands idle,
-    # so the whole sitting stretch was mislabeled as approach.
+    # so the whole sitting stretch was mislabeled as non_contact.
     any_contact_score = contact_state.max(axis=-1)                     # (T,)
     is_contact = any_contact_score > config.contact_threshold           # (T,)
 
@@ -137,12 +139,6 @@ def extract_interaction_phase(
             return phase
     elif object_positions.ndim == 1:
         object_positions = np.tile(object_positions, (T, 1))
-
-    # Distance from each hand to object center (still hand-led because the
-    # approach/pre-contact distinction tracks the reaching hand).
-    dist_left = np.linalg.norm(left_hand - object_positions, axis=-1)
-    dist_right = np.linalg.norm(right_hand - object_positions, axis=-1)
-    hand_obj_dist = np.minimum(dist_left, dist_right)  # (T,)
 
     # Object translational velocity.
     trans_vel = np.zeros(T)
@@ -166,55 +162,14 @@ def extract_interaction_phase(
         | (ang_vel > config.rotational_velocity_eps)
     )
 
-    # --- Heuristic state machine ---
+    # --- Heuristic state machine (3-class) ---
+    # Non-contact frames stay at PHASE_NON_CONTACT (the array's init value),
+    # so we only need to assign during the in-contact branch.
     for t in range(T):
         if is_contact[t]:
             phase[t] = PHASE_MANIPULATION if is_moving[t] else PHASE_STABLE_CONTACT
-        elif hand_obj_dist[t] < config.near_threshold:
-            phase[t] = PHASE_PRE_CONTACT
-        else:
-            phase[t] = PHASE_APPROACH
-
-    # --- Mark release: frames right after contact ends ---
-    _mark_release(phase, is_contact, config.release_window)
 
     # --- Temporal smoothing ---
     phase = median_filter(phase, size=config.median_filter_size).astype(np.int64)
 
     return phase
-
-
-def _mark_release(
-    phase: np.ndarray,
-    is_contact: np.ndarray,
-    release_window: int,
-) -> None:
-    """In-place: mark RELEASE from each contact-end until the next
-    contact-start (or ``release_window`` frames, whichever is shorter).
-
-    Old v9 behaviour was a fixed 10-frame window then flip-back to
-    APPROACH, which made `release` semantically incoherent: the actual
-    departure (the person walking away) was labelled as "approach to
-    something" past the 10-frame mark. The model could therefore not
-    learn `release` at all — F1 ≈ 0 even on the training set after
-    focal loss in v2.
-
-    With ``release_window`` set high (default 9999), this version
-    extends RELEASE to cover the entire post-contact period, matching
-    the GRAB ECCV'20 labelling convention of physically-meaningful
-    release windows. Multi-cycle clips lose some "approach to second
-    grab" annotation in exchange — accepted, single-cycle clips
-    dominate InterAct.
-    """
-    T = len(phase)
-    contact_diff = np.diff(is_contact.astype(np.int8), prepend=0, append=0)
-    release_starts = np.where(contact_diff == -1)[0]    # contact just ended
-    contact_starts = np.where(contact_diff == 1)[0]     # contact about to start
-
-    for start in release_starts:
-        # Release until the next contact-start (a re-grab) or the
-        # release_window cap or end-of-clip — whichever is earliest.
-        following_contacts = contact_starts[contact_starts > start]
-        next_contact_start = following_contacts[0] if len(following_contacts) > 0 else T
-        end = min(start + release_window, next_contact_start, T)
-        phase[start:end] = PHASE_RELEASE

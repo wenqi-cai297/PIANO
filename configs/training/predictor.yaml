@@ -2,7 +2,8 @@
 #
 # Hardware target: 2 × NVIDIA A6000 (48 GB each), bf16, Accelerate DDP.
 # Effective batch per optimizer step = per_gpu (32) × num_gpu (2) × accum (2) = 128.
-# Dataset: v9 InterAct pseudo-labels, 4 subsets, 8108 clean clips.
+# Dataset: v11 InterAct pseudo-labels (3-class phase, closest-point
+# xyz GT), 4 subsets, ~8100 clean clips.
 #
 # Launch:
 #   accelerate launch --config_file configs/accelerate_config.yaml \
@@ -86,7 +87,7 @@ training:
   max_grad_norm: 1.0
   # Keep-best-val: every N epochs, re-run the training step on the
   # val+test object split with grads disabled; write best_val.pt
-  # whenever val total loss improves. Does NOT interrupt training;
+  # whenever val ``val_best_key`` improves. Does NOT interrupt training;
   # final.pt is still saved at the end. 0 disables the val loop.
   # Community evidence (ContactGen ICCV'23, PointNeXt NeurIPS'22,
   # ViT, T5, HOI-Diff APDM) supports best-val selection for
@@ -94,6 +95,16 @@ training:
   # diffusion papers (MDM / MoMask / MLD) don't use it — our
   # Stage A predictor is in the supervised-regression family.
   val_every_epochs: 5
+  # Which key from the step_fn loss dict to minimise for best-val
+  # selection. v4 found that the Kendall multi-task total ``loss``
+  # contains a ``+0.5·s_i`` term whose magnitude grows monotonically
+  # as log_var_target descends (s ≈ -3.3 at equilibrium → -1.6
+  # contribution). That term decoupled total val_loss from supervision
+  # quality, so v4's best_val.pt got saved at epoch 4 (before Kendall
+  # took off) and final.pt was 3× better on phase macro-F1 than
+  # best_val.pt. v5 selects on ``loss_unweighted`` = sum of the four
+  # raw per-task losses (no Kendall combinator, no `0.5·s` term).
+  val_best_key: "loss_unweighted"
 
 loss:
   # Contact: BCE on soft [0,1] pseudo-labels.
@@ -124,19 +135,22 @@ loss:
   # Focal loss gamma for phase + support CE (Lin et al., RetinaNet
   # ICCV 2017). Downweights easy/confident samples so rare-class
   # gradient is not swamped. γ=2.0 is the RetinaNet default. 0.0
-  # disables. v3 found focal alone left `pre_contact` (0.4%) F1=0
-  # and `single_foot` (5%) F1=0 even on train — too weak at extreme
-  # imbalance. v4 stacks Logit Adjustment on top.
+  # disables. With v5's 3-class phase (lowest class ~30%), focal is
+  # almost a no-op on phase; for support's 2.9% `hand_support` and
+  # 4.4% `single_foot` it remains the primary tail mechanism.
   focal_gamma: 2.0
 
   # Logit Adjustment (Menon et al. ICLR 2021) — train-time logit
-  # offset by `tau × log π_y` per class. Bayes-optimal under known
-  # class priors at extreme imbalance. Computes per-task class
-  # frequencies once at train startup from the training dataset
-  # (~30s scan over 6400 clips). Applied to phase + support heads.
-  # tau=1.0 is the original paper default; lower values approach
-  # plain CE, higher values bias more toward rare classes.
-  use_logit_adjustment: true
+  # offset by `tau × log π_y` per class. **DISABLED in v5** because v4
+  # demonstrated catastrophic over-correction at our class frequencies:
+  # phase `pre_contact` (0.51% prior) trained the model to add ~5.3 to
+  # raw logit at training, which then dominated argmax at inference and
+  # produced "predict pre_contact for ~95% of frames" collapse. The v5
+  # phase-class redesign (5→3 classes, lowest now ~30%) makes LA
+  # unnecessary at the phase head; support's lowest class is 2.9%
+  # which focal γ=2 + label_smoothing 0.1 handle. Re-enable only at
+  # τ ≤ 0.25 if v5 leaves support `single_foot` / `hand_support` F1 at 0.
+  use_logit_adjustment: false
   logit_adjust_tau: 1.0
 
 priors:
@@ -147,16 +161,12 @@ priors:
   #   quantity) rather than "hand-to-contact-target distance" as the
   #   docstring claims. Inert until rewritten.
   #
-  # * phase_monotonicity: the extract_phase labelling sends the clip
-  #   back to APPROACH after the 10-frame RELEASE window ends (person
-  #   walking away from the object), so label-defined trajectories
-  #   contain a release(4) → approach(0) backward jump. The soft-
-  #   expected-phase monotonicity prior penalises exactly that
-  #   transition → it contradicts the labels at episode boundaries,
-  #   with boundary-frame prior-loss and CE-loss roughly equal in
-  #   magnitude (~0.2). Disabled pending either (a) a label-aware
-  #   transition-matrix version or (b) a v10 labelling pass that
-  #   introduces a post-release / departing state.
+  # * phase_monotonicity: the v5 3-class scheme has no monotonic
+  #   ordering at all (non_contact → contact → non_contact is a cycle,
+  #   not a monotone progression). The previous expected-phase soft
+  #   penalty assumed a 5-class linear ordering. Re-enable only with
+  #   a label-aware transition-matrix prior; the current
+  #   ``phase_monotonicity_loss`` is meaningless under 3-class.
   #
   # Remaining two priors (contact_persistence, support_smoothness)
   # linearly ramp from 0 to full weight over `prior_warmup_steps`
@@ -170,7 +180,7 @@ priors:
 
 logging:
   project: "piano"
-  run_name: "predictor_stageA_v9"
+  run_name: "predictor_stageA_v5"
   log_every_n_steps: 50
   save_every_n_epochs: 10
 

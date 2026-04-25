@@ -48,7 +48,7 @@ from piano.data.pseudo_labels.refine_phase_hmm import (
     build_phase_features,
     refine_phases_hmm,
 )
-from piano.data.pseudo_labels.extract_phase import PHASE_APPROACH
+from piano.data.pseudo_labels.extract_phase import PHASE_NON_CONTACT
 from piano.data.pseudo_labels.extract_target import TargetConfig
 from piano.utils.geometry import soft_patch_assignment
 
@@ -81,11 +81,10 @@ def test_phase_sitting_enters_stable_contact() -> None:
         joints, contact, object_positions, None, cfg,
     )
 
-    # Majority of the sequence must have reached stable-contact. Edge
-    # frames can be consumed by the release_window, that's fine.
+    # Majority of the sequence must have reached stable-contact.
     assert (phase == PHASE_STABLE_CONTACT).sum() > T * 0.5, (
         f"expected mostly stable-contact, got histogram "
-        f"{np.bincount(phase, minlength=5).tolist()}"
+        f"{np.bincount(phase, minlength=3).tolist()}"
     )
 
 
@@ -119,7 +118,7 @@ def test_phase_rotation_only_enters_manipulation() -> None:
     # Most contact frames must be manipulation (not stable-contact).
     assert (phase == PHASE_MANIPULATION).sum() > T * 0.5, (
         f"expected mostly manipulation, got histogram "
-        f"{np.bincount(phase, minlength=5).tolist()}"
+        f"{np.bincount(phase, minlength=3).tolist()}"
     )
 
 
@@ -169,7 +168,7 @@ def test_hmm_state_ids_preserve_phase_semantics() -> None:
     features = features + rng.normal(scale=1e-3, size=features.shape)
 
     initial_phases = np.concatenate([
-        np.zeros(10, dtype=np.int64),              # approach = PHASE_APPROACH = 0
+        np.zeros(10, dtype=np.int64),              # non_contact = PHASE_NON_CONTACT = 0
         np.full(10, PHASE_STABLE_CONTACT),
         np.full(10, PHASE_MANIPULATION),
     ])
@@ -763,7 +762,7 @@ def test_hmm_falls_back_to_initial_on_bad_features() -> None:
     features[:, 0] = 0.5
     features[5, 0] = np.nan   # poisons fit()
 
-    initial_phases = np.full(T, PHASE_APPROACH, dtype=np.int64)
+    initial_phases = np.full(T, PHASE_NON_CONTACT, dtype=np.int64)
     initial_phases[5:] = PHASE_STABLE_CONTACT
 
     refined = refine_phases_hmm(features, initial_phases, HMMConfig(n_iter=1))

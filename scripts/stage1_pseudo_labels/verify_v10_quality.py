@@ -1,18 +1,18 @@
 """Aggregate-stats + integrity checks for a freshly-extracted pseudo-
-label run (v10 specifically — checks the new ``contact_target_xyz_gt``
-field and the wider RELEASE phase distribution that the v10 extractor
-introduced).
+label run (v11 — 3-class phase + closest-point xyz GT).
 
 Reports per subset:
 
     - Field presence: confirm ``contact_target_xyz_gt`` is in every npz.
     - xyz GT sanity: shape, dtype, finite, magnitude (typical 0.05-0.5 m).
-    - Phase distribution: counts + % per class. v10 should show
-      ``release`` at ~25-35% (was ~12% in v9 because of the 10-frame cap).
+    - Phase distribution: counts + % per class. v11 (3-class) expects
+      ``non_contact`` ~25-40%, ``stable_contact`` ~12-22%,
+      ``manipulation`` ~45-60%. Contrast: v10 had 5 classes including
+      ``release`` 25-35% and ``pre_contact`` 0.5%; v11 absorbs both
+      into ``non_contact``.
     - Support distribution.
     - Contact rate per body part.
     - Cleaning report status (kept / dropped / per-reason counts).
-    - Comparison vs v9 expectation table at the end.
 
 Usage (server):
     python scripts/stage1_pseudo_labels/verify_v10_quality.py \\
@@ -20,7 +20,7 @@ Usage (server):
         --subsets chairs imhd neuraldome omomo_correct_v2
 
 Run after ``rerun_pseudo_labels_interact.sh`` + ``clean_pseudo_labels.py``
-to validate the v10 extraction worked correctly before committing to a
+to validate the v11 extraction worked correctly before committing to a
 re-train.
 """
 from __future__ import annotations
@@ -32,20 +32,17 @@ from pathlib import Path
 import numpy as np
 
 
-PHASE_NAMES = ("approach", "pre_contact", "stable_contact", "manipulation", "release")
+# 3-class phase scheme as of v5 / v11 extraction.
+PHASE_NAMES = ("non_contact", "stable_contact", "manipulation")
 SUPPORT_NAMES = ("both_feet", "single_foot", "sitting", "hand_support")
 BODY_PART_NAMES = ("left_hand", "right_hand", "left_foot", "right_foot", "pelvis")
 
-# v9 → v10 expected delta (rough). Use to flag "looks weird" cases.
-V9_PHASE_PCT_TYPICAL = {
-    "approach": (15.0, 25.0),
-    "pre_contact": (0.2, 1.0),
-    "stable_contact": (12.0, 22.0),
-    "manipulation": (45.0, 60.0),
-    "release": (10.0, 14.0),  # v9 was here; v10 should be > 20
-}
-V10_PHASE_PCT_EXPECTED = {
-    "release": (20.0, 40.0),  # widened by extractor
+# Per-class expected ranges for v11 3-class phase. Outside these and
+# something is probably wrong with the extraction.
+V11_PHASE_PCT_EXPECTED = {
+    "non_contact": (25.0, 45.0),
+    "stable_contact": (10.0, 25.0),
+    "manipulation": (40.0, 65.0),
 }
 
 
@@ -148,16 +145,12 @@ def _print_subset(r: dict) -> None:
                 print(f"    - {s}")
 
     print()
-    print("  Phase distribution:")
+    print("  Phase distribution (3-class):")
     for name, pct in r['phase_pct'].items():
-        lo, hi = V9_PHASE_PCT_TYPICAL.get(name, (None, None))
-        v10 = V10_PHASE_PCT_EXPECTED.get(name)
+        lo, hi = V11_PHASE_PCT_EXPECTED.get(name, (None, None))
         tag = ""
-        if v10 is not None:
-            if not (v10[0] <= pct <= v10[1]):
-                tag = f"  [WARN — v10 expected {v10[0]:.0f}-{v10[1]:.0f}%]"
-        elif lo is not None and not (lo <= pct <= hi):
-            tag = f"  [WARN — v9-typical {lo:.0f}-{hi:.0f}%]"
+        if lo is not None and not (lo <= pct <= hi):
+            tag = f"  [WARN — v11 expected {lo:.0f}-{hi:.0f}%]"
         print(f"    {name:<16s} {pct:>6.2f}%{tag}")
 
     print("  Support distribution:")
@@ -216,17 +209,18 @@ def main() -> int:
     print("=" * 78)
     print("Cross-subset summary (the most-watched signals)")
     print("=" * 78)
-    print(f"{'subset':<18}  {'n_npz':>7}  {'%xyz_gt':>8}  {'%release':>9}  {'%sitting':>9}  {'cleaned_kept%':>15}")
+    print(f"{'subset':<18}  {'n_npz':>7}  {'%xyz_gt':>8}  {'%non_ct':>9}  {'%manip':>9}  {'%sitting':>9}  {'cleaned_kept%':>15}")
     for r in all_summaries:
         if "error" in r:
             print(f"  {r['subset']:<16s}  ERROR")
             continue
         xyz_cov = 100.0 * r['has_xyz_gt'] / max(r['n_npz'], 1)
-        release_pct = r['phase_pct'].get('release', 0)
+        non_contact_pct = r['phase_pct'].get('non_contact', 0)
+        manip_pct = r['phase_pct'].get('manipulation', 0)
         sitting_pct = r['support_pct'].get('sitting', 0)
         kept_pct = (100.0 * r['cleaning']['num_kept'] /
                     max(r['cleaning']['num_in_metadata'], 1)) if r.get('cleaning') else float('nan')
-        print(f"  {r['subset']:<16s}  {r['n_npz']:>7d}  {xyz_cov:>7.1f}%  {release_pct:>8.1f}%  {sitting_pct:>8.1f}%  {kept_pct:>13.1f}%")
+        print(f"  {r['subset']:<16s}  {r['n_npz']:>7d}  {xyz_cov:>7.1f}%  {non_contact_pct:>8.1f}%  {manip_pct:>8.1f}%  {sitting_pct:>8.1f}%  {kept_pct:>13.1f}%")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(all_summaries, indent=2))

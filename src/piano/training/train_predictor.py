@@ -451,11 +451,16 @@ def run(config_path: str) -> None:
         # are trained from scratch (no pretrained fallback exists).
         extra_modules={"object_encoder": object_encoder},
         # Keep-best-val: re-run the step_fn on val_dataloader every N
-        # epochs, save a best_val.pt when total val loss improves.
+        # epochs, save a best_val.pt when val ``val_best_key`` improves.
         # Does not interrupt training — best checkpoint is kept in
-        # parallel to the final one.
+        # parallel to the final one. Default ``val_best_key`` is
+        # "loss" (the Kendall-combined total), but when Kendall is on
+        # this is decoupled from supervision quality (see losses.py
+        # comment) — set ``training.val_best_key: "loss_unweighted"``
+        # in the config to track raw supervision instead.
         val_dataloader=val_dataloader,
         val_every_epochs=val_every_epochs,
+        val_best_key=cfg.training.get("val_best_key", "loss"),
     )
 
 

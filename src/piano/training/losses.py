@@ -295,8 +295,20 @@ class PredictorLoss(nn.Module):
             )
             kendall_log = {}
 
+        # Unweighted sum of raw per-task losses — the supervision
+        # signal that actually tracks model quality, with no Kendall
+        # combinator and no `+0.5·s_i` term. v4 found that selecting
+        # best_val on the Kendall-combined ``loss`` was broken: as
+        # log_var_target descended (good), the `0.5·s` contribution
+        # made total ``loss`` decrease monotonically regardless of
+        # supervision quality, so best_val.pt got saved at epoch 4
+        # (before Kendall took off) and final.pt was 3× better on
+        # phase macro-F1. Use this key for ``val_best_key`` instead.
+        loss_unweighted = loss_contact + loss_target + loss_phase + loss_support
+
         return {
             "loss": total,
+            "loss_unweighted": loss_unweighted,
             "loss_contact": loss_contact,
             "loss_target": loss_target,
             "loss_phase": loss_phase,

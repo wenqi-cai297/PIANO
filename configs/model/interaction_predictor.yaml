@@ -33,7 +33,7 @@ output:
   # for back-compat but is a no-op; the head output is 3 regardless.
   num_object_patches: 16
   target_coord_dim: 3
-  num_phases: 5           # approach, pre-contact, stable-contact, manipulation, release
+  num_phases: 3           # non_contact, stable_contact, manipulation (v5: 5→3, see analyses/2026-04-25_stageA_v4_results_and_v5_plan.md)
   num_support_states: 4   # both_feet, single_foot, sitting, hand_support
 
 sequence:
