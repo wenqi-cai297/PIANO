@@ -31,13 +31,22 @@ Verdict thresholds (per the root-cause research §"Decision tree"):
 Pure measurement — no training, no checkpoint writes. Reads
 ``best_val.pt`` and runs forward in eval mode.
 
+Output files (all under ``--output-dir``):
+
+- ``summary.txt`` — pretty-printed per-layer table + verdict + recommendation
+  (mirror of what's printed to stdout, so nothing has to be captured from terminal)
+- ``summary.json`` — structured result with all per-layer stats and verdict
+- ``raw_ratios.npz`` — per-layer concatenated per-token ratio arrays
+  (``ratio_pre_layer<i>``, ``ratio_post_layer<i>``) for downstream plotting
+  / additional analysis without re-running the script
+
 Usage::
 
     python scripts/stage_b_generator/measure_effect_size.py \\
         --config configs/training/generator.yaml \\
         --ckpt runs/training/generator/best_val.pt \\
         --num-batches 100 \\
-        --output runs/eval/stageB_v0_3_pre/effect_size.json
+        --output-dir runs/eval/stageB_v0_3_pre
 """
 from __future__ import annotations
 
@@ -316,13 +325,19 @@ def measure(
     device: torch.device,
     num_batches: int,
     token_stride: int,
-) -> dict[str, Any]:
-    """Run forward on N val batches, capture activations, return per-layer stats.
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    """Run forward on N val batches, capture activations, return aggregated stats + raw ratios.
 
     Returns
     -------
-    Dict with keys ``per_layer`` (list of length n_layers, each a dict with
-    aggregated ratio statistics) and ``num_batches`` / ``num_clips`` totals.
+    summary
+        Dict with keys ``per_layer`` (list of length n_layers, each a dict with
+        aggregated ratio statistics) and ``num_batches`` / ``num_clips`` totals.
+    raw
+        Per-layer concatenated per-token ratio arrays. Keys are
+        ``ratio_pre_layer{i}`` / ``ratio_post_layer{i}`` for layer index ``i``.
+        Useful for histograms / downstream plotting without re-running the
+        forward pass.
     """
     n_layers = len(transformer.mask_transformer.seqTransEncoder.layers)
     cap = ActivationCapture(n_layers)
@@ -432,12 +447,22 @@ def measure(
             "ratio_post_p95": float(np.percentile(post_all, 95)) if post_all.size > 0 else 0.0,
         })
 
-    return {
+    summary = {
         "num_batches": n_batches_seen,
         "num_clips": n_clips_seen,
         "n_layers": n_layers,
         "per_layer": per_layer_out,
     }
+    # Raw per-token arrays for downstream plotting / further analysis.
+    raw: dict[str, np.ndarray] = {}
+    for i in range(n_layers):
+        raw[f"ratio_pre_layer{i}"] = (
+            np.concatenate(pre_ratios[i]) if pre_ratios[i] else np.zeros(0)
+        )
+        raw[f"ratio_post_layer{i}"] = (
+            np.concatenate(post_ratios[i]) if post_ratios[i] else np.zeros(0)
+        )
+    return summary, raw
 
 
 # ============================================================================
@@ -493,17 +518,26 @@ def _verdict(per_layer: list[dict[str, Any]]) -> dict[str, Any]:
 # Pretty-print + JSON dump
 # ============================================================================
 
-def _print_summary(result: dict[str, Any]) -> None:
-    print(f"\n=== Stage B v0.3-pre effect-size measurement ===")
-    print(f"  ckpt:          {result['ckpt']}")
-    print(f"  num_batches:   {result['num_batches']}")
-    print(f"  num_clips:     {result['num_clips']}")
-    print(f"  n_layers:      {result['n_layers']}")
-    print()
+def _format_summary(result: dict[str, Any]) -> str:
+    """Build the pretty-printed report as a single string.
 
-    print(f"  {'L':>2} {'γ_int':>8} {'‖γ·int_out‖':>12} {'‖src_pre‖':>10} "
-          f"{'%pre':>7} {'%post':>7} {'p50post':>8} {'p95post':>8}")
-    print(f"  {'-' * 70}")
+    Identical content to what previous versions printed to stdout, but
+    returnable so we can both ``print`` it and write it to a file
+    without diverging.
+    """
+    lines: list[str] = []
+    lines.append(f"\n=== Stage B v0.3-pre effect-size measurement ===")
+    lines.append(f"  ckpt:          {result['ckpt']}")
+    lines.append(f"  num_batches:   {result['num_batches']}")
+    lines.append(f"  num_clips:     {result['num_clips']}")
+    lines.append(f"  n_layers:      {result['n_layers']}")
+    lines.append("")
+
+    lines.append(
+        f"  {'L':>2} {'γ_int':>8} {'‖γ·int_out‖':>12} {'‖src_pre‖':>10} "
+        f"{'%pre':>7} {'%post':>7} {'p50post':>8} {'p95post':>8}"
+    )
+    lines.append(f"  {'-' * 70}")
     for layer in result["per_layer"]:
         i = layer["layer_idx"]
         g = layer["gamma_int"]
@@ -513,19 +547,28 @@ def _print_summary(result: dict[str, Any]) -> None:
         rpost = layer["ratio_post_mean"] * 100.0
         p50 = layer["ratio_post_p50"] * 100.0
         p95 = layer["ratio_post_p95"] * 100.0
-        print(f"  {i:>2} {g:>+8.4f} {eff:>12.4f} {pre:>10.4f} "
-              f"{rpre:>6.2f}% {rpost:>6.2f}% {p50:>7.2f}% {p95:>7.2f}%")
+        lines.append(
+            f"  {i:>2} {g:>+8.4f} {eff:>12.4f} {pre:>10.4f} "
+            f"{rpre:>6.2f}% {rpost:>6.2f}% {p50:>7.2f}% {p95:>7.2f}%"
+        )
 
     v = result["verdict"]
-    print()
-    print(f"  Verdict:        {v['category']}")
-    print(f"  Max layer post-residual ratio:  {v['max_layer_ratio_post_mean'] * 100:.2f}%")
-    print(f"  Mean layer post-residual ratio: {v['mean_layer_ratio_post_mean'] * 100:.2f}%")
-    print()
-    print(f"  Recommendation:")
+    lines.append("")
+    lines.append(f"  Verdict:        {v['category']}")
+    lines.append(
+        f"  Max layer post-residual ratio:  "
+        f"{v['max_layer_ratio_post_mean'] * 100:.2f}%"
+    )
+    lines.append(
+        f"  Mean layer post-residual ratio: "
+        f"{v['mean_layer_ratio_post_mean'] * 100:.2f}%"
+    )
+    lines.append("")
+    lines.append(f"  Recommendation:")
     for line in v["recommendation"].split(". "):
         if line.strip():
-            print(f"    {line.strip().rstrip('.')}.")
+            lines.append(f"    {line.strip().rstrip('.')}.")
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -554,9 +597,9 @@ def main() -> int:
         help="cuda / cpu; auto-detect if omitted.",
     )
     parser.add_argument(
-        "--output", "-o", type=Path,
-        default=Path("runs/eval/stageB_v0_3_pre/effect_size.json"),
-        help="JSON output path.",
+        "--output-dir", "-o", type=Path,
+        default=Path("runs/eval/stageB_v0_3_pre"),
+        help="output directory; will contain summary.txt + summary.json + raw_ratios.npz.",
     )
     args = parser.parse_args()
 
@@ -581,7 +624,7 @@ def main() -> int:
     print(f"  val: {n_total_clips} clips total; will forward up to {args.num_batches} batches.")
 
     print(f"Measuring effect size...")
-    measurement = measure(
+    measurement, raw_ratios = measure(
         transformer=transformer,
         vq_model=vq_model,
         val_loader=val_loader,
@@ -596,12 +639,26 @@ def main() -> int:
         **measurement,
         "verdict": _verdict(measurement["per_layer"]),
     }
-    _print_summary(result)
+    report = _format_summary(result)
+    print(report)
 
-    ensure_dir(args.output.parent)
-    with args.output.open("w", encoding="utf-8") as f:
+    # Write all artifacts into the output dir — nothing only-on-stdout.
+    ensure_dir(args.output_dir)
+    summary_txt = args.output_dir / "summary.txt"
+    summary_json = args.output_dir / "summary.json"
+    raw_npz = args.output_dir / "raw_ratios.npz"
+
+    with summary_txt.open("w", encoding="utf-8") as f:
+        f.write(report)
+        f.write("\n")
+    with summary_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
-    print(f"\nWrote → {args.output}")
+    np.savez(raw_npz, **raw_ratios)
+
+    print(f"\nWrote:")
+    print(f"  {summary_txt}")
+    print(f"  {summary_json}")
+    print(f"  {raw_npz}")
     return 0
 
 
