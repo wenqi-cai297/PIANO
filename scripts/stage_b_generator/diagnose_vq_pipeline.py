@@ -218,6 +218,29 @@ def _per_clip_diagnose(
     motion_raw = sample["motion"].numpy().astype(np.float32)         # (T, 263) raw
     seq_len = int(sample["seq_len"].item())
     valid_T = min(seq_len, motion_raw.shape[0])
+    # MoMask VQ-VAE is stride-4 (down_t=2, stride_t=2 → 2² = 4), so the
+    # decoder always emits ``floor(T/4) * 4`` frames. Truncate GT to the
+    # same length so all three round-trip arrays have matching first axis
+    # (otherwise the L2 / per-frame comparisons hit a shape mismatch when
+    # seq_len isn't a multiple of 4).
+    TOKEN_STRIDE = 4
+    valid_T = (valid_T // TOKEN_STRIDE) * TOKEN_STRIDE
+    if valid_T < TOKEN_STRIDE:
+        # Degenerate clip (< 4 frames). Skip with zero-drift entries.
+        return {
+            "seq_id": str(sample.get("seq_id", "?")),
+            "subset": str(sample.get("subset", "?")),
+            "valid_T": 0,
+            "gt": {"max_drift": 0.0, "end_drift": 0.0, "path_length": 0.0},
+            "roundtrip_raw_encode": {"max_drift": 0.0, "end_drift": 0.0, "path_length": 0.0},
+            "roundtrip_norm_encode": {"max_drift": 0.0, "end_drift": 0.0, "path_length": 0.0},
+            "l2_decoded_vs_gt_motion": {"raw_encode": 0.0, "norm_encode": 0.0},
+            "ratios": {
+                "raw_max_drift_ratio": 0.0, "norm_max_drift_ratio": 0.0,
+                "raw_path_ratio": 0.0, "norm_path_ratio": 0.0,
+            },
+            "skipped": True,
+        }
 
     # Path 0 — GT (no encode at all, just recover joints from raw motion).
     gt_joints = _recover_joints(motion_raw[:valid_T])
@@ -281,12 +304,34 @@ def _verdict(per_clip: list[dict[str, Any]]) -> dict[str, Any]:
     """Apply decision matrix from the docstring.
 
     Aggregates the per-clip max-drift and path-length preservation ratios
-    across clips, then maps to one of three categories.
+    across clips, then maps to one of three categories. Skipped clips
+    (too short for VQ stride-4) and zero-GT-drift clips (static poses
+    where the ratio is ill-defined) are filtered before aggregation.
     """
-    raw_max_ratios = np.array([c["ratios"]["raw_max_drift_ratio"] for c in per_clip])
-    norm_max_ratios = np.array([c["ratios"]["norm_max_drift_ratio"] for c in per_clip])
-    raw_path_ratios = np.array([c["ratios"]["raw_path_ratio"] for c in per_clip])
-    norm_path_ratios = np.array([c["ratios"]["norm_path_ratio"] for c in per_clip])
+    usable = [
+        c for c in per_clip
+        if not c.get("skipped", False) and c["gt"]["max_drift"] > 0.05
+    ]
+    if not usable:
+        return {
+            "category": "no_valid_clips",
+            "raw_encode_max_drift_ratio_median": 0.0,
+            "norm_encode_max_drift_ratio_median": 0.0,
+            "raw_encode_path_length_ratio_median": 0.0,
+            "norm_encode_path_length_ratio_median": 0.0,
+            "n_usable_clips": 0,
+            "n_total_clips": len(per_clip),
+            "recommendation": (
+                "All sampled clips were either too short (< 4 frames) or "
+                "had near-zero GT root drift (static interactions). Re-run "
+                "with --num-clips 50 or seed-shuffle to get clips with "
+                "meaningful translation."
+            ),
+        }
+    raw_max_ratios = np.array([c["ratios"]["raw_max_drift_ratio"] for c in usable])
+    norm_max_ratios = np.array([c["ratios"]["norm_max_drift_ratio"] for c in usable])
+    raw_path_ratios = np.array([c["ratios"]["raw_path_ratio"] for c in usable])
+    norm_path_ratios = np.array([c["ratios"]["norm_path_ratio"] for c in usable])
 
     raw_max_med = float(np.median(raw_max_ratios))
     norm_max_med = float(np.median(norm_max_ratios))
@@ -340,6 +385,8 @@ def _verdict(per_clip: list[dict[str, Any]]) -> dict[str, Any]:
         "norm_encode_max_drift_ratio_median": norm_max_med,
         "raw_encode_path_length_ratio_median": raw_path_med,
         "norm_encode_path_length_ratio_median": norm_path_med,
+        "n_usable_clips": len(usable),
+        "n_total_clips": len(per_clip),
         "recommendation": rec,
     }
 
