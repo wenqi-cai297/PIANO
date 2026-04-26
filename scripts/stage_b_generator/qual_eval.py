@@ -132,6 +132,38 @@ def _build_val_dataset(cfg) -> ConcatDataset:
 # Model setup
 # ============================================================================
 
+def _load_motion_stats(vq_vae_ckpt: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load HumanML3D motion mean/std from the MoMask co-located meta dir.
+
+    MoMask convention: ``<vq_vae_root>/meta/mean.npy`` + ``std.npy``. The
+    ``vq_vae_ckpt`` argument is the .tar inside ``<vq_vae_root>/model/``,
+    so we go up two levels to find ``meta/``.
+
+    The decoded motion from ``vq_model.forward_decoder(...)`` is in
+    **normalized** space — without ``x * std + mean`` the values are
+    ``O(0.01-1)`` per channel and ``recover_from_ric`` integrates them
+    as if they were world-frame velocities → joint positions cluster
+    near the canonical origin → mp4 looks like "body stands still".
+    This helper resolves the stats so callers can denorm before save.
+
+    Raises FileNotFoundError if either file is missing.
+    """
+    vq_vae_dir = Path(vq_vae_ckpt).parent.parent  # .../<root>/model/x.tar → .../<root>/
+    meta_dir = vq_vae_dir / "meta"
+    mean_path = meta_dir / "mean.npy"
+    std_path = meta_dir / "std.npy"
+    if not mean_path.exists() or not std_path.exists():
+        raise FileNotFoundError(
+            f"HumanML3D motion stats not found at {meta_dir}. Expected "
+            f"mean.npy + std.npy alongside the VQ-VAE checkpoint, per the "
+            f"MoMask convention."
+        )
+    return (
+        np.load(mean_path).astype(np.float32),
+        np.load(std_path).astype(np.float32),
+    )
+
+
 def _build_model(cfg, ckpt_path: Path, device: torch.device):
     """Build the wrapped InteractionMaskTransformer + frozen VQ-VAE +
     frozen ResidualTransformer, then load the Stage B checkpoint."""
@@ -268,14 +300,31 @@ def _generate(
     *,
     w_text: float,
     w_int: float,
+    motion_mean: np.ndarray,
+    motion_std: np.ndarray,
     timesteps: int = 10,
     res_cond_scale: float = 2.0,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run base + residual generation, then VQ decode.
+    """Run base + residual generation, then VQ decode + denormalize.
+
+    The VQ-VAE was trained on **normalized** HumanML3D 263-d
+    (``(raw - mean) / std``) so its decoder also outputs in normalized
+    space. We denormalize via ``motion * std + mean`` before returning,
+    so the caller sees motion in the same scale as
+    ``preprocess_interact``'s saved ``motion_263`` and downstream
+    ``recover_from_ric`` reconstructs joints in real-world units.
+    Without this denorm, joint positions cluster near the canonical
+    origin and mp4 viewers see a "stationary blob" regardless of what
+    the model actually generated. (This was the root cause of the
+    apparent "body in place" failure mode in v0.1, v0.2, v0.3-α — the
+    visualisation pipeline never denormalised. See
+    analyses/2026-04-27_v0_3_root_cause_research.md note appended after
+    v0.3-α evaluation.)
 
     Returns ``(motion_263, base_token_ids)`` numpy arrays of shapes
     ``(T_frames, 263)`` and ``(S_tokens,)`` respectively (B=1, squeezed).
+    Motion is in **denormalized** HumanML3D scale.
     """
     cond_vector = transformer.encode_text([text]).to(device).float()
     base_ids = transformer.generate(
@@ -301,9 +350,15 @@ def _generate(
     )                                           # (1, S, Q), -1 at padded
     all_for_decode = torch.where(all_ids < 0, torch.zeros_like(all_ids), all_ids)
 
-    # Decode to 263-d motion.
+    # Decode to 263-d motion (still in normalized space — VQ-VAE was
+    # trained on (raw - mean) / std normalized features).
     motion = vq_model.forward_decoder(all_for_decode)   # (1, T, 263)
     motion = motion.squeeze(0).detach().cpu().numpy()
+    # Denormalize so downstream recover_from_ric reconstructs joints in
+    # real-world (HumanML3D-canonical) units. Without this, joint
+    # positions stay clustered near the origin and the mp4 viewer sees
+    # a stationary blob regardless of what the model generated.
+    motion = motion * motion_std + motion_mean
     base_np = base_ids.squeeze(0).detach().cpu().numpy()
     return motion, base_np
 
@@ -447,6 +502,13 @@ def main() -> int:
     )
     print(f"Token stride: {token_stride}  (frame T → token S = T/{token_stride})")
 
+    # Load HumanML3D motion stats so generated motion gets denormalized
+    # to real-world scale before being saved + visualized. See
+    # ``_load_motion_stats`` docstring for why this is load-bearing for
+    # mp4 visual quality.
+    motion_mean, motion_std = _load_motion_stats(cfg.model.checkpoints.vq_vae)
+    print(f"Loaded HumanML3D mean/std: shape={motion_mean.shape}")
+
     # Build val dataset, sample N clips (deterministic).
     val_dataset = _build_val_dataset(cfg)
     pool = list(range(len(val_dataset)))
@@ -513,17 +575,20 @@ def main() -> int:
         m_full, base_full = _generate(
             transformer, vq_model, res_transformer,
             text=text, int_kv=kv_self, int_pad=pad_self,
-            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int, device=device,
+            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int,
+            motion_mean=motion_mean, motion_std=motion_std, device=device,
         )
         m_text, base_text = _generate(
             transformer, vq_model, res_transformer,
             text=text, int_kv=None, int_pad=None,
-            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int, device=device,
+            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int,
+            motion_mean=motion_mean, motion_std=motion_std, device=device,
         )
         m_swap, base_swap = _generate(
             transformer, vq_model, res_transformer,
             text=text, int_kv=kv_other, int_pad=pad_other,
-            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int, device=device,
+            m_lens_tok=m_lens_tok, w_text=args.w_text, w_int=w_int,
+            motion_mean=motion_mean, motion_std=motion_std, device=device,
         )
         return {
             "full":      {"motion": m_full, "base": base_full,  "swap_from": None},
