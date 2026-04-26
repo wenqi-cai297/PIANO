@@ -278,6 +278,12 @@ def run_eval(
     all_gt_phase: list[np.ndarray] = []
     all_pred_support: list[np.ndarray] = []
     all_gt_support: list[np.ndarray] = []
+    # Per-clip records for per-object aggregation. Each entry is
+    # {subset, object_id, seq_id, n_frames_valid, n_gated_target,
+    #  target_mean_l2_m_per_clip, contact_any_n_pos, contact_any_n_pred_pos,
+    #  contact_any_n_tp}. Stored as plain dicts so the aggregation post-
+    # loop is purely numpy / Python — no torch state.
+    clip_records: list[dict] = []
     loss_sums = {
         "loss": 0.0, "loss_contact": 0.0, "loss_target": 0.0,
         "loss_phase": 0.0, "loss_support": 0.0,
@@ -360,6 +366,42 @@ def run_eval(
         all_pred_support.append(pred_support.reshape(-1)[valid])
         all_gt_support.append(gt_support.reshape(-1)[valid])
 
+        # Per-clip records for per-object aggregation. We compute the
+        # contact-gated target xyz mean L2 per clip so that the post-
+        # loop aggregation can group by object_id and tell us whether
+        # the global val mean L2 is uniform across objects or driven by
+        # a few outlier geometries.
+        seq_lens_np = batch["seq_len"].cpu().numpy()
+        gt_contact_clip = batch["contact_state"].float().cpu().numpy()  # (B, T, 5)
+        pred_contact_clip = pred_contact                                 # already (B, T, 5)
+        err_clip = np.linalg.norm(pred_txyz - gt_txyz, axis=-1)          # (B, T, 5)
+        for i in range(B):
+            T_i = int(seq_lens_np[i])
+            if T_i <= 0:
+                continue
+            gate_i = gt_contact_clip[i, :T_i, :] > 0.5     # (T_i, 5)
+            err_i = err_clip[i, :T_i, :]                   # (T_i, 5)
+            n_gated_i = int(gate_i.sum())
+            tgt_mean = float(err_i[gate_i].mean()) if n_gated_i > 0 else None
+            # Per-clip any-part contact: did model agree on
+            # "frame has any contact" across the clip?
+            gt_any_i = gate_i.any(axis=-1)                 # (T_i,)
+            pred_any_i = (pred_contact_clip[i, :T_i, :] > 0.5).any(axis=-1)
+            tp_i = int(((gt_any_i) & (pred_any_i)).sum())
+            n_gt_pos_i = int(gt_any_i.sum())
+            n_pred_pos_i = int(pred_any_i.sum())
+            clip_records.append({
+                "subset": batch["subset"][i],
+                "object_id": batch["object_id"][i],
+                "seq_id": batch["seq_id"][i],
+                "n_frames_valid": T_i,
+                "n_gated_target": n_gated_i,
+                "target_mean_l2_m_per_clip": tgt_mean,
+                "contact_any_n_gt_pos": n_gt_pos_i,
+                "contact_any_n_pred_pos": n_pred_pos_i,
+                "contact_any_n_tp": tp_i,
+            })
+
         total_valid_frames += int(valid.sum())
         total_clips += B
         if batch_idx % 10 == 0:
@@ -440,6 +482,100 @@ def run_eval(
         class_names=["both_feet", "single_foot", "sitting", "hand_support"],
     )
 
+    # ------------------------------------------------------------------
+    # Per-object aggregation (Item 6 — diagnose whether the global val
+    # target mean L2 is uniform across objects or driven by a few
+    # outlier geometries; see analyses/2026-04-25_stageA_three_layer_diagnosis.md
+    # §3.1). Groups clips by (subset, object_id) and computes:
+    #   - n_clips: total clips for this object
+    #   - n_clips_with_contact: clips that had any gated frames
+    #   - n_total_gated_frames: sum of gated frame×part cells across all clips
+    #   - frame_weighted_mean_l2_m: total error / total gated count
+    #     (the "if you concatenated all frames of this object" mean)
+    #   - clip_mean_l2_m: mean of per-clip means (each clip weighted equally)
+    #   - clip_median / max / min L2: distribution of per-clip means
+    #   - contact_any_p / r / f1: any-part-contact agreement at frame level
+    # The output is sorted by frame_weighted_mean_l2_m (worst objects first)
+    # so the analyst can immediately see whether the val mean is uniform or
+    # has 1-2 outliers dragging it.
+    # ------------------------------------------------------------------
+    from collections import defaultdict
+    by_obj: dict[tuple, list[dict]] = defaultdict(list)
+    for rec in clip_records:
+        by_obj[(rec["subset"], rec["object_id"])].append(rec)
+
+    per_object_stats: list[dict] = []
+    for (subset, obj_id), recs in by_obj.items():
+        valid = [r for r in recs if r["target_mean_l2_m_per_clip"] is not None]
+        n_clips = len(recs)
+        n_clips_with_contact = len(valid)
+        total_gated = sum(r["n_gated_target"] for r in valid)
+
+        # Frame-weighted mean L2 across all clips of this object
+        # (recovers what the global mean L2 would be if restricted to
+        # this object's clips). Weight each clip's mean by its
+        # n_gated_target so frame-rich clips contribute more.
+        if total_gated > 0:
+            frame_weighted_mean = (
+                sum(r["target_mean_l2_m_per_clip"] * r["n_gated_target"] for r in valid)
+                / total_gated
+            )
+        else:
+            frame_weighted_mean = None
+
+        clip_means = [r["target_mean_l2_m_per_clip"] for r in valid]
+        if clip_means:
+            clip_mean = float(np.mean(clip_means))
+            clip_median = float(np.median(clip_means))
+            clip_max = float(np.max(clip_means))
+            clip_min = float(np.min(clip_means))
+        else:
+            clip_mean = clip_median = clip_max = clip_min = None
+
+        # Any-part contact F1 at frame level for this object.
+        n_gt_pos = sum(r["contact_any_n_gt_pos"] for r in recs)
+        n_pred_pos = sum(r["contact_any_n_pred_pos"] for r in recs)
+        n_tp = sum(r["contact_any_n_tp"] for r in recs)
+        if n_pred_pos > 0:
+            cprec = n_tp / n_pred_pos
+        else:
+            cprec = 0.0
+        if n_gt_pos > 0:
+            crec = n_tp / n_gt_pos
+        else:
+            crec = 0.0
+        if cprec + crec > 0:
+            cf1 = 2 * cprec * crec / (cprec + crec)
+        else:
+            cf1 = 0.0
+
+        per_object_stats.append({
+            "subset": subset,
+            "object_id": obj_id,
+            "n_clips": n_clips,
+            "n_clips_with_contact": n_clips_with_contact,
+            "n_total_gated_frames": int(total_gated),
+            "target_frame_weighted_mean_l2_m": (
+                float(frame_weighted_mean) if frame_weighted_mean is not None else None
+            ),
+            "target_clip_mean_l2_m": clip_mean,
+            "target_clip_median_l2_m": clip_median,
+            "target_clip_max_l2_m": clip_max,
+            "target_clip_min_l2_m": clip_min,
+            "contact_any_precision": float(cprec),
+            "contact_any_recall": float(crec),
+            "contact_any_f1": float(cf1),
+        })
+
+    # Sort by target frame-weighted mean (worst object first); objects
+    # with no gated frames go to the end.
+    per_object_stats.sort(
+        key=lambda r: (
+            r["target_frame_weighted_mean_l2_m"] if r["target_frame_weighted_mean_l2_m"] is not None else -1.0
+        ),
+        reverse=True,
+    )
+
     # Losses → mean over batches
     loss_mean = {k: v / max(n_loss_batches, 1) for k, v in loss_sums.items()}
 
@@ -474,6 +610,12 @@ def run_eval(
         },
         "phase": phase_metrics,
         "support": support_metrics,
+        # Per-object table (sorted worst-target-first). Surfaces whether
+        # the global val mean L2 is uniform across the held-out objects
+        # or driven by 1-2 outlier geometries — directly informs whether
+        # the next move is "improve target head" (uniform) or "look at
+        # data split" (outlier-driven).
+        "per_object": per_object_stats,
     }
     return report
 
@@ -542,6 +684,41 @@ def _print_report(r: dict) -> None:
         for ci, cn in enumerate(section["class_names"]):
             row = "  " + f"{cn[:14]:<14s}" + " ".join(f"{v:>10d}" for v in section["confusion_matrix"][ci])
             print(row)
+
+    # Per-object diagnostic table — answers "is the global val mean L2
+    # uniform across objects, or driven by a few outliers?". Print all
+    # rows (the val+test set is at most ~13 objects).
+    if r.get("per_object"):
+        print("\n[per-object — sorted by target frame-weighted mean L2, worst first]")
+        header = (
+            f"  {'subset':<18s} {'object_id':<14s} "
+            f"{'n_clips':>8s} {'n_gated':>8s} "
+            f"{'L2_fw_cm':>9s} {'L2_clip_mean':>13s} {'L2_med':>8s} "
+            f"{'L2_max':>8s} {'L2_min':>8s} {'ct_any_F1':>10s}"
+        )
+        print(header)
+        for po in r["per_object"]:
+            def _cm(x):
+                return f"{x*100:.1f}" if x is not None else "  -- "
+            print(
+                f"  {po['subset']:<18s} {po['object_id']:<14s} "
+                f"{po['n_clips']:>8d} {po['n_total_gated_frames']:>8d} "
+                f"{_cm(po['target_frame_weighted_mean_l2_m']):>9s} "
+                f"{_cm(po['target_clip_mean_l2_m']):>13s} "
+                f"{_cm(po['target_clip_median_l2_m']):>8s} "
+                f"{_cm(po['target_clip_max_l2_m']):>8s} "
+                f"{_cm(po['target_clip_min_l2_m']):>8s} "
+                f"{po['contact_any_f1']:>10.3f}"
+            )
+        # One-line aggregate to sanity-check vs the global target metric:
+        valid_po = [p for p in r['per_object'] if p['target_frame_weighted_mean_l2_m'] is not None]
+        if valid_po:
+            tot_g = sum(p['n_total_gated_frames'] for p in valid_po)
+            agg = sum(p['target_frame_weighted_mean_l2_m'] * p['n_total_gated_frames']
+                      for p in valid_po) / max(tot_g, 1)
+            print(f"  (aggregate frame-weighted across all objects: {agg*100:.2f} cm — "
+                  f"should match the overall mean L2 above)")
+
     print()
     print("=" * 78)
 

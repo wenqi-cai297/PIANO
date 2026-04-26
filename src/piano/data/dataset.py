@@ -267,12 +267,19 @@ class HOIDataset(Dataset):
             )
 
         # --- Build output dict ---
-        result: dict[str, torch.Tensor] = {
+        # `object_id` and `subset` are passed through as plain strings
+        # so downstream code (eval_predictor per-object aggregation) can
+        # group clips by object identity. The collate fn accumulates them
+        # as parallel string lists alongside the tensor batches.
+        result: dict[str, torch.Tensor | str] = {
             "motion": torch.from_numpy(motion),
             "joints": torch.from_numpy(joints),
             "object_pc": torch.from_numpy(object_pc),
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
             "text": text,
+            "object_id": str(obj_id),
+            "subset": self.root.name,
+            "seq_id": str(seq_id),
         }
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
@@ -519,7 +526,13 @@ def compute_class_priors(
 
 
 def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
-    """Custom collate that handles variable-presence pseudo-labels and text strings."""
+    """Custom collate that handles variable-presence pseudo-labels and string fields.
+
+    Tensor fields are stacked. String fields (text, object_id, subset,
+    seq_id) are accumulated as parallel ``list[str]`` so downstream
+    code can pair each batch row with its provenance (per-object
+    eval analysis, debugging, etc.).
+    """
     result: dict[str, torch.Tensor | list[str]] = {}
 
     # Stack all tensor fields
@@ -527,9 +540,10 @@ def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
     for key in tensor_keys:
         result[key] = torch.stack([sample[key] for sample in batch])
 
-    # Collect text as list of strings
-    if "text" in batch[0]:
-        result["text"] = [sample["text"] for sample in batch]
+    # Collect string fields as parallel lists (text + provenance fields)
+    for key in ("text", "object_id", "subset", "seq_id"):
+        if key in batch[0]:
+            result[key] = [sample[key] for sample in batch]
 
     return result
 
