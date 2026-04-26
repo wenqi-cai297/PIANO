@@ -227,9 +227,17 @@ def run_training_loop(
                 scheduler.step()
                 optimizer.zero_grad()
 
-            # Accumulate metrics
+            # Accumulate metrics. Skip non-scalar tensors (diagnostic
+            # outputs like predicted token IDs) — they're allowed in
+            # the step_fn's return dict for downstream consumers but
+            # don't fit the per-step ``+= val.item()`` reduction.
+            # Older Stage A step_fns only returned scalars, so this
+            # branch is a no-op there; Stage B onwards may include
+            # per-token diagnostics.
             for key, val in loss_dict.items():
                 if isinstance(val, torch.Tensor):
+                    if val.numel() != 1:
+                        continue
                     val = val.item()
                 epoch_losses[key] = epoch_losses.get(key, 0.0) + val
 
@@ -244,7 +252,12 @@ def run_training_loop(
                 lr = optimizer.param_groups[0]["lr"]
                 msg = f"  step {global_step} | lr={lr:.2e}"
                 for key, val in loss_dict.items():
-                    v = val.item() if isinstance(val, torch.Tensor) else val
+                    if isinstance(val, torch.Tensor):
+                        if val.numel() != 1:
+                            continue
+                        v = val.item()
+                    else:
+                        v = val
                     msg += f" | {key}={v:.4f}"
                 accelerator.print(msg)
 
