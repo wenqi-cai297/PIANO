@@ -117,6 +117,7 @@ def _build_val_dataset(cfg) -> ConcatDataset:
             max_seq_length=cfg.data.max_seq_length,
             subject_id_filter=val_filter,
             augment=None,
+            surface_obj_pose=True,           # v0.2 tokenizer needs canonical object pose
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -236,9 +237,16 @@ def _tokenize_z_int(
     ph = sample["phase"].unsqueeze(0).long().to(device)
     sup = sample["support"].unsqueeze(0).long().to(device)
     seq_len = sample["seq_len"].unsqueeze(0).long().to(device)
+    # v0.2: HOIDataset(surface_obj_pose=True) places these in the sample
+    # dict; both must be present for a v0.2-built tokenizer.
+    obj_com = sample["obj_com_canonical"].unsqueeze(0).float().to(device)
+    obj_rot6d = sample["obj_rot6d_canonical"].unsqueeze(0).float().to(device)
     int_kv, pad = transformer.interaction_tokenizer(
         contact_state=cs, contact_target_xyz=ctx,
-        phase=ph, support=sup, seq_lens=seq_len,
+        phase=ph, support=sup,
+        obj_com_canonical=obj_com,
+        obj_rot6d_canonical=obj_rot6d,
+        seq_lens=seq_len,
     )
     return int_kv, pad
 

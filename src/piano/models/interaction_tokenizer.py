@@ -54,6 +54,13 @@ DEFAULT_TARGET_COORD_DIM = 3    # xyz in object-local frame
 DEFAULT_NUM_PHASES = 3          # non_contact / stable_contact / manipulation
 DEFAULT_NUM_SUPPORT = 4         # both_feet / single_foot / sitting / hand_support
 DEFAULT_TOKEN_STRIDE = 4        # MoMask VQ-VAE temporal downsample factor
+# v0.2 (analyses/2026-04-27_object_conditioning_review.md): per-frame
+# object pose channels added to z_int. Position 3-d, 6D rotation 6-d
+# (Zhou et al. CVPR'19, arXiv:1812.07035), in body-canonical frame —
+# same frame as contact_target_xyz, so the IntXAttn K/V is internally
+# frame-consistent. Disable via ``num_obj_pose_channels=0`` to recover
+# the v0.1 27-d behaviour.
+DEFAULT_NUM_OBJ_POSE_CHANNELS = 9   # 3 (com) + 6 (rot6d)
 
 
 def z_int_input_dim(
@@ -61,16 +68,19 @@ def z_int_input_dim(
     target_coord_dim: int = DEFAULT_TARGET_COORD_DIM,
     num_phases: int = DEFAULT_NUM_PHASES,
     num_support: int = DEFAULT_NUM_SUPPORT,
+    num_obj_pose_channels: int = DEFAULT_NUM_OBJ_POSE_CHANNELS,
 ) -> int:
     """Total per-frame z_int width after concat.
 
-    With v11 defaults: 5 + 5×3 + 3 + 4 = 27.
+    With v11 + v0.2 defaults: 5 + 5×3 + 3 + 4 + 9 = 36.
+    Pass ``num_obj_pose_channels=0`` to recover v0.1 27-d behaviour.
     """
     return (
         num_body_parts                          # contact_state
         + num_body_parts * target_coord_dim     # contact_target_xyz flattened
         + num_phases                            # phase one-hot
         + num_support                           # support one-hot
+        + num_obj_pose_channels                 # v0.2: obj_com (3) + obj_rot6d (6)
     )
 
 
@@ -110,6 +120,7 @@ class InteractionTokenizer(nn.Module):
         mlp_hidden: int | None = None,
         dropout: float = 0.0,
         max_seq_length: int = 196,
+        num_obj_pose_channels: int = DEFAULT_NUM_OBJ_POSE_CHANNELS,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -118,9 +129,11 @@ class InteractionTokenizer(nn.Module):
         self.num_phases = num_phases
         self.num_support = num_support
         self.token_stride = token_stride
+        self.num_obj_pose_channels = num_obj_pose_channels
 
         in_dim = z_int_input_dim(
             num_body_parts, target_coord_dim, num_phases, num_support,
+            num_obj_pose_channels,
         )
         hidden = mlp_hidden if mlp_hidden is not None else d_model
 
@@ -185,11 +198,13 @@ class InteractionTokenizer(nn.Module):
 
     def forward(
         self,
-        contact_state: Tensor,           # (B, T, num_body_parts)
-        contact_target_xyz: Tensor,      # (B, T, num_body_parts, 3)
-        phase: Tensor,                   # (B, T) int OR (B, T, num_phases) one-hot
-        support: Tensor,                 # (B, T) int OR (B, T, num_support) one-hot
-        seq_lens: Tensor | None = None,  # (B,) frame-space lengths
+        contact_state: Tensor,             # (B, T, num_body_parts)
+        contact_target_xyz: Tensor,        # (B, T, num_body_parts, 3)
+        phase: Tensor,                     # (B, T) int OR (B, T, num_phases) one-hot
+        support: Tensor,                   # (B, T) int OR (B, T, num_support) one-hot
+        obj_com_canonical: Tensor | None = None,    # (B, T, 3)  body-canonical
+        obj_rot6d_canonical: Tensor | None = None,  # (B, T, 6)  body-canonical
+        seq_lens: Tensor | None = None,    # (B,) frame-space lengths
     ) -> tuple[Tensor, Tensor | None]:
         """Encode z_int into K/V tokens.
 
@@ -200,6 +215,15 @@ class InteractionTokenizer(nn.Module):
             xyz in object-local frame (the v10/v11 GT field).
         phase : either int (B, T) or one-hot (B, T, num_phases)
         support : either int (B, T) or one-hot (B, T, num_support)
+        obj_com_canonical : (B, T, 3) — per-frame object COM in BODY-CANONICAL
+            frame (v0.2). Required when ``num_obj_pose_channels > 0``;
+            ignored otherwise. Caller must apply
+            :func:`piano.utils.canonical_frame.world_to_canonical_object_pose`
+            (or its torch counterpart) to lift world-frame InterAct
+            object_positions into the body's canonical frame BEFORE
+            calling this.
+        obj_rot6d_canonical : (B, T, 6) — per-frame 6D rotation
+            (Zhou et al. CVPR'19) in body-canonical frame.
         seq_lens : optional (B,) frame-space sequence lengths. When
             provided, the returned padding mask covers token-space
             (lengths // token_stride). When None, no mask is returned
@@ -230,14 +254,43 @@ class InteractionTokenizer(nn.Module):
         # Flatten contact_target_xyz to (B, T, P*3) so concat works.
         ctx_flat = contact_target_xyz.reshape(B, T, P * self.target_coord_dim)
 
-        # Concatenate the 4 components along the feature axis.
-        z = torch.cat([contact_state, ctx_flat, phase_oh, support_oh], dim=-1)
+        components: list[Tensor] = [contact_state, ctx_flat, phase_oh, support_oh]
+
+        # v0.2: append per-frame object pose channels (canonical frame).
+        # Required when the tokenizer was constructed with
+        # ``num_obj_pose_channels > 0``. We keep it strict (no silent
+        # zero fill-in) so that misconfiguration is caught early
+        # rather than producing a model that silently ignores object
+        # pose at training time.
+        if self.num_obj_pose_channels > 0:
+            if obj_com_canonical is None or obj_rot6d_canonical is None:
+                raise ValueError(
+                    "tokenizer was built with num_obj_pose_channels="
+                    f"{self.num_obj_pose_channels}; obj_com_canonical and "
+                    "obj_rot6d_canonical must both be provided.",
+                )
+            if obj_com_canonical.shape != (B, T, 3):
+                raise ValueError(
+                    f"obj_com_canonical must be (B, T, 3); got "
+                    f"{tuple(obj_com_canonical.shape)}",
+                )
+            if obj_rot6d_canonical.shape != (B, T, 6):
+                raise ValueError(
+                    f"obj_rot6d_canonical must be (B, T, 6); got "
+                    f"{tuple(obj_rot6d_canonical.shape)}",
+                )
+            components.append(obj_com_canonical.to(contact_state.dtype))
+            components.append(obj_rot6d_canonical.to(contact_state.dtype))
+
+        # Concatenate all components along the feature axis.
+        z = torch.cat(components, dim=-1)
         # Sanity check: concatenated width matches z_int_input_dim().
         # Guards against silent shape-mismatches when callers pass
         # off-spec channel counts.
         expected = z_int_input_dim(
             self.num_body_parts, self.target_coord_dim,
             self.num_phases, self.num_support,
+            self.num_obj_pose_channels,
         )
         if z.shape[-1] != expected:
             raise ValueError(

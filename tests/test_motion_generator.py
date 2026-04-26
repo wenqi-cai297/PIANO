@@ -31,6 +31,7 @@ import torch.nn as nn
 
 from piano.models.interaction_tokenizer import (
     DEFAULT_NUM_BODY_PARTS,
+    DEFAULT_NUM_OBJ_POSE_CHANNELS,
     DEFAULT_NUM_PHASES,
     DEFAULT_NUM_SUPPORT,
     DEFAULT_TARGET_COORD_DIM,
@@ -70,26 +71,39 @@ def tokenizer() -> InteractionTokenizer:
     )
 
 
-def _make_z_int(B: int, T: int):
+def _make_z_int(B: int, T: int, with_obj_pose: bool = True):
     torch.manual_seed(0)
     contact_state = torch.rand(B, T, DEFAULT_NUM_BODY_PARTS)
     contact_target_xyz = torch.randn(B, T, DEFAULT_NUM_BODY_PARTS, DEFAULT_TARGET_COORD_DIM)
     phase = torch.randint(0, DEFAULT_NUM_PHASES, (B, T))
     support = torch.randint(0, DEFAULT_NUM_SUPPORT, (B, T))
-    return contact_state, contact_target_xyz, phase, support
+    out = (contact_state, contact_target_xyz, phase, support)
+    if not with_obj_pose:
+        return out
+    # v0.2: add per-frame body-canonical object pose (3 + 6).
+    obj_com = torch.randn(B, T, 3)
+    obj_rot6d = torch.randn(B, T, 6)
+    return out + (obj_com, obj_rot6d)
 
 
 def test_z_int_input_dim_default() -> None:
-    """5 + 5×3 + 3 + 4 = 27 (verbatim from design §3.2)."""
-    assert z_int_input_dim() == 27
+    """5 + 5×3 + 3 + 4 + 9 = 36 (v0.2: includes obj pose channels per
+    analyses/2026-04-27_object_conditioning_review.md §5.2)."""
+    assert z_int_input_dim() == 36
+    # And without obj pose: 27 (v0.1).
+    assert z_int_input_dim(num_obj_pose_channels=0) == 27
 
 
 def test_tokenizer_shape_and_downsample(tokenizer: InteractionTokenizer) -> None:
     B = 2
-    cs, ctx, ph, sup = _make_z_int(B, T_FRAMES)
+    cs, ctx, ph, sup, oc, or6d = _make_z_int(B, T_FRAMES)
     seq_lens = torch.tensor([T_FRAMES, T_FRAMES // 2])
 
-    kv, pad_mask = tokenizer(cs, ctx, ph, sup, seq_lens=seq_lens)
+    kv, pad_mask = tokenizer(
+        cs, ctx, ph, sup,
+        obj_com_canonical=oc, obj_rot6d_canonical=or6d,
+        seq_lens=seq_lens,
+    )
 
     # Output shape: (B, S, d_model) where S = T // stride.
     assert kv.shape == (B, S_TOKENS, D_MODEL)
@@ -106,11 +120,17 @@ def test_tokenizer_accepts_one_hot_inputs(tokenizer: InteractionTokenizer) -> No
     """phase / support can also come in as one-hot floats — useful when
     feeding predictor outputs (which are softmax probs) into Stage 4."""
     B = 2
-    cs, ctx, ph_int, sup_int = _make_z_int(B, T_FRAMES)
+    cs, ctx, ph_int, sup_int, oc, or6d = _make_z_int(B, T_FRAMES)
     ph_oh = torch.nn.functional.one_hot(ph_int, DEFAULT_NUM_PHASES).float()
     sup_oh = torch.nn.functional.one_hot(sup_int, DEFAULT_NUM_SUPPORT).float()
-    kv_a, _ = tokenizer(cs, ctx, ph_int, sup_int)
-    kv_b, _ = tokenizer(cs, ctx, ph_oh, sup_oh)
+    kv_a, _ = tokenizer(
+        cs, ctx, ph_int, sup_int,
+        obj_com_canonical=oc, obj_rot6d_canonical=or6d,
+    )
+    kv_b, _ = tokenizer(
+        cs, ctx, ph_oh, sup_oh,
+        obj_com_canonical=oc, obj_rot6d_canonical=or6d,
+    )
     assert torch.allclose(kv_a, kv_b, atol=1e-6)
 
 
@@ -120,8 +140,60 @@ def test_tokenizer_rejects_wrong_target_shape(tokenizer: InteractionTokenizer) -
     ctx_wrong = torch.zeros(B, T_FRAMES, DEFAULT_NUM_BODY_PARTS * 3)   # flat instead of (B,T,5,3)
     ph = torch.zeros(B, T_FRAMES, dtype=torch.long)
     sup = torch.zeros(B, T_FRAMES, dtype=torch.long)
+    oc = torch.zeros(B, T_FRAMES, 3)
+    or6d = torch.zeros(B, T_FRAMES, 6)
     with pytest.raises(ValueError, match="contact_target_xyz"):
-        tokenizer(cs, ctx_wrong, ph, sup)
+        tokenizer(cs, ctx_wrong, ph, sup,
+                  obj_com_canonical=oc, obj_rot6d_canonical=or6d)
+
+
+def test_tokenizer_rejects_missing_obj_pose() -> None:
+    """v0.2: when num_obj_pose_channels > 0 but obj pose isn't passed,
+    we should fail loudly rather than silently produce an undersized
+    concat."""
+    tok = InteractionTokenizer(
+        d_model=D_MODEL, token_stride=TOKEN_STRIDE,
+        max_seq_length=T_FRAMES, num_obj_pose_channels=9,
+    )
+    cs, ctx, ph, sup, _oc, _or6d = _make_z_int(1, T_FRAMES)
+    with pytest.raises(ValueError, match="num_obj_pose_channels"):
+        tok(cs, ctx, ph, sup)
+
+
+def test_tokenizer_v0_1_compat() -> None:
+    """Caller can opt out of v0.2 channels with num_obj_pose_channels=0."""
+    tok = InteractionTokenizer(
+        d_model=D_MODEL, token_stride=TOKEN_STRIDE,
+        max_seq_length=T_FRAMES, num_obj_pose_channels=0,
+    )
+    cs, ctx, ph, sup = _make_z_int(2, T_FRAMES, with_obj_pose=False)
+    kv, _ = tok(cs, ctx, ph, sup)
+    assert kv.shape == (2, S_TOKENS, D_MODEL)
+
+
+def test_canonical_frame_roundtrip() -> None:
+    """world_to_canonical_object_pose followed by an inverse rotation +
+    translation should recover the original world-frame object COM."""
+    from piano.utils.canonical_frame import (
+        world_to_canonical_object_pose, y_rotation_matrix,
+    )
+    rng = torch.manual_seed(0)
+    T = 12
+    obj_pos_world = torch.randn(T, 3).numpy()
+    obj_rot_world_aa = torch.randn(T, 3).numpy() * 0.5
+    R_y = 0.7
+    T_xz = torch.tensor([1.5, -0.3]).numpy()
+
+    obj_com_can, _obj_rot6d_can = world_to_canonical_object_pose(
+        obj_pos_world, obj_rot_world_aa, R_y, T_xz,
+    )
+    # Re-apply the forward transform and check we get back the world pos.
+    R = y_rotation_matrix(R_y)
+    recovered = obj_com_can @ R.T
+    recovered[..., 0] += T_xz[0]
+    recovered[..., 2] += T_xz[1]
+    import numpy as np
+    assert np.allclose(recovered, obj_pos_world, atol=1e-5)
 
 
 # ============================================================================

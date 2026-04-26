@@ -156,11 +156,20 @@ class HOIDataset(Dataset):
         object_id_filter: set[str] | None = None,
         subject_id_filter: set[str] | None = None,
         augment: AugmentConfig | None = None,
+        surface_obj_pose: bool = False,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
         self.num_object_points = num_object_points
         self.augment = augment or AugmentConfig()
+        # v0.2: when True, compute body-canonical-frame object pose
+        # (obj_com_canonical, obj_rot6d_canonical) per clip and surface
+        # them in __getitem__. Stage B's tokenizer uses these as the
+        # per-frame object pose channels (per
+        # analyses/2026-04-27_object_conditioning_review.md §5.2).
+        # Off by default so Stage A predictor training (which doesn't
+        # need them) doesn't pay the MoMask-recovery import cost.
+        self.surface_obj_pose = surface_obj_pose
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -246,10 +255,35 @@ class HOIDataset(Dataset):
         # --- Pad or truncate to max_seq_length ---
         motion = self._pad_or_truncate(motion, self.max_seq_length)
         joints = self._pad_or_truncate(joints, self.max_seq_length)
+        # v0.2: compute body-canonical-frame object pose BEFORE padding,
+        # so the canonicalization sees the genuine frame-0 pelvis (not
+        # a zero-pad row). The output is then padded along the time axis
+        # to ``max_seq_length`` like the other per-frame fields.
+        obj_com_canonical: np.ndarray | None = None
+        obj_rot6d_canonical: np.ndarray | None = None
+        if (
+            self.surface_obj_pose
+            and object_positions is not None
+            and object_rotations is not None
+        ):
+            valid = min(seq_len, len(joints), len(motion))
+            obj_com_canonical, obj_rot6d_canonical = (
+                self._compute_canonical_object_pose(
+                    motion[:valid],
+                    joints[:valid],
+                    object_positions[:valid],
+                    object_rotations[:valid],
+                )
+            )
+
         if object_positions is not None:
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
         if object_rotations is not None:
             object_rotations = self._pad_or_truncate(object_rotations, self.max_seq_length)
+        if obj_com_canonical is not None:
+            obj_com_canonical = self._pad_or_truncate(obj_com_canonical, self.max_seq_length)
+        if obj_rot6d_canonical is not None:
+            obj_rot6d_canonical = self._pad_or_truncate(obj_rot6d_canonical, self.max_seq_length)
 
         padded_labels: dict[str, np.ndarray] = {}
         for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
@@ -283,6 +317,10 @@ class HOIDataset(Dataset):
             result["object_positions"] = torch.from_numpy(object_positions)
         if object_rotations is not None:
             result["object_rotations"] = torch.from_numpy(object_rotations)
+        if obj_com_canonical is not None:
+            result["obj_com_canonical"] = torch.from_numpy(obj_com_canonical)
+        if obj_rot6d_canonical is not None:
+            result["obj_rot6d_canonical"] = torch.from_numpy(obj_rot6d_canonical)
         for key, arr in padded_labels.items():
             result[key] = torch.from_numpy(arr)
 
@@ -300,6 +338,52 @@ class HOIDataset(Dataset):
         else:
             indices = np.random.choice(len(points), n, replace=True)
         return points[indices]
+
+    @staticmethod
+    def _compute_canonical_object_pose(
+        motion_263: np.ndarray,         # (T, 263) HumanML3D canonical
+        joints_world: np.ndarray,       # (T, 22, 3) world frame
+        object_positions: np.ndarray,   # (T, 3) world frame
+        object_rotations: np.ndarray,   # (T, 3) axis-angle, world frame
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Lift the per-frame world-frame object pose into body-canonical
+        frame, matching the body's representation.
+
+        The transform ``(R_y, T_xz)`` is recovered from frame 0 of
+        ``joints_world`` vs ``recover_from_ric(motion_263)`` (canonical),
+        then inverted and applied to every frame. See
+        :mod:`piano.utils.canonical_frame` for the maths and
+        :doc:`analyses/2026-04-27_object_conditioning_review.md` for the
+        v0.2 design rationale.
+        """
+        # Lazy import: MoMask path setup is paid only when callers pass
+        # ``surface_obj_pose=True`` (Stage B), not by Stage A predictor
+        # training.
+        import torch as _torch
+        import piano.models.backbones.momask_adapter  # noqa: F401 — path side-effect
+        from utils.motion_process import recover_from_ric
+
+        from piano.utils.canonical_frame import (
+            get_canonicalize_transform_from_clip,
+            world_to_canonical_object_pose,
+        )
+
+        canonical_joints = (
+            recover_from_ric(
+                _torch.from_numpy(motion_263).float().unsqueeze(0),
+                joints_num=22,
+            )
+            .squeeze(0)
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        R_y, T_xz = get_canonicalize_transform_from_clip(
+            joints_world, canonical_joints,
+        )
+        return world_to_canonical_object_pose(
+            object_positions, object_rotations, R_y, T_xz,
+        )
 
     @staticmethod
     def _pad_or_truncate(arr: np.ndarray, length: int) -> np.ndarray:

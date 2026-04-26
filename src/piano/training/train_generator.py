@@ -183,6 +183,13 @@ def _build_dataset(cfg, split_override: str | None = None, enable_augment: bool 
             object_id_filter=split_info["object_id_filter"],
             subject_id_filter=split_info["subject_id_filter"],
             augment=augment,
+            # v0.2: surface body-canonical-frame object pose
+            # (obj_com_canonical + obj_rot6d_canonical) so the
+            # tokenizer's new 9 channels (per
+            # analyses/2026-04-27_object_conditioning_review.md §5.2)
+            # have something to consume. Stage A trainer leaves this
+            # off — Stage A doesn't need object pose.
+            surface_obj_pose=True,
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -313,11 +320,16 @@ def build_generator_step_fn(
         # Per design §4.2: train against the clean GT signal; switch to
         # predictor output only at Stage 4 joint finetune. Decoupled
         # curricula + no predictor noise leakage + cheaper.
+        # v0.2: also pass body-canonical-frame object pose channels.
+        # HOIDataset(surface_obj_pose=True) computes them per __getitem__
+        # using piano.utils.canonical_frame.world_to_canonical_object_pose.
         int_tokens_bf, int_pad_mask_bf = transformer.interaction_tokenizer(
             contact_state=batch["contact_state"].to(device).float(),
             contact_target_xyz=batch["contact_target_xyz"].to(device).float(),
             phase=batch["phase"].to(device).long(),
             support=batch["support"].to(device).long(),
+            obj_com_canonical=batch["obj_com_canonical"].to(device).float(),
+            obj_rot6d_canonical=batch["obj_rot6d_canonical"].to(device).float(),
             seq_lens=seq_len,
         )
 
