@@ -1,41 +1,102 @@
-"""Motion Generator: wraps MoMask backbone with interaction cross-attention.
+"""Motion Generator: MoMask MaskTransformer with per-block interaction cross-attention.
 
-Instead of reimplementing MoMask's architecture, we:
-    1. Import MoMask's original ``MaskTransformer`` via ``momask_adapter``
-    2. Patch its ``seqTransEncoder`` to inject interaction cross-attention
-    3. Override ``trans_forward`` to pass interaction tokens through
+Stage B finetunes MoMask's pretrained MaskTransformer to consume the
+per-frame interaction latent ``z_int`` (predicted by Stage A or, at
+training time, the v11 GT pseudo-labels). The modification is
+**surgical**: we keep all 8 of MoMask's ``nn.TransformerEncoderLayer``
+sublayers — including their pretrained weights — and insert a new
+interaction cross-attention sublayer between each block's self-attention
+and feedforward. The new sublayer is gated by a per-layer learnable
+scalar ``γ_int`` initialised to 0, so at step 0 the wrapped model is
+**byte-identical** to the pretrained MoMask checkpoint (ControlNet /
+LLaMA-Adapter zero-init convention).
 
-This guarantees 100% weight compatibility — we load the exact same model
-and only add new parameters (interaction cross-attention layers).
+Architecture (verified from
+``src/piano/models/backbones/momask/models/mask_transformer/transformer.py``):
 
-Usage::
+    MoMask original block (post-norm, n_layers=8):
+        h = norm1(h + dropout(self_attn(h)))
+        h = norm2(h + dropout(ffn(h)))
 
-    from piano.models.motion_generator import InteractionMaskTransformer
+    PIANO-modified block (this file):
+        h = norm1(h + dropout(self_attn(h)))                           # MoMask original
+        h = h + γ_int · dropout(int_attn(LayerNorm(h), int_kv))         # NEW; γ_int = 0 at init
+        h = norm2(h + dropout(ffn(h)))                                  # MoMask original
 
-    model = InteractionMaskTransformer.from_pretrained(
-        "checkpoints/momask/t2m_.../model/latest.tar"
-    )
-    # model.mask_transformer is MoMask's original MaskTransformer
-    # model.interaction_blocks are the new cross-attention layers
+The new sublayer uses pre-norm + γ-gate + residual (LLaMA-Adapter /
+ControlNet structure) rather than the post-norm wrapping the
+``analyses/2026-04-26_stageB_design.md §1.3`` sketch shows. Reason:
+post-norm with a residual would still invoke ``LayerNorm(h_self + 0)``
+at γ=0, which differs from ``h_self`` for non-Gaussian inputs and
+breaks byte-identity. Pre-norm + γ-gate gives an **exact** zero-init
+identity, which is the whole point of the technique. ControlNet ICCV'23
+mixes pre-norm zero-conv branches into a post-norm SD UNet for the same
+reason. The flagged design uncertainty in §6.5 is resolved this way.
+
+The text condition stays exactly where MoMask put it: encoded by a
+frozen CLIP ViT-B/32, projected via ``cond_emb: Linear(512, 384)``, and
+**prepended as token 0** of the motion sequence. We do not move text
+into a per-block xattn path — that would change weight identity vs.
+the pretrained checkpoint. (The original SPEC §7.2 sketch was wrong
+about MoMask having per-block text xattn; correction lives in the
+2026-04-26 Stage B design doc.)
+
+Compositional dual-CFG (Liu et al. ECCV'22 eq. 5):
+
+    logits = logits_uncond
+           + w_text · (logits_text_only - logits_uncond)
+           + w_int  · (logits_full       - logits_text_only)
+
+3 forward passes per denoising step: uncond / text-only / full. Each
+sample's "drop interaction" branch substitutes a learnable ``null_int_kv``
+(S, d) tensor — broadcast across the batch — to avoid the
+softmax-over-all-zero numerical footgun that ``int_kv = 0`` would create
+in the new IntXAttn (per design §6.3). At training time, per-sample
+4-bucket categorical drops (drop both / drop int only / drop text only /
+keep both) populate the equation's branches with the right marginal
+probabilities (10% / 10% / 5% / 75%, per design §2.2).
+
+Citations
+---------
+- Guo et al. *MoMask.* CVPR 2024 Highlight. arXiv:2312.00063.
+- Tevet et al. *Human Motion Diffusion Model.* ICLR 2023. arXiv:2209.14916.
+- Liu et al. *Compositional Visual Generation with Composable Diffusion
+  Models.* ECCV 2022. arXiv:2206.01714. Eq. 5 (multi-condition CFG).
+- Zhang & Agrawala. *Adding Conditional Control to Text-to-Image
+  Diffusion Models (ControlNet).* ICCV 2023. arXiv:2302.05543.
+  Zero-init convention.
+- Zhang et al. *LLaMA-Adapter.* arXiv:2303.16199. Per-layer γ-gate.
+- Diller & Dai. *CG-HOI.* CVPR 2024. arXiv:2311.16097. Per-block xattn
+  precedent for HOI.
+- Wang et al. *Move as You Say, Interact as You Can.* CVPR 2024
+  Highlight. arXiv:2403.18036. Per-block affordance xattn precedent.
+- Ho & Salimans. *Classifier-Free Diffusion Guidance.*
+  NeurIPS 2021 Workshop. arXiv:2207.12598.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from piano.models.interaction_cross_attn import InteractionCrossAttention, InteractionTokenizer
-from piano.models.masking import cosine_schedule, mask_by_confidence, sample_from_logits
+from piano.models.interaction_tokenizer import InteractionTokenizer
 
 
-class InteractionTransformerBlock(nn.Module):
-    """Wraps a single ``nn.TransformerEncoderLayer`` and adds interaction cross-attention.
+# ============================================================================
+# Single-block wrapper: [SelfAttn (MoMask) → IntXAttn(γ·proj) → FFN (MoMask)]
+# ============================================================================
 
-    During forward: runs the original encoder layer first, then applies
-    interaction cross-attention. Zero-init ensures this is a no-op at start.
+class MaskTransformerBlockWithInteraction(nn.Module):
+    """One MoMask encoder layer with an injected interaction cross-attn sublayer.
+
+    Holds a reference to the original ``nn.TransformerEncoderLayer`` so
+    its self-attn and FFN submodules — and their pretrained weights —
+    are reused unchanged. The new IntXAttn sublayer + per-layer γ
+    scalar are the only additions.
     """
 
     def __init__(
@@ -44,48 +105,92 @@ class InteractionTransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         dropout: float = 0.1,
+        zero_init_gamma: bool = True,
     ) -> None:
         super().__init__()
-        self.original_layer = original_layer
-        self.interaction_attn = InteractionCrossAttention(
-            d_model=d_model,
+        self.layer = original_layer
+
+        # Pre-norm on the cross-attn input. Initialised at PyTorch
+        # default (weight=1, bias=0) so the very first forward sees
+        # `LayerNorm(h)` as a unit-variance projection of h. The γ gate
+        # below makes this layer's contribution exactly zero at init
+        # regardless of LayerNorm details.
+        self.norm_int = nn.LayerNorm(d_model)
+
+        # Standard multi-head cross-attention. ``batch_first=False``
+        # to match MoMask's seq-first convention `(S, B, d)` so we
+        # don't have to permute on every block.
+        self.int_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
-            zero_init=True,
+            batch_first=False,
         )
+        self.dropout_int = nn.Dropout(dropout)
+
+        # γ_int: per-layer learnable scalar gate. Zero-init makes the
+        # new sublayer an *exact* no-op at step 0, so the wrapped block
+        # is byte-identical to the pretrained MoMask block. Training
+        # learns to grow γ_int as the interaction signal becomes
+        # useful (ControlNet / LLaMA-Adapter convention).
+        init_gamma = 0.0 if zero_init_gamma else 1.0
+        self.gamma_int = nn.Parameter(torch.full((1,), init_gamma))
 
     def forward(
         self,
-        src: Tensor,
-        interaction_tokens: Tensor | None = None,
-        src_mask: Tensor | None = None,
-        src_key_padding_mask: Tensor | None = None,
+        src: Tensor,                          # (S+1, B, d) — text token + motion tokens
+        int_kv: Tensor | None,                # (S_int, B, d) — interaction K/V
+        src_key_padding_mask: Tensor | None = None,   # (B, S+1) True = padded
+        int_key_padding_mask: Tensor | None = None,   # (B, S_int) True = padded
     ) -> Tensor:
-        """Run original layer, then interaction cross-attention.
+        layer = self.layer
 
-        Parameters
-        ----------
-        src : (S, B, d) — seq-first (MoMask convention)
-        interaction_tokens : (B, S_int, d) — batch-first, or None
-        """
-        # Original TransformerEncoderLayer forward
-        src = self.original_layer(src, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask)
+        # ---- MoMask original: SelfAttn + post-norm + residual ----
+        # Replicate ``nn.TransformerEncoderLayer.forward`` (post-norm
+        # branch) using the same submodules. We don't call the original
+        # layer's ``forward`` directly because we need to insert
+        # IntXAttn between SelfAttn and FFN, not before/after the whole
+        # block.
+        attn_out, _ = layer.self_attn(
+            src, src, src,
+            attn_mask=None,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+        )
+        src = layer.norm1(src + layer.dropout1(attn_out))
 
-        # Interaction cross-attention (if tokens provided)
-        if interaction_tokens is not None:
-            # Convert seq-first → batch-first for cross-attn
-            src_bf = src.permute(1, 0, 2)  # (B, S, d)
-            src_bf = self.interaction_attn(src_bf, interaction_tokens)
-            src = src_bf.permute(1, 0, 2)  # (S, B, d)
+        # ---- NEW: IntXAttn pre-norm + γ-gated residual ----
+        # Skip entirely when no interaction tokens are provided
+        # (matches the design's "interaction-dropped" branches in
+        # the compositional CFG arithmetic). At γ_int=0 with int_kv
+        # supplied, the contribution is also exactly zero — both
+        # paths are byte-identical at init.
+        if int_kv is not None:
+            q = self.norm_int(src)
+            int_out, _ = self.int_attn(
+                query=q,
+                key=int_kv,
+                value=int_kv,
+                key_padding_mask=int_key_padding_mask,
+                need_weights=False,
+            )
+            src = src + self.gamma_int * self.dropout_int(int_out)
 
+        # ---- MoMask original: FFN + post-norm + residual ----
+        ff_out = layer.linear2(
+            layer.dropout(layer.activation(layer.linear1(src)))
+        )
+        src = layer.norm2(src + layer.dropout2(ff_out))
         return src
 
 
-class InteractionTransformerEncoder(nn.Module):
-    """Drop-in replacement for ``nn.TransformerEncoder`` that supports interaction tokens.
+class MaskTransformerEncoderWithInteraction(nn.Module):
+    """Drop-in replacement for ``nn.TransformerEncoder`` carrying interaction K/V.
 
-    Wraps each original ``TransformerEncoderLayer`` with an
-    ``InteractionTransformerBlock``, preserving all original weights.
+    Wraps every layer in the original encoder with
+    :class:`MaskTransformerBlockWithInteraction`, preserving the original
+    weights and the optional final ``norm`` (typically None for MoMask,
+    which uses post-norm inside each layer).
     """
 
     def __init__(
@@ -94,40 +199,127 @@ class InteractionTransformerEncoder(nn.Module):
         d_model: int,
         num_heads: int,
         dropout: float = 0.1,
+        zero_init_gamma: bool = True,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            InteractionTransformerBlock(layer, d_model, num_heads, dropout)
+            MaskTransformerBlockWithInteraction(
+                layer, d_model=d_model, num_heads=num_heads,
+                dropout=dropout, zero_init_gamma=zero_init_gamma,
+            )
             for layer in original_encoder.layers
         ])
-        self.norm = original_encoder.norm  # may be None
+        # MoMask's ``nn.TransformerEncoder`` has ``norm = None`` (post-
+        # norm is inside each layer), but keep this for API parity
+        # with PyTorch's stock encoder.
+        self.norm = original_encoder.norm
 
     def forward(
         self,
         src: Tensor,
-        interaction_tokens: Tensor | None = None,
-        mask: Tensor | None = None,
+        int_kv: Tensor | None = None,
         src_key_padding_mask: Tensor | None = None,
+        int_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
-        """Forward through all layers with interaction conditioning."""
-        output = src
-        for layer in self.layers:
-            output = layer(output, interaction_tokens, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+        h = src
+        for blk in self.layers:
+            h = blk(
+                h, int_kv,
+                src_key_padding_mask=src_key_padding_mask,
+                int_key_padding_mask=int_key_padding_mask,
+            )
         if self.norm is not None:
-            output = self.norm(output)
-        return output
+            h = self.norm(h)
+        return h
 
+
+# ============================================================================
+# CFG drop bucketing helper (training time)
+# ============================================================================
+
+def sample_cfg_buckets(
+    batch_size: int,
+    p_drop_both: float = 0.10,
+    p_drop_int_only: float = 0.10,
+    p_drop_text_only: float = 0.05,
+    *,
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Sample per-sample drop masks from the design §2.2 4-bucket categorical.
+
+    Mutually exclusive buckets:
+      - p_drop_both         → drop_text=True,  drop_int=True
+      - p_drop_int_only     → drop_text=False, drop_int=True
+      - p_drop_text_only    → drop_text=True,  drop_int=False
+      - 1 − sum(above)      → drop_text=False, drop_int=False (keep both)
+
+    Default probabilities (10/10/5/75) match the design — text-only
+    is over-sampled vs. interaction-only because text-only is the
+    "safer fallback" path the model already trained on, and the
+    asymmetry encourages the new IntXAttn weights to become useful
+    rather than be merely additive. The 5% text-only-drop is the
+    minimum needed to make the ``logits_int_only`` branch in
+    compositional CFG well-defined.
+
+    Returns
+    -------
+    drop_text_mask : (B,) bool — True ⇒ replace text cond with zeros
+    drop_int_mask  : (B,) bool — True ⇒ replace int K/V with null_int_kv
+    """
+    total = p_drop_both + p_drop_int_only + p_drop_text_only
+    if total > 1.0 + 1e-6:
+        raise ValueError(
+            f"CFG bucket probabilities sum to {total:.4f} > 1.0",
+        )
+    u = torch.rand(batch_size, device=device, generator=generator)
+    in_drop_both = u < p_drop_both
+    in_drop_int_only = (u >= p_drop_both) & (u < p_drop_both + p_drop_int_only)
+    in_drop_text_only = (
+        (u >= p_drop_both + p_drop_int_only)
+        & (u < p_drop_both + p_drop_int_only + p_drop_text_only)
+    )
+    drop_text_mask = in_drop_both | in_drop_text_only
+    drop_int_mask = in_drop_both | in_drop_int_only
+    return drop_text_mask, drop_int_mask
+
+
+# ============================================================================
+# Full Stage B model
+# ============================================================================
 
 class InteractionMaskTransformer(nn.Module):
-    """MoMask MaskTransformer with interaction cross-attention injection.
+    """MoMask MaskTransformer + per-block interaction cross-attention.
 
-    This class:
-    1. Holds the original MoMask MaskTransformer (loaded from checkpoint)
-    2. Replaces its ``seqTransEncoder`` with ``InteractionTransformerEncoder``
-    3. Provides interaction-aware ``trans_forward``, ``forward``, and ``generate``
+    Composition:
+        - ``self.mask_transformer`` — the original MoMask MaskTransformer
+          loaded via :func:`piano.models.backbones.momask_adapter.load_momask_mask_transformer`.
+          Its 8-layer ``seqTransEncoder`` is **replaced in-place** with
+          :class:`MaskTransformerEncoderWithInteraction` so every block
+          gains an IntXAttn sublayer while keeping its self-attn + FFN
+          weights.
+        - ``self.interaction_tokenizer`` — projects per-frame z_int
+          into the K/V tensor shared across all 8 IntXAttn sublayers.
+        - ``self.null_int_kv`` — learnable (S_max, d) null token bank
+          used when interaction is dropped (CFG inference + training
+          drop). At init it's zeros, but the model can grow it during
+          training; per design §6.3, learnable null beats zero K/V
+          because zero K/V causes the IntXAttn softmax to be
+          undefined when V is all-zero.
 
-    The original model's weights are fully preserved. Only the new
-    interaction cross-attention layers are added (zero-initialized).
+    Parameters
+    ----------
+    mask_transformer
+        A pretrained MoMask MaskTransformer (already loaded). Its
+        ``seqTransEncoder`` will be patched in this constructor.
+    interaction_tokenizer
+        Pre-built tokenizer module (must have ``d_model`` matching
+        ``mask_transformer.latent_dim``).
+    interaction_drop_prob
+        Per-sample probability of dropping the interaction K/V at
+        training time, used by the simple ``mask_int`` path. Ignored
+        when the caller passes explicit per-sample drop masks (the
+        recommended path). Kept for backward compat.
     """
 
     def __init__(
@@ -135,24 +327,61 @@ class InteractionMaskTransformer(nn.Module):
         mask_transformer: nn.Module,
         interaction_tokenizer: InteractionTokenizer,
         interaction_drop_prob: float = 0.1,
+        zero_init_gamma: bool = True,
+        max_token_seq_length: int = 49,
     ) -> None:
         super().__init__()
         self.mask_transformer = mask_transformer
         self.interaction_tokenizer = interaction_tokenizer
-        self.interaction_drop_prob = interaction_drop_prob
+        self.interaction_drop_prob = float(interaction_drop_prob)
 
-        # Patch: replace seqTransEncoder with interaction-aware version
-        mt = self.mask_transformer
-        d_model = mt.latent_dim
-        num_heads = mt.seqTransEncoder.layers[0].self_attn.num_heads
-        dropout = mt.dropout
+        # Sanity: tokenizer d_model must match MoMask latent_dim so K/V
+        # can cross-attend without an extra projection.
+        if interaction_tokenizer.d_model != mask_transformer.latent_dim:
+            raise ValueError(
+                "InteractionTokenizer.d_model "
+                f"({interaction_tokenizer.d_model}) must equal "
+                f"MaskTransformer.latent_dim ({mask_transformer.latent_dim})",
+            )
 
-        mt.seqTransEncoder = InteractionTransformerEncoder(
-            original_encoder=mt.seqTransEncoder,
+        # Patch: replace seqTransEncoder with our interaction-aware
+        # version. The new wrapper holds references to the original
+        # nn.TransformerEncoderLayer instances, so MoMask's pretrained
+        # self-attn + FFN weights are preserved.
+        d_model = mask_transformer.latent_dim
+        num_heads = mask_transformer.seqTransEncoder.layers[0].self_attn.num_heads
+        dropout = mask_transformer.dropout
+
+        mask_transformer.seqTransEncoder = MaskTransformerEncoderWithInteraction(
+            original_encoder=mask_transformer.seqTransEncoder,
             d_model=d_model,
             num_heads=num_heads,
             dropout=dropout,
+            zero_init_gamma=zero_init_gamma,
         )
+
+        # Disable MoMask's own internal text-drop. We handle CFG
+        # bucketed drops at the wrapper level so per-sample masks for
+        # text and interaction stay aligned; if MoMask still ran
+        # ``mask_cond`` with cond_drop_prob=0.1, we'd get extra
+        # uncoordinated text drops on top of our explicit ones.
+        self.mask_transformer.cond_drop_prob = 0.0
+
+        # Learnable null interaction K/V tokens (per design §6.3).
+        # Shape (S_max, 1, d_model) — broadcast across batch when used.
+        # Init from N(0, 0.02) (same as MoMask's __init_weights) — the
+        # model can learn what "no interaction" means in K/V space.
+        self.null_int_kv = nn.Parameter(
+            torch.empty(max_token_seq_length, 1, d_model).normal_(0.0, 0.02),
+        )
+
+        # Cache the model's max token seq length so we can slice
+        # null_int_kv for shorter sequences without recomputing.
+        self.max_token_seq_length = max_token_seq_length
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_pretrained(
@@ -160,300 +389,520 @@ class InteractionMaskTransformer(nn.Module):
         transformer_checkpoint: str | Path,
         interaction_tokenizer: InteractionTokenizer | None = None,
         interaction_drop_prob: float = 0.1,
-        device: str = "cpu",
-        **kwargs,
+        zero_init_gamma: bool = True,
+        device: str | torch.device = "cpu",
+        max_token_seq_length: int = 49,
+        **mask_transformer_kwargs: Any,
     ) -> "InteractionMaskTransformer":
         """Load pretrained MoMask MaskTransformer and wrap with interaction layers.
 
-        Parameters
-        ----------
-        transformer_checkpoint : path to MoMask MaskTransformer checkpoint
-        interaction_tokenizer : InteractionTokenizer instance (created if None)
+        Forwards ``mask_transformer_kwargs`` to
+        :func:`piano.models.backbones.momask_adapter.load_momask_mask_transformer`
+        — useful if the checkpoint comes from a non-default config
+        (different latent_dim, num_layers, etc.).
         """
         from piano.models.backbones.momask_adapter import load_momask_mask_transformer
 
         mask_transformer = load_momask_mask_transformer(
-            transformer_checkpoint, device=device, **kwargs,
+            transformer_checkpoint, device=device, **mask_transformer_kwargs,
         )
-
         if interaction_tokenizer is None:
             interaction_tokenizer = InteractionTokenizer(
                 d_model=mask_transformer.latent_dim,
-                temporal_stride=4,
+                token_stride=4,
             )
-
-        wrapper = cls(mask_transformer, interaction_tokenizer, interaction_drop_prob)
-        # ``mask_transformer`` was loaded onto ``device``, but the newly-created
-        # interaction layers (and the tokenizer) start on CPU. Move everything
-        # to the same device so forward passes don't cross CPU/GPU.
+        wrapper = cls(
+            mask_transformer=mask_transformer,
+            interaction_tokenizer=interaction_tokenizer,
+            interaction_drop_prob=interaction_drop_prob,
+            zero_init_gamma=zero_init_gamma,
+            max_token_seq_length=max_token_seq_length,
+        )
+        # Move EVERYTHING (not just the loaded MoMask) to the target
+        # device. The newly-created wrapper layers + tokenizer +
+        # null_int_kv start on CPU.
         wrapper.to(device)
         return wrapper
 
+    # ------------------------------------------------------------------
+    # Forward primitives
+    # ------------------------------------------------------------------
+
+    def _broadcast_null_kv(self, batch_size: int, S: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+        """Slice and broadcast the learnable null K/V to (S, B, d)."""
+        if S > self.null_int_kv.shape[0]:
+            raise ValueError(
+                f"requested null_int_kv length {S} exceeds "
+                f"max_token_seq_length {self.null_int_kv.shape[0]}; "
+                f"raise max_token_seq_length when constructing the model",
+            )
+        null = self.null_int_kv[:S].to(dtype=dtype, device=device)   # (S, 1, d)
+        return null.expand(-1, batch_size, -1).contiguous()
+
+    def _build_int_kv(
+        self,
+        int_tokens_bf: Tensor | None,                  # (B, S_int, d) batch-first or None
+        int_padding_mask_bf: Tensor | None,            # (B, S_int) bool or None
+        drop_int_mask: Tensor | None,                  # (B,) bool or None
+        batch_size: int,
+        seq_S: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Materialise the K/V tensor (and optional padding mask) the
+        IntXAttn sublayers consume, applying per-sample CFG drops.
+
+        Returns ``(int_kv_seq_first, int_kv_padding_mask)`` where
+        ``int_kv_seq_first`` is ``(S_int, B, d)`` ready to feed into a
+        ``nn.MultiheadAttention(batch_first=False)``.
+
+        The three calling conventions from compositional CFG inference:
+        1. ``int_tokens_bf=None`` → no interaction at all → returns
+           ``(None, None)``. IntXAttn sublayers skip entirely.
+        2. ``int_tokens_bf=given``, ``drop_int_mask=None`` → all samples
+           use real interaction tokens.
+        3. ``int_tokens_bf=given``, ``drop_int_mask=given`` → per-sample
+           replacement: samples with True get null_int_kv, others get
+           their real tokens.
+        """
+        if int_tokens_bf is None:
+            # Pure text-only or unconditional path. No K/V to attend over;
+            # the wrapped block will skip IntXAttn entirely.
+            return None, None
+
+        # (B, S_int, d) → (S_int, B, d) for MoMask's seq-first convention.
+        int_kv = int_tokens_bf.transpose(0, 1).contiguous()
+        S_int = int_kv.shape[0]
+
+        if drop_int_mask is not None and drop_int_mask.any():
+            # Replace dropped samples' K/V with the broadcast null bank.
+            null_kv = self._broadcast_null_kv(batch_size, S_int, dtype, device)
+            # drop_int_mask is (B,). Index along the batch axis (dim=1).
+            replace = drop_int_mask.to(device=int_kv.device).view(1, -1, 1)
+            int_kv = torch.where(replace, null_kv, int_kv)
+            # Padding for the null branch: null tokens are valid (the
+            # model learns what they mean), so dropped samples don't
+            # need any positions masked. We zero the padding mask for
+            # those samples. Otherwise the original mask is preserved.
+            if int_padding_mask_bf is not None:
+                pad = int_padding_mask_bf.clone()
+                pad[drop_int_mask.to(device=pad.device)] = False
+                int_padding_mask_out = pad
+            else:
+                int_padding_mask_out = None
+        else:
+            int_padding_mask_out = int_padding_mask_bf
+
+        return int_kv, int_padding_mask_out
+
     def trans_forward(
         self,
-        motion_ids: Tensor,
-        cond: Tensor,
-        padding_mask: Tensor,
-        interaction_tokens: Tensor | None = None,
-        force_mask: bool = False,
+        motion_ids: Tensor,                            # (B, S) token indices
+        cond_vector: Tensor,                           # (B, clip_dim) raw CLIP (pooled)
+        token_padding_mask: Tensor,                    # (B, S) bool, True = padded motion-token
+        int_tokens_bf: Tensor | None = None,           # (B, S_int, d) or None
+        int_padding_mask_bf: Tensor | None = None,     # (B, S_int) bool or None
+        drop_text_mask: Tensor | None = None,          # (B,) bool — True ⇒ zero text vec
+        drop_int_mask: Tensor | None = None,           # (B,) bool — True ⇒ null_int_kv
     ) -> Tensor:
         """Interaction-aware version of MoMask's ``trans_forward``.
 
-        Mirrors the original logic but passes interaction_tokens through
-        the patched ``seqTransEncoder``.
+        Mirrors the MoMask source at
+        ``backbones/momask/models/mask_transformer/transformer.py:210-240``,
+        with two changes:
+
+        1. The CFG drop is per-sample (a (B,) bool mask) instead of
+           MoMask's per-batch Bernoulli, so the wrapper can coordinate
+           drops across text and interaction in compositional CFG.
+        2. The encoder is our interaction-aware version, fed
+           ``int_kv`` + ``int_padding_mask`` from ``_build_int_kv``.
+
+        Returns
+        -------
+        logits : (B, num_tokens, S) — same shape as MoMask original.
         """
         mt = self.mask_transformer
+        B = motion_ids.shape[0]
 
-        # Condition masking (CFG)
-        cond = mt.mask_cond(cond, force_mask=force_mask)
+        # ---- Token embedding + InputProcess ----
+        x = mt.token_emb(motion_ids)                         # (B, S, code_dim)
+        x = mt.input_process(x)                              # (S, B, latent_dim)
 
-        # Token embedding → positional encoding
-        x = mt.token_emb(motion_ids)
-        x = mt.input_process(x)
-        cond_emb = mt.cond_emb(cond).unsqueeze(0)  # (1, B, d)
-        x = mt.position_enc(x)
-        xseq = torch.cat([cond_emb, x], dim=0)  # (S+1, B, d)
+        # ---- Text condition (per-sample drop) ----
+        if drop_text_mask is not None and drop_text_mask.any():
+            cond_in = cond_vector.clone()
+            cond_in[drop_text_mask.to(cond_in.device)] = 0.0
+        else:
+            cond_in = cond_vector
+        cond_emb = mt.cond_emb(cond_in).unsqueeze(0)         # (1, B, d)
 
-        # Padding mask (prepend False for cond token)
-        padding_mask = torch.cat([
-            torch.zeros_like(padding_mask[:, 0:1]), padding_mask,
-        ], dim=1)
+        # ---- Positional encoding + prepend cond token ----
+        x = mt.position_enc(x)                               # (S, B, d)
+        xseq = torch.cat([cond_emb, x], dim=0)               # (S+1, B, d)
 
-        # Forward through patched encoder (with interaction tokens)
+        # Padding mask — prepend False for the cond token (always valid).
+        full_pad_mask = torch.cat(
+            [torch.zeros_like(token_padding_mask[:, 0:1]), token_padding_mask],
+            dim=1,
+        )                                                    # (B, S+1)
+
+        # ---- Interaction K/V (with per-sample CFG drops) ----
+        int_kv, int_pad_mask = self._build_int_kv(
+            int_tokens_bf=int_tokens_bf,
+            int_padding_mask_bf=int_padding_mask_bf,
+            drop_int_mask=drop_int_mask,
+            batch_size=B,
+            seq_S=x.shape[0],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        # ---- Forward through interaction-aware encoder ----
         output = mt.seqTransEncoder(
             xseq,
-            interaction_tokens=interaction_tokens,
-            src_key_padding_mask=padding_mask,
-        )[1:]  # drop cond token
+            int_kv=int_kv,
+            src_key_padding_mask=full_pad_mask,
+            int_key_padding_mask=int_pad_mask,
+        )                                                    # (S+1, B, d)
 
-        logits = mt.output_process(output)  # (B, num_tokens, S)
+        # Drop the cond token before the output head (MoMask convention).
+        output = output[1:]                                  # (S, B, d)
+        logits = mt.output_process(output)                   # (B, num_tokens, S)
         return logits
 
     def forward(
         self,
-        ids: Tensor,
-        cond: Tensor,
-        m_lens: Tensor,
-        interaction_labels: dict[str, Tensor] | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Training forward: mask, predict, compute loss.
+        ids: Tensor,                                # (B, S) GT VQ tokens
+        cond_vector: Tensor,                        # (B, clip_dim) CLIP pooled
+        m_lens_tok: Tensor,                         # (B,) token-space lengths (= seq_len // 4)
+        int_tokens_bf: Tensor | None = None,        # (B, S_int, d) or None
+        int_padding_mask_bf: Tensor | None = None,  # (B, S_int) or None
+        drop_text_mask: Tensor | None = None,       # (B,) bool — explicit text drops
+        drop_int_mask: Tensor | None = None,        # (B,) bool — explicit interaction drops
+        cfg_drop_buckets: tuple[float, float, float] | None = None,
+    ) -> dict[str, Tensor]:
+        """Training forward: BERT-style mask + masked-CE loss.
 
-        Parameters
-        ----------
-        ids : (B, S) — ground-truth VQ token indices
-        cond : (B, clip_dim) — CLIP text embedding (already encoded)
-        m_lens : (B,) — token sequence lengths
-        interaction_labels : dict with contact_state, contact_target, phase, support
-            If None, trains without interaction conditioning.
+        Mirrors MoMask's ``MaskTransformer.forward`` at
+        ``transformer.py:242-304`` exactly (cosine schedule, BERT 88/10/2
+        token corruption split, ``cal_performance`` over masked positions
+        with ``ignore_index=mask_id``). The only changes:
+
+        - Per-sample CFG drop masks are populated from
+          ``cfg_drop_buckets`` (training default: 10/10/5) when explicit
+          masks are not provided. ``cfg_drop_buckets=None`` disables
+          drops entirely (used by val).
+        - Each block's encoder forward consumes interaction K/V via the
+          patched encoder.
 
         Returns
         -------
-        loss, pred_ids, accuracy
+        Dict with:
+          - ``loss``: scalar masked-CE loss (only at masked positions)
+          - ``acc``: scalar mean accuracy at masked positions
+          - ``pred_id``: (B, S) predicted token IDs (for diagnostics)
+
+        The dict shape matches what
+        :func:`piano.training.trainer.run_training_loop` expects from
+        the ``step_fn`` callable.
         """
-        from models.mask_transformer.tools import lengths_to_mask, get_mask_subset_prob, cal_performance, uniform
+        # MoMask's own helpers — re-imported here to keep the wrapper
+        # self-contained (the tools module path is set up by
+        # ``momask_adapter`` at import time).
+        from models.mask_transformer.tools import (
+            cal_performance,
+            cosine_schedule,
+            get_mask_subset_prob,
+            lengths_to_mask,
+            uniform,
+        )
 
         mt = self.mask_transformer
         B, S = ids.shape
         device = ids.device
 
-        # Build interaction tokens
-        interaction_tokens = None
-        if interaction_labels is not None:
-            interaction_tokens = self.interaction_tokenizer(
-                interaction_labels["contact_state"],
-                interaction_labels["contact_target"],
-                interaction_labels["phase"],
-                interaction_labels["support"],
-            )
-
-            # Drop interaction for CFG training
-            if self.training:
-                drop_mask = torch.rand(B, device=device) < self.interaction_drop_prob
-                if drop_mask.any():
-                    interaction_tokens = interaction_tokens.clone()
-                    interaction_tokens[drop_mask] = 0.0
-
-        # --- Original MoMask masking logic (from MaskTransformer.forward) ---
-        non_pad_mask = lengths_to_mask(m_lens, S)
+        # ---- Per-sample padding mask ----
+        non_pad_mask = lengths_to_mask(m_lens_tok, S)        # (B, S) — True = valid
         ids = torch.where(non_pad_mask, ids, mt.pad_id)
 
-        # Random mask
+        # ---- BERT-style random masking ----
         rand_time = uniform((B,), device=device)
         rand_mask_probs = cosine_schedule(rand_time)
         num_token_masked = (S * rand_mask_probs).round().clamp(min=1)
-
         batch_randperm = torch.rand((B, S), device=device).argsort(dim=-1)
         mask = batch_randperm < num_token_masked.unsqueeze(-1)
         mask &= non_pad_mask
+        labels = torch.where(mask, ids, mt.mask_id)          # GT only at masked positions
 
-        labels = torch.where(mask, ids, mt.mask_id)
-
+        # 88/10/2 BERT corruption split at masked positions.
         x_ids = ids.clone()
-        # 10% replace with random token
         mask_rid = get_mask_subset_prob(mask, 0.1)
         rand_id = torch.randint_like(x_ids, high=mt.opt.num_tokens)
         x_ids = torch.where(mask_rid, rand_id, x_ids)
-        # 90% × 88% replace with mask token
         mask_mid = get_mask_subset_prob(mask & ~mask_rid, 0.88)
         x_ids = torch.where(mask_mid, mt.mask_id, x_ids)
 
-        # Forward with interaction tokens
-        logits = self.trans_forward(x_ids, cond, ~non_pad_mask, interaction_tokens)
-        ce_loss, pred_id, acc = cal_performance(logits, labels, ignore_index=mt.mask_id)
+        # ---- CFG drop masks ----
+        if drop_text_mask is None and drop_int_mask is None and cfg_drop_buckets is not None:
+            p_both, p_int_only, p_text_only = cfg_drop_buckets
+            drop_text_mask, drop_int_mask = sample_cfg_buckets(
+                B, p_drop_both=p_both, p_drop_int_only=p_int_only,
+                p_drop_text_only=p_text_only, device=device,
+            )
 
-        return ce_loss, pred_id, acc
+        # ---- Forward through interaction-aware MaskTransformer ----
+        logits = self.trans_forward(
+            motion_ids=x_ids,
+            cond_vector=cond_vector,
+            token_padding_mask=~non_pad_mask,
+            int_tokens_bf=int_tokens_bf,
+            int_padding_mask_bf=int_padding_mask_bf,
+            drop_text_mask=drop_text_mask,
+            drop_int_mask=drop_int_mask,
+        )                                                    # (B, num_tokens, S)
+
+        ce_loss, pred_id, acc = cal_performance(
+            logits, labels, ignore_index=mt.mask_id,
+        )
+        return {
+            "loss": ce_loss,
+            "acc": torch.tensor(acc, device=device),
+            "pred_id": pred_id,
+        }
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
     def forward_with_cond_scale(
         self,
         motion_ids: Tensor,
-        cond: Tensor,
-        padding_mask: Tensor,
-        interaction_tokens: Tensor | None = None,
-        cond_scale: float = 4.5,
-        interaction_scale: float = 2.0,
+        cond_vector: Tensor,
+        token_padding_mask: Tensor,
+        int_tokens_bf: Tensor | None = None,
+        int_padding_mask_bf: Tensor | None = None,
+        w_text: float = 4.0,
+        w_int: float = 2.0,
     ) -> Tensor:
-        """Dual-condition classifier-free guidance."""
-        # Unconditional
+        """Compositional dual-condition CFG (Liu et al. ECCV'22 eq. 5).
+
+        Three forward passes:
+          1. ``logits_uncond``       — text dropped, interaction dropped
+          2. ``logits_text_only``    — text given,   interaction dropped (null_int_kv)
+          3. ``logits_full``         — text given,   interaction given
+
+        Combined as::
+
+            logits = logits_uncond
+                   + w_text · (logits_text_only - logits_uncond)
+                   + w_int  · (logits_full       - logits_text_only)
+
+        When ``int_tokens_bf`` is None or ``w_int == 0``, the equation
+        collapses to MoMask's standard 2-pass single-condition CFG.
+
+        Parameters
+        ----------
+        w_text
+            Text guidance weight (≈ MoMask's ``cond_scale - 1``).
+            Default 4 — slightly higher than MoMask's default 2 because
+            text now competes with interaction for control authority.
+        w_int
+            Interaction guidance weight. Sweep on val per design §2.2;
+            default 2 is the SPEC starting point.
+        """
+        B = motion_ids.shape[0]
+        device = motion_ids.device
+
+        # 1. Unconditional: drop everything.
+        drop_all = torch.ones(B, dtype=torch.bool, device=device)
         logits_uncond = self.trans_forward(
-            motion_ids, cond, padding_mask,
-            interaction_tokens=None, force_mask=True,
+            motion_ids=motion_ids,
+            cond_vector=cond_vector,
+            token_padding_mask=token_padding_mask,
+            int_tokens_bf=int_tokens_bf,
+            int_padding_mask_bf=int_padding_mask_bf,
+            drop_text_mask=drop_all,
+            drop_int_mask=drop_all if int_tokens_bf is not None else None,
         )
 
-        if cond_scale == 1 and interaction_tokens is None:
+        # No-condition shortcut: no text scale and no interaction.
+        if w_text == 0 and (int_tokens_bf is None or w_int == 0):
             return logits_uncond
 
-        # Text-only
-        logits_text = self.trans_forward(
-            motion_ids, cond, padding_mask,
-            interaction_tokens=None, force_mask=False,
+        # 2. Text-only: text given, interaction dropped (or absent).
+        keep_text = torch.zeros(B, dtype=torch.bool, device=device)
+        logits_text_only = self.trans_forward(
+            motion_ids=motion_ids,
+            cond_vector=cond_vector,
+            token_padding_mask=token_padding_mask,
+            int_tokens_bf=int_tokens_bf,
+            int_padding_mask_bf=int_padding_mask_bf,
+            drop_text_mask=keep_text,
+            drop_int_mask=drop_all if int_tokens_bf is not None else None,
         )
 
-        if interaction_tokens is None:
-            # Standard single-condition CFG
-            return logits_uncond + cond_scale * (logits_text - logits_uncond)
+        if int_tokens_bf is None or w_int == 0:
+            # Single-condition CFG — same arithmetic as MoMask's
+            # ``forward_with_cond_scale`` but with our per-sample
+            # bookkeeping. ``w_text=4`` corresponds to MoMask
+            # ``cond_scale=5``.
+            return logits_uncond + w_text * (logits_text_only - logits_uncond)
 
-        # Full (text + interaction)
+        # 3. Full: text given, interaction given.
         logits_full = self.trans_forward(
-            motion_ids, cond, padding_mask,
-            interaction_tokens=interaction_tokens, force_mask=False,
+            motion_ids=motion_ids,
+            cond_vector=cond_vector,
+            token_padding_mask=token_padding_mask,
+            int_tokens_bf=int_tokens_bf,
+            int_padding_mask_bf=int_padding_mask_bf,
+            drop_text_mask=keep_text,
+            drop_int_mask=keep_text,    # all-False ⇒ keep interaction
         )
 
-        # Dual-condition guidance
         return (
             logits_uncond
-            + cond_scale * (logits_text - logits_uncond)
-            + interaction_scale * (logits_full - logits_text)
+            + w_text * (logits_text_only - logits_uncond)
+            + w_int * (logits_full - logits_text_only)
         )
 
     @torch.no_grad()
     def generate(
         self,
-        cond: Tensor,
-        m_lens: Tensor,
-        interaction_tokens: Tensor | None = None,
+        cond_vector: Tensor,            # (B, clip_dim)
+        m_lens_tok: Tensor,             # (B,) token-space lengths
+        int_tokens_bf: Tensor | None = None,
+        int_padding_mask_bf: Tensor | None = None,
         timesteps: int = 10,
-        cond_scale: float = 4.5,
-        interaction_scale: float = 2.0,
+        w_text: float = 4.0,
+        w_int: float = 2.0,
         temperature: float = 1.0,
         topk_filter_thres: float = 0.9,
     ) -> Tensor:
-        """Iterative unmasking generation with interaction guidance.
+        """Iterative parallel-decoding generation (MoMask MaskGIT-style)
+        with compositional dual CFG.
 
-        Parameters
-        ----------
-        cond : (B, clip_dim) — CLIP text embedding
-        m_lens : (B,) — desired token sequence lengths
-        interaction_tokens : (B, S_int, d) or None
-        timesteps : number of unmasking iterations
+        Mirrors MoMask's ``MaskTransformer.generate`` (10 unmasking
+        iterations, cosine remask schedule, gumbel sampling) but
+        replaces the inner ``forward_with_cond_scale`` call with the
+        3-pass compositional version.
 
         Returns
         -------
-        ids : (B, S) — generated token indices, -1 for padding
+        ids : (B, S) — generated VQ-VAE base-layer token IDs.
+                      Padded positions are -1 (matches MoMask convention).
         """
+        from models.mask_transformer.tools import (
+            cosine_schedule, gumbel_sample, lengths_to_mask, top_k,
+        )
+
         mt = self.mask_transformer
-        device = cond.device
-        B = cond.shape[0]
-        S = int(m_lens.max().item())
+        device = next(self.parameters()).device
+        B = cond_vector.shape[0]
+        S = int(m_lens_tok.max().item())
 
-        from models.mask_transformer.tools import lengths_to_mask
-
-        non_pad_mask = lengths_to_mask(m_lens, S)
+        non_pad_mask = lengths_to_mask(m_lens_tok, S)        # (B, S)
         padding_mask = ~non_pad_mask
 
-        # Start fully masked
+        # Start fully masked (except padded positions which are pad_id).
         ids = torch.where(padding_mask, mt.pad_id, mt.mask_id)
-        scores = torch.where(padding_mask, 1e5, 0.0)
+        scores = torch.where(padding_mask, torch.full_like(ids, 1e5, dtype=torch.float), torch.zeros_like(ids, dtype=torch.float))
+        starting_temperature = temperature
 
-        for timestep, steps_until_x0 in zip(
-            torch.linspace(0, 1, timesteps, device=device),
-            reversed(range(timesteps)),
-        ):
-            rand_mask_prob = cosine_schedule(timestep)
-            num_mask = (rand_mask_prob * m_lens.float()).long().clamp(min=1)
+        for timestep in torch.linspace(0, 1, timesteps, device=device):
+            rand_mask_prob = cosine_schedule(timestep)        # scalar tensor
+            num_token_masked = torch.round(rand_mask_prob * m_lens_tok.float()).clamp(min=1)
 
-            # Re-mask lowest confidence tokens (except first step)
-            if timestep > 0:
-                scores_for_mask = scores.clone()
-                scores_for_mask[padding_mask] = 1e5
-                for i in range(B):
-                    n = num_mask[i].item()
-                    if n >= m_lens[i].item():
-                        ids[i, :m_lens[i]] = mt.mask_id
-                    else:
-                        _, low_idx = scores_for_mask[i, :m_lens[i]].topk(n, largest=False)
-                        ids[i, low_idx] = mt.mask_id
+            # Re-mask the lowest-confidence tokens at this iteration.
+            sorted_indices = scores.argsort(dim=1)
+            ranks = sorted_indices.argsort(dim=1)
+            is_mask = ranks < num_token_masked.unsqueeze(-1)
+            ids = torch.where(is_mask, mt.mask_id, ids)
 
-            # Get logits with guidance
+            # 3-pass compositional CFG.
             logits = self.forward_with_cond_scale(
-                ids, cond, padding_mask,
-                interaction_tokens=interaction_tokens,
-                cond_scale=cond_scale,
-                interaction_scale=interaction_scale,
-            ).permute(0, 2, 1)  # (B, S, V)
+                motion_ids=ids,
+                cond_vector=cond_vector,
+                token_padding_mask=padding_mask,
+                int_tokens_bf=int_tokens_bf,
+                int_padding_mask_bf=int_padding_mask_bf,
+                w_text=w_text,
+                w_int=w_int,
+            )
+            logits = logits.permute(0, 2, 1)                  # (B, S, V)
 
-            # Adjust temperature
-            filtered_logits = logits / max(temperature, 1e-3)
+            filtered_logits = top_k(logits, topk_filter_thres, dim=-1)
 
-            # Top-k filtering
-            if topk_filter_thres < 1.0:
-                V = filtered_logits.shape[-1]
-                k = max(1, int(V * (1 - topk_filter_thres)))
-                val, _ = filtered_logits.topk(k, dim=-1)
-                filtered_logits = filtered_logits.masked_fill(
-                    filtered_logits < val[..., -1:], float("-inf"),
-                )
+            # Gumbel sample (matches MoMask's default ``gsample=False``
+            # would use multinomial; we follow the gumbel branch since
+            # it's the cleaner implementation and equivalent in
+            # expectation).
+            pred_ids = gumbel_sample(
+                filtered_logits, temperature=starting_temperature, dim=-1,
+            )
+            ids = torch.where(is_mask, pred_ids, ids)
 
-            # Sample
-            probs = F.softmax(filtered_logits, dim=-1)
-            sampled = probs.reshape(-1, probs.shape[-1]).multinomial(1).reshape(B, S)
-            sampled_scores = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+            # Update scores: prob assigned to the sampled token.
+            probs = logits.softmax(dim=-1)
+            tok_scores = probs.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)
+            scores = torch.where(is_mask, tok_scores, scores)
+            scores = scores.masked_fill(~is_mask, 1e5)
 
-            # Update only masked positions
-            is_masked = ids == mt.mask_id
-            ids = torch.where(is_masked, sampled, ids)
-            scores = torch.where(is_masked, sampled_scores, scores)
-
-        # Mark padding as -1
-        ids[padding_mask] = -1
+        ids = torch.where(padding_mask, torch.full_like(ids, -1), ids)
         return ids
 
     def encode_text(self, raw_text: list[str]) -> Tensor:
-        """Encode raw text strings via MoMask's CLIP model."""
+        """Pass-through to MoMask's frozen CLIP text encoder."""
         return self.mask_transformer.encode_text(raw_text)
 
-    def interaction_parameters(self) -> list[nn.Parameter]:
-        """Return only the new interaction cross-attention parameters (for separate LR)."""
-        params = []
-        for name, p in self.mask_transformer.seqTransEncoder.named_parameters():
-            if "interaction_attn" in name:
-                params.append(p)
+    # ------------------------------------------------------------------
+    # Parameter groups (for the trainer's two-LR optimiser)
+    # ------------------------------------------------------------------
+
+    def new_parameters(self) -> list[nn.Parameter]:
+        """Trained-from-scratch params: tokenizer + IntXAttn + γ + null_int_kv.
+
+        These need a higher LR than the MoMask backbone finetune. Per
+        ControlNet ICCV'23 + LLaMA-Adapter convention, "new" weights
+        train at full LR while pretrained weights move at a much lower
+        rate. The trainer routes these into a separate AdamW group.
+        """
+        params: list[nn.Parameter] = []
+        # Tokenizer (Linear/Conv1d/PE).
         params.extend(self.interaction_tokenizer.parameters())
+        # null_int_kv learnable bank.
+        params.append(self.null_int_kv)
+        # Per-block IntXAttn weights + γ + norm_int (anything that lives
+        # under the new ``MaskTransformerEncoderWithInteraction`` and
+        # ISN'T part of the original MoMask ``nn.TransformerEncoderLayer``).
+        for blk in self.mask_transformer.seqTransEncoder.layers:
+            # ``blk.layer`` is the original MoMask layer (don't touch);
+            # everything else on ``blk`` is new.
+            for name, p in blk.named_parameters():
+                if name.startswith("layer."):
+                    continue
+                params.append(p)
         return params
 
     def backbone_parameters(self) -> list[nn.Parameter]:
-        """Return only the original MoMask parameters (for lower LR finetuning)."""
-        params = []
+        """Pretrained MoMask params (excluding CLIP, which stays frozen).
+
+        Includes:
+          - token_emb, input_process, position_enc, output_process,
+            cond_emb (text projection)
+          - Each ``blk.layer`` — MoMask's original
+            nn.TransformerEncoderLayer with self-attn + FFN weights.
+
+        Excludes:
+          - clip_model.* (frozen by MoMask's ``load_and_freeze_clip``)
+          - null_int_kv, IntXAttn, γ, norm_int, tokenizer
+            (counted by ``new_parameters``)
+        """
+        new_param_ids = {id(p) for p in self.new_parameters()}
+        backbone: list[nn.Parameter] = []
         for name, p in self.mask_transformer.named_parameters():
-            if "interaction_attn" not in name and "clip_model" not in name:
-                params.append(p)
-        return params
+            if name.startswith("clip_model."):
+                continue
+            if id(p) in new_param_ids:
+                continue
+            backbone.append(p)
+        return backbone
