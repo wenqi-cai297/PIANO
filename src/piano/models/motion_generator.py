@@ -597,14 +597,16 @@ class InteractionMaskTransformer(nn.Module):
 
         Returns
         -------
-        Dict with:
+        Dict with scalar-tensor entries only (so the trainer's per-step
+        ``.item()`` accumulation in :func:`piano.training.trainer.run_training_loop`
+        works without per-element shape gymnastics):
+
           - ``loss``: scalar masked-CE loss (only at masked positions)
           - ``acc``: scalar mean accuracy at masked positions
-          - ``pred_id``: (B, S) predicted token IDs (for diagnostics)
 
-        The dict shape matches what
-        :func:`piano.training.trainer.run_training_loop` expects from
-        the ``step_fn`` callable.
+        The full ``pred_id`` tensor (B, S) is NOT returned — it's
+        not consumed by the training loop, and including non-scalar
+        tensors in this dict would crash the per-step logger.
         """
         # MoMask's own helpers — re-imported here to keep the wrapper
         # self-contained (the tools module path is set up by
@@ -661,13 +663,12 @@ class InteractionMaskTransformer(nn.Module):
             drop_int_mask=drop_int_mask,
         )                                                    # (B, num_tokens, S)
 
-        ce_loss, pred_id, acc = cal_performance(
+        ce_loss, _pred_id, acc = cal_performance(
             logits, labels, ignore_index=mt.mask_id,
         )
         return {
             "loss": ce_loss,
             "acc": torch.tensor(acc, device=device),
-            "pred_id": pred_id,
         }
 
     # ------------------------------------------------------------------
