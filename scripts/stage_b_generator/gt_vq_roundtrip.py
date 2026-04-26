@@ -250,8 +250,16 @@ def _save_dir(
     )
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(
-            {"seq_ids": seq_ids, "texts": texts,
-             "seq_lens_frames": seq_lens_frames},
+            {
+                "seq_ids": seq_ids,
+                "texts": texts,
+                # Key MUST be "seq_lens" — that's what
+                # ``visualize_motion.load_generated_samples`` reads. With the
+                # wrong key, the visualizer falls back to motion.shape[1]
+                # (= padded T_max) and renders zero-padded frames as a
+                # collapsed body at the end of the mp4.
+                "seq_lens": seq_lens_frames,
+            },
             f, indent=2,
         )
 
