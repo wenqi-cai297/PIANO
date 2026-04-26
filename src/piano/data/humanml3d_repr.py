@@ -149,3 +149,44 @@ def denormalize_motion(
 ) -> np.ndarray:
     """Reverse z-normalization."""
     return features * std + mean
+
+
+def load_motion_stats(vq_vae_ckpt: str | "Path") -> tuple[np.ndarray, np.ndarray]:
+    """Load HumanML3D motion mean/std from MoMask co-located meta dir.
+
+    MoMask convention: ``<vq_vae_root>/meta/{mean,std}.npy``. The
+    ``vq_vae_ckpt`` argument is the .tar inside ``<vq_vae_root>/model/``,
+    so we go up two levels to find ``meta/``.
+
+    Both Stage B's encoder path (``vq_model.encode``) and decoder path
+    (``vq_model.forward_decoder``) operate in normalized space — the
+    pretrained MoMask VQ-VAE was trained on
+    ``motion = (raw - mean) / std`` features (verified at
+    ``EricGuo5513/momask-codes/data/t2m_dataset.py:85``). Feeding raw
+    motion to the encoder produces OOD-scale inputs that quantize to
+    wrong codes (verified empirically by
+    ``scripts/stage_b_generator/diagnose_vq_pipeline.py``: raw input
+    preserves only 44.5% of GT path length on round-trip vs 94.7% with
+    normalized input). Use these stats to normalize before encode and
+    denormalize after decode.
+
+    Raises FileNotFoundError if either file is missing.
+
+    Returns
+    -------
+    mean, std : ``(263,)`` float32 arrays.
+    """
+    from pathlib import Path
+    vq_vae_dir = Path(vq_vae_ckpt).parent.parent
+    mean_path = vq_vae_dir / "meta" / "mean.npy"
+    std_path = vq_vae_dir / "meta" / "std.npy"
+    if not mean_path.exists() or not std_path.exists():
+        raise FileNotFoundError(
+            f"HumanML3D motion stats not found at {vq_vae_dir / 'meta'}. "
+            "Expected mean.npy + std.npy alongside the VQ-VAE checkpoint, "
+            "per the MoMask convention.",
+        )
+    return (
+        np.load(mean_path).astype(np.float32),
+        np.load(std_path).astype(np.float32),
+    )

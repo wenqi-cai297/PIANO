@@ -58,6 +58,7 @@ from torch import Tensor
 from torch.utils.data import ConcatDataset
 
 from piano.data.dataset import HOIDataset
+from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import (
     load_momask_mask_transformer,
@@ -131,38 +132,6 @@ def _build_val_dataset(cfg) -> ConcatDataset:
 # ============================================================================
 # Model setup
 # ============================================================================
-
-def _load_motion_stats(vq_vae_ckpt: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load HumanML3D motion mean/std from the MoMask co-located meta dir.
-
-    MoMask convention: ``<vq_vae_root>/meta/mean.npy`` + ``std.npy``. The
-    ``vq_vae_ckpt`` argument is the .tar inside ``<vq_vae_root>/model/``,
-    so we go up two levels to find ``meta/``.
-
-    The decoded motion from ``vq_model.forward_decoder(...)`` is in
-    **normalized** space — without ``x * std + mean`` the values are
-    ``O(0.01-1)`` per channel and ``recover_from_ric`` integrates them
-    as if they were world-frame velocities → joint positions cluster
-    near the canonical origin → mp4 looks like "body stands still".
-    This helper resolves the stats so callers can denorm before save.
-
-    Raises FileNotFoundError if either file is missing.
-    """
-    vq_vae_dir = Path(vq_vae_ckpt).parent.parent  # .../<root>/model/x.tar → .../<root>/
-    meta_dir = vq_vae_dir / "meta"
-    mean_path = meta_dir / "mean.npy"
-    std_path = meta_dir / "std.npy"
-    if not mean_path.exists() or not std_path.exists():
-        raise FileNotFoundError(
-            f"HumanML3D motion stats not found at {meta_dir}. Expected "
-            f"mean.npy + std.npy alongside the VQ-VAE checkpoint, per the "
-            f"MoMask convention."
-        )
-    return (
-        np.load(mean_path).astype(np.float32),
-        np.load(std_path).astype(np.float32),
-    )
-
 
 def _build_model(cfg, ckpt_path: Path, device: torch.device):
     """Build the wrapped InteractionMaskTransformer + frozen VQ-VAE +
@@ -504,9 +473,9 @@ def main() -> int:
 
     # Load HumanML3D motion stats so generated motion gets denormalized
     # to real-world scale before being saved + visualized. See
-    # ``_load_motion_stats`` docstring for why this is load-bearing for
-    # mp4 visual quality.
-    motion_mean, motion_std = _load_motion_stats(cfg.model.checkpoints.vq_vae)
+    # ``piano.data.humanml3d_repr.load_motion_stats`` docstring for why
+    # this is load-bearing for mp4 visual quality.
+    motion_mean, motion_std = load_motion_stats(cfg.model.checkpoints.vq_vae)
     print(f"Loaded HumanML3D mean/std: shape={motion_mean.shape}")
 
     # Build val dataset, sample N clips (deterministic).

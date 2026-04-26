@@ -60,6 +60,7 @@ from torch import Tensor
 from torch.utils.data import ConcatDataset
 
 from piano.data.dataset import HOIDataset
+from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import load_momask_vqvae
 from piano.utils.io_utils import ensure_dir, load_json
@@ -115,29 +116,6 @@ def _build_val_dataset(cfg) -> ConcatDataset:
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
-
-
-# ============================================================================
-# Stats loading (same convention as qual_eval._load_motion_stats)
-# ============================================================================
-
-def _load_motion_stats(vq_vae_ckpt: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load HumanML3D mean/std from MoMask co-located meta dir.
-
-    Convention: ``<vq_vae_root>/meta/{mean,std}.npy``. The ``vq_vae_ckpt`` is
-    the .tar inside ``<root>/model/``, so ``parent.parent`` gives ``<root>/``.
-    """
-    vq_vae_dir = Path(vq_vae_ckpt).parent.parent
-    mean_path = vq_vae_dir / "meta" / "mean.npy"
-    std_path = vq_vae_dir / "meta" / "std.npy"
-    if not mean_path.exists() or not std_path.exists():
-        raise FileNotFoundError(
-            f"HumanML3D motion stats not found at {vq_vae_dir / 'meta'}.",
-        )
-    return (
-        np.load(mean_path).astype(np.float32),
-        np.load(std_path).astype(np.float32),
-    )
 
 
 # ============================================================================
@@ -479,7 +457,7 @@ def main() -> int:
         device=str(device),
     )
 
-    motion_mean, motion_std = _load_motion_stats(cfg.model.checkpoints.vq_vae)
+    motion_mean, motion_std = load_motion_stats(cfg.model.checkpoints.vq_vae)
     print(f"  mean.shape={motion_mean.shape} std.shape={motion_std.shape}")
     print(f"  mean range [{motion_mean.min():.3f}, {motion_mean.max():.3f}]")
     print(f"  std range  [{motion_std.min():.3f}, {motion_std.max():.3f}]")

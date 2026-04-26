@@ -45,6 +45,7 @@ from piano.data.dataset import (
     collate_hoi,
     extract_subject_id,
 )
+from piano.data.humanml3d_repr import load_motion_stats
 from piano.models.backbones.momask_adapter import (
     load_momask_mask_transformer,
     load_momask_vqvae,
@@ -270,6 +271,8 @@ def build_generator_step_fn(
     *,
     cfg_drop_buckets: tuple[float, float, float],
     token_stride: int = 4,
+    motion_mean: torch.Tensor | None = None,
+    motion_std: torch.Tensor | None = None,
 ):
     """Build the Stage B training step.
 
@@ -292,21 +295,42 @@ def build_generator_step_fn(
     token_stride
         VQ-VAE temporal downsample (4 for MoMask). Used to compute
         token-space ``m_lens``.
+    motion_mean, motion_std
+        ``(263,)`` torch tensors on the same device as ``transformer``.
+        Required for the encoder normalization fix (v0.3-β-norm). Per
+        ``analyses/2026-04-27_v0_3_root_cause_research.md`` v0.3-β
+        diagnostic: MoMask VQ-VAE was trained on ``(raw - mean) / std``
+        normalized features; feeding raw motion produces OOD-scale
+        encoder inputs that quantize to the wrong codes (only 44.5% of
+        GT path length preserved on round-trip vs 94.7% with normalized
+        input). Apply ``(motion - mean) / std`` before ``vq_model.encode``.
     """
 
     def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
         device = next(transformer.parameters()).device
 
-        motion = batch["motion"].to(device).float()       # (B, T, 263)
+        motion = batch["motion"].to(device).float()       # (B, T, 263) raw
         seq_len = batch["seq_len"].to(device).long()       # (B,)
         text = batch["text"]                               # list[str]
 
         # ---- Frozen VQ-VAE encode: (B, T, 263) → (B, S=T/4, Q) ----
+        # Normalize first: VQ-VAE was trained on (raw - mean) / std
+        # features (MoMask t2m_dataset.py:85). Without this, encoder
+        # OOD-quantizes to a saturated default-prototype cluster and
+        # the MaskTransformer's text→token prior is broken.
         # We follow MoMask's trainer pattern verbatim: use the BASE
         # quantiser layer only (``[..., 0]``); the residual layers are
         # the ResidualTransformer's job and are out of scope for Stage B.
+        if motion_mean is None or motion_std is None:
+            raise ValueError(
+                "build_generator_step_fn requires motion_mean + motion_std "
+                "(load via piano.data.humanml3d_repr.load_motion_stats). "
+                "Without normalization, the VQ-VAE encoder OOD-quantizes "
+                "and Stage B trains on a degraded token distribution.",
+            )
         with torch.no_grad():
-            code_idx, _ = vq_model.encode(motion)          # (B, S, Q)
+            motion_norm = (motion - motion_mean) / motion_std.clamp(min=1e-8)
+            code_idx, _ = vq_model.encode(motion_norm)     # (B, S, Q)
             base_ids = code_idx[..., 0].long()             # (B, S)
 
         # Token-space sequence lengths.
@@ -507,11 +531,29 @@ def run(config_path: str) -> None:
 
     # Resolve the inner transformer (Accelerate may have wrapped it in DDP).
     inner_transformer = accelerator.unwrap_model(transformer)
+
+    # Load HumanML3D motion mean/std (v0.3-β-norm fix). VQ-VAE was
+    # trained on normalized features; without this the encoder OOD-
+    # quantizes and Stage B trains on a degraded token distribution.
+    # See analyses/2026-04-27_v0_3_root_cause_research.md and
+    # scripts/stage_b_generator/diagnose_vq_pipeline.py for the empirical
+    # demonstration (raw input preserves 44.5% of GT path length on
+    # round-trip; normalized input preserves 94.7%).
+    motion_mean_np, motion_std_np = load_motion_stats(cfg.model.checkpoints.vq_vae)
+    motion_mean_t = torch.from_numpy(motion_mean_np).float().to(device)
+    motion_std_t = torch.from_numpy(motion_std_np).float().to(device)
+    accelerator.print(
+        f"Loaded HumanML3D motion stats: mean.shape={motion_mean_np.shape}, "
+        f"std range [{motion_std_np.min():.3f}, {motion_std_np.max():.3f}]",
+    )
+
     step_fn = build_generator_step_fn(
         transformer=inner_transformer,
         vq_model=vq_model,
         cfg_drop_buckets=cfg_drop_buckets,
         token_stride=token_stride,
+        motion_mean=motion_mean_t,
+        motion_std=motion_std_t,
     )
 
     # ---- Wandb ----

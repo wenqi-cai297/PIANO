@@ -62,6 +62,7 @@ from torch import Tensor
 from torch.utils.data import ConcatDataset, DataLoader
 
 from piano.data.dataset import HOIDataset, collate_hoi
+from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import (
     load_momask_mask_transformer,
@@ -329,6 +330,8 @@ def measure(
     device: torch.device,
     num_batches: int,
     token_stride: int,
+    motion_mean: torch.Tensor,
+    motion_std: torch.Tensor,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Run forward on N val batches, capture activations, return aggregated stats + raw ratios.
 
@@ -378,7 +381,10 @@ def measure(
 
         # GT base tokens (all real, no masking — measures the adapter's
         # effect at "all-context-visible" inference, the cleanest signal).
-        code_idx, _ = vq_model.encode(motion)                # (B, S, Q)
+        # Normalize motion before encode (v0.3-β-norm fix): VQ-VAE was
+        # trained on (raw - mean) / std features; raw input OOD-quantizes.
+        motion_norm = (motion - motion_mean) / motion_std.clamp(min=1e-8)
+        code_idx, _ = vq_model.encode(motion_norm)            # (B, S, Q)
         base_ids = code_idx[..., 0].long()                    # (B, S)
         m_lens_tok = (seq_len // token_stride).clamp(min=1).long()
 
@@ -627,6 +633,13 @@ def main() -> int:
     n_total_clips = len(val_loader.dataset)
     print(f"  val: {n_total_clips} clips total; will forward up to {args.num_batches} batches.")
 
+    # v0.3-β-norm fix: normalize motion before VQ encode (see
+    # piano.data.humanml3d_repr.load_motion_stats docstring).
+    motion_mean_np, motion_std_np = load_motion_stats(cfg.model.checkpoints.vq_vae)
+    motion_mean_t = torch.from_numpy(motion_mean_np).float().to(device)
+    motion_std_t = torch.from_numpy(motion_std_np).float().to(device)
+    print(f"Loaded HumanML3D motion stats: shape={motion_mean_np.shape}")
+
     print(f"Measuring effect size...")
     measurement, raw_ratios = measure(
         transformer=transformer,
@@ -635,6 +648,8 @@ def main() -> int:
         device=device,
         num_batches=args.num_batches,
         token_stride=token_stride,
+        motion_mean=motion_mean_t,
+        motion_std=motion_std_t,
     )
 
     result: dict[str, Any] = {
