@@ -374,6 +374,25 @@ def main() -> int:
     seq_lens_tok = [max(1, n // token_stride) for n in seq_lens_frames]
     texts = [str(s["text"]) for s in samples]
     seq_ids = [str(s["seq_id"]) for s in samples]
+    # Per-clip object info captured for visualization overlay. PC is the
+    # subsampled-1024 cloud HOIDataset already returns; positions /
+    # rotations come straight from the source clip's preprocessed npz
+    # (added in 2026-04-27 to dataset.py). Some older clips lack rotations
+    # — substitute zeros so visualize_motion can ignore the rotation
+    # without a None-check explosion.
+    object_pcs = [s["object_pc"].cpu().numpy() for s in samples]
+    object_positions = [
+        s["object_positions"].cpu().numpy()
+        if "object_positions" in s
+        else np.zeros((cfg.data.max_seq_length, 3), dtype=np.float32)
+        for s in samples
+    ]
+    object_rotations = [
+        s["object_rotations"].cpu().numpy()
+        if "object_rotations" in s
+        else np.zeros((cfg.data.max_seq_length, 3), dtype=np.float32)
+        for s in samples
+    ]
 
     # Pre-tokenise z_int for each sample (so we can swap freely).
     z_int_per = []
@@ -422,17 +441,32 @@ def main() -> int:
 
     # Per-condition save (visualize_motion-compatible: generated.npz +
     # summary.json). One subdir per condition, one row per clip.
+    # Visualisation overlays: for every condition we ship the SOURCE
+    # clip's object — so when the user looks at "swap", they see whether
+    # the human, conditioned on a different clip's z_int, still tracks
+    # the source clip's object. (For a future variant we could also
+    # ship the swap-source's object, but starting with the simpler
+    # comparison is the right first cut.)
     _save_condition_dir(
         args.output_dir / "full", per_clip_default, "full",
         texts, seq_lens_frames, seq_ids,
+        object_pcs=object_pcs,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
     )
     _save_condition_dir(
         args.output_dir / "text_only", per_clip_default, "text_only",
         texts, seq_lens_frames, seq_ids,
+        object_pcs=object_pcs,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
     )
     _save_condition_dir(
         args.output_dir / "swap", per_clip_default, "swap",
         texts, seq_lens_frames, seq_ids,
+        object_pcs=object_pcs,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
     )
 
     # Diff metrics for the default run.
@@ -490,13 +524,20 @@ def _save_condition_dir(
     texts: list[str],
     seq_lens_frames: list[int],
     seq_ids: list[str],
+    object_pcs: list[np.ndarray] | None = None,
+    object_positions: list[np.ndarray] | None = None,
+    object_rotations: list[np.ndarray] | None = None,
 ) -> None:
     """Save one condition as visualize_motion-compatible run dir.
 
     Different clips generate different lengths, so we right-pad each
     motion with zeros to the per-batch maximum before stacking. The
     saved ``seq_lens`` field tells the visualizer how many valid
-    frames to render per row.
+    frames to render per row. Object overlays — ``object_pc`` (per-clip
+    point cloud, fixed N), ``object_positions`` (per-frame center) and
+    ``object_rotations`` (per-frame axis-angle) — are saved alongside
+    when supplied; visualize_motion picks them up via its
+    ``load_generated_samples`` extension.
     """
     ensure_dir(out_dir)
     motions_list = [row[condition]["motion"] for row in per_clip]
@@ -505,7 +546,20 @@ def _save_condition_dir(
     padded = np.zeros((len(motions_list), max_T, feat_dim), dtype=np.float32)
     for i, m in enumerate(motions_list):
         padded[i, : m.shape[0]] = m
-    np.savez(out_dir / "generated.npz", motion_263=padded)
+
+    save_kwargs: dict[str, np.ndarray] = {"motion_263": padded}
+    if object_pcs is not None:
+        # Per-clip PC has fixed N (1024 from HOIDataset's subsample); stack.
+        save_kwargs["object_pc"] = np.stack(object_pcs).astype(np.float32)
+    if object_positions is not None:
+        # Each is already padded to max_seq_length by HOIDataset; truncate
+        # / right-pad to match motion's max_T so the visualizer can index
+        # them in lock-step with the rendered motion.
+        save_kwargs["object_positions"] = _pad_per_frame_to(object_positions, max_T)
+    if object_rotations is not None:
+        save_kwargs["object_rotations"] = _pad_per_frame_to(object_rotations, max_T)
+
+    np.savez(out_dir / "generated.npz", **save_kwargs)
     summary = {
         "condition": condition,
         "texts": texts,
@@ -514,6 +568,17 @@ def _save_condition_dir(
         "swap_from": [row[condition].get("swap_from") for row in per_clip],
     }
     save_json(out_dir / "summary.json", summary)
+
+
+def _pad_per_frame_to(arrs: list[np.ndarray], max_T: int) -> np.ndarray:
+    """Stack per-clip per-frame arrays to (N, max_T, …), zero-padding
+    along the time axis. Each arr has shape ``(T_i, *rest)``."""
+    rest = arrs[0].shape[1:]
+    out = np.zeros((len(arrs), max_T, *rest), dtype=np.float32)
+    for i, a in enumerate(arrs):
+        T = min(a.shape[0], max_T)
+        out[i, :T] = a[:T]
+    return out
 
 
 def _summarise_diffs(

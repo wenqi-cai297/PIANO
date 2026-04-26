@@ -289,10 +289,21 @@ def load_real_samples(
 
 
 def load_generated_samples(run_dir: Path) -> list[dict]:
-    """Load generated motions from a smoke-test run directory.
+    """Load generated motions from a smoke-test or qual-eval run directory.
 
-    Also loads the input ``object_positions`` (if saved by the smoke test)
-    so the red object marker shows where the conditioning object was.
+    Reads ``generated.npz``. Recognised optional keys (added per
+    qual_eval.py's overlay support, 2026-04-27):
+
+        - ``object_positions`` — (B, T, 3) per-frame object center
+        - ``object_rotations`` — (B, T, 3) per-frame axis-angle
+        - ``object_pc``        — (B, N, 3) per-clip object point cloud
+                                 (fixed N, in object-local frame)
+
+    All four are optional; missing ones translate to ``None`` on the
+    sample so :func:`render_motion_video` can ignore them. The
+    summary's ``seq_ids`` field (when present) is preferred over
+    auto-generated ``generated_NN`` so the rendered file names match
+    the source clips.
     """
     npz_path = run_dir / "generated.npz"
     summary_path = run_dir / "summary.json"
@@ -301,19 +312,24 @@ def load_generated_samples(run_dir: Path) -> list[dict]:
     data = np.load(npz_path)
     motion = data["motion_263"]  # (B, T, 263)
     object_positions = data["object_positions"] if "object_positions" in data.files else None
+    object_rotations = data["object_rotations"] if "object_rotations" in data.files else None
+    object_pcs = data["object_pc"] if "object_pc" in data.files else None
 
     summary = load_json(summary_path) if summary_path.exists() else {}
     texts = summary.get("texts", [f"sample_{i}" for i in range(len(motion))])
     seq_lens = summary.get("seq_lens", [motion.shape[1]] * len(motion))
+    seq_ids = summary.get("seq_ids", [f"generated_{i:02d}" for i in range(len(motion))])
 
     samples: list[dict] = []
     for i in range(len(motion)):
         samples.append({
-            "seq_id": f"generated_{i:02d}",
+            "seq_id": seq_ids[i] if i < len(seq_ids) else f"generated_{i:02d}",
             "text": texts[i] if i < len(texts) else "",
             "motion_263": motion[i],
             "joints_22": None,          # need to reconstruct from motion_263
             "object_positions": object_positions[i] if object_positions is not None else None,
+            "object_rotations": object_rotations[i] if object_rotations is not None else None,
+            "object_pc": object_pcs[i] if object_pcs is not None else None,
             "num_frames": int(seq_lens[i] if i < len(seq_lens) else motion[i].shape[0]),
         })
     return samples

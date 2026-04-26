@@ -223,11 +223,15 @@ class HOIDataset(Dataset):
         joints = motion_data["joints_22"].astype(np.float32)     # (T, 22, 3)
         seq_len = min(len(motion), self.max_seq_length)
 
-        # Object trajectory in world frame (per-frame object center position).
-        # Used for pseudo-label extraction and for overlay during visualization.
+        # Object trajectory in world frame (per-frame object center position
+        # + per-frame axis-angle rotation). Used for pseudo-label extraction
+        # and — when present — for overlay during visualization.
         object_positions = None
         if "object_positions" in motion_data.files:
             object_positions = motion_data["object_positions"].astype(np.float32)
+        object_rotations = None
+        if "object_rotations" in motion_data.files:
+            object_rotations = motion_data["object_rotations"].astype(np.float32)
 
         # --- Load object point cloud ---
         obj_id = meta["object_id"]
@@ -244,6 +248,8 @@ class HOIDataset(Dataset):
         joints = self._pad_or_truncate(joints, self.max_seq_length)
         if object_positions is not None:
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
+        if object_rotations is not None:
+            object_rotations = self._pad_or_truncate(object_rotations, self.max_seq_length)
 
         padded_labels: dict[str, np.ndarray] = {}
         for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
@@ -275,6 +281,8 @@ class HOIDataset(Dataset):
         }
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
+        if object_rotations is not None:
+            result["object_rotations"] = torch.from_numpy(object_rotations)
         for key, arr in padded_labels.items():
             result[key] = torch.from_numpy(arr)
 
