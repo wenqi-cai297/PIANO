@@ -157,6 +157,7 @@ class HOIDataset(Dataset):
         subject_id_filter: set[str] | None = None,
         augment: AugmentConfig | None = None,
         surface_obj_pose: bool = False,
+        force_world_frame: bool = False,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
@@ -170,6 +171,18 @@ class HOIDataset(Dataset):
         # Off by default so Stage A predictor training (which doesn't
         # need them) doesn't pay the MoMask-recovery import cost.
         self.surface_obj_pose = surface_obj_pose
+        # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
+        # True, the obj-pose channels are returned in WORLD frame instead
+        # of body-canonical frame. Tests Hypothesis E (frame-choice
+        # confused the model) per
+        # analyses/2026-04-27_v0_3_root_cause_research.md §"v0.3-α".
+        # The 7-method lit consensus
+        # (analyses/2026-04-27_object_conditioning_review.md §3.2)
+        # is world-frame; v0.2 deviated to body-canonical and got
+        # body-in-place visual failure despite a measurably alive
+        # adapter (effect-size 9.3% mean / 21.2% peak), so this flag
+        # tests the canonicalization choice in isolation.
+        self.force_world_frame = force_world_frame
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -273,6 +286,7 @@ class HOIDataset(Dataset):
                     joints[:valid],
                     object_positions[:valid],
                     object_rotations[:valid],
+                    force_world_frame=self.force_world_frame,
                 )
             )
 
@@ -345,9 +359,10 @@ class HOIDataset(Dataset):
         joints_world: np.ndarray,       # (T, 22, 3) world frame
         object_positions: np.ndarray,   # (T, 3) world frame
         object_rotations: np.ndarray,   # (T, 3) axis-angle, world frame
+        force_world_frame: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Lift the per-frame world-frame object pose into body-canonical
-        frame, matching the body's representation.
+        frame (default), matching the body's representation.
 
         The transform ``(R_y, T_xz)`` is recovered from frame 0 of
         ``joints_world`` vs ``recover_from_ric(motion_263)`` (canonical),
@@ -355,17 +370,35 @@ class HOIDataset(Dataset):
         :mod:`piano.utils.canonical_frame` for the maths and
         :doc:`analyses/2026-04-27_object_conditioning_review.md` for the
         v0.2 design rationale.
+
+        When ``force_world_frame=True``, short-circuits the recovery and
+        passes ``(R_y=0, T_xz=[0, 0])`` to
+        :func:`world_to_canonical_object_pose` — the result is then the
+        world-frame obj pose in 6D rep (since the inverse transform is
+        identity). Used by v0.3-α to test Hypothesis E (frame-choice
+        deviation from the 7/7 lit consensus). Skips the costly
+        ``recover_from_ric`` call.
         """
         # Lazy import: MoMask path setup is paid only when callers pass
         # ``surface_obj_pose=True`` (Stage B), not by Stage A predictor
         # training.
+        from piano.utils.canonical_frame import (
+            world_to_canonical_object_pose,
+        )
+
+        if force_world_frame:
+            R_y = 0.0
+            T_xz = np.zeros(2, dtype=np.float32)
+            return world_to_canonical_object_pose(
+                object_positions, object_rotations, R_y, T_xz,
+            )
+
         import torch as _torch
         import piano.models.backbones.momask_adapter  # noqa: F401 — path side-effect
         from utils.motion_process import recover_from_ric
 
         from piano.utils.canonical_frame import (
             get_canonicalize_transform_from_clip,
-            world_to_canonical_object_pose,
         )
 
         canonical_joints = (

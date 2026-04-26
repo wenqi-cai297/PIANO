@@ -174,6 +174,10 @@ def _build_dataset(cfg, split_override: str | None = None, enable_augment: bool 
         )
 
     pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    # v0.3-α: when cfg.data.force_world_frame=true, the obj-pose channels
+    # are returned in world frame rather than body-canonical. Defaults
+    # to false (v0.2 behaviour) when the key is absent.
+    force_world_frame = bool(cfg.data.get("force_world_frame", False))
     datasets = []
     for entry in cfg.data.datasets:
         ds = HOIDataset(
@@ -190,6 +194,7 @@ def _build_dataset(cfg, split_override: str | None = None, enable_augment: bool 
             # have something to consume. Stage A trainer leaves this
             # off — Stage A doesn't need object pose.
             surface_obj_pose=True,
+            force_world_frame=force_world_frame,
         )
         datasets.append(ds)
     return ConcatDataset(datasets)

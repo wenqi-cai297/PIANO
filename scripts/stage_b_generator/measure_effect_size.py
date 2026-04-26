@@ -111,6 +111,9 @@ def _build_val_loader(cfg, batch_size: int) -> DataLoader:
     )
     val_filter = splits["val"]
     pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    # v0.3-α: pick up force_world_frame from training config so the
+    # measurement loader matches what the model trained on.
+    force_world_frame = bool(cfg.data.get("force_world_frame", False))
     datasets = []
     for entry in cfg.data.datasets:
         ds = HOIDataset(
@@ -120,6 +123,7 @@ def _build_val_loader(cfg, batch_size: int) -> DataLoader:
             subject_id_filter=val_filter,
             augment=None,
             surface_obj_pose=True,           # v0.2 tokenizer wants 36-d z_int
+            force_world_frame=force_world_frame,
         )
         datasets.append(ds)
     return DataLoader(

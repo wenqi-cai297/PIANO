@@ -196,6 +196,46 @@ def test_canonical_frame_roundtrip() -> None:
     assert np.allclose(recovered, obj_pos_world, atol=1e-5)
 
 
+def test_compute_canonical_object_pose_force_world_frame() -> None:
+    """v0.3-α: ``force_world_frame=True`` short-circuits canonicalization.
+
+    The output ``obj_com`` should equal the input world ``object_positions``
+    exactly (identity transform), and ``obj_rot6d`` should equal the 6D
+    rep of the world axis-angle (no R_y composition). This branch DOES
+    NOT trigger MoMask path setup or ``recover_from_ric``, so the test
+    runs without a server.
+    """
+    import numpy as np
+    from piano.data.dataset import HOIDataset
+    from piano.utils.canonical_frame import (
+        axis_angle_to_matrix_np, matrix_to_rotation_6d_np,
+    )
+
+    rng = np.random.default_rng(42)
+    T = 12
+    # motion_263 + joints are NOT touched in the force_world_frame=True
+    # branch — pass small dummies so the call signature is satisfied.
+    motion_dummy = rng.standard_normal((T, 263)).astype(np.float32)
+    joints_dummy = rng.standard_normal((T, 22, 3)).astype(np.float32)
+    obj_pos_world = rng.standard_normal((T, 3)).astype(np.float32)
+    obj_rot_world_aa = (rng.standard_normal((T, 3)) * 0.5).astype(np.float32)
+
+    obj_com, obj_rot6d = HOIDataset._compute_canonical_object_pose(
+        motion_dummy, joints_dummy, obj_pos_world, obj_rot_world_aa,
+        force_world_frame=True,
+    )
+    # Identity-transform expectation: COM equals the input world position.
+    assert obj_com.shape == (T, 3)
+    np.testing.assert_allclose(obj_com, obj_pos_world, atol=1e-6)
+    # 6D rotation should match the axis-angle → matrix → first-2-cols
+    # composition (no R_y rotation applied since R_y=0 → identity).
+    expected_rot6d = matrix_to_rotation_6d_np(
+        axis_angle_to_matrix_np(obj_rot_world_aa),
+    )
+    assert obj_rot6d.shape == (T, 6)
+    np.testing.assert_allclose(obj_rot6d, expected_rot6d, atol=1e-6)
+
+
 # ============================================================================
 # Block byte-identity at γ_int = 0
 # ============================================================================

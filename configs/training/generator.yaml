@@ -37,6 +37,17 @@ data:
   max_seq_length: 196            # 196 frames @ 20 fps (= 9.8 s)
   fps: 20
 
+  # v0.3-α toggle (2026-04-27, post-effect-size measurement). When true,
+  # the per-frame obj_com / obj_rot6d channels in z_int are returned in
+  # WORLD frame instead of body-canonical (matching the 7/7 lit
+  # consensus from analyses/2026-04-27_object_conditioning_review.md
+  # §3.2). False here keeps v0.2 behaviour (body-canonical, the choice
+  # that produced the body-in-place visual failure despite a measurably
+  # alive adapter at 9.3% mean / 21.2% peak residual contribution per
+  # runs/eval/stageB_v0_3_pre/summary.txt). Override to true via
+  # configs/training/generator_v03_worldframe.yaml.
+  force_world_frame: false
+
   # Use the SAME by-subject split as Stage A (seed=42). This way the
   # Stage B "val" loader holds the same subjects the Stage A predictor
   # of record (final.pt) never saw — relevant if we ever switch
