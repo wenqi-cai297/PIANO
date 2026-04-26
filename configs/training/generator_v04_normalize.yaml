@@ -1,0 +1,121 @@
+# Stage B v0.4: encoder normalization fix.
+#
+# After the v0.3-β VQ pipeline diagnostic
+# (runs/eval/stageB_v0_3_beta_vq/summary.txt) confirmed the
+# encoder_normalization_bug — VQ encoder was being fed raw motion when
+# it expects (raw - mean) / std normalized features → wrong codebook
+# quantization → MaskTransformer learned a degraded token distribution
+# → generated motion always lands near a saturated default-prototype
+# cluster — commit 12f3a51 added normalize-before-encode in
+# train_generator step_fn.
+#
+# v0.4 retrains Stage B from MoMask pretrained with the encoder
+# normalization in place. Same single-var hyperparams as v0.2
+# (body-canonical frame for z_int's object pose channels) since
+# v0.3-α's world-frame variant produced near-identical numerics.
+# Frame-choice (Hypothesis E) was empirically not the issue — encoder
+# normalization is.
+#
+# If v0.4 body translates in qual eval → ship to Stage C, mark all of
+# v0.3-α/-β/-γ/-δ as superseded.
+# If v0.4 body still in-place → the remaining hypotheses are:
+#   - Hypothesis C: codebook lacks HOI motions even after normalization
+#     (run v0.3-β again on v0.4 ckpt to verify if NORM path is now < 0.7
+#     preservation — if so, codebook is bottleneck → v0.3-γ retrain VQ)
+#   - Hypothesis D / F: γ-gate architecture / train-inference mismatch
+#     → v0.3-δ trainable-copy InterControl rebuild
+#
+# Hardware target: 2 × NVIDIA A6000 (48 GB each), bf16, Accelerate DDP.
+# Effective batch per optimizer step = per_gpu (32) × num_gpu (2) × accum (2) = 128.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_generator \
+#     --config configs/training/generator_v04_normalize.yaml
+
+model:
+  config: configs/model/motion_generator.yaml
+  text_encoder: "ViT-B/32"
+  checkpoints:
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  # Body-canonical frame for z_int's obj pose channels — same as v0.2.
+  # v0.3-α tested world-frame; numerics + visuals were near-identical
+  # (frame-choice is not the issue per the v0.3-α retrospective).
+  force_world_frame: false
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  seed: 42
+  batch_size: 32
+  num_epochs: 80                 # same as v0.2 — single-var test
+  num_workers: 4
+  mixed_precision: "bf16"
+
+  optimizer:
+    name: "adamw"
+    new_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  cfg_drop_buckets:
+    drop_both: 0.10
+    drop_int_only: 0.10
+    drop_text_only: 0.05
+
+  val_every_epochs: 5
+  val_best_key: "loss"
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageB_v04_normalize"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+
+# Separate output dir to preserve v0.2 + v0.3-α ckpts for
+# before/after comparison.
+output_dir: "runs/training/generator_v04_normalize"
