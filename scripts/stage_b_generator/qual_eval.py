@@ -491,10 +491,21 @@ def _save_condition_dir(
     seq_lens_frames: list[int],
     seq_ids: list[str],
 ) -> None:
-    """Save one condition as visualize_motion-compatible run dir."""
+    """Save one condition as visualize_motion-compatible run dir.
+
+    Different clips generate different lengths, so we right-pad each
+    motion with zeros to the per-batch maximum before stacking. The
+    saved ``seq_lens`` field tells the visualizer how many valid
+    frames to render per row.
+    """
     ensure_dir(out_dir)
-    motions = np.stack([row[condition]["motion"] for row in per_clip])
-    np.savez(out_dir / "generated.npz", motion_263=motions)
+    motions_list = [row[condition]["motion"] for row in per_clip]
+    max_T = max(m.shape[0] for m in motions_list)
+    feat_dim = motions_list[0].shape[1]
+    padded = np.zeros((len(motions_list), max_T, feat_dim), dtype=np.float32)
+    for i, m in enumerate(motions_list):
+        padded[i, : m.shape[0]] = m
+    np.savez(out_dir / "generated.npz", motion_263=padded)
     summary = {
         "condition": condition,
         "texts": texts,
