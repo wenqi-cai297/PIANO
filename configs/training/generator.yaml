@@ -16,8 +16,8 @@ model:
   # what we finetune; VQ-VAE and ResidualTransformer stay frozen.
   # See analyses/early_setup.md for ``_sw`` suffix gotcha.
   checkpoints:
-    vq_vae: "checkpoints/momask/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
-    masked_transformer: "checkpoints/momask/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
 
 data:
   # Same 4 InterAct subset roots as Stage A. Stage B reads

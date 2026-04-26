@@ -77,10 +77,10 @@ generation:
 # Defaults match the layout used by the existing
 # ``scripts/prep/check_momask_weights.sh`` — adjust per-server.
 checkpoints:
-  vq_vae: "checkpoints/momask/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
-  masked_transformer: "checkpoints/momask/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
-  residual_transformer: "checkpoints/momask/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
-  length_estimator: "checkpoints/momask/length_estimator/model/finest.tar"
+  vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+  masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+  residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
+  length_estimator: "checkpoints/momask/t2m/length_estimator/model/finest.tar"
 
 # --- Motion representation ---
 motion:
