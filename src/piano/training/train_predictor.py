@@ -24,8 +24,10 @@ from piano.data.dataset import (
     AugmentConfig,
     HOIDataset,
     build_object_split,
+    build_subject_split,
     collate_hoi,
     compute_class_priors,
+    extract_subject_id,
 )
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.object_encoder import ObjectEncoder
@@ -44,17 +46,18 @@ from piano.utils.io_utils import load_json
 # Dataset assembly
 # ---------------------------------------------------------------------------
 
-def _collect_object_ids(roots: list) -> list[str]:
-    """Collect the union of object_ids across all dataset roots.
+def _read_metadata(roots: list) -> list[tuple[str, dict]]:
+    """Read every (subset_name, metadata_entry) pair across all roots.
 
     Reads each root's ``metadata_clean.json`` (or ``metadata.json``
     fallback — the clean variant is what HOIDataset prefers at train
-    time, so the split should be computed on the same universe). Returns
-    object_ids sorted for deterministic iteration across processes.
+    time, so the split must be computed on the same universe). Returns
+    a flat list of (subset_name, entry) tuples; downstream callers can
+    project to object_ids or subject_ids as needed.
     """
     from pathlib import Path
 
-    seen: set[str] = set()
+    out: list[tuple[str, dict]] = []
     for entry in roots:
         root = Path(entry.root)
         meta_path = root / "metadata_clean.json"
@@ -62,11 +65,112 @@ def _collect_object_ids(roots: list) -> list[str]:
             meta_path = root / "metadata.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"metadata not found in {root}")
+        subset_name = root.name
         for m in load_json(meta_path):
-            obj_id = m.get("object_id")
-            if obj_id is not None:
-                seen.add(obj_id)
+            out.append((subset_name, m))
+    return out
+
+
+def _collect_object_ids(roots: list) -> list[str]:
+    """Sorted unique object_ids across all roots (legacy / object_split path)."""
+    seen: set[str] = set()
+    for _, m in _read_metadata(roots):
+        obj_id = m.get("object_id")
+        if obj_id is not None:
+            seen.add(obj_id)
     return sorted(seen)
+
+
+def _collect_subject_keys(roots: list) -> list[tuple[str, str]]:
+    """Collect (subset_name, raw_subject_id) across all roots.
+
+    Used to feed ``build_subject_split``. Drops entries whose seq_id
+    doesn't parse for the subset (subset has no pattern, or seq_id
+    format unexpected) — these would also be dropped at HOIDataset
+    filter time, so excluding them from the split universe is consistent.
+    Deduped within each subset; outer list preserves duplicates only
+    across subsets (which never collide since pattern keys are
+    subset-specific).
+    """
+    seen: set[tuple[str, str]] = set()
+    for subset_name, m in _read_metadata(roots):
+        raw_id = extract_subject_id(subset_name, m.get("seq_id", ""))
+        if raw_id is not None:
+            seen.add((subset_name, raw_id))
+    return sorted(seen)
+
+
+def _resolve_split(cfg, split_override: str | None) -> dict:
+    """Pick which split to apply (subject vs object) and return the
+    filter sets HOIDataset needs.
+
+    Precedence:
+      1. ``data.subject_split.enabled = true`` → primary path
+         (used as of 2026-04-26 / v6+).
+      2. ``data.object_split.enabled = true`` → secondary path,
+         kept for the optional novel-object ablation eval.
+      3. Neither enabled → no filter (use all clips).
+
+    Returns a dict with keys ``object_id_filter``, ``subject_id_filter``
+    (one or both can be None), and a ``label`` for log printing.
+    """
+    subj_cfg = cfg.data.get("subject_split")
+    obj_cfg = cfg.data.get("object_split")
+    bucket = split_override
+
+    # Primary: subject_split
+    if subj_cfg is not None and subj_cfg.get("enabled", False):
+        subject_keys = _collect_subject_keys(cfg.data.datasets)
+        splits = build_subject_split(
+            subject_keys,
+            train_pct=subj_cfg.train_pct,
+            val_pct=subj_cfg.val_pct,
+            seed=subj_cfg.seed,
+        )
+        b = bucket or subj_cfg.get("split", "train")
+        if b == "all":
+            allowed = None
+        elif b in splits:
+            allowed = splits[b]
+        else:
+            raise ValueError(f"unknown subject_split bucket: {b!r}; expected train/val/all")
+        return {
+            "object_id_filter": None,
+            "subject_id_filter": allowed,
+            "label": f"subject_split[{b}] ({len(allowed) if allowed else 'all'} subjects)",
+        }
+
+    # Secondary: object_split (legacy / ablation only)
+    if obj_cfg is not None and obj_cfg.get("enabled", False):
+        object_ids = _collect_object_ids(cfg.data.datasets)
+        splits = build_object_split(
+            object_ids,
+            train_pct=obj_cfg.train_pct,
+            val_pct=obj_cfg.val_pct,
+            test_pct=obj_cfg.test_pct,
+            seed=obj_cfg.seed,
+        )
+        b = bucket or obj_cfg.get("split", "train")
+        if b == "val+test":
+            allowed = splits["val"] | splits["test"]
+        elif b == "all":
+            allowed = None
+        elif b in splits:
+            allowed = splits[b]
+        else:
+            raise ValueError(f"unknown object_split bucket: {b!r}")
+        return {
+            "object_id_filter": allowed,
+            "subject_id_filter": None,
+            "label": f"object_split[{b}] ({len(allowed) if allowed else 'all'} objects)",
+        }
+
+    # No split configured
+    return {
+        "object_id_filter": None,
+        "subject_id_filter": None,
+        "label": "no_split (all clips)",
+    }
 
 
 def _build_dataset(
@@ -76,33 +180,14 @@ def _build_dataset(
 ) -> ConcatDataset:
     """Build a Stage A dataset from the 4 InterAct subset roots.
 
-    Applies the object-id split (H5). Caller decides which bucket via
-    ``split_override`` (``train`` / ``val`` / ``test`` / ``val+test``
-    / ``all``) or lets the config default take effect. Augmentation is
-    toggleable independent of the split so the val loader can share
-    this builder with augmentation disabled.
+    Applies the configured split (subject_split if enabled, else
+    object_split, else no filter). ``split_override`` lets the caller
+    pick a bucket different from the config default — used by the val
+    loader to grab the "val" bucket when training is on "train".
+    Augmentation is toggleable independent of the split so the val
+    loader can share this builder with augmentation disabled.
     """
-    # Object-id split — deterministic hash, identical across ranks.
-    split_cfg = cfg.data.object_split
-    allowed_object_ids: set[str] | None = None
-    if split_cfg.enabled:
-        object_ids = _collect_object_ids(cfg.data.datasets)
-        splits = build_object_split(
-            object_ids,
-            train_pct=split_cfg.train_pct,
-            val_pct=split_cfg.val_pct,
-            test_pct=split_cfg.test_pct,
-            seed=split_cfg.seed,
-        )
-        bucket = split_override or split_cfg.get("split", "train")
-        if bucket == "val+test":
-            allowed_object_ids = splits["val"] | splits["test"]
-        elif bucket == "all":
-            allowed_object_ids = None   # no filter
-        elif bucket in splits:
-            allowed_object_ids = splits[bucket]
-        else:
-            raise ValueError(f"unknown object_split bucket: {bucket!r}")
+    split_info = _resolve_split(cfg, split_override)
 
     # Augmentation — mirror + Y-rotation + pc jitter (train only by default).
     aug_cfg = cfg.data.get("augmentation", None)
@@ -125,7 +210,8 @@ def _build_dataset(
             root=entry.root,
             pseudo_label_dir=pseudo_label_dir,
             max_seq_length=cfg.data.max_seq_length,
-            object_id_filter=allowed_object_ids,
+            object_id_filter=split_info["object_id_filter"],
+            subject_id_filter=split_info["subject_id_filter"],
             augment=augment,
         )
         datasets.append(ds)
@@ -292,9 +378,10 @@ def run(config_path: str) -> None:
     # dataloader is constructed later, after the criterion + optimizer
     # + scheduler so all four can share one accelerator.prepare call.)
     dataset = _build_dataset(cfg)
+    train_split_info = _resolve_split(cfg, split_override=None)
     accelerator.print(
         f"Train dataset: {len(dataset)} clips across {len(cfg.data.datasets)} roots "
-        f"(split={cfg.data.object_split.get('split', 'train')})",
+        f"(split={train_split_info['label']})",
     )
 
     # Logit Adjustment class priors (Menon ICLR'21) — needed before
@@ -350,18 +437,25 @@ def run(config_path: str) -> None:
         pin_memory=True, drop_last=True,
     )
 
-    # Val dataloader — same builder with split=val+test, augmentation
+    # Val dataloader — same builder with split=val, augmentation
     # disabled. Used by the in-training keep-best-val loop in
     # run_training_loop. Skipped when val_every_epochs <= 0.
+    # (As of 2026-04-26 / v6+ we drop the test bucket from any
+    # development-time signal — the predictor's only metric that
+    # matters for the paper is the downstream generation quality
+    # in Stage C, so a held-out test set on the predictor is unused.
+    # The 85/15 train/val subject_split + this "val" bucket is the
+    # entire eval surface during Stage A development.)
     val_dataloader = None
     val_every_epochs = int(cfg.training.get("val_every_epochs", 0))
     if val_every_epochs > 0:
         val_dataset = _build_dataset(
-            cfg, split_override="val+test", enable_augment=False,
+            cfg, split_override="val", enable_augment=False,
         )
+        val_split_info = _resolve_split(cfg, split_override="val")
         accelerator.print(
             f"Val dataset:   {len(val_dataset)} clips "
-            f"(split=val+test, augmentation disabled)",
+            f"(split={val_split_info['label']}, augmentation disabled)",
         )
         val_dataloader = DataLoader(
             val_dataset, batch_size=cfg.training.batch_size,

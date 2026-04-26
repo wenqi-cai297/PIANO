@@ -6,7 +6,6 @@ the interaction predictor and motion generator.
 """
 from __future__ import annotations
 
-import hashlib
 import math
 import random
 import re
@@ -66,53 +65,18 @@ _BODY_PART_LR_PAIRS: tuple[tuple[int, int], ...] = ((0, 1), (2, 3))
 
 
 # ---------------------------------------------------------------------------
-# Object-id split (H5)
+# Train/val splits live in piano.data.split — pure-Python, no torch dep.
+# Re-exported here so existing call sites (training scripts) keep their
+# imports stable: `from piano.data.dataset import build_subject_split`
+# still works; the test suite imports from the underlying module
+# directly to avoid pulling in torch.
 # ---------------------------------------------------------------------------
 
-def build_object_split(
-    object_ids: list[str],
-    train_pct: int = 85,
-    val_pct: int = 8,
-    test_pct: int = 7,
-    seed: int = 42,
-) -> dict[str, set[str]]:
-    """Deterministically assign each object_id to train / val / test.
-
-    Uses md5(seed || obj_id) % 100 so the split is reproducible across
-    processes (no global state), stable under object-id additions, and
-    does not require a pre-shuffled list. All processes in DDP end up
-    with the same split without having to broadcast it.
-
-    Parameters
-    ----------
-    object_ids : unique object ids across all subsets.
-    train_pct / val_pct / test_pct : must sum to 100.
-    seed : changes the hash salt, shuffles the assignment.
-
-    Returns
-    -------
-    dict with keys "train" / "val" / "test" → set of object_ids.
-    """
-    if train_pct + val_pct + test_pct != 100:
-        raise ValueError(
-            f"train_pct + val_pct + test_pct must sum to 100, "
-            f"got {train_pct + val_pct + test_pct}",
-        )
-
-    train: set[str] = set()
-    val: set[str] = set()
-    test: set[str] = set()
-    for obj_id in object_ids:
-        # Salted hash — seed=0 gives a different split than seed=42 etc.
-        h = hashlib.md5(f"{seed}::{obj_id}".encode("utf-8")).hexdigest()[:8]
-        bucket = int(h, 16) % 100
-        if bucket < train_pct:
-            train.add(obj_id)
-        elif bucket < train_pct + val_pct:
-            val.add(obj_id)
-        else:
-            test.add(obj_id)
-    return {"train": train, "val": val, "test": test}
+from piano.data.split import (
+    build_object_split,
+    build_subject_split,
+    extract_subject_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +129,17 @@ class HOIDataset(Dataset):
         filtered set once it exists; set False to train on the raw set.
     object_id_filter : optional set of object_ids. When provided, only
         metadata entries whose object_id is in the set are retained —
-        used by the H5 train/val/test split.
+        used by the secondary (object-id) split, kept for novel-object
+        ablation eval.
+    subject_id_filter : optional set of namespaced subject keys of the
+        form ``"{subset}/{raw_subject_id}"``. When provided, only
+        metadata entries whose seq_id parses to a subject in the set
+        are retained — used by the primary (subject-id) split as of
+        2026-04-26. The subset name is taken from ``self.root.name``;
+        subject extraction uses ``extract_subject_id``. Entries whose
+        seq_id doesn't parse (subset has no pattern, or seq_id format
+        unexpected) are dropped — preferable to silently keeping them
+        in train and leaking into val.
     augment : optional AugmentConfig. When ``augment.enabled`` is True,
         each __getitem__ randomly applies (mirror, rotate around Y, pc
         jitter) per the config probabilities. Disabled by default so
@@ -180,6 +154,7 @@ class HOIDataset(Dataset):
         num_object_points: int = 1024,
         use_clean_metadata: bool = True,
         object_id_filter: set[str] | None = None,
+        subject_id_filter: set[str] | None = None,
         augment: AugmentConfig | None = None,
     ) -> None:
         self.root = Path(root)
@@ -203,10 +178,27 @@ class HOIDataset(Dataset):
             raise FileNotFoundError(f"metadata not found in {self.root}")
         metadata: list[dict] = load_json(meta_path)
 
-        # Object-id split filter (H5). Drops metadata entries whose
-        # object_id is not in the allowed set.
+        # Object-id split filter (legacy primary, now secondary —
+        # used only by the novel-object ablation eval). Drops metadata
+        # entries whose object_id is not in the allowed set.
         if object_id_filter is not None:
             metadata = [m for m in metadata if m.get("object_id") in object_id_filter]
+
+        # Subject-id split filter (primary as of 2026-04-26). Drops
+        # metadata entries whose extracted subject (namespaced as
+        # "{subset}/{raw_subject_id}") is not in the allowed set.
+        # Entries whose seq_id doesn't parse fall through to "drop";
+        # cheaper than silently keeping them in the wrong bucket.
+        if subject_id_filter is not None:
+            subset_name = self.root.name
+            kept = []
+            for m in metadata:
+                raw_id = extract_subject_id(subset_name, m.get("seq_id", ""))
+                if raw_id is None:
+                    continue
+                if f"{subset_name}/{raw_id}" in subject_id_filter:
+                    kept.append(m)
+            metadata = kept
 
         self.metadata = metadata
         self.metadata_source = meta_path.name

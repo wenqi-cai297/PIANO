@@ -44,7 +44,9 @@ from piano.data.dataset import (
     AugmentConfig,
     HOIDataset,
     build_object_split,
+    build_subject_split,
     collate_hoi,
+    extract_subject_id,
 )
 from piano.data.pseudo_labels.extract_phase import PHASE_NAMES
 from piano.models.interaction_predictor import InteractionPredictor
@@ -59,8 +61,13 @@ from piano.utils.io_utils import load_json
 # evaluates on a single named bucket, no augmentation)
 # ---------------------------------------------------------------------------
 
-def _collect_object_ids(roots) -> list[str]:
-    seen: set[str] = set()
+def _read_metadata(roots) -> list[tuple[str, dict]]:
+    """Flat list of (subset_name, metadata_entry) across all roots.
+
+    Reads metadata_clean.json when present, else metadata.json, so the
+    split universe matches what HOIDataset uses at load time.
+    """
+    out: list[tuple[str, dict]] = []
     for entry in roots:
         root = Path(entry.root)
         meta_path = root / "metadata_clean.json"
@@ -69,44 +76,117 @@ def _collect_object_ids(roots) -> list[str]:
         if not meta_path.exists():
             raise FileNotFoundError(f"metadata not found in {root}")
         for m in load_json(meta_path):
-            if (obj := m.get("object_id")) is not None:
-                seen.add(obj)
+            out.append((root.name, m))
+    return out
+
+
+def _collect_object_ids(roots) -> list[str]:
+    seen: set[str] = set()
+    for _, m in _read_metadata(roots):
+        if (obj := m.get("object_id")) is not None:
+            seen.add(obj)
     return sorted(seen)
 
 
-def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict[str, set[str]], set[str]]:
-    """Return (ConcatDataset, full_split_map, allowed_object_ids)."""
-    object_ids = _collect_object_ids(cfg.data.datasets)
-    split_cfg = cfg.data.object_split
-    splits = build_object_split(
-        object_ids,
-        train_pct=split_cfg.train_pct,
-        val_pct=split_cfg.val_pct,
-        test_pct=split_cfg.test_pct,
-        seed=split_cfg.seed,
-    )
+def _collect_subject_keys(roots) -> list[tuple[str, str]]:
+    """Sorted unique (subset, raw_subject_id) pairs across all roots."""
+    seen: set[tuple[str, str]] = set()
+    for subset_name, m in _read_metadata(roots):
+        raw_id = extract_subject_id(subset_name, m.get("seq_id", ""))
+        if raw_id is not None:
+            seen.add((subset_name, raw_id))
+    return sorted(seen)
 
-    if split == "val+test":
-        allowed = splits["val"] | splits["test"]
-    elif split == "all":
-        allowed = splits["train"] | splits["val"] | splits["test"]
-    elif split in splits:
-        allowed = splits[split]
-    else:
-        raise ValueError(f"unknown split {split!r}; expected train/val/test/val+test/all")
 
+def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict, dict]:
+    """Apply the configured split (subject_split if enabled, else
+    object_split, else no filter) and return (dataset, splits_map, info).
+
+    ``info`` carries enough diagnostic data for the JSON report to
+    surface which split was used and how many subjects/objects were in
+    each bucket.
+
+    The legacy ``"val+test"`` split keyword is supported only when
+    object_split is the active path (back-compat for the secondary
+    ablation entry point). Under subject_split there is no test bucket
+    by design — paper-final metrics live downstream in Stage C eval.
+    """
     pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+
+    subj_cfg = cfg.data.get("subject_split")
+    obj_cfg = cfg.data.get("object_split")
+
+    object_id_filter: set[str] | None = None
+    subject_id_filter: set[str] | None = None
+    splits_map: dict = {}
+    info: dict = {}
+
+    if subj_cfg is not None and subj_cfg.get("enabled", False):
+        subject_keys = _collect_subject_keys(cfg.data.datasets)
+        splits_map = build_subject_split(
+            subject_keys,
+            train_pct=subj_cfg.train_pct,
+            val_pct=subj_cfg.val_pct,
+            seed=subj_cfg.seed,
+        )
+        if split == "all":
+            subject_id_filter = splits_map["train"] | splits_map["val"]
+        elif split in splits_map:
+            subject_id_filter = splits_map[split]
+        else:
+            raise ValueError(
+                f"unknown split {split!r} under subject_split; "
+                f"expected train/val/all (no test bucket — see "
+                f"build_subject_split docstring)"
+            )
+        info = {
+            "split_kind": "subject_split",
+            "num_subjects_train": len(splits_map["train"]),
+            "num_subjects_val": len(splits_map["val"]),
+            "num_subjects_used": len(subject_id_filter) if subject_id_filter else 0,
+        }
+    elif obj_cfg is not None and obj_cfg.get("enabled", False):
+        object_ids = _collect_object_ids(cfg.data.datasets)
+        splits_map = build_object_split(
+            object_ids,
+            train_pct=obj_cfg.train_pct,
+            val_pct=obj_cfg.val_pct,
+            test_pct=obj_cfg.test_pct,
+            seed=obj_cfg.seed,
+        )
+        if split == "val+test":
+            object_id_filter = splits_map["val"] | splits_map["test"]
+        elif split == "all":
+            object_id_filter = splits_map["train"] | splits_map["val"] | splits_map["test"]
+        elif split in splits_map:
+            object_id_filter = splits_map[split]
+        else:
+            raise ValueError(
+                f"unknown split {split!r} under object_split; "
+                f"expected train/val/test/val+test/all"
+            )
+        info = {
+            "split_kind": "object_split",
+            "num_objects_train": len(splits_map["train"]),
+            "num_objects_val": len(splits_map["val"]),
+            "num_objects_test": len(splits_map["test"]),
+            "num_objects_used": len(object_id_filter) if object_id_filter else 0,
+        }
+    else:
+        info = {"split_kind": "none"}
+
     datasets = [
         HOIDataset(
             root=entry.root,
             pseudo_label_dir=pseudo_label_dir,
             max_seq_length=cfg.data.max_seq_length,
-            object_id_filter=allowed,
+            object_id_filter=object_id_filter,
+            subject_id_filter=subject_id_filter,
             augment=AugmentConfig(enabled=False),   # eval → deterministic
         )
         for entry in cfg.data.datasets
     ]
-    return ConcatDataset(datasets), splits, allowed
+    return ConcatDataset(datasets), splits_map, info
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +313,23 @@ def run_eval(
     device: torch.device,
 ) -> dict:
     # Data
-    dataset, splits_map, allowed = _build_eval_dataset(cfg, split)
-    print(
-        f"[split={split}] train={len(splits_map['train'])} "
-        f"val={len(splits_map['val'])} test={len(splits_map['test'])} "
-        f"objects in total → using {len(allowed)} objects, {len(dataset)} clips"
-    )
+    dataset, splits_map, split_info = _build_eval_dataset(cfg, split)
+    if split_info["split_kind"] == "subject_split":
+        print(
+            f"[split={split}] subject_split: "
+            f"train_subjects={len(splits_map['train'])} "
+            f"val_subjects={len(splits_map['val'])} "
+            f"→ using {split_info['num_subjects_used']} subjects, {len(dataset)} clips"
+        )
+    elif split_info["split_kind"] == "object_split":
+        print(
+            f"[split={split}] object_split (legacy / ablation): "
+            f"train={len(splits_map['train'])} "
+            f"val={len(splits_map['val'])} test={len(splits_map['test'])} "
+            f"objects → using {split_info['num_objects_used']} objects, {len(dataset)} clips"
+        )
+    else:
+        print(f"[split={split}] no_split: {len(dataset)} clips (no filter)")
     if len(dataset) == 0:
         raise RuntimeError(f"empty dataset for split={split!r}")
 
@@ -579,16 +670,33 @@ def run_eval(
     # Losses → mean over batches
     loss_mean = {k: v / max(n_loss_batches, 1) for k, v in loss_sums.items()}
 
+    # Split summary — flat fields shaped by which split is active so
+    # downstream scripts can read either schema. Under subject_split
+    # we emit `num_subjects_*`; under object_split we emit
+    # `num_objects_*` (matching the legacy schema for back-compat).
+    split_summary = {"split_kind": split_info["split_kind"]}
+    if split_info["split_kind"] == "subject_split":
+        split_summary.update({
+            "num_subjects_total": len(splits_map["train"]) + len(splits_map["val"]),
+            "num_subjects_train": len(splits_map["train"]),
+            "num_subjects_val": len(splits_map["val"]),
+            "num_subjects_used": split_info["num_subjects_used"],
+        })
+    elif split_info["split_kind"] == "object_split":
+        split_summary.update({
+            "num_objects_total": len(splits_map["train"]) + len(splits_map["val"]) + len(splits_map["test"]),
+            "num_objects_train": len(splits_map["train"]),
+            "num_objects_val": len(splits_map["val"]),
+            "num_objects_test": len(splits_map["test"]),
+            "num_objects_used": split_info["num_objects_used"],
+        })
+
     report = {
         "checkpoint": str(ckpt_path),
         "epoch": meta["epoch"],
         "global_step": meta["global_step"],
         "split": split,
-        "num_objects_total": len(splits_map["train"]) + len(splits_map["val"]) + len(splits_map["test"]),
-        "num_objects_train": len(splits_map["train"]),
-        "num_objects_val": len(splits_map["val"]),
-        "num_objects_test": len(splits_map["test"]),
-        "num_objects_used": len(allowed),
+        **split_summary,
         "num_clips": total_clips,
         "num_valid_frames": total_valid_frames,
         "eval_time_sec": round(elapsed, 1),
@@ -630,8 +738,14 @@ def _print_report(r: dict) -> None:
     print(f"Stage A predictor eval — split={r['split']}")
     print(f"  ckpt: {r['checkpoint']}")
     print(f"  epoch={r['epoch']}  global_step={r['global_step']}")
-    print(f"  objects: {r['num_objects_used']}/{r['num_objects_total']} "
-          f"(train={r['num_objects_train']} val={r['num_objects_val']} test={r['num_objects_test']})")
+    kind = r.get("split_kind", "object_split")
+    if kind == "subject_split":
+        print(f"  subjects: {r.get('num_subjects_used','?')}/{r.get('num_subjects_total','?')} "
+              f"(train={r.get('num_subjects_train','?')} val={r.get('num_subjects_val','?')})")
+    elif kind == "object_split":
+        print(f"  objects: {r.get('num_objects_used','?')}/{r.get('num_objects_total','?')} "
+              f"(train={r.get('num_objects_train','?')} val={r.get('num_objects_val','?')} "
+              f"test={r.get('num_objects_test','?')})")
     print(f"  clips: {r['num_clips']}   valid frames: {r['num_valid_frames']}")
     print("-" * 78)
 
@@ -733,6 +847,10 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--split", type=str, default="val",
+        # Under subject_split (primary as of 2026-04-26): {train, val, all}.
+        # Under object_split (legacy / ablation only): {train, val, test,
+        # val+test, all}. The validator inside _build_eval_dataset
+        # enforces the per-path subset.
         choices=["train", "val", "test", "val+test", "all"],
         help="which object-id bucket to evaluate on (default: val)",
     )

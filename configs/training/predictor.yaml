@@ -35,17 +35,40 @@ data:
   max_seq_length: 196
   fps: 20                        # InterAct preprocessed data rate
 
-  # Object-id split (H5). Deterministic hash on object_id assigns each
-  # of the 106 unique objects to train/val/test. Stage A trains on
-  # `train` only; `val`/`test` objects are held out for post-training
-  # evaluation (H4 val loop lands after Stage A completes).
-  object_split:
+  # PRIMARY (as of 2026-04-26 / v6+): subject-id split. Stratified per
+  # subset so each of the 4 InterAct subsets contributes proportionally
+  # to both train and val. Aligns with the HOI generation field standard
+  # (BEHAVE/GRAB/OMOMO/InterAct all split by subject, not object —
+  # CG-HOI CVPR'24, HOI-Diff, OMOMO SIGGRAPH Asia'23, etc).
+  #
+  # No test bucket: PIANO's only paper-grade metric is downstream
+  # generation quality (Stage C). The Stage A predictor is an
+  # intermediate component, so train/val is sufficient — the val bucket
+  # is what we look at every iteration to decide v_n -> v_{n+1}.
+  #
+  # Per-subset 85/15 yields: chairs ~343/60 subjects, imhd 8/1,
+  # neuraldome 8-9/1-2, omomo 14/3 (verified locally on v11 metadata).
+  subject_split:
     enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"               # train | val | all
+
+  # SECONDARY (legacy primary, demoted 2026-04-26): object-id split.
+  # Reserved for the optional "novel object generalisation" ablation
+  # table — set enabled=true here AND enabled=false on subject_split
+  # above to switch paths. Used as Stage A primary in v1-v5; v5 per-
+  # object analysis showed 35cm val L2 was outlier-driven (omomo tripod
+  # / largetable both novel-geometry, no train neighbour) — see
+  # analyses/2026-04-26_*_per_object_analysis.md for the full diagnosis.
+  object_split:
+    enabled: false
     train_pct: 85
     val_pct: 8
     test_pct: 7
     seed: 42
-    split: "train"               # train | val | test | all
+    split: "train"               # train | val | test | val+test | all
 
   # Data augmentation (Stage A only). Applied inside HOIDataset
   # __getitem__ before returning. Each is independent; all three are
