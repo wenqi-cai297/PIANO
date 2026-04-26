@@ -54,6 +54,8 @@ def motion_263_to_joints(
     fps: float = 20.0,
     mean: np.ndarray | None = None,
     std: np.ndarray | None = None,
+    world_R_y_angle: float | None = None,
+    world_T_xz: np.ndarray | None = None,
 ) -> np.ndarray:
     """Reconstruct 22 absolute joint positions from HumanML3D 263-dim features.
 
@@ -67,10 +69,21 @@ def motion_263_to_joints(
     motion : (T, 263) — HumanML3D features
     fps : unused (kept for API compatibility; recovery is frame-rate agnostic)
     mean, std : (263,) optional — denormalization stats applied before recovery
+    world_R_y_angle, world_T_xz : optional — per-clip canonical→world
+        transform (Y-axis rotation in radians, XZ translation 2-vector).
+        When supplied, joints recovered in HumanML3D canonical frame are
+        rotated by R_y around +Y and translated by (T_x, 0, T_z) so they
+        sit in the SOURCE clip's world frame. This is what lets a
+        canonical-frame generated motion be visualised together with a
+        world-frame object trajectory (without it the body always starts
+        at canonical origin while the object is metres away). Computed
+        in :func:`scripts/stage_b_generator/qual_eval._get_canon_to_world_transform`.
 
     Returns
     -------
-    joints : (T, 22, 3) — absolute joint positions in world frame
+    joints : (T, 22, 3) — absolute joint positions, in world frame when
+        ``world_R_y_angle`` + ``world_T_xz`` were provided, else in
+        canonical frame.
     """
     import torch
 
@@ -84,7 +97,22 @@ def motion_263_to_joints(
 
     data = torch.from_numpy(motion).float().unsqueeze(0)  # (1, T, 263)
     joints = recover_from_ric(data, joints_num=22)         # (1, T, 22, 3)
-    return joints.squeeze(0).cpu().numpy().astype(np.float32)
+    joints = joints.squeeze(0).cpu().numpy().astype(np.float32)
+
+    if world_R_y_angle is not None and world_T_xz is not None:
+        cos_a = float(np.cos(world_R_y_angle))
+        sin_a = float(np.sin(world_R_y_angle))
+        R = np.array(
+            [[cos_a, 0.0, sin_a],
+             [0.0,   1.0, 0.0],
+             [-sin_a, 0.0, cos_a]],
+            dtype=np.float32,
+        )
+        joints = joints @ R.T            # (T, 22, 3)
+        joints[..., 0] += float(world_T_xz[0])
+        joints[..., 2] += float(world_T_xz[1])
+
+    return joints
 
 
 def _axis_angle_to_rotmat(aa: np.ndarray) -> np.ndarray:
@@ -314,6 +342,8 @@ def load_generated_samples(run_dir: Path) -> list[dict]:
     object_positions = data["object_positions"] if "object_positions" in data.files else None
     object_rotations = data["object_rotations"] if "object_rotations" in data.files else None
     object_pcs = data["object_pc"] if "object_pc" in data.files else None
+    world_R_y = data["world_R_y_angle"] if "world_R_y_angle" in data.files else None
+    world_T_xz = data["world_T_xz"] if "world_T_xz" in data.files else None
 
     summary = load_json(summary_path) if summary_path.exists() else {}
     texts = summary.get("texts", [f"sample_{i}" for i in range(len(motion))])
@@ -330,6 +360,8 @@ def load_generated_samples(run_dir: Path) -> list[dict]:
             "object_positions": object_positions[i] if object_positions is not None else None,
             "object_rotations": object_rotations[i] if object_rotations is not None else None,
             "object_pc": object_pcs[i] if object_pcs is not None else None,
+            "world_R_y_angle": float(world_R_y[i]) if world_R_y is not None else None,
+            "world_T_xz": world_T_xz[i] if world_T_xz is not None else None,
             "num_frames": int(seq_lens[i] if i < len(seq_lens) else motion[i].shape[0]),
         })
     return samples
@@ -372,6 +404,8 @@ def run_visualization(
         else:
             joints = motion_263_to_joints(
                 sample["motion_263"], fps=fps, mean=mean, std=std,
+                world_R_y_angle=sample.get("world_R_y_angle"),
+                world_T_xz=sample.get("world_T_xz"),
             )
 
         # Clip joints to actual number of frames

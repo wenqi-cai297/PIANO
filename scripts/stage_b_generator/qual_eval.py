@@ -299,6 +299,78 @@ def _generate(
 # Diff metrics
 # ============================================================================
 
+# ============================================================================
+# Coordinate-frame helpers
+# ============================================================================
+
+def _get_canon_to_world_transform(
+    joints_world: np.ndarray,
+    motion_263: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    """Recover the (R_y_angle, T_xz) that maps canonical → world for one clip.
+
+    HumanML3D canonicalization (verified from MoMask
+    ``utils/motion_process.process_file``) (1) translates so frame-0
+    pelvis sits at XZ origin and (2) rotates around Y so a hip-line-derived
+    "facing direction" aligns with +Z. This function inverts both steps
+    by comparing frame-0 of:
+
+      - ``joints_world``  — (T, 22, 3) preprocessed in world frame
+        (saved by ``preprocess_interact.py`` as ``joints_22``)
+      - ``motion_263``    — canonical-frame HumanML3D 263-d features
+
+    so the GENERATED motion (which is also in canonical frame, since it
+    came out of the VQ-VAE that was trained on HumanML3D) can be lifted
+    back into THIS source clip's world frame for visualization.
+
+    Returns
+    -------
+    R_y_angle : scalar — rotation around +Y, in radians
+    T_xz : (2,) — translation along world X and Z (Y is preserved by
+        canonicalization, so no T_y component)
+    """
+    # MoMask path is set up at module import via momask_adapter — the
+    # qual_eval entrypoint already imports it. ``recover_from_ric`` is
+    # the canonical-frame integrator HumanML3D ships with.
+    import torch
+    import piano.models.backbones.momask_adapter  # noqa: F401
+    from utils.motion_process import recover_from_ric
+
+    canonical_joints = recover_from_ric(
+        torch.from_numpy(motion_263).float().unsqueeze(0),
+        joints_num=22,
+    ).squeeze(0).cpu().numpy().astype(np.float32)   # (T, 22, 3)
+
+    # Frame 0 anchor.
+    world_t0 = joints_world[0]                       # (22, 3)
+    canon_t0 = canonical_joints[0]                   # (22, 3)
+
+    # Translation: where does frame-0 pelvis sit in world? Canonical
+    # pelvis is at (0, h, 0); world pelvis is at world_t0[0]. The XZ
+    # delta is the translation we need.
+    T_xz = world_t0[0, [0, 2]] - canon_t0[0, [0, 2]]
+
+    # Rotation around Y: align hip-line directions. Right hip (joint 2)
+    # minus left hip (joint 1) is approximately horizontal across the
+    # hips and rotates with the body's facing — exactly the signal
+    # canonicalization aligns to +Z.
+    hip_world = world_t0[2] - world_t0[1]
+    hip_canon = canon_t0[2] - canon_t0[1]
+    angle_world = float(np.arctan2(hip_world[0], hip_world[2]))
+    angle_canon = float(np.arctan2(hip_canon[0], hip_canon[2]))
+    R_y_angle = angle_world - angle_canon
+    return R_y_angle, T_xz.astype(np.float32)
+
+
+# (Transform application moved to visualize_motion.motion_263_to_joints
+# so denormalization (mean/std) and joint recovery happen in the right
+# order. qual_eval only computes + saves the per-clip (R_y, T_xz) params.)
+
+
+# ============================================================================
+# Diff metrics
+# ============================================================================
+
 def _hamming(a: np.ndarray, b: np.ndarray, valid_lens: int | None = None) -> float:
     """Per-position fraction of disagreement on valid tokens.
 
@@ -374,6 +446,21 @@ def main() -> int:
     seq_lens_tok = [max(1, n // token_stride) for n in seq_lens_frames]
     texts = [str(s["text"]) for s in samples]
     seq_ids = [str(s["seq_id"]) for s in samples]
+    # Per-source-clip world transform (R_y, T_xz) so we can put generated
+    # canonical-frame motion back into the SOURCE's world frame and
+    # render it together with the world-frame object. Without this, the
+    # body always starts at canonical origin while the object sits 1-3m
+    # away → visually they never interact regardless of z_int quality.
+    # See ``_get_canon_to_world_transform`` for the math.
+    source_canon_xforms: list[tuple[float, np.ndarray]] = []
+    for s in samples:
+        # joints_22 is world frame, motion is canonical (per
+        # analyses/early_setup.md "Two coordinate frames, kept side-by-side").
+        Ry, Txz = _get_canon_to_world_transform(
+            s["joints"].cpu().numpy(),       # (T, 22, 3) world
+            s["motion"].cpu().numpy(),       # (T, 263) canonical motion_263
+        )
+        source_canon_xforms.append((Ry, Txz))
     # Per-clip object info captured for visualization overlay. PC is the
     # subsampled-1024 cloud HOIDataset already returns; positions /
     # rotations come straight from the source clip's preprocessed npz
@@ -453,6 +540,8 @@ def main() -> int:
         object_pcs=object_pcs,
         object_positions=object_positions,
         object_rotations=object_rotations,
+        world_R_y=[x[0] for x in source_canon_xforms],
+        world_T_xz=[x[1] for x in source_canon_xforms],
     )
     _save_condition_dir(
         args.output_dir / "text_only", per_clip_default, "text_only",
@@ -460,6 +549,8 @@ def main() -> int:
         object_pcs=object_pcs,
         object_positions=object_positions,
         object_rotations=object_rotations,
+        world_R_y=[x[0] for x in source_canon_xforms],
+        world_T_xz=[x[1] for x in source_canon_xforms],
     )
     _save_condition_dir(
         args.output_dir / "swap", per_clip_default, "swap",
@@ -467,6 +558,8 @@ def main() -> int:
         object_pcs=object_pcs,
         object_positions=object_positions,
         object_rotations=object_rotations,
+        world_R_y=[x[0] for x in source_canon_xforms],
+        world_T_xz=[x[1] for x in source_canon_xforms],
     )
 
     # Diff metrics for the default run.
@@ -527,6 +620,8 @@ def _save_condition_dir(
     object_pcs: list[np.ndarray] | None = None,
     object_positions: list[np.ndarray] | None = None,
     object_rotations: list[np.ndarray] | None = None,
+    world_R_y: list[float] | None = None,
+    world_T_xz: list[np.ndarray] | None = None,
 ) -> None:
     """Save one condition as visualize_motion-compatible run dir.
 
@@ -558,6 +653,10 @@ def _save_condition_dir(
         save_kwargs["object_positions"] = _pad_per_frame_to(object_positions, max_T)
     if object_rotations is not None:
         save_kwargs["object_rotations"] = _pad_per_frame_to(object_rotations, max_T)
+    if world_R_y is not None:
+        save_kwargs["world_R_y_angle"] = np.asarray(world_R_y, dtype=np.float32)
+    if world_T_xz is not None:
+        save_kwargs["world_T_xz"] = np.stack(world_T_xz).astype(np.float32)
 
     np.savez(out_dir / "generated.npz", **save_kwargs)
     summary = {
