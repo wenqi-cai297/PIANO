@@ -132,6 +132,18 @@ class InterControlTransformerEncoder(nn.Module):
             nn.init.zeros_(conn.weight)
             nn.init.zeros_(conn.bias)
 
+        # Compatibility alias: the v0.6 ``MaskTransformerEncoderWithInteraction``
+        # exposes ``.layers`` as the IntXAttn-bearing blocks (each has
+        # ``.gamma_int``). Several call sites — train_generator's
+        # γ_int_abs_mean diagnostic, measure_effect_size's hook attach,
+        # tests/test_motion_generator.py param-group test — iterate
+        # ``encoder.layers`` to find the per-block γ. In v0.3-δ those
+        # γ live on the **control branch** (the trainable copy with
+        # IntXAttn). Aliasing ``layers`` to ``ctrl_layers`` lets the
+        # existing diagnostics work transparently. Main branch layers
+        # (frozen, no γ) stay accessible as ``main_layers``.
+        self.layers = self.ctrl_layers
+
     def freeze_main_branch(self) -> None:
         """Set ``requires_grad=False`` on all main-branch layer params.
 
