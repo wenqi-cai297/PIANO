@@ -48,10 +48,12 @@ from piano.data.dataset import (
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.models.backbones.momask_adapter import (
     load_momask_mask_transformer,
+    load_momask_residual_transformer,
     load_momask_vqvae,
 )
 from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.motion_generator import InteractionMaskTransformer
+from piano.training.contact_eval import build_contact_eval_fn
 from piano.training.trainer import build_scheduler, run_training_loop
 from piano.utils.io_utils import load_json
 
@@ -584,6 +586,79 @@ def run(config_path: str) -> None:
         except ImportError:
             pass
 
+    # ---- Contact-aware checkpointing (B1) ----
+    # Per analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md: the
+    # training objective (masked-CE) is empirically decoupled from the
+    # ship metric (geometric body-to-object distance). We additionally
+    # save best_contact.pt selected on a fixed mini-eval-set's contact
+    # distance. Disabled by default for backward compatibility with
+    # configs that don't declare training.contact_eval; future Stage B
+    # configs should set training.contact_eval.enabled: true.
+    contact_eval_cfg = cfg.training.get("contact_eval", None)
+    contact_eval_enabled = (
+        contact_eval_cfg is not None
+        and bool(contact_eval_cfg.get("enabled", False))
+        and val_every_epochs > 0
+    )
+    contact_eval_fn = None
+    if contact_eval_enabled:
+        # Load the frozen residual transformer (only main process generates,
+        # but every rank must load so torch.distributed broadcast in the
+        # trainer matches; the model itself is small).
+        accelerator.print("Loading MoMask Residual Transformer for contact eval...")
+        res_ckpt = model_cfg.checkpoints.get("residual_transformer", None)
+        if res_ckpt is None:
+            raise ValueError(
+                "training.contact_eval.enabled=true requires "
+                "configs/model/motion_generator.yaml to declare "
+                "checkpoints.residual_transformer.",
+            )
+        res_transformer = load_momask_residual_transformer(
+            res_ckpt,
+            code_dim=model_cfg.residual_transformer.get("code_dim", 512),
+            latent_dim=model_cfg.residual_transformer.latent_dim,
+            ff_size=model_cfg.residual_transformer.ff_size,
+            num_layers=model_cfg.residual_transformer.num_layers,
+            num_heads=model_cfg.residual_transformer.num_heads,
+            dropout=model_cfg.residual_transformer.dropout,
+            cond_drop_prob=model_cfg.residual_transformer.cond_drop_prob,
+            num_quantizers=model_cfg.vq_vae.num_quantizers,
+            shared_codebook=model_cfg.residual_transformer.shared_codebook,
+            share_weight=model_cfg.residual_transformer.share_weight,
+            device=str(device),
+        )
+        res_transformer.eval()
+
+        # Build a fixed mini-batch from the first N val clips. shuffle=False
+        # in val_dataloader makes this deterministic.
+        num_clips = int(contact_eval_cfg.get("num_clips", 5))
+        # Build a single-shot loader for the fixed batch (don't go through
+        # accelerator.prepare — eval runs on main process only, and we want
+        # the un-sharded view of val_dataset).
+        fixed_loader = DataLoader(
+            val_dataset, batch_size=num_clips,
+            shuffle=False, collate_fn=collate_hoi,
+            num_workers=0, drop_last=False,
+        )
+        fixed_val_batch = next(iter(fixed_loader))
+        accelerator.print(
+            f"Contact eval: {num_clips} fixed val clips "
+            f"(seq_ids={fixed_val_batch.get('seq_id', '?')[:num_clips]})",
+        )
+
+        contact_eval_fn = build_contact_eval_fn(
+            transformer=inner_transformer,
+            vq_model=vq_model,
+            res_transformer=res_transformer,
+            fixed_val_batch=fixed_val_batch,
+            motion_mean=motion_mean_t,
+            motion_std=motion_std_t,
+            device=device,
+            token_stride=token_stride,
+            w_text=float(contact_eval_cfg.get("w_text", 4.0)),
+            w_int=float(contact_eval_cfg.get("w_int", 2.0)),
+        )
+
     # ---- Train ----
     run_training_loop(
         accelerator=accelerator,
@@ -601,6 +676,11 @@ def run(config_path: str) -> None:
         val_dataloader=val_dataloader,
         val_every_epochs=val_every_epochs,
         val_best_key=cfg.training.get("val_best_key", "loss"),
+        contact_eval_fn=contact_eval_fn,
+        contact_best_key=str(
+            contact_eval_cfg.get("best_key", "mean_min_dist")
+            if contact_eval_cfg is not None else "mean_min_dist"
+        ),
     )
 
 

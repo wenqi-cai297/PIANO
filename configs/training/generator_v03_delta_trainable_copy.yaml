@@ -171,6 +171,17 @@ training:
   val_every_epochs: 5
   val_best_key: "loss"
 
+  # B1 — Contact-aware checkpointing (see
+  # analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md).
+  # Save best_contact.pt alongside best_val.pt so future
+  # comparisons can use the contact-best ckpt directly.
+  contact_eval:
+    enabled: true
+    num_clips: 5
+    w_text: 4.0
+    w_int: 2.0
+    best_key: "mean_min_dist"
+
 logging:
   project: "piano"
   run_name: "predictor_stageB_v03_delta_trainable_copy"

@@ -146,6 +146,8 @@ def run_training_loop(
     val_dataloader: DataLoader | None = None,
     val_every_epochs: int = 0,
     val_best_key: str = "loss",
+    contact_eval_fn: Callable[[], dict[str, float]] | None = None,
+    contact_best_key: str = "mean_min_dist",
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -182,10 +184,22 @@ def run_training_loop(
     val_best_key : which key from step_fn's loss_dict to minimise
         for best-val selection. Defaults to ``"loss"`` (total). Use
         e.g. ``"loss_target"`` to select on a specific component.
+    contact_eval_fn : optional ``Callable[[], dict[str, float]]`` that
+        returns a contact metrics dict (e.g.
+        ``{"mean_min_dist": 0.16, "n_clips": 5}``) when called with no
+        args. Invoked at the same cadence as ``val_dataloader``. Stage B
+        uses this to save ``best_contact.pt`` alongside ``best_val.pt``,
+        because val_loss and contact distance are empirically
+        decoupled (see
+        ``analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md``).
+        ``None`` disables contact eval (Stage A predictor doesn't need it).
+    contact_best_key : which key in the contact metrics dict to minimise.
+        Defaults to ``"mean_min_dist"``.
     """
     output_dir = ensure_dir(output_dir)
     global_step = 0
     best_val_loss: float = float("inf")
+    best_contact_dist: float = float("inf")
 
     # Backward-compatible hand-off of optimizer-step count to step_fn.
     # New stage scripts (predictor) declare ``global_step`` so their
@@ -319,6 +333,59 @@ def run_training_loop(
                         f"  ↑ new best val {val_best_key}={cur_val:.4f} "
                         f"(epoch {epoch+1})",
                     )
+
+            # Contact-aware checkpointing (B1 from
+            # analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md).
+            # Stage B's training objective (masked-CE) is empirically
+            # decoupled from the ship metric (geometric body-to-object
+            # distance) — v0.4→v0.5 same-arch ablation showed CE↓ but
+            # contact↑. So `best_val.pt` selected by val_loss is the
+            # wrong checkpoint for shipping. We additionally save
+            # `best_contact.pt` selected by the contact metric. Only
+            # the main process generates + measures, then broadcasts
+            # the float so all ranks save consistently.
+            if contact_eval_fn is not None:
+                if accelerator.is_main_process:
+                    contact_metrics = contact_eval_fn()
+                    cur_contact = float(contact_metrics.get(
+                        contact_best_key, float("inf"),
+                    ))
+                else:
+                    contact_metrics = {}
+                    cur_contact = float("inf")
+                # Broadcast cur_contact across ranks so the best-ckpt
+                # decision matches on every rank. Accelerate's
+                # gather/broadcast is the lightest tool here.
+                cur_contact_t = torch.tensor(
+                    [cur_contact], device=accelerator.device, dtype=torch.float32,
+                )
+                if accelerator.num_processes > 1:
+                    torch.distributed.broadcast(cur_contact_t, src=0)
+                cur_contact = float(cur_contact_t.item())
+
+                if accelerator.is_main_process:
+                    msg = f"  Contact @ epoch {epoch+1}"
+                    for k, v in contact_metrics.items():
+                        msg += f" | contact_{k}={v:.4f}"
+                    accelerator.print(msg)
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {f"contact_{k}": v for k, v in contact_metrics.items()},
+                            step=epoch + 1,
+                        )
+
+                if cur_contact < best_contact_dist:
+                    best_contact_dist = cur_contact
+                    _save_checkpoint(
+                        accelerator, model, optimizer, epoch, global_step, output_dir,
+                        name="best_contact", extra_modules=extra_modules,
+                    )
+                    if accelerator.is_main_process:
+                        accelerator.print(
+                            f"  ↑ new best contact "
+                            f"{contact_best_key}={cur_contact:.4f} "
+                            f"(epoch {epoch+1})",
+                        )
 
         # Save checkpoint
         if (epoch + 1) % save_every_epochs == 0:

@@ -138,6 +138,25 @@ training:
   val_every_epochs: 5
   val_best_key: "loss"
 
+  # B1 — Contact-aware checkpointing. Per
+  # analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md, the
+  # masked-CE val loss is empirically decoupled from the geometric
+  # contact-distance ship metric (v0.4 → v0.5 ablation: CE↓ contact↑;
+  # v0.5 → v0.6: CE↑ contact↓). When enabled, we additionally save
+  # `best_contact.pt` selected on the fixed-mini-batch contact metric.
+  # Cost ~1 sec/clip on bf16 / 2× A6000; for 5 clips × 16 val intervals
+  # in an 80-epoch run this is ~80 sec total overhead. The fixed batch
+  # is the first ``num_clips`` val clips (val_dataloader uses
+  # shuffle=False so this is deterministic). w_text/w_int match
+  # qual_eval.py defaults so during-training contact metric is
+  # comparable to the offline B0 measurement.
+  contact_eval:
+    enabled: true
+    num_clips: 5
+    w_text: 4.0
+    w_int: 2.0
+    best_key: "mean_min_dist"
+
 logging:
   project: "piano"
   run_name: "predictor_stageB_v06_per_head_gamma"
