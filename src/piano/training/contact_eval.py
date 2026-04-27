@@ -105,12 +105,12 @@ def _per_frame_body_to_object_distance(
 # ============================================================================
 
 def compute_clip_contact_distance(
-    motion_263_generated: np.ndarray,   # (T, 263) generated, denormalized
+    motion_263_generated: np.ndarray,   # (T_gen, 263) generated, denormalized
     R_y_angle: float,                   # source-clip canonical→world rotation
     T_xz: np.ndarray,                   # (2,) source-clip canonical→world translation
     object_pc_local: np.ndarray,        # (N_pc, 3)
-    object_positions: np.ndarray,       # (T, 3) world frame
-    object_rotations: np.ndarray,       # (T, 3) axis-angle, world frame
+    object_positions: np.ndarray,       # (T_src, 3) world frame
+    object_rotations: np.ndarray,       # (T_src, 3) axis-angle, world frame
     seq_len: int,
     *,
     recover_from_ric_fn: Callable,
@@ -126,8 +126,19 @@ def compute_clip_contact_distance(
     source ``motion_263``. We re-use that transform on the GENERATED
     motion's canonical joints so the generated body is anchored in the
     same world frame as the source's object trajectory.
+
+    Frame-count alignment
+    ---------------------
+
+    MoMask VQ-VAE has total temporal stride 4 (down_t=2, stride_t=2).
+    For source ``seq_len`` not divisible by 4, the generated motion has
+    ``(seq_len // 4) * 4`` frames — up to 3 fewer than ``seq_len``. We
+    truncate to ``T = min(seq_len, T_gen)`` so the body-trajectory and
+    object-trajectory tensors broadcast cleanly. Any source frames
+    beyond ``T_gen`` simply aren't evaluated (the model didn't generate
+    them).
     """
-    T = int(seq_len)
+    T = min(int(seq_len), int(motion_263_generated.shape[0]))
 
     motion_t = torch.from_numpy(motion_263_generated[:T]).float().unsqueeze(0)
     canon_gen = recover_from_ric_fn(motion_t, 22).squeeze(0).cpu().numpy().astype(np.float32)

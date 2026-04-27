@@ -103,6 +103,50 @@ def test_per_frame_body_to_object_distance_takes_min_over_pc():
     np.testing.assert_allclose(d[0, 0], 1.0, atol=1e-6)
 
 
+def test_compute_clip_contact_distance_handles_decoded_shorter_than_seq_len():
+    """Regression for 2026-04-28 server-training crash.
+
+    MoMask VQ-VAE has total stride 4. For seq_len=186 the generator
+    outputs ``(186 // 4) * 4 = 184`` frames. ``compute_clip_contact_distance``
+    received ``seq_len=186`` and tried to index source object trajectories
+    by 186 while body had 184 → broadcast error (184,5,1,3) vs (186,1,N,3).
+    Fix: ``T = min(seq_len, motion_gen.shape[0])``. This test pins the
+    contract.
+    """
+    try:
+        import piano.models.backbones.momask_adapter  # noqa: F401
+        from utils.motion_process import recover_from_ric
+    except Exception:
+        pytest.skip("MoMask repo not on sys.path (server-only test)")
+
+    from piano.training.contact_eval import compute_clip_contact_distance
+
+    T_gen = 184          # what the model actually produces
+    T_src = 186          # source clip's seq_len (≠ multiple of 4)
+
+    motion = np.zeros((T_gen, 263), dtype=np.float32)
+    motion[:, 3] = 1.0   # root height
+
+    pc = np.random.RandomState(0).randn(64, 3).astype(np.float32)
+    obj_pos = np.zeros((T_src, 3), dtype=np.float32)
+    obj_pos[:, 0] = np.linspace(0.0, 1.0, T_src)
+    obj_rot = np.zeros((T_src, 3), dtype=np.float32)
+
+    d = compute_clip_contact_distance(
+        motion_263_generated=motion,
+        R_y_angle=0.0,
+        T_xz=np.zeros(2, dtype=np.float32),
+        object_pc_local=pc,
+        object_positions=obj_pos,
+        object_rotations=obj_rot,
+        seq_len=T_src,                              # callers pass source seq_len
+        recover_from_ric_fn=recover_from_ric,
+    )
+    assert isinstance(d, float)
+    assert d >= 0.0
+    assert np.isfinite(d)
+
+
 def test_compute_clip_contact_distance_does_not_crash_and_is_nonneg():
     """End-to-end synthetic — exercises recover_from_ric + lift + distance.
 
