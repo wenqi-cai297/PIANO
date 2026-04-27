@@ -51,6 +51,16 @@ def _make_fake_residual_transformer() -> nn.Module:
                 activation="gelu",
             )
             self.seqTransEncoder = nn.TransformerEncoder(layer, num_layers=NUM_LAYERS)
+            self.forward_seen = None
+            self.generate_seen = None
+
+        def forward(self, *args, **kwargs):
+            self.forward_seen = (args, kwargs)
+            return "forward-result"
+
+        def generate(self, *args, **kwargs):
+            self.generate_seen = (args, kwargs)
+            return "generate-result"
 
     return FakeResidual()
 
@@ -459,3 +469,21 @@ def test_parameters_wo_clip_excludes_clip_module():
     assert wo_clip_ids.isdisjoint(clip_param_ids), (
         "parameters_wo_clip leaked clip_model.* params"
     )
+
+
+def test_drop_in_forward_and_generate_passthroughs():
+    """Wrapper remains usable where callers expect raw ResidualTransformer."""
+    from piano.models.motion_generator_residual import (
+        ResidualTransformerWithInteraction,
+    )
+
+    residual = _make_fake_residual_transformer()
+    wrapper = ResidualTransformerWithInteraction(
+        residual, d_model=D_MODEL, num_heads=NUM_HEADS, dropout=DROPOUT,
+    )
+
+    assert wrapper("ids", y="text", m_lens="lens") == "forward-result"
+    assert residual.forward_seen == (("ids",), {"y": "text", "m_lens": "lens"})
+
+    assert wrapper.generate("base", conds=["text"]) == "generate-result"
+    assert residual.generate_seen == (("base",), {"conds": ["text"]})

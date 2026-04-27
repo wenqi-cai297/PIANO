@@ -319,6 +319,38 @@ def _build_decode_ids_with_baseline_residuals(
     )
 
 
+def _generate_residual_tokens(
+    res_transformer: torch.nn.Module,
+    *,
+    motion_ids: Tensor,
+    text: str,
+    m_lens_tok: Tensor,
+    int_kv: Tensor | None,
+    int_pad: Tensor | None,
+    res_cond_scale: float,
+) -> Tensor:
+    """Generate RVQ residual tokens, using C1 z_int path when available."""
+    if hasattr(res_transformer, "generate_with_int"):
+        res_int_kv = (
+            None if int_kv is None
+            else int_kv.transpose(0, 1).contiguous()
+        )
+        return res_transformer.generate_with_int(
+            motion_ids=motion_ids,
+            conds=[text],
+            m_lens=m_lens_tok,
+            int_kv=res_int_kv,
+            int_padding_mask=int_pad,
+            cond_scale=res_cond_scale,
+        )
+    return res_transformer.generate(
+        motion_ids=motion_ids,
+        conds=[text],
+        m_lens=m_lens_tok,
+        cond_scale=res_cond_scale,
+    )
+
+
 # ============================================================================
 # Public entry point
 # ============================================================================
@@ -431,11 +463,14 @@ def guide_with_contact(
         # base_ids_after == base_for_res bit-identical.
         if residual_seed is not None:
             torch.manual_seed(int(residual_seed))
-        all_ids = res_transformer.generate(
+        all_ids = _generate_residual_tokens(
+            res_transformer,
             motion_ids=base_for_res,
-            conds=[text],
-            m_lens=m_lens_tok,
-            cond_scale=res_cond_scale,
+            text=text,
+            m_lens_tok=m_lens_tok,
+            int_kv=int_kv,
+            int_pad=int_pad,
+            res_cond_scale=res_cond_scale,
         )                                                                      # (1, S, Q)
         all_for_decode = torch.where(all_ids < 0, torch.zeros_like(all_ids), all_ids)
 
@@ -588,11 +623,14 @@ def guide_with_contact(
             # attributable to Gumbel-noise drift between the two calls.
             if residual_seed is not None:
                 torch.manual_seed(int(residual_seed))
-            all_ids_after = res_transformer.generate(
+            all_ids_after = _generate_residual_tokens(
+                res_transformer,
                 motion_ids=base_ids_after,
-                conds=[text],
-                m_lens=m_lens_tok,
-                cond_scale=res_cond_scale,
+                text=text,
+                m_lens_tok=m_lens_tok,
+                int_kv=int_kv,
+                int_pad=int_pad,
+                res_cond_scale=res_cond_scale,
             )
             all_for_decode_after = torch.where(
                 all_ids_after < 0, torch.zeros_like(all_ids_after), all_ids_after,

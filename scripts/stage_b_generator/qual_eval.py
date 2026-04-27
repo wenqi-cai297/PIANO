@@ -67,6 +67,7 @@ from piano.models.backbones.momask_adapter import (
 )
 from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.motion_generator import InteractionMaskTransformer
+from piano.models.motion_generator_residual import ResidualTransformerWithInteraction
 from piano.utils.io_utils import ensure_dir, load_json, save_json
 
 
@@ -156,7 +157,7 @@ def _build_model(cfg, ckpt_path: Path, device: torch.device):
 
     # Frozen Residual Transformer (per analyses/early_setup.md the `_sw`
     # checkpoint suffix encodes share_weight=True).
-    res_ckpt_cfg = model_cfg.checkpoints.get("residual_transformer", None)
+    res_ckpt_cfg = cfg.model.checkpoints.get("residual_transformer", None)
     if res_ckpt_cfg is None:
         raise ValueError(
             "configs/model/motion_generator.yaml must declare "
@@ -220,6 +221,23 @@ def _build_model(cfg, ckpt_path: Path, device: torch.device):
         gamma_kind=gamma_kind,
         wrapper_kind=wrapper_kind,
     )
+    residual_int_cfg = cfg.model.get("residual_int_xattn", None)
+    residual_int_enabled = (
+        residual_int_cfg is not None
+        and bool(residual_int_cfg.get("enabled", False))
+    )
+    if residual_int_enabled:
+        res_transformer = ResidualTransformerWithInteraction(
+            residual_transformer=res_transformer,
+            d_model=model_cfg.residual_transformer.latent_dim,
+            num_heads=model_cfg.residual_transformer.num_heads,
+            dropout=float(residual_int_cfg.get(
+                "dropout", model_cfg.residual_transformer.dropout,
+            )),
+            zero_init_gamma=bool(residual_int_cfg.get("zero_init_gamma", True)),
+            gamma_kind=str(residual_int_cfg.get("gamma_kind", gamma_kind)),
+        )
+        transformer.residual_transformer = res_transformer
     transformer.to(device)
 
     # Load Stage B checkpoint on top.
@@ -320,13 +338,28 @@ def _generate(
     # since padding tokens get re-masked downstream.
     base_for_res = torch.where(base_ids < 0, torch.zeros_like(base_ids), base_ids)
 
-    # Residual layers.
-    all_ids = res_transformer.generate(
-        motion_ids=base_for_res,
-        conds=[text],
-        m_lens=m_lens_tok,
-        cond_scale=res_cond_scale,
-    )                                           # (1, S, Q), -1 at padded
+    # Residual layers. C1 checkpoints wrap the residual transformer so
+    # it sees the same z_int K/V as the base MaskTransformer.
+    if hasattr(res_transformer, "generate_with_int"):
+        res_int_kv = (
+            None if int_kv is None
+            else int_kv.transpose(0, 1).contiguous()
+        )
+        all_ids = res_transformer.generate_with_int(
+            motion_ids=base_for_res,
+            conds=[text],
+            m_lens=m_lens_tok,
+            int_kv=res_int_kv,
+            int_padding_mask=int_pad,
+            cond_scale=res_cond_scale,
+        )
+    else:
+        all_ids = res_transformer.generate(
+            motion_ids=base_for_res,
+            conds=[text],
+            m_lens=m_lens_tok,
+            cond_scale=res_cond_scale,
+        )                                       # (1, S, Q), -1 at padded
     all_for_decode = torch.where(all_ids < 0, torch.zeros_like(all_ids), all_ids)
 
     # Decode to 263-d motion (still in normalized space — VQ-VAE was

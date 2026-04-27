@@ -196,12 +196,22 @@ def _generate_full_condition(
     )                                              # (1, S_max), -1 at padded
     base_for_res = torch.where(base_ids < 0, torch.zeros_like(base_ids), base_ids)
 
-    all_ids = res_transformer.generate(
-        motion_ids=base_for_res,
-        conds=[text],
-        m_lens=m_lens_tok,
-        cond_scale=res_cond_scale,
-    )
+    if hasattr(res_transformer, "generate_with_int"):
+        all_ids = res_transformer.generate_with_int(
+            motion_ids=base_for_res,
+            conds=[text],
+            m_lens=m_lens_tok,
+            int_kv=int_kv.transpose(0, 1).contiguous(),
+            int_padding_mask=int_pad,
+            cond_scale=res_cond_scale,
+        )
+    else:
+        all_ids = res_transformer.generate(
+            motion_ids=base_for_res,
+            conds=[text],
+            m_lens=m_lens_tok,
+            cond_scale=res_cond_scale,
+        )
     all_for_decode = torch.where(all_ids < 0, torch.zeros_like(all_ids), all_ids)
 
     motion = vq_model.forward_decoder(all_for_decode)   # (1, T, 263)

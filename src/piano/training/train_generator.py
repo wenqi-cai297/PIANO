@@ -53,6 +53,7 @@ from piano.models.backbones.momask_adapter import (
 )
 from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.motion_generator import InteractionMaskTransformer
+from piano.models.motion_generator_residual import ResidualTransformerWithInteraction
 from piano.training.contact_eval import build_contact_eval_fn
 from piano.training.trainer import build_scheduler, run_training_loop
 from piano.utils.io_utils import load_json
@@ -272,6 +273,8 @@ def build_generator_step_fn(
     vq_model: nn.Module,
     *,
     cfg_drop_buckets: tuple[float, float, float],
+    residual_transformer: ResidualTransformerWithInteraction | None = None,
+    residual_loss_weight: float = 0.0,
     token_stride: int = 4,
     motion_mean: torch.Tensor | None = None,
     motion_std: torch.Tensor | None = None,
@@ -373,6 +376,22 @@ def build_generator_step_fn(
             int_padding_mask_bf=int_pad_mask_bf,
             cfg_drop_buckets=cfg_drop_buckets,
         )
+        out["loss_base"] = out["loss"]
+
+        if residual_transformer is not None and residual_loss_weight > 0.0:
+            res_int_kv = int_tokens_bf.transpose(0, 1).contiguous()
+            res_loss, _res_pred, res_acc = residual_transformer.forward_with_int(
+                all_indices=code_idx.long(),
+                y=text,
+                m_lens=m_lens_tok,
+                int_kv=res_int_kv,
+                int_padding_mask=int_pad_mask_bf,
+            )
+            out["loss_residual"] = res_loss
+            out["acc_residual"] = torch.as_tensor(
+                res_acc, device=device, dtype=out["loss"].dtype,
+            )
+            out["loss"] = out["loss"] + float(residual_loss_weight) * res_loss
         # Diagnostic: mean γ_int across the 8 layers — useful to track
         # whether the new IntXAttn sublayers are actually learning to
         # contribute. Per design §6 decision tree: if γ_int stays at 0
@@ -383,6 +402,13 @@ def build_generator_step_fn(
                 for blk in transformer.mask_transformer.seqTransEncoder.layers
             ]).mean()
         out["gamma_int_abs_mean"] = gamma_mean
+        if residual_transformer is not None:
+            with torch.no_grad():
+                gamma_res_mean = torch.stack([
+                    blk.gamma_int.detach().abs().mean()
+                    for blk in residual_transformer.encoder.layers
+                ]).mean()
+            out["gamma_int_res_abs_mean"] = gamma_res_mean
 
         return out
 
@@ -478,6 +504,50 @@ def run(config_path: str) -> None:
     )
     transformer.to(device)
 
+    residual_wrapper: ResidualTransformerWithInteraction | None = None
+    residual_int_cfg = cfg.model.get("residual_int_xattn", None)
+    residual_int_enabled = (
+        residual_int_cfg is not None
+        and bool(residual_int_cfg.get("enabled", False))
+    )
+    if residual_int_enabled:
+        accelerator.print(
+            "Loading MoMask ResidualTransformer + adding residual IntXAttn sublayers...",
+        )
+        res_ckpt = cfg.model.checkpoints.get("residual_transformer", None)
+        if res_ckpt is None:
+            raise ValueError(
+                "model.residual_int_xattn.enabled=true requires "
+                "model.checkpoints.residual_transformer.",
+            )
+        res_base = load_momask_residual_transformer(
+            res_ckpt,
+            code_dim=model_cfg.residual_transformer.get("code_dim", 512),
+            latent_dim=model_cfg.residual_transformer.latent_dim,
+            ff_size=model_cfg.residual_transformer.ff_size,
+            num_layers=model_cfg.residual_transformer.num_layers,
+            num_heads=model_cfg.residual_transformer.num_heads,
+            dropout=model_cfg.residual_transformer.dropout,
+            cond_drop_prob=model_cfg.residual_transformer.cond_drop_prob,
+            num_quantizers=model_cfg.vq_vae.num_quantizers,
+            shared_codebook=model_cfg.residual_transformer.shared_codebook,
+            share_weight=model_cfg.residual_transformer.share_weight,
+            device=str(device),
+        )
+        residual_wrapper = ResidualTransformerWithInteraction(
+            residual_transformer=res_base,
+            d_model=model_cfg.residual_transformer.latent_dim,
+            num_heads=model_cfg.residual_transformer.num_heads,
+            dropout=float(residual_int_cfg.get(
+                "dropout", model_cfg.residual_transformer.dropout,
+            )),
+            zero_init_gamma=bool(residual_int_cfg.get("zero_init_gamma", True)),
+            gamma_kind=str(residual_int_cfg.get("gamma_kind", gamma_kind)),
+        ).to(device)
+        # Make the residual wrapper part of the main module tree so
+        # DDP, gradient clipping, .train/.eval, and checkpoints include it.
+        transformer.residual_transformer = residual_wrapper
+
     # ---- Datasets + dataloaders ----
     train_dataset = _build_dataset(cfg, split_override=None, enable_augment=True)
     train_split_info = _resolve_split(cfg, split_override=None)
@@ -511,9 +581,14 @@ def run(config_path: str) -> None:
         )
 
     # ---- Optimiser (two LR groups) + scheduler ----
+    new_params = transformer.new_parameters()
+    backbone_params = transformer.backbone_parameters()
+    if residual_wrapper is not None:
+        new_params.extend(residual_wrapper.new_parameters())
+        backbone_params.extend(residual_wrapper.backbone_parameters())
     optimizer = build_two_group_optimizer(
-        new_params=transformer.new_parameters(),
-        backbone_params=transformer.backbone_parameters(),
+        new_params=new_params,
+        backbone_params=backbone_params,
         new_lr=float(cfg.training.optimizer.new_lr),
         backbone_lr=float(cfg.training.optimizer.backbone_lr),
         weight_decay=float(cfg.training.optimizer.weight_decay),
@@ -550,6 +625,7 @@ def run(config_path: str) -> None:
 
     # Resolve the inner transformer (Accelerate may have wrapped it in DDP).
     inner_transformer = accelerator.unwrap_model(transformer)
+    inner_residual = getattr(inner_transformer, "residual_transformer", None)
 
     # Load HumanML3D motion mean/std (v0.3-β-norm fix). VQ-VAE was
     # trained on normalized features; without this the encoder OOD-
@@ -570,6 +646,8 @@ def run(config_path: str) -> None:
         transformer=inner_transformer,
         vq_model=vq_model,
         cfg_drop_buckets=cfg_drop_buckets,
+        residual_transformer=inner_residual,
+        residual_loss_weight=float(cfg.training.get("residual_loss_weight", 0.0)),
         token_stride=token_stride,
         motion_mean=motion_mean_t,
         motion_std=motion_std_t,
@@ -602,31 +680,33 @@ def run(config_path: str) -> None:
     )
     contact_eval_fn = None
     if contact_eval_enabled:
-        # Load the frozen residual transformer (only main process generates,
-        # but every rank must load so torch.distributed broadcast in the
-        # trainer matches; the model itself is small).
-        accelerator.print("Loading MoMask Residual Transformer for contact eval...")
-        res_ckpt = model_cfg.checkpoints.get("residual_transformer", None)
-        if res_ckpt is None:
-            raise ValueError(
-                "training.contact_eval.enabled=true requires "
-                "configs/model/motion_generator.yaml to declare "
-                "checkpoints.residual_transformer.",
+        if inner_residual is not None:
+            res_transformer = inner_residual
+            accelerator.print("Contact eval: using trained C1 residual wrapper.")
+        else:
+            # Backward-compatible B1 path: load the frozen residual
+            # transformer only for contact eval.
+            accelerator.print("Loading MoMask Residual Transformer for contact eval...")
+            res_ckpt = cfg.model.checkpoints.get("residual_transformer", None)
+            if res_ckpt is None:
+                raise ValueError(
+                    "training.contact_eval.enabled=true requires "
+                    "model.checkpoints.residual_transformer.",
+                )
+            res_transformer = load_momask_residual_transformer(
+                res_ckpt,
+                code_dim=model_cfg.residual_transformer.get("code_dim", 512),
+                latent_dim=model_cfg.residual_transformer.latent_dim,
+                ff_size=model_cfg.residual_transformer.ff_size,
+                num_layers=model_cfg.residual_transformer.num_layers,
+                num_heads=model_cfg.residual_transformer.num_heads,
+                dropout=model_cfg.residual_transformer.dropout,
+                cond_drop_prob=model_cfg.residual_transformer.cond_drop_prob,
+                num_quantizers=model_cfg.vq_vae.num_quantizers,
+                shared_codebook=model_cfg.residual_transformer.shared_codebook,
+                share_weight=model_cfg.residual_transformer.share_weight,
+                device=str(device),
             )
-        res_transformer = load_momask_residual_transformer(
-            res_ckpt,
-            code_dim=model_cfg.residual_transformer.get("code_dim", 512),
-            latent_dim=model_cfg.residual_transformer.latent_dim,
-            ff_size=model_cfg.residual_transformer.ff_size,
-            num_layers=model_cfg.residual_transformer.num_layers,
-            num_heads=model_cfg.residual_transformer.num_heads,
-            dropout=model_cfg.residual_transformer.dropout,
-            cond_drop_prob=model_cfg.residual_transformer.cond_drop_prob,
-            num_quantizers=model_cfg.vq_vae.num_quantizers,
-            shared_codebook=model_cfg.residual_transformer.shared_codebook,
-            share_weight=model_cfg.residual_transformer.share_weight,
-            device=str(device),
-        )
         res_transformer.eval()
 
         # Build a fixed mini-batch from the first N val clips. shuffle=False

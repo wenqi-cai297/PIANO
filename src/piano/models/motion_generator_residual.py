@@ -223,6 +223,20 @@ class ResidualTransformerWithInteraction(nn.Module):
         ]
 
     # ------------------------------------------------------------------
+    # Drop-in passthroughs for code that still expects a raw
+    # ResidualTransformer instance. C1-specific paths should call
+    # forward_with_int / generate_with_int below.
+    # ------------------------------------------------------------------
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the wrapped residual transformer's original forward."""
+        return self.residual(*args, **kwargs)
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the wrapped residual transformer's original generate."""
+        return self.residual.generate(*args, **kwargs)
+
+    # ------------------------------------------------------------------
     # z_int-aware trans_forward / forward / generate
     # ------------------------------------------------------------------
 
@@ -252,9 +266,8 @@ class ResidualTransformerWithInteraction(nn.Module):
         x = r.position_enc(x)
         xseq = torch.cat([cond_emb, q_emb, x], dim=0)          # (S+2, B, d)
         # Pad the front 2 positions (cond + q_emb) as non-pad.
-        padding_mask_aug = torch.cat(
-            [torch.zeros_like(padding_mask[:, 0:2]), padding_mask], dim=1,
-        )
+        prefix_mask = padding_mask.new_zeros((padding_mask.shape[0], 2))
+        padding_mask_aug = torch.cat([prefix_mask, padding_mask], dim=1)
         # If int_kv provided, also augment its key_padding_mask layout.
         # IntXAttn's K/V are along dim 0 of int_kv (S_int) so its mask
         # is independent of the source-side cond/q_emb prepend.
