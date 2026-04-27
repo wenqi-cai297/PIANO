@@ -204,11 +204,20 @@ def _build_model(cfg, ckpt_path: Path, device: torch.device):
         token_stride=token_stride,
         max_seq_length=max_seq_length_frames,
     )
+    # γ-gate kind must match training-time config so loaded state_dict
+    # gamma_int shapes line up. v0.6 sets cfg.model.gamma_kind="per_head"
+    # → (n_heads,); v0.1-v0.5 default to "scalar" → (1,).
+    gamma_kind = str(cfg.model.get(
+        "gamma_kind",
+        mt_cfg.interaction_cross_attn.get("gamma_kind", "scalar"),
+    ))
+    print(f"γ-gate kind: {gamma_kind}")
     transformer = InteractionMaskTransformer(
         mask_transformer=base_mt,
         interaction_tokenizer=interaction_tokenizer,
         zero_init_gamma=bool(mt_cfg.interaction_cross_attn.get("zero_init", True)),
         max_token_seq_length=max_seq_length_tokens,
+        gamma_kind=gamma_kind,
     )
     transformer.to(device)
 
