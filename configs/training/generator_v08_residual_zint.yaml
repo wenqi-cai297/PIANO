@@ -113,7 +113,7 @@ model:
     masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
     # *** v0.8 — residual transformer ckpt is now ALWAYS loaded (not just
     # for contact_eval), since the wrapper trains it.
-    residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/latest.tar"
+    residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
 
 data:
   datasets:
