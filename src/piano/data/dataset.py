@@ -268,10 +268,42 @@ class HOIDataset(Dataset):
         # --- Pad or truncate to max_seq_length ---
         motion = self._pad_or_truncate(motion, self.max_seq_length)
         joints = self._pad_or_truncate(joints, self.max_seq_length)
-        # v0.2: compute body-canonical-frame object pose BEFORE padding,
-        # so the canonicalization sees the genuine frame-0 pelvis (not
-        # a zero-pad row). The output is then padded along the time axis
-        # to ``max_seq_length`` like the other per-frame fields.
+        if object_positions is not None:
+            object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
+        if object_rotations is not None:
+            object_rotations = self._pad_or_truncate(object_rotations, self.max_seq_length)
+
+        padded_labels: dict[str, np.ndarray] = {}
+        for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
+            if labels.get(key) is not None:
+                padded_labels[key] = self._pad_or_truncate(labels[key], self.max_seq_length)
+
+        text = meta.get("text", "")
+
+        # --- Augment (training only; disabled by default) ---
+        # Runs BEFORE canonical-frame computation so that the canonical
+        # transform derives from frame-0 of the (possibly mirrored) body
+        # pose. For Stage B (surface_obj_pose=True) we pass motion +
+        # object_positions + object_rotations through so they get
+        # mirrored alongside joints / labels / text — required for the
+        # encoder to see consistent-handedness inputs (v0.7+).
+        if self.augment.enabled:
+            joints, object_pc, text, padded_labels, motion, object_positions, object_rotations = (
+                self._apply_augmentation(
+                    joints, object_pc, text, padded_labels,
+                    motion=motion,
+                    object_positions=object_positions,
+                    object_rotations=object_rotations,
+                )
+            )
+
+        # --- Body-canonical object pose (Stage B; v0.2+) ---
+        # Computed AFTER augmentation so mirror flips through. The
+        # canonical-frame transform is derived from frame-0 of joints
+        # + motion_263; both have been mirrored together at this point
+        # (see _apply_augmentation Stage-B branch). Uses the unpadded
+        # prefix [:valid] so frame-0 references real data, not a
+        # zero-pad row.
         obj_com_canonical: np.ndarray | None = None
         obj_rot6d_canonical: np.ndarray | None = None
         if (
@@ -289,28 +321,8 @@ class HOIDataset(Dataset):
                     force_world_frame=self.force_world_frame,
                 )
             )
-
-        if object_positions is not None:
-            object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
-        if object_rotations is not None:
-            object_rotations = self._pad_or_truncate(object_rotations, self.max_seq_length)
-        if obj_com_canonical is not None:
             obj_com_canonical = self._pad_or_truncate(obj_com_canonical, self.max_seq_length)
-        if obj_rot6d_canonical is not None:
             obj_rot6d_canonical = self._pad_or_truncate(obj_rot6d_canonical, self.max_seq_length)
-
-        padded_labels: dict[str, np.ndarray] = {}
-        for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
-            if labels.get(key) is not None:
-                padded_labels[key] = self._pad_or_truncate(labels[key], self.max_seq_length)
-
-        text = meta.get("text", "")
-
-        # --- Augment (training only; disabled by default) ---
-        if self.augment.enabled:
-            joints, object_pc, text, padded_labels = self._apply_augmentation(
-                joints, object_pc, text, padded_labels,
-            )
 
         # --- Build output dict ---
         # `object_id` and `subset` are passed through as plain strings
@@ -494,12 +506,33 @@ class HOIDataset(Dataset):
         object_pc: np.ndarray,          # (N, 3)
         text: str,
         labels: dict[str, np.ndarray],  # may contain contact_state, contact_target, phase, support
-    ) -> tuple[np.ndarray, np.ndarray, str, dict[str, np.ndarray]]:
+        *,
+        motion: np.ndarray | None = None,            # (T, 263) HumanML3D rep (Stage B)
+        object_positions: np.ndarray | None = None,  # (T, 3) world frame (Stage B)
+        object_rotations: np.ndarray | None = None,  # (T, 3) axis-angle (Stage B)
+    ) -> tuple[
+        np.ndarray, np.ndarray, str, dict[str, np.ndarray],
+        np.ndarray | None, np.ndarray | None, np.ndarray | None,
+    ]:
         """Apply mirror / Y-rotation / pc-jitter augmentations.
 
         All three are pseudo-label-safe because labels were extracted in
         object-local frame (rotation-invariant w.r.t. world heading) and
         mirror only swaps L/R channels on human-side arrays.
+
+        Stage B path (when ``motion`` / ``object_positions`` /
+        ``object_rotations`` are passed): mirror also applies to
+        ``motion_263`` (via :func:`piano.utils.humanml3d_mirror.mirror_motion_263`)
+        and the world-frame object pose. This is required for Stage B
+        because the trainer feeds ``motion_263`` to the VQ encoder; if
+        only joints/labels were mirrored the encoder would receive the
+        original-handedness tokens contradicting the mirrored z_int.
+        Caller must invoke this BEFORE
+        :meth:`_compute_canonical_object_pose` so the canonical-frame
+        pose derives from frame-0 of the (possibly mirrored) body.
+
+        Stage A path (Stage B fields = None): keeps original behaviour;
+        only ``joints`` / labels / text mirror.
         """
         # 1. Left-right mirror. Flips world-x, swaps SMPL L/R joint
         #    pairs, swaps L/R body-part channels in contact_state /
@@ -548,10 +581,37 @@ class HOIDataset(Dataset):
 
             text = _swap_left_right_in_text(text)
 
+            # Stage B: also mirror motion_263 + world-frame object pose
+            # so the encoder + canonical-frame derivation see consistent
+            # handedness. Lazy-import to keep Stage A test path light.
+            if motion is not None:
+                from piano.utils.humanml3d_mirror import mirror_motion_263
+                motion = mirror_motion_263(motion)
+            if object_positions is not None or object_rotations is not None:
+                from piano.utils.humanml3d_mirror import mirror_object_world_pose
+                # Both must be present together for a full mirror; if
+                # only one is, mirror it in isolation.
+                if object_positions is not None and object_rotations is not None:
+                    object_positions, object_rotations = mirror_object_world_pose(
+                        object_positions, object_rotations,
+                    )
+                elif object_positions is not None:
+                    object_positions = object_positions.copy()
+                    object_positions[..., 0] *= -1.0
+                else:
+                    object_rotations = object_rotations.copy()
+                    object_rotations[..., 1] *= -1.0
+                    object_rotations[..., 2] *= -1.0
+
         # 2. Random rotation around world Y (up axis). Rotates every
         #    joint frame by the same θ. Labels are rotation-invariant
         #    (object-local frame). Object PC in object-local frame is
-        #    untouched.
+        #    untouched. NOTE: when surface_obj_pose=True, ``motion_263``
+        #    is in body-canonical frame (rotation-invariant by
+        #    construction) but ``object_positions`` is world-frame and
+        #    WOULD need rotation. Currently rotate_around_y is disabled
+        #    for Stage B configs (``rotate_around_y_prob: 0``) — if
+        #    enabled, object world pose would need a parallel rotation.
         if (
             self.augment.rotate_around_y_prob > 0
             and random.random() < self.augment.rotate_around_y_prob
@@ -573,7 +633,7 @@ class HOIDataset(Dataset):
             noise = np.random.randn(*object_pc.shape).astype(np.float32)
             object_pc = object_pc + self.augment.pc_jitter_std * noise
 
-        return joints, object_pc, text, labels
+        return joints, object_pc, text, labels, motion, object_positions, object_rotations
 
 
 # ---------------------------------------------------------------------------

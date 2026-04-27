@@ -1,0 +1,155 @@
+# Stage B v0.7: bilateral mirror augmentation on top of v0.6 per-head γ.
+#
+# B0 contact-distance measurement (commit 65b9623) showed v0.6 closes
+# 4.9 cm of v0.4's 9.6 cm model gap, but **all of the gain came from
+# the right hand** (−11.8 cm) while left hand stayed flat at 31 cm
+# (vs gt_original 13 cm). Per-head γ inspect (commit 6183aa3) further
+# showed all 6 heads converged to nearly-uniform |γ| within each layer
+# (per_layer_abs_std / abs_mean ratio ~10%) — i.e., per-head γ buys
+# sign flexibility but not magnitude specialization. So adding more
+# capacity (B2 trainable copy) likely doesn't fix the bilateral
+# coverage problem on its own.
+#
+# Hypothesis: the asymmetry is a DATA bias (most InterAct grasps are
+# right-handed; or the dataset's mocap subjects skew right-dominant).
+# v0.4-v0.6 all set augmentation.mirror_prob=0, so the model never
+# sees a mirrored sample. Enabling mirror at p=0.5 forces the model
+# to learn bilateral coverage by symmetry.
+#
+# This is **single-variable** off v0.6:
+#   augmentation.enabled:    false → true
+#   augmentation.mirror_prob: 0.0  → 0.5
+#   logging.run_name:         v06 → v07
+#   output_dir:               v06 → v07
+#
+# All other knobs (encoder normalize, body-canonical frame, per-head γ,
+# 80 epochs, lr, CFG buckets) match v0.6.
+#
+# The mirror is **Stage B-correct** as of commit <this>. Specifically,
+# the augmentation now mirrors:
+#   - motion_263 (HumanML3D rep) via mirror_motion_263 — all 263
+#     channels handled (root, ric, cont6d, local-vel, foot-contact)
+#   - object_positions (world-frame, x-flip)
+#   - object_rotations (world-frame axis-angle, y/z components flip)
+#   - joints_22 (existing)
+#   - contact_state / contact_target_xyz L/R channels (existing)
+#   - text 'left' ↔ 'right' (existing)
+# Canonical-frame computation runs AFTER augmentation so the
+# canonical transform derives from frame-0 of the (mirrored) body.
+#
+# Decision rule post-v0.7 (compare against v0.6's
+# mean_min_dist_per_frame = 16.0 cm):
+#   - drop ≥ 5 cm (≤ 11 cm; closes most of the bilateral gap)
+#     → bilateral was the dominant remaining issue → ship Stage C.
+#   - drop 1-5 cm (11-15 cm)
+#     → bilateral helped but model gap remains → fire B2 trainable copy.
+#   - drop < 1 cm or regression
+#     → bilateral isn't the constraint; per_head_abs_mean per-hand-relevant
+#     head was already balanced → fire B2 trainable copy directly.
+#
+# Hardware target: 2 × NVIDIA A6000 (48 GB each), bf16, Accelerate DDP.
+# Wallclock: ~13 min (mirror adds <5% per __getitem__ — mirror_motion_263
+# is pure numpy index permutation + sign flips).
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_generator \
+#     --config configs/training/generator_v07_mirror_aug.yaml
+#
+# Eval (same five clips, same gt_roundtrip baseline):
+#   python scripts/stage_b_generator/qual_eval.py \
+#     --config configs/training/generator_v07_mirror_aug.yaml \
+#     --ckpt runs/training/generator_v07_mirror_aug/best_val.pt \
+#     --output-dir runs/eval/stageB_v0_7_qual --w-int-sweep
+#   python scripts/stage_b_generator/measure_contact_distance.py \
+#     --input-dir runs/eval/stageB_v0_7_qual/full \
+#     --input-dir runs/eval/stageB_v0_7_qual/text_only \
+#     --input-dir runs/eval/stageB_v0_7_qual/swap \
+#     --input-dir runs/eval/stageB_v0_4_gt_roundtrip/gt_original \
+#     --input-dir runs/eval/stageB_v0_4_gt_roundtrip/gt_roundtrip \
+#     --output-dir runs/eval/stageB_v0_7_contact_dist
+
+model:
+  config: configs/model/motion_generator.yaml
+  text_encoder: "ViT-B/32"
+  # Inherit per-head γ from v0.6.
+  gamma_kind: "per_head"
+  checkpoints:
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  force_world_frame: false      # body-canonical, same as v0.4-v0.6
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true               # *** v0.7 delta — turn on aug ***
+    mirror_prob: 0.5            # *** v0.7 delta — bilateral mirror at 50% ***
+    rotate_around_y_prob: 0.0   # keep off; not yet plumbed for object pose
+    pc_jitter_std: 0.0          # keep off; not the focus
+
+training:
+  seed: 42
+  batch_size: 32
+  num_epochs: 80                 # same as v0.4 / v0.6
+  num_workers: 4
+  mixed_precision: "bf16"
+
+  optimizer:
+    name: "adamw"
+    new_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  cfg_drop_buckets:
+    drop_both: 0.10
+    drop_int_only: 0.10
+    drop_text_only: 0.05
+
+  val_every_epochs: 5
+  val_best_key: "loss"
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageB_v07_mirror_aug"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+
+# Separate output dir to preserve v0.4 / v0.5 / v0.6 ckpts.
+output_dir: "runs/training/generator_v07_mirror_aug"
