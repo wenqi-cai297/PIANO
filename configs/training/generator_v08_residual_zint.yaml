@@ -1,0 +1,205 @@
+# Stage B v0.8: Residual Transformer z_int conditioning (C1).
+#
+# Single architectural change from v0.6: in addition to base-layer
+# IntXAttn (per-head γ), the 5-layer ResidualTransformer also gets
+# IntXAttn(z_int K/V) on each of its 8 transformer blocks.
+#
+# Why this — empirical motivation
+# -------------------------------
+#
+# B3 v5 4-combo sweep (2026-04-28) on v0.6 b1_bestval found that
+# inference-time logit guidance can move decoded contact (loss drops
+# 84-91%) but **not consistently in the right direction** — same
+# autoregressive-feedback mechanism in the text-only residual stage
+# produced both biggest win (largebox −14 cm) and biggest loss
+# (plasticbox_037 +16 cm). None of 4 combos passes 16 cm ship gate.
+# Best (norerun 23.5 cm) ≈ baseline `full` 23.6 cm.
+#
+# Three-layer takeaway from v5:
+#   1. plasticbox_014's +7.3 cm (0/23 flips) = RNG drift.
+#   2. plasticbox_037's +16 cm (1/37 flip) = autoregressive feedback.
+#   3. largebox's v4 −14 cm win = also autoregressive feedback,
+#      direction-uncontrolled.
+#
+# Same mechanism = both biggest win and biggest loss → no inference
+# fix can ship. Empirical proof of Codex P0 #1: base-token logits are
+# NOT the binding lever; the 5/6 of decoded capacity in the residual
+# transformer (text-only at inference) is.
+#
+# C1 architecture
+# ---------------
+#
+# Add per-block IntXAttn(z_int K/V, γ_int_res zero-init) to every layer
+# of ResidualTransformer's seqTransEncoder. Reuses
+# :class:`MaskTransformerEncoderWithInteraction` from motion_generator.py
+# (the v0.6 SOTA pattern); refs original layers without deepcopy.
+# γ_int_res zero-init → byte-identical to original frozen-residual at
+# step 0 → safe warm-start from MoMask pretrained ckpt.
+#
+# Loss = base_masked_CE + residual_masked_CE (both transformers
+# train jointly). Residual sees the same int_kv as base via the
+# interaction_tokenizer output (no extra tokenizer).
+#
+# Training
+#   - All MaskTransformer (base) params: same LR groups as v0.6.
+#   - Residual transformer + new γ_int_res / IntXAttn / norm_int:
+#     all join optimizer. Residual's pretrained weights treated as
+#     "backbone" (low LR); new IntXAttn-residual params at "new" LR.
+#
+# Inference
+#   - qual_eval / contact_eval / contact_guidance pass z_int K/V to
+#     residual via res_wrapper.generate_with_int(...).
+#   - Backward compat: when model.residual_int_xattn.enabled = false,
+#     use original ResidualTransformer.generate(...) path (frozen,
+#     text-only).
+#
+# Decision rule (vs v0.6 b1_bestval `full` 23.6 cm baseline)
+#   - drop ≥ 5 cm (≤ 18.6 cm) → ship Stage C; queue C2 (decoded aux loss).
+#   - 1-5 cm drop → partial; consider C2 on top.
+#   - <1 cm or regression → audit residual training (RVQ aux loss
+#     balance, z_int channel saturation, γ_int_res growth trajectory).
+#
+# Reference recipes
+#   - InterControl: Wang et al. *Generating Interactive Human Motions
+#     with Spatial-Temporal Cross-Conditioning.* NeurIPS 2024.
+#     arXiv:2311.15864. (Trainable-copy + zero-init linear; we adapt
+#     to per-block IntXAttn since v0.3-δ trainable-copy regressed
+#     +14.92 cm — see analyses/2026-04-28_v0_3_delta_retrain_and_v0_5_contact.md.)
+#   - MaskControl: Pinyoanuntapong et al. *MaskControl: Spatio-Temporal
+#     Control for Masked Motion Synthesis.* ICCV 2025. arXiv:2410.10780.
+#   - LLaMA-Adapter (per-head γ source recipe): Zhang et al. ICLR 2024.
+#     arXiv:2303.16199.
+#
+# Hardware target: 2 × NVIDIA A6000 (48 GB each), bf16, Accelerate DDP.
+# Wallclock estimate: ~25-30 min (v0.6's ~13 min + ~12-17 min for the
+# residual side which has comparable param count to base).
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_generator \
+#     --config configs/training/generator_v08_residual_zint.yaml
+#
+# Eval:
+#   python scripts/stage_b_generator/qual_eval.py \
+#     --config configs/training/generator_v08_residual_zint.yaml \
+#     --ckpt runs/training/generator_v08_residual_zint/best_contact.pt \
+#     --output-dir runs/eval/stageB_v0_8_qual
+#   python scripts/stage_b_generator/measure_contact_distance.py \
+#     --input-dir runs/eval/stageB_v0_8_qual/full \
+#     --input-dir runs/eval/stageB_v0_8_qual/text_only \
+#     --input-dir runs/eval/stageB_v0_8_qual/swap \
+#     --input-dir runs/eval/stageB_v0_4_gt_roundtrip/gt_original \
+#     --input-dir runs/eval/stageB_v0_4_gt_roundtrip/gt_roundtrip \
+#     --output-dir runs/eval/stageB_v0_8_contact_dist
+
+model:
+  config: configs/model/motion_generator.yaml
+  text_encoder: "ViT-B/32"
+  # v0.6 inheritance: base IntXAttn with per-head γ.
+  gamma_kind: "per_head"
+  # *** v0.8 delta — enable residual transformer z_int conditioning ***
+  residual_int_xattn:
+    enabled: true
+    # γ_int_res zero-init at step 0 → byte-identity to original frozen
+    # residual. Set False only for ablation (γ=1 init = "trainable from
+    # step 0", risks the doubly-zero-init pathology mirror).
+    zero_init_gamma: true
+    # per-head matches v0.6 base; "scalar" for ablation.
+    gamma_kind: "per_head"
+    # Dropout in the new IntXAttn-residual sublayers. Match base.
+    dropout: 0.1
+  checkpoints:
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+    # *** v0.8 — residual transformer ckpt is now ALWAYS loaded (not just
+    # for contact_eval), since the wrapper trains it.
+    residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/latest.tar"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  force_world_frame: false
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  seed: 42
+  batch_size: 32
+  num_epochs: 80
+  num_workers: 4
+  mixed_precision: "bf16"
+
+  optimizer:
+    name: "adamw"
+    new_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  cfg_drop_buckets:
+    drop_both: 0.10
+    drop_int_only: 0.10
+    drop_text_only: 0.05
+
+  # *** v0.8 — residual loss weight. The base masked-CE loss is on the
+  # base layer's vocabulary (V=512); residual masked-CE loops over 5
+  # quantizer layers and samples one per batch (q_schedule). They have
+  # different magnitudes — start with 1.0 weight and re-tune if base
+  # learning slows.
+  residual_loss_weight: 1.0
+
+  val_every_epochs: 5
+  val_best_key: "loss"
+
+  contact_eval:
+    enabled: true
+    num_clips: 5
+    w_text: 4.0
+    w_int: 2.0
+    best_key: "mean_min_dist"
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageB_v08_residual_zint"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+
+output_dir: "runs/training/generator_v08_residual_zint"
