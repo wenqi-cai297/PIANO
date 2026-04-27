@@ -41,6 +41,10 @@ masked_transformer:
   interaction_cross_attn:
     enabled: true
     zero_init: true               # γ_int starts at 0 → byte-identical to pretrained MoMask
+    gamma_kind: "scalar"          # "scalar" (v0.1-v0.5: 1 dof per layer)
+                                  # | "per_head" (v0.6+: n_heads dof per layer,
+                                  #               LLaMA-Adapter ICLR'24 pattern).
+                                  # Per-training override: cfg.model.gamma_kind.
 
 # --- Interaction tokenizer (z_int → K/V) ---
 # Channel layout matches v11 pseudo-labels (5 + 5×3 + 3 + 4 = 27).

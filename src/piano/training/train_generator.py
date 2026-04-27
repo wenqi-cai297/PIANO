@@ -450,12 +450,22 @@ def run(config_path: str) -> None:
         token_stride=token_stride,
         max_seq_length=max_seq_length_frames,
     )
+    # γ-gate kind: training-config override > model-config default > "scalar".
+    # v0.6 sets ``cfg.model.gamma_kind: per_head`` for the LLaMA-Adapter-style
+    # 48-dof gate (6 heads × 8 layers); v0.1-v0.5 leave both unset and fall
+    # through to the scalar 8-dof gate.
+    gamma_kind = str(cfg.model.get(
+        "gamma_kind",
+        mt_cfg.interaction_cross_attn.get("gamma_kind", "scalar"),
+    ))
+    accelerator.print(f"γ-gate kind: {gamma_kind}")
     transformer = InteractionMaskTransformer(
         mask_transformer=base_mt,
         interaction_tokenizer=interaction_tokenizer,
         interaction_drop_prob=float(mt_cfg.get("interaction_drop_prob", 0.1)),
         zero_init_gamma=bool(mt_cfg.interaction_cross_attn.get("zero_init", True)),
         max_token_seq_length=max_seq_length_tokens,
+        gamma_kind=gamma_kind,
     )
     transformer.to(device)
 

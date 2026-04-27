@@ -106,9 +106,17 @@ class MaskTransformerBlockWithInteraction(nn.Module):
         num_heads: int,
         dropout: float = 0.1,
         zero_init_gamma: bool = True,
+        gamma_kind: str = "scalar",
     ) -> None:
         super().__init__()
         self.layer = original_layer
+        self.num_heads = int(num_heads)
+        if d_model % self.num_heads != 0:
+            raise ValueError(
+                f"d_model {d_model} must be divisible by num_heads {self.num_heads} "
+                f"for per-head gamma to reshape cleanly",
+            )
+        self.head_dim = d_model // self.num_heads
 
         # Pre-norm on the cross-attn input. Initialised at PyTorch
         # default (weight=1, bias=0) so the very first forward sees
@@ -128,13 +136,44 @@ class MaskTransformerBlockWithInteraction(nn.Module):
         )
         self.dropout_int = nn.Dropout(dropout)
 
-        # γ_int: per-layer learnable scalar gate. Zero-init makes the
-        # new sublayer an *exact* no-op at step 0, so the wrapped block
-        # is byte-identical to the pretrained MoMask block. Training
-        # learns to grow γ_int as the interaction signal becomes
-        # useful (ControlNet / LLaMA-Adapter convention).
-        init_gamma = 0.0 if zero_init_gamma else 1.0
-        self.gamma_int = nn.Parameter(torch.full((1,), init_gamma))
+        # γ_int: learnable gate, shape depends on ``gamma_kind``. Zero-init
+        # makes the new sublayer an *exact* no-op at step 0, so the wrapped
+        # block is byte-identical to the pretrained MoMask block.
+        #
+        # - "scalar"   : single scalar per layer (8 dof total, v0.1-v0.5
+        #                ControlNet-flavour). Stored as ``(1,)`` so
+        #                ``.mean()``/``.abs()`` are well-defined.
+        # - "per_head" : one scalar per attention head (n_heads dof per
+        #                layer = 48 total, v0.6+, LLaMA-Adapter pattern
+        #                ICLR'24 — `OpenGVLab/LLaMA-Adapter@alpaca_finetuning_v1/llama/model.py`).
+        #                Each head gates independently, allowing some heads
+        #                to attend to z_int while others ignore it.
+        self.gamma_kind = str(gamma_kind)
+        init_value = 0.0 if zero_init_gamma else 1.0
+        if self.gamma_kind == "scalar":
+            self.gamma_int = nn.Parameter(torch.full((1,), init_value))
+        elif self.gamma_kind == "per_head":
+            self.gamma_int = nn.Parameter(torch.full((self.num_heads,), init_value))
+        else:
+            raise ValueError(
+                f"gamma_kind must be 'scalar' or 'per_head', got {self.gamma_kind!r}",
+            )
+
+    def _apply_gamma(self, x: Tensor) -> Tensor:
+        """Multiply ``(S, B, d)`` interaction output by the γ gate.
+
+        Scalar path is plain broadcast multiply (preserves v0.1-v0.5
+        behaviour bytewise). Per-head path reshapes the channel axis
+        to ``(num_heads, head_dim)``, multiplies each head by its scalar
+        gate, then folds back.
+        """
+        if self.gamma_kind == "scalar":
+            return self.gamma_int * x
+        # per-head
+        S, B, d = x.shape
+        x_h = x.view(S, B, self.num_heads, self.head_dim)
+        x_h = x_h * self.gamma_int.view(1, 1, self.num_heads, 1)
+        return x_h.reshape(S, B, d)
 
     def forward(
         self,
@@ -174,7 +213,7 @@ class MaskTransformerBlockWithInteraction(nn.Module):
                 key_padding_mask=int_key_padding_mask,
                 need_weights=False,
             )
-            src = src + self.gamma_int * self.dropout_int(int_out)
+            src = src + self._apply_gamma(self.dropout_int(int_out))
 
         # ---- MoMask original: FFN + post-norm + residual ----
         ff_out = layer.linear2(
@@ -200,12 +239,14 @@ class MaskTransformerEncoderWithInteraction(nn.Module):
         num_heads: int,
         dropout: float = 0.1,
         zero_init_gamma: bool = True,
+        gamma_kind: str = "scalar",
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
             MaskTransformerBlockWithInteraction(
                 layer, d_model=d_model, num_heads=num_heads,
                 dropout=dropout, zero_init_gamma=zero_init_gamma,
+                gamma_kind=gamma_kind,
             )
             for layer in original_encoder.layers
         ])
@@ -329,11 +370,13 @@ class InteractionMaskTransformer(nn.Module):
         interaction_drop_prob: float = 0.1,
         zero_init_gamma: bool = True,
         max_token_seq_length: int = 49,
+        gamma_kind: str = "scalar",
     ) -> None:
         super().__init__()
         self.mask_transformer = mask_transformer
         self.interaction_tokenizer = interaction_tokenizer
         self.interaction_drop_prob = float(interaction_drop_prob)
+        self.gamma_kind = str(gamma_kind)
 
         # Sanity: tokenizer d_model must match MoMask latent_dim so K/V
         # can cross-attend without an extra projection.
@@ -358,6 +401,7 @@ class InteractionMaskTransformer(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             zero_init_gamma=zero_init_gamma,
+            gamma_kind=self.gamma_kind,
         )
 
         # Disable MoMask's own internal text-drop. We handle CFG
@@ -392,6 +436,7 @@ class InteractionMaskTransformer(nn.Module):
         zero_init_gamma: bool = True,
         device: str | torch.device = "cpu",
         max_token_seq_length: int = 49,
+        gamma_kind: str = "scalar",
         **mask_transformer_kwargs: Any,
     ) -> "InteractionMaskTransformer":
         """Load pretrained MoMask MaskTransformer and wrap with interaction layers.
@@ -417,6 +462,7 @@ class InteractionMaskTransformer(nn.Module):
             interaction_drop_prob=interaction_drop_prob,
             zero_init_gamma=zero_init_gamma,
             max_token_seq_length=max_token_seq_length,
+            gamma_kind=gamma_kind,
         )
         # Move EVERYTHING (not just the loaded MoMask) to the target
         # device. The newly-created wrapper layers + tokenizer +
