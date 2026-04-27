@@ -51,6 +51,53 @@ def test_lift_canonical_to_world_torch_y_rotation():
     assert torch.allclose(out[0, 0, 0], expected, atol=1e-5)
 
 
+def test_lift_target_to_world_zero_rotation_pure_translation():
+    """target_world = R(0) @ target_local + obj_pos = target_local + obj_pos"""
+    from piano.inference.contact_guidance import _lift_target_to_world_np
+
+    target_local = np.zeros((2, 3, 3), dtype=np.float32)        # (T=2, n_parts=3, 3)
+    target_local[0, 0] = [1.0, 0.0, 0.0]
+    target_local[1, 2] = [0.0, 1.0, 0.0]
+
+    obj_pos = np.array([[10.0, 0.0, 0.0], [0.0, 0.0, 5.0]], dtype=np.float32)
+    obj_rot = np.zeros((2, 3), dtype=np.float32)                # axis-angle = 0 → identity
+
+    out = _lift_target_to_world_np(target_local, obj_pos, obj_rot)
+    assert out.shape == (2, 3, 3)
+    # frame 0, part 0: (1,0,0) + (10,0,0) = (11,0,0)
+    np.testing.assert_allclose(out[0, 0], [11.0, 0.0, 0.0], atol=1e-6)
+    # frame 1, part 2: (0,1,0) + (0,0,5) = (0,1,5)
+    np.testing.assert_allclose(out[1, 2], [0.0, 1.0, 5.0], atol=1e-6)
+
+
+def test_lift_target_to_world_rotation_only():
+    """target_world = R @ target_local with obj_pos=0"""
+    from piano.inference.contact_guidance import _lift_target_to_world_np
+
+    # +90° around Y: (1, 0, 0) → (0, 0, -1)
+    target_local = np.array([[[1.0, 0.0, 0.0]]], dtype=np.float32)   # (T=1, n_parts=1, 3)
+    obj_pos = np.zeros((1, 3), dtype=np.float32)
+    # axis-angle for +90° around Y axis = [0, π/2, 0]
+    obj_rot = np.array([[0.0, np.pi / 2, 0.0]], dtype=np.float32)
+
+    out = _lift_target_to_world_np(target_local, obj_pos, obj_rot)
+    np.testing.assert_allclose(out[0, 0], [0.0, 0.0, -1.0], atol=1e-5)
+
+
+def test_lift_target_to_world_rotation_and_translation():
+    """target_world = R @ target_local + obj_pos."""
+    from piano.inference.contact_guidance import _lift_target_to_world_np
+
+    # +180° around Y: (1, 0, 0) → (-1, 0, 0)
+    target_local = np.array([[[1.0, 0.0, 0.0]]], dtype=np.float32)
+    obj_pos = np.array([[5.0, 0.0, 7.0]], dtype=np.float32)
+    obj_rot = np.array([[0.0, np.pi, 0.0]], dtype=np.float32)
+
+    out = _lift_target_to_world_np(target_local, obj_pos, obj_rot)
+    # rotated: (-1, 0, 0); +obj_pos: (4, 0, 7)
+    np.testing.assert_allclose(out[0, 0], [4.0, 0.0, 7.0], atol=1e-5)
+
+
 def test_masked_contact_l2_shape_and_value():
     from piano.inference.contact_guidance import _masked_contact_l2
 

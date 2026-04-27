@@ -652,8 +652,14 @@ def main() -> int:
                 [seq_lens_tok[i]], dtype=torch.long, device=device,
             )
             kv_self, pad_self = z_int_per[i]
-            cstate_i = samples[i]["contact_state"].unsqueeze(0).to(device).float()
-            ctgt_i = samples[i]["contact_target_xyz"].unsqueeze(0).to(device).float()
+            # Source clip data (numpy on CPU). The guide_with_contact
+            # helper lifts contact_target_xyz from object-local to world
+            # frame internally — pass the LOCAL-frame target + per-frame
+            # object pose (so the rigid transform is reconstructible).
+            cstate_i = samples[i]["contact_state"].cpu().numpy().astype(np.float32)
+            ctgt_local_i = samples[i]["contact_target_xyz"].cpu().numpy().astype(np.float32)
+            obj_pos_i = object_positions[i]                              # (T, 3) world
+            obj_rot_i = object_rotations[i]                              # (T, 3) axis-angle world
             R_y_i, T_xz_i = source_canon_xforms[i]
 
             print(
@@ -668,8 +674,10 @@ def main() -> int:
                 int_kv=kv_self,
                 int_pad=pad_self,
                 m_lens_tok=m_lens_tok_i,
-                contact_target_xyz_gt=ctgt_i,
+                contact_target_xyz_local=ctgt_local_i,
                 contact_state=cstate_i,
+                object_positions=obj_pos_i,
+                object_rotations=obj_rot_i,
                 R_y_angle=R_y_i,
                 T_xz=T_xz_i,
                 motion_mean=torch.from_numpy(motion_mean).float().to(device),

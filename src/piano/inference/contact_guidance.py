@@ -82,7 +82,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from piano.utils.canonical_frame import y_rotation_matrix
+from piano.utils.canonical_frame import axis_angle_to_matrix_np, y_rotation_matrix
 from piano.utils.smpl_utils import BODY_PART_INDICES
 
 
@@ -147,7 +147,36 @@ def _decode_relaxed_base(
 
 
 # ============================================================================
-# Loss: masked L2 against contact_target_xyz_gt under contact_state
+# Object-local → world target lift (constant per-clip, pre-computed once)
+# ============================================================================
+
+def _lift_target_to_world_np(
+    target_local: np.ndarray,           # (T, n_parts, 3) object-local frame
+    object_positions: np.ndarray,       # (T, 3) world frame
+    object_rotations: np.ndarray,       # (T, 3) axis-angle world frame
+) -> np.ndarray:
+    """Lift per-body-part contact target from object-local to world frame.
+
+    The pseudo-label ``contact_target_xyz_gt`` field is stored in
+    object-local frame (per ``src/piano/data/pseudo_labels/extract_target.py``
+    docstring: "exact closest-surface-point in object-local frame via
+    trimesh.proximity.closest_point"). To use it as the L2 target in
+    a world-frame contact loss, we rigidly transform via the source
+    clip's per-frame object pose:
+
+        target_world[t, p, :] = R_obj[t] @ target_local[t, p, :] + obj_pos[t]
+
+    Same convention as ``_world_object_pc_per_frame`` (used by the
+    eval metric). Pre-computed once per clip; constant across the
+    optimization loop.
+    """
+    R_obj = axis_angle_to_matrix_np(object_rotations.astype(np.float32))   # (T, 3, 3)
+    rotated = np.einsum("tij,tpj->tpi", R_obj, target_local.astype(np.float32))
+    return rotated + object_positions[:, None, :].astype(np.float32)         # (T, n_parts, 3)
+
+
+# ============================================================================
+# Loss: masked L2 against contact_target_xyz_gt (lifted to world) under contact_state
 # ============================================================================
 
 def _masked_contact_l2(
@@ -204,10 +233,12 @@ def guide_with_contact(
     int_kv: Tensor,                  # (S_int, 1, d) — interaction K/V (B=1)
     int_pad: Tensor | None,          # (1, S_int) or None
     m_lens_tok: Tensor,              # (1,)
-    contact_target_xyz_gt: Tensor,   # (1, T, 5, 3) — closest-surface-point per body part
-    contact_state: Tensor,           # (1, T, 5) — binary in-contact mask
-    R_y_angle: float,                # source clip's canonical→world rotation
-    T_xz: np.ndarray,                # (2,) source clip's canonical→world translation
+    contact_target_xyz_local: np.ndarray,   # (T, 5, 3) — closest-surface-point per body part, OBJECT-LOCAL frame
+    contact_state: np.ndarray,              # (T, 5) — binary in-contact mask
+    object_positions: np.ndarray,           # (T, 3) — world-frame object COM per frame
+    object_rotations: np.ndarray,           # (T, 3) — world-frame object axis-angle per frame
+    R_y_angle: float,                # source clip's canonical→world rotation (for body lift)
+    T_xz: np.ndarray,                # (2,) source clip's canonical→world translation (for body lift)
     motion_mean: Tensor,             # (263,) on device
     motion_std: Tensor,              # (263,) on device
     w_text: float = 4.0,
@@ -273,7 +304,8 @@ def guide_with_contact(
 
     # If there's nothing to guide against (no contact frames), short-circuit:
     # baseline's the answer.
-    if contact_state.sum() < 0.5:
+    contact_state_np = np.asarray(contact_state, dtype=np.float32)
+    if float(contact_state_np.sum()) < 0.5:
         with torch.no_grad():
             motion = vq_model.forward_decoder(all_for_decode)
             motion = motion.squeeze(0) * motion_std + motion_mean
@@ -284,6 +316,23 @@ def guide_with_contact(
              "loss_final": float("nan"), "steps_taken": 0,
              "base_token_change_count": 0},
         )
+
+    # Pre-compute the world-frame target ONCE (constant across the
+    # optimization loop). Per the data-loader docstring, the
+    # `contact_target_xyz_gt` field is in OBJECT-LOCAL frame; the body
+    # we compare against is in WORLD frame after the canonical→world
+    # lift. Without this rigid transform the loss compares two frames
+    # whose alignment depends on where the object sits in the world
+    # — which produces wildly variable gradients across clips and was
+    # the bug behind the +8 cm regression on guidance30 (4/5 clips
+    # got worse on canonical val set).
+    target_world_np = _lift_target_to_world_np(
+        target_local=np.asarray(contact_target_xyz_local, dtype=np.float32),
+        object_positions=np.asarray(object_positions, dtype=np.float32),
+        object_rotations=np.asarray(object_rotations, dtype=np.float32),
+    )                                                                          # (T, 5, 3)
+    target_world_t = torch.from_numpy(target_world_np).to(device).float().unsqueeze(0)   # (1, T, 5, 3)
+    contact_state_t = torch.from_numpy(contact_state_np).to(device).float().unsqueeze(0) # (1, T, 5)
 
     # --- Step 2: initialize logits to optimize ---
     # One-hot(base_ids) * init_scale. Strong preference for the argmax,
@@ -304,8 +353,6 @@ def guide_with_contact(
     optimizer = torch.optim.AdamW(
         [logits], lr=guidance_lr, betas=(0.5, 0.9), weight_decay=1e-6,
     )
-    target = contact_target_xyz_gt.to(device).float()                          # (1, T, 5, 3)
-    cstate = contact_state.to(device).float()                                  # (1, T, 5)
     body_idx_t = torch.tensor(list(body_part_indices), device=device, dtype=torch.long)
 
     loss_initial: float = float("nan")
@@ -326,13 +373,13 @@ def guide_with_contact(
         # may be slightly different from the seq_lens-derived T; align
         # by taking the min).
         T_dec = body_world.shape[1]
-        T_tgt = target.shape[1]
+        T_tgt = target_world_t.shape[1]
         T_use = min(T_dec, T_tgt)
 
         loss = _masked_contact_l2(
             body_world=body_world[:, :T_use],
-            target_world=target[:, :T_use],
-            contact_state=cstate[:, :T_use],
+            target_world=target_world_t[:, :T_use],
+            contact_state=contact_state_t[:, :T_use],
         )
 
         optimizer.zero_grad()
