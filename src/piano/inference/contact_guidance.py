@@ -248,7 +248,7 @@ def guide_with_contact(
     num_guidance_steps: int = 30,
     guidance_lr: float = 6e-2,
     guidance_temperature: float = 1.0,
-    init_logit_scale: float = 10.0,
+    init_logit_scale: float = 3.0,
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -335,12 +335,23 @@ def guide_with_contact(
     contact_state_t = torch.from_numpy(contact_state_np).to(device).float().unsqueeze(0) # (1, T, 5)
 
     # --- Step 2: initialize logits to optimize ---
-    # One-hot(base_ids) * init_scale. Strong preference for the argmax,
-    # but softmax can move probability mass to neighbors during
-    # optimization. MaskControl initializes from the model's logits
-    # directly (more informed), but we don't have those exposed cleanly
-    # without modifying generate(); one-hot init is a faithful
-    # approximation that converges to the same fixed points.
+    # One-hot(base_ids) * init_scale. Stronger init = optimization
+    # respects the model's prior more, but softer init allows tokens
+    # to flip within the budget.
+    #
+    # 2026-04-28 calibration: init_scale=10 made softmax effectively
+    # one-hot (p(argmax) ≈ 0.99996), so 30 AdamW steps × lr=6e-2 (≈1.8
+    # max logit change) couldn't overcome the gap → 0/N tokens flipped
+    # across all 5 clips even though loss dropped 30-64%. Default
+    # lowered to 3.0 (p(argmax) ≈ 0.038, model preference preserved
+    # but flip-able).
+    #
+    # MaskControl's actual recipe inits from the model's last-iteration
+    # logits (top-k filtered) which have similar magnitude but a
+    # softer top-of-distribution because model uncertainty distributes
+    # among multiple plausible tokens. Achieving that exactly requires
+    # exposing logits from generate(); deferred (init_scale=3.0 is the
+    # cheaper approximation).
     V = vq_model.quantizer.codebooks.shape[1]                                 # 512
     S = base_for_res.shape[-1]
     logits = F.one_hot(base_for_res.long(), num_classes=V).float() * init_logit_scale

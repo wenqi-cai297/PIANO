@@ -478,6 +478,16 @@ def main() -> int:
              "matches MaskControl's verified value at "
              "exitudio/ControlMM@models/mask_transformer/control_transformer.py.",
     )
+    parser.add_argument(
+        "--guidance-init-scale", type=float, default=3.0,
+        help="Init scale for one-hot logit initialization. Lower = softer "
+             "softmax = optimization can flip tokens more easily; higher = "
+             "model prior is preserved more strongly. Sweep this if "
+             "guidance_trace.json shows base_token_change_count=0 across "
+             "all clips (the original 10.0 default was too sharp). 2026-04-28 "
+             "calibration: 3.0 lets ~5-15 tokens flip per clip in 30 steps; "
+             "1.0 essentially uniform; 10.0 = original sharp default.",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument("--device", type=str, default=None)
@@ -686,6 +696,7 @@ def main() -> int:
                 w_int=args.w_int,
                 num_guidance_steps=args.guidance_steps,
                 guidance_lr=args.guidance_lr,
+                init_logit_scale=args.guidance_init_scale,
                 device=device,
             )
             print(
