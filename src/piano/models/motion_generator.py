@@ -371,12 +371,26 @@ class InteractionMaskTransformer(nn.Module):
         zero_init_gamma: bool = True,
         max_token_seq_length: int = 49,
         gamma_kind: str = "scalar",
+        wrapper_kind: str = "v0.6",
     ) -> None:
         super().__init__()
         self.mask_transformer = mask_transformer
         self.interaction_tokenizer = interaction_tokenizer
         self.interaction_drop_prob = float(interaction_drop_prob)
         self.gamma_kind = str(gamma_kind)
+        # ``wrapper_kind`` selects which encoder swap-in to use:
+        #   - "v0.6"       : MaskTransformerEncoderWithInteraction (per-block IntXAttn
+        #                    on the same layers, backbone fine-tuned). v0.1-v0.7 default.
+        #   - "v0.3-delta" : InterControlTransformerEncoder (trainable deepcopy
+        #                    of seqTransEncoder + per-layer zero-init Linear
+        #                    connectors + frozen main branch). InterControl
+        #                    NeurIPS'24 / OmniControl ICLR'24 / MotionLCM
+        #                    ECCV'24 recipe.
+        self.wrapper_kind = str(wrapper_kind)
+        if self.wrapper_kind not in ("v0.6", "v0.3-delta"):
+            raise ValueError(
+                f"wrapper_kind must be 'v0.6' or 'v0.3-delta', got {self.wrapper_kind!r}",
+            )
 
         # Sanity: tokenizer d_model must match MoMask latent_dim so K/V
         # can cross-attend without an extra projection.
@@ -395,14 +409,41 @@ class InteractionMaskTransformer(nn.Module):
         num_heads = mask_transformer.seqTransEncoder.layers[0].self_attn.num_heads
         dropout = mask_transformer.dropout
 
-        mask_transformer.seqTransEncoder = MaskTransformerEncoderWithInteraction(
-            original_encoder=mask_transformer.seqTransEncoder,
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            zero_init_gamma=zero_init_gamma,
-            gamma_kind=self.gamma_kind,
-        )
+        if self.wrapper_kind == "v0.6":
+            mask_transformer.seqTransEncoder = MaskTransformerEncoderWithInteraction(
+                original_encoder=mask_transformer.seqTransEncoder,
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                zero_init_gamma=zero_init_gamma,
+                gamma_kind=self.gamma_kind,
+            )
+        else:  # "v0.3-delta" — InterControl trainable-copy
+            from piano.models.motion_generator_intercontrol import (
+                InterControlTransformerEncoder,
+            )
+            mask_transformer.seqTransEncoder = InterControlTransformerEncoder(
+                original_encoder=mask_transformer.seqTransEncoder,
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                gamma_kind=self.gamma_kind,
+            )
+            # Freeze main branch (the deepcopy-source frozen layers).
+            mask_transformer.seqTransEncoder.freeze_main_branch()
+            # Per InterControl §3.2: freeze ALL of MoMask's pretrained
+            # components (token_emb, input_process, position_enc,
+            # cond_emb, output_process). Only the trainable-copy ctrl
+            # branch + zero-init connectors + tokenizer + null_int_kv
+            # learn. The seqTransEncoder.main_layers were already frozen
+            # by freeze_main_branch above.
+            for name, p in mask_transformer.named_parameters():
+                if name.startswith("clip_model."):
+                    continue   # already frozen by load_and_freeze_clip
+                if name.startswith("seqTransEncoder."):
+                    continue   # main_layers handled by freeze_main_branch;
+                               # ctrl_layers + connectors stay trainable
+                p.requires_grad = False
 
         # Disable MoMask's own internal text-drop. We handle CFG
         # bucketed drops at the wrapper level so per-sample masks for
@@ -437,6 +478,7 @@ class InteractionMaskTransformer(nn.Module):
         device: str | torch.device = "cpu",
         max_token_seq_length: int = 49,
         gamma_kind: str = "scalar",
+        wrapper_kind: str = "v0.6",
         **mask_transformer_kwargs: Any,
     ) -> "InteractionMaskTransformer":
         """Load pretrained MoMask MaskTransformer and wrap with interaction layers.
@@ -463,6 +505,7 @@ class InteractionMaskTransformer(nn.Module):
             zero_init_gamma=zero_init_gamma,
             max_token_seq_length=max_token_seq_length,
             gamma_kind=gamma_kind,
+            wrapper_kind=wrapper_kind,
         )
         # Move EVERYTHING (not just the loaded MoMask) to the target
         # device. The newly-created wrapper layers + tokenizer +
@@ -906,44 +949,70 @@ class InteractionMaskTransformer(nn.Module):
     # ------------------------------------------------------------------
 
     def new_parameters(self) -> list[nn.Parameter]:
-        """Trained-from-scratch params: tokenizer + IntXAttn + γ + null_int_kv.
+        """Trained-from-scratch params: tokenizer + IntXAttn + γ + null_int_kv
+        (+ control branch + zero-init connectors when wrapper_kind=v0.3-delta).
 
         These need a higher LR than the MoMask backbone finetune. Per
         ControlNet ICCV'23 + LLaMA-Adapter convention, "new" weights
         train at full LR while pretrained weights move at a much lower
         rate. The trainer routes these into a separate AdamW group.
+
+        Layout per wrapper_kind:
+          - "v0.6"       : tokenizer + null_int_kv + per-block IntXAttn
+                           (the new sublayers added on top of frozen
+                           ``blk.layer`` references inside
+                           ``MaskTransformerEncoderWithInteraction``).
+          - "v0.3-delta" : tokenizer + null_int_kv + ctrl_layers
+                           (deepcopy of seqTransEncoder layers wrapped
+                           with IntXAttn) + per-layer zero-init
+                           connectors. Main layers (frozen at
+                           pretrained MoMask weights) NOT included.
         """
         params: list[nn.Parameter] = []
-        # Tokenizer (Linear/Conv1d/PE).
+        # Common: tokenizer + null_int_kv.
         params.extend(self.interaction_tokenizer.parameters())
-        # null_int_kv learnable bank.
         params.append(self.null_int_kv)
-        # Per-block IntXAttn weights + γ + norm_int (anything that lives
-        # under the new ``MaskTransformerEncoderWithInteraction`` and
-        # ISN'T part of the original MoMask ``nn.TransformerEncoderLayer``).
-        for blk in self.mask_transformer.seqTransEncoder.layers:
-            # ``blk.layer`` is the original MoMask layer (don't touch);
-            # everything else on ``blk`` is new.
-            for name, p in blk.named_parameters():
-                if name.startswith("layer."):
-                    continue
-                params.append(p)
+
+        encoder = self.mask_transformer.seqTransEncoder
+        if self.wrapper_kind == "v0.6":
+            # Per-block IntXAttn weights + γ + norm_int (anything that
+            # lives under MaskTransformerEncoderWithInteraction and
+            # ISN'T part of the original MoMask
+            # ``nn.TransformerEncoderLayer`` referenced by ``blk.layer``).
+            for blk in encoder.layers:
+                for name, p in blk.named_parameters():
+                    if name.startswith("layer."):
+                        continue
+                    params.append(p)
+        else:  # "v0.3-delta" — InterControlTransformerEncoder
+            # Trainable-copy ctrl branch (deepcopy + IntXAttn wrap)
+            # + per-layer zero-init Linear connectors. main_layers and
+            # main_norm are frozen and excluded.
+            params.extend(encoder.ctrl_layers.parameters())
+            params.extend(encoder.connectors.parameters())
         return params
 
     def backbone_parameters(self) -> list[nn.Parameter]:
         """Pretrained MoMask params (excluding CLIP, which stays frozen).
 
-        Includes:
-          - token_emb, input_process, position_enc, output_process,
-            cond_emb (text projection)
-          - Each ``blk.layer`` — MoMask's original
-            nn.TransformerEncoderLayer with self-attn + FFN weights.
+        Layout per wrapper_kind:
+          - "v0.6": token_emb + input_process + position_enc +
+                    output_process + cond_emb + each ``blk.layer``
+                    (original nn.TransformerEncoderLayer with self-attn
+                    + FFN weights). All trained at backbone_lr.
+          - "v0.3-delta": empty list. Per InterControl §3.2, the main
+                          branch (including embeddings + projections)
+                          stays frozen at pretrained MoMask weights.
+                          Optimiser uses one effective LR group (new_lr).
 
-        Excludes:
+        Always excludes:
           - clip_model.* (frozen by MoMask's ``load_and_freeze_clip``)
-          - null_int_kv, IntXAttn, γ, norm_int, tokenizer
-            (counted by ``new_parameters``)
+          - Anything counted by ``new_parameters`` (no double-count)
         """
+        if self.wrapper_kind == "v0.3-delta":
+            # Main branch frozen by InterControl convention; no
+            # backbone-LR group.
+            return []
         new_param_ids = {id(p) for p in self.new_parameters()}
         backbone: list[nn.Parameter] = []
         for name, p in self.mask_transformer.named_parameters():

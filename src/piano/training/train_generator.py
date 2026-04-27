@@ -458,7 +458,13 @@ def run(config_path: str) -> None:
         "gamma_kind",
         mt_cfg.interaction_cross_attn.get("gamma_kind", "scalar"),
     ))
-    accelerator.print(f"γ-gate kind: {gamma_kind}")
+    # Wrapper kind: "v0.6" (default — per-block IntXAttn on a single
+    # finetuned encoder) or "v0.3-delta" (trainable-copy InterControl
+    # pattern: deepcopy ctrl branch + per-layer zero-init linear
+    # connectors + frozen main branch). v0.1-v0.7 leave the key unset
+    # → backward-compatible v0.6 path.
+    wrapper_kind = str(cfg.model.get("wrapper_kind", "v0.6"))
+    accelerator.print(f"γ-gate kind: {gamma_kind}, wrapper_kind: {wrapper_kind}")
     transformer = InteractionMaskTransformer(
         mask_transformer=base_mt,
         interaction_tokenizer=interaction_tokenizer,
@@ -466,6 +472,7 @@ def run(config_path: str) -> None:
         zero_init_gamma=bool(mt_cfg.interaction_cross_attn.get("zero_init", True)),
         max_token_seq_length=max_seq_length_tokens,
         gamma_kind=gamma_kind,
+        wrapper_kind=wrapper_kind,
     )
     transformer.to(device)
 
