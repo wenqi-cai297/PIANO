@@ -462,6 +462,22 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--w-text", type=float, default=4.0)
     parser.add_argument("--w-int", type=float, default=2.0)
+    parser.add_argument(
+        "--guidance-steps", type=int, default=0,
+        help="Contact-aware inference-time logit guidance (B3, MaskControl "
+             "arXiv:2410.10780). When > 0, additionally generate a "
+             "'full_guided' condition per clip: optimise base-token logits "
+             "in decoded geometric space against contact_target_xyz_gt for "
+             "this many AdamW steps before argmax + residual decode. "
+             "Default 0 = baseline only. Recommended starting value: 30. "
+             "Cost ~1 sec per step per clip on bf16 / single A6000.",
+    )
+    parser.add_argument(
+        "--guidance-lr", type=float, default=6e-2,
+        help="Learning rate for contact guidance optimiser. Default 6e-2 "
+             "matches MaskControl's verified value at "
+             "exitudio/ControlMM@models/mask_transformer/control_transformer.py.",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument("--device", type=str, default=None)
@@ -618,6 +634,76 @@ def main() -> int:
         world_R_y=[x[0] for x in source_canon_xforms],
         world_T_xz=[x[1] for x in source_canon_xforms],
     )
+
+    # Optional: contact-aware inference-time logit guidance (B3).
+    # Source-verified MaskControl arXiv:2410.10780 recipe. See
+    # piano.inference.contact_guidance for the algorithm.
+    if args.guidance_steps > 0:
+        from piano.inference.contact_guidance import guide_with_contact
+
+        print(
+            f"\n=== Generating 'full_guided' condition with contact guidance "
+            f"({args.guidance_steps} steps, lr={args.guidance_lr}) ===",
+        )
+        per_clip_guided: list[dict[str, dict]] = []
+        for i in range(len(samples)):
+            text_i = texts[i]
+            m_lens_tok_i = torch.tensor(
+                [seq_lens_tok[i]], dtype=torch.long, device=device,
+            )
+            kv_self, pad_self = z_int_per[i]
+            cstate_i = samples[i]["contact_state"].unsqueeze(0).to(device).float()
+            ctgt_i = samples[i]["contact_target_xyz"].unsqueeze(0).to(device).float()
+            R_y_i, T_xz_i = source_canon_xforms[i]
+
+            print(
+                f"  clip {i+1}/{len(samples)}: {seq_ids[i]}  "
+                f"text={text_i[:60]!r}",
+            )
+            motion_g, base_g, info = guide_with_contact(
+                transformer=transformer,
+                vq_model=vq_model,
+                res_transformer=res_transformer,
+                text=text_i,
+                int_kv=kv_self,
+                int_pad=pad_self,
+                m_lens_tok=m_lens_tok_i,
+                contact_target_xyz_gt=ctgt_i,
+                contact_state=cstate_i,
+                R_y_angle=R_y_i,
+                T_xz=T_xz_i,
+                motion_mean=torch.from_numpy(motion_mean).float().to(device),
+                motion_std=torch.from_numpy(motion_std).float().to(device),
+                w_text=args.w_text,
+                w_int=args.w_int,
+                num_guidance_steps=args.guidance_steps,
+                guidance_lr=args.guidance_lr,
+                device=device,
+            )
+            print(
+                f"    guidance: loss {info['loss_initial']:.4f} → "
+                f"{info['loss_final']:.4f} | "
+                f"tokens changed: {info['base_token_change_count']}/"
+                f"{info['base_token_total']}",
+            )
+            per_clip_guided.append({
+                "full": {
+                    "motion": motion_g,
+                    "base": base_g,
+                    "swap_from": None,
+                    "guidance_info": info,
+                },
+            })
+
+        _save_condition_dir(
+            args.output_dir / "full_guided", per_clip_guided, "full",
+            texts, seq_lens_frames, seq_ids,
+            object_pcs=object_pcs,
+            object_positions=object_positions,
+            object_rotations=object_rotations,
+            world_R_y=[x[0] for x in source_canon_xforms],
+            world_T_xz=[x[1] for x in source_canon_xforms],
+        )
 
     # Diff metrics for the default run.
     diffs_default = _summarise_diffs(per_clip_default, seq_lens_tok, seq_lens_frames)
