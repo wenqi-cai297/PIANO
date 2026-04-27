@@ -96,9 +96,17 @@ def test_byte_identity_at_init_no_int_kv(base_encoder):
 
 
 def test_byte_identity_at_init_with_int_kv(base_encoder):
-    """Even when int_kv is supplied, ctrl branch's IntXAttn produces
-    a γ-gated output that is zero at init (γ_int starts at 0). The
-    connector then projects 0 to 0. So output still matches base."""
+    """Even when int_kv is supplied, the encoder's main output equals
+    the base encoder bytewise at init.
+
+    NOTE: byte-identity here relies SOLELY on the zero-init connectors
+    (``connector_W = 0`` ⇒ ``connector(ctrl_out) = 0`` regardless of
+    ctrl_out's value). γ_int defaults to NON-zero (1.0) in
+    InterControlTransformerEncoder per InterControl §3.2 to avoid the
+    doubly-zero gradient pathology — see the class docstring's
+    ``zero_init_gamma`` discussion. With γ=1, ctrl_out ≠ main_out at
+    init, but the connector projects ctrl_out to zero so main is
+    unchanged."""
     wrapper = InterControlTransformerEncoder(
         original_encoder=base_encoder,
         d_model=D_MODEL,
@@ -214,6 +222,43 @@ def test_grad_does_not_flow_into_main(base_encoder):
     # → ctrl grads may legitimately be all zero. We just check no
     # exception was raised + main params remain frozen.
     _ = has_ctrl_grad   # not asserted; can be False at init.
+
+
+def test_gamma_int_default_non_zero_init(base_encoder):
+    """InterControl pattern: γ_int defaults to 1.0 (non-zero) so the
+    ctrl branch's IntXAttn participates from epoch 0. The single
+    zero-init point is the connector. Verifies the v0.3-δ-dead-init
+    fix described in the class docstring + analyses/2026-04-27_v0_3_delta_dead_init.md."""
+    wrapper = InterControlTransformerEncoder(
+        original_encoder=base_encoder,
+        d_model=D_MODEL,
+        num_heads=N_HEADS,
+        dropout=DROPOUT,
+        gamma_kind="per_head",
+    )
+    for L, blk in enumerate(wrapper.ctrl_layers):
+        # γ_int per-head is shape (n_heads,) = (4,) in this fixture;
+        # all entries should be 1.0 at init.
+        assert torch.allclose(
+            blk.gamma_int, torch.ones_like(blk.gamma_int)
+        ), f"layer {L} γ_int not init'd to 1.0: {blk.gamma_int}"
+
+
+def test_zero_init_gamma_override_round_trips(base_encoder):
+    """For ablation / backward-compat: zero_init_gamma=True still
+    initializes γ to 0.0 (matches v0.6 MaskTransformerEncoderWithInteraction
+    convention) — useful if a caller wants to test the doubly-zero-init
+    regime explicitly."""
+    wrapper = InterControlTransformerEncoder(
+        original_encoder=base_encoder,
+        d_model=D_MODEL,
+        num_heads=N_HEADS,
+        dropout=DROPOUT,
+        gamma_kind="per_head",
+        zero_init_gamma=True,
+    )
+    for blk in wrapper.ctrl_layers:
+        assert torch.allclose(blk.gamma_int, torch.zeros_like(blk.gamma_int))
 
 
 def test_separate_main_and_ctrl_weights(base_encoder):

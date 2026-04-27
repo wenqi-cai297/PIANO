@@ -92,7 +92,34 @@ class InterControlTransformerEncoder(nn.Module):
         num_heads: int,
         dropout: float = 0.1,
         gamma_kind: str = "per_head",
+        zero_init_gamma: bool = False,
     ) -> None:
+        """
+        zero_init_gamma : bool, default False (note: differs from
+            MaskTransformerEncoderWithInteraction's default True).
+
+            Per InterControl §3.2 / OmniControl §3.2 / MotionLCM, the
+            **single** zero-init point in this architecture is the
+            connector. Stacking γ-zero-init INSIDE the ctrl branch on
+            top of zero-init connectors creates a doubly-zero gradient
+            pathway: at step 0, ``γ · IntXAttn → 0`` so ``ctrl_out`` is
+            essentially identical to a deepcopy-of-main forward, AND
+            ``connector(ctrl_out) → 0`` so main stays unchanged. The
+            connector weights still get useful gradient signal from
+            step 1 (``∂(conn(x))/∂W = x ≠ 0``), but γ doesn't update
+            until connectors grow non-trivially. Empirically this
+            stretches the wake-up time ~30× compared to v0.6 (γ stuck
+            at 2e-4 after 80 epochs vs v0.6's 0.020 — see
+            analyses/2026-04-27_v0_3_delta_dead_init.md).
+
+            With ``zero_init_gamma=False`` (default for InterControl),
+            γ starts at 1.0 so the ctrl branch's IntXAttn participates
+            from epoch 0; ctrl_out ≠ main_out immediately; connector
+            weights get rich gradient signal and grow at the v0.6 rate.
+            Byte-identity at init is preserved by the zero-init
+            connectors alone (``connector(ctrl_out) = 0`` regardless of
+            ctrl_out's value at init).
+        """
         super().__init__()
 
         # Main branch: hold by reference (no copy). Caller freezes via
@@ -113,7 +140,7 @@ class InterControlTransformerEncoder(nn.Module):
                 d_model=d_model,
                 num_heads=num_heads,
                 dropout=dropout,
-                zero_init_gamma=True,
+                zero_init_gamma=zero_init_gamma,
                 gamma_kind=gamma_kind,
             )
             for layer in ctrl_raw_layers
