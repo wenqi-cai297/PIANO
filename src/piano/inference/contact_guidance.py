@@ -147,6 +147,28 @@ def _decode_relaxed_base(
 
 
 # ============================================================================
+# Object PC → world frame lift (constant per-clip, pre-computed once)
+# ============================================================================
+
+def _lift_pc_to_world_np(
+    object_pc_local: np.ndarray,        # (N_pc, 3)
+    object_positions: np.ndarray,       # (T, 3)
+    object_rotations: np.ndarray,       # (T, 3) axis-angle world
+) -> np.ndarray:                         # (T, N_pc, 3)
+    """Lift the object's sampled PC into per-frame world coordinates.
+
+    Mirrors ``_world_object_pc_per_frame`` in ``measure_contact_distance.py``
+    and ``contact_eval.py`` — same einsum pattern. This is the canonical
+    eval-metric reference: the metric is min over these PC samples per
+    body part per frame.
+    """
+    R_obj = axis_angle_to_matrix_np(object_rotations.astype(np.float32))   # (T, 3, 3)
+    pc_world = np.einsum("tij,nj->tni", R_obj, object_pc_local.astype(np.float32))
+    pc_world += object_positions[:, None, :].astype(np.float32)
+    return pc_world
+
+
+# ============================================================================
 # Object-local → world target lift (constant per-clip, pre-computed once)
 # ============================================================================
 
@@ -176,7 +198,45 @@ def _lift_target_to_world_np(
 
 
 # ============================================================================
-# Loss: masked L2 against contact_target_xyz_gt (lifted to world) under contact_state
+# Loss mode "metric": min-over-PC, min-over-body-parts, mean-over-time
+# (mirrors measure_contact_distance.py's eval metric exactly — used as loss)
+# ============================================================================
+
+def _eval_metric_as_loss(
+    body_world: Tensor,             # (B, T, n_parts, 3)
+    pc_world: Tensor,               # (B, T, N_pc, 3)
+) -> Tensor:
+    """The exact eval metric, used as a differentiable loss.
+
+    Computes ``mean_t min_p min_n ||body[t,p,:] - pc_world[t,n,:]||``.
+    This matches ``measure_contact_distance.py``'s
+    ``mean_min_dist_per_frame`` exactly.
+
+    Differentiable via PyTorch's subgradient on min(). Each body part
+    + frame backprops gradient only through the closest PC sample —
+    similar pattern to max-margin / nearest-neighbor losses.
+
+    NOTE: this loss intentionally does NOT mask by contact_state. The
+    eval metric considers all frames; using contact_state-masked L2
+    against the GT target was the bug behind the 2026-04-28 mixed
+    per-clip results (see analyses/...). Matching the metric exactly
+    eliminates the loss-vs-metric decoupling.
+
+    Returns scalar tensor.
+    """
+    # Pairwise distances: (B, T, n_parts, N_pc)
+    diff = body_world[:, :, :, None, :] - pc_world[:, :, None, :, :]      # (B, T, n_parts, N_pc, 3)
+    d = torch.linalg.vector_norm(diff, dim=-1)                            # (B, T, n_parts, N_pc)
+    # Min over PC samples per body part:
+    d_min_pc, _ = d.min(dim=-1)                                            # (B, T, n_parts)
+    # Min over body parts per frame:
+    d_min_parts, _ = d_min_pc.min(dim=-1)                                  # (B, T)
+    # Mean over time:
+    return d_min_parts.mean()
+
+
+# ============================================================================
+# Loss mode "target": masked L2 against contact_target_xyz_gt (lifted to world) under contact_state
 # ============================================================================
 
 def _masked_contact_l2(
@@ -235,6 +295,7 @@ def guide_with_contact(
     m_lens_tok: Tensor,              # (1,)
     contact_target_xyz_local: np.ndarray,   # (T, 5, 3) — closest-surface-point per body part, OBJECT-LOCAL frame
     contact_state: np.ndarray,              # (T, 5) — binary in-contact mask
+    object_pc_local: np.ndarray,            # (N_pc, 3) — object PC in object-local frame
     object_positions: np.ndarray,           # (T, 3) — world-frame object COM per frame
     object_rotations: np.ndarray,           # (T, 3) — world-frame object axis-angle per frame
     R_y_angle: float,                # source clip's canonical→world rotation (for body lift)
@@ -249,6 +310,7 @@ def guide_with_contact(
     guidance_lr: float = 6e-2,
     guidance_temperature: float = 1.0,
     init_logit_scale: float = 3.0,
+    loss_mode: str = "target",       # "target" or "metric"
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -317,22 +379,39 @@ def guide_with_contact(
              "base_token_change_count": 0},
         )
 
-    # Pre-compute the world-frame target ONCE (constant across the
-    # optimization loop). Per the data-loader docstring, the
-    # `contact_target_xyz_gt` field is in OBJECT-LOCAL frame; the body
-    # we compare against is in WORLD frame after the canonical→world
-    # lift. Without this rigid transform the loss compares two frames
-    # whose alignment depends on where the object sits in the world
-    # — which produces wildly variable gradients across clips and was
-    # the bug behind the +8 cm regression on guidance30 (4/5 clips
-    # got worse on canonical val set).
-    target_world_np = _lift_target_to_world_np(
-        target_local=np.asarray(contact_target_xyz_local, dtype=np.float32),
-        object_positions=np.asarray(object_positions, dtype=np.float32),
-        object_rotations=np.asarray(object_rotations, dtype=np.float32),
-    )                                                                          # (T, 5, 3)
-    target_world_t = torch.from_numpy(target_world_np).to(device).float().unsqueeze(0)   # (1, T, 5, 3)
-    contact_state_t = torch.from_numpy(contact_state_np).to(device).float().unsqueeze(0) # (1, T, 5)
+    # Pre-compute the world-frame loss reference ONCE (constant across
+    # the optimization loop). Per the data-loader docstring, the
+    # ``contact_target_xyz_gt`` field is in OBJECT-LOCAL frame; the
+    # body we compare against is in WORLD frame after the
+    # canonical→world lift. Without this rigid transform the loss
+    # compares two frames whose alignment depends on where the object
+    # sits in the world — which produces wildly variable gradients
+    # across clips and was the bug behind an earlier mixed-result run.
+    if loss_mode == "target":
+        # Lift target points from object-local to world. (T, 5, 3).
+        target_world_np = _lift_target_to_world_np(
+            target_local=np.asarray(contact_target_xyz_local, dtype=np.float32),
+            object_positions=np.asarray(object_positions, dtype=np.float32),
+            object_rotations=np.asarray(object_rotations, dtype=np.float32),
+        )
+        target_world_t = torch.from_numpy(target_world_np).to(device).float().unsqueeze(0)
+        contact_state_t = torch.from_numpy(contact_state_np).to(device).float().unsqueeze(0)
+        pc_world_t = None
+    elif loss_mode == "metric":
+        # Lift PC samples from object-local to world. (T, N_pc, 3).
+        # This becomes the loss reference set: distances are min over
+        # the lifted PC, matching measure_contact_distance.py's eval
+        # metric exactly.
+        pc_world_np = _lift_pc_to_world_np(
+            object_pc_local=np.asarray(object_pc_local, dtype=np.float32),
+            object_positions=np.asarray(object_positions, dtype=np.float32),
+            object_rotations=np.asarray(object_rotations, dtype=np.float32),
+        )
+        pc_world_t = torch.from_numpy(pc_world_np).to(device).float().unsqueeze(0)
+        target_world_t = None
+        contact_state_t = None
+    else:
+        raise ValueError(f"loss_mode must be 'target' or 'metric', got {loss_mode!r}")
 
     # --- Step 2: initialize logits to optimize ---
     # One-hot(base_ids) * init_scale. Stronger init = optimization
@@ -380,18 +459,24 @@ def guide_with_contact(
         joints_world = _lift_canonical_to_world_torch(joints_canon, R_y_angle, T_xz)
         body_world = joints_world.index_select(2, body_idx_t)                  # (1, T, 5, 3)
 
-        # Truncate target / mask to actual decoded T (residual decode
-        # may be slightly different from the seq_lens-derived T; align
-        # by taking the min).
+        # Truncate to actual decoded T (residual decode may differ from
+        # seq_lens-derived T by 1-3 frames due to VQ stride).
         T_dec = body_world.shape[1]
-        T_tgt = target_world_t.shape[1]
-        T_use = min(T_dec, T_tgt)
-
-        loss = _masked_contact_l2(
-            body_world=body_world[:, :T_use],
-            target_world=target_world_t[:, :T_use],
-            contact_state=contact_state_t[:, :T_use],
-        )
+        if loss_mode == "target":
+            T_tgt = target_world_t.shape[1]
+            T_use = min(T_dec, T_tgt)
+            loss = _masked_contact_l2(
+                body_world=body_world[:, :T_use],
+                target_world=target_world_t[:, :T_use],
+                contact_state=contact_state_t[:, :T_use],
+            )
+        else:  # loss_mode == "metric"
+            T_pc = pc_world_t.shape[1]
+            T_use = min(T_dec, T_pc)
+            loss = _eval_metric_as_loss(
+                body_world=body_world[:, :T_use],
+                pc_world=pc_world_t[:, :T_use],
+            )
 
         optimizer.zero_grad()
         loss.backward()

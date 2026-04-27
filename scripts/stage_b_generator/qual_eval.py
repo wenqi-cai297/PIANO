@@ -488,6 +488,17 @@ def main() -> int:
              "calibration: 3.0 lets ~5-15 tokens flip per clip in 30 steps; "
              "1.0 essentially uniform; 10.0 = original sharp default.",
     )
+    parser.add_argument(
+        "--guidance-loss", choices=["target", "metric"], default="metric",
+        help="Loss formulation: 'target' = masked L2 against GT contact "
+             "target points (object-local lifted to world); 'metric' = "
+             "exact eval metric (min over PC samples, min over body parts, "
+             "mean over time). 'target' was the initial recipe (matches "
+             "MaskControl's get_loss); 'metric' eliminates loss-vs-metric "
+             "decoupling. Default 'metric' since 2026-04-28 calibration "
+             "showed 'target' produced per-clip mixed results (largebox "
+             "-13 cm BUT plasticbox_037 +14 cm).",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument("--device", type=str, default=None)
@@ -686,6 +697,7 @@ def main() -> int:
                 m_lens_tok=m_lens_tok_i,
                 contact_target_xyz_local=ctgt_local_i,
                 contact_state=cstate_i,
+                object_pc_local=object_pcs[i],                    # (N_pc, 3) — for metric-mode loss
                 object_positions=obj_pos_i,
                 object_rotations=obj_rot_i,
                 R_y_angle=R_y_i,
@@ -697,6 +709,7 @@ def main() -> int:
                 num_guidance_steps=args.guidance_steps,
                 guidance_lr=args.guidance_lr,
                 init_logit_scale=args.guidance_init_scale,
+                loss_mode=args.guidance_loss,
                 device=device,
             )
             print(

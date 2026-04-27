@@ -84,6 +84,56 @@ def test_lift_target_to_world_rotation_only():
     np.testing.assert_allclose(out[0, 0], [0.0, 0.0, -1.0], atol=1e-5)
 
 
+def test_lift_pc_to_world_zero_rotation_pure_translation():
+    from piano.inference.contact_guidance import _lift_pc_to_world_np
+
+    pc = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)   # (N=2, 3)
+    obj_pos = np.array([[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]], dtype=np.float32)
+    obj_rot = np.zeros((2, 3), dtype=np.float32)
+
+    out = _lift_pc_to_world_np(pc, obj_pos, obj_rot)
+    assert out.shape == (2, 2, 3)
+    np.testing.assert_allclose(out[0, 0], [10.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(out[0, 1], [11.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(out[1, 0], [20.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(out[1, 1], [21.0, 0.0, 0.0], atol=1e-6)
+
+
+def test_eval_metric_as_loss_min_distance():
+    """Loss = mean_t min_p min_n ||body[t,p] - pc_world[t,n]||"""
+    from piano.inference.contact_guidance import _eval_metric_as_loss
+
+    # 1 frame, 2 body parts, 2 PC samples.
+    body = torch.tensor([[
+        [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+    ]])                                                                 # (B=1, T=1, n_parts=2, 3)
+    pc = torch.tensor([[
+        [[5.0, 0.0, 0.0], [15.0, 0.0, 0.0]],
+    ]])                                                                 # (B=1, T=1, N_pc=2, 3)
+
+    # body[0, 0]: nearest PC point is 5.0 away (5.0)
+    # body[10, 0]: nearest PC point is 5.0 away (15.0 - 10.0 = 5.0; or 0.0 - 10.0 = 10.0; min = 5.0)
+    # min over body parts: 5.0
+    # mean over t: 5.0
+    out = _eval_metric_as_loss(body, pc)
+    assert torch.allclose(out, torch.tensor(5.0), atol=1e-5)
+
+
+def test_eval_metric_as_loss_gradient_flows():
+    """Gradient flows from loss back through body_world."""
+    from piano.inference.contact_guidance import _eval_metric_as_loss
+
+    body = torch.zeros(1, 4, 2, 3, requires_grad=True)
+    pc = torch.ones(1, 4, 8, 3) * 5.0   # all PC points at (5,5,5)
+
+    loss = _eval_metric_as_loss(body, pc)
+    loss.backward()
+    assert body.grad is not None
+    assert torch.isfinite(body.grad).all()
+    # Gradient should push body toward (5,5,5) (i.e., negative for all coords)
+    assert (body.grad < 0).any()
+
+
 def test_lift_target_to_world_rotation_and_translation():
     """target_world = R @ target_local + obj_pos."""
     from piano.inference.contact_guidance import _lift_target_to_world_np
