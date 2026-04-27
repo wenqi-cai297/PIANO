@@ -281,6 +281,45 @@ def _lift_canonical_to_world_torch(
 
 
 # ============================================================================
+# no-residual-rerun helper: combine post-guidance base with baseline residuals
+# ============================================================================
+
+def _build_decode_ids_with_baseline_residuals(
+    base_ids_after: Tensor,           # (1, S) post-guidance argmax
+    baseline_residual_ids: Tensor,    # (1, S, Q-1) from baseline residual call
+    m_lens_tok: Tensor,               # (1,) actual token-space sequence length
+) -> Tensor:                          # (1, S, Q)
+    """Build decoder input from post-guidance base + frozen baseline residuals.
+
+    Used when ``no_residual_rerun=True``: the post-guidance base may differ
+    from the baseline base (token flips from optimization), but residuals
+    are reused as-is from the baseline call. This isolates "what does base
+    flip alone do?" by removing the residual rerun's contribution to
+    contact deltas (RNG drift + autoregressive feedback both eliminated).
+
+    Pad convention: the residual-rerun path zeros pad positions in the
+    decoder input via ``where(all_ids_after < 0, 0, all_ids_after)``. To
+    match that convention, this helper zeros pad positions in
+    ``base_ids_after`` (residuals are already 0 at pad — inherited from
+    baseline's where clause).
+    """
+    S = int(base_ids_after.shape[-1])
+    pad_mask = (
+        torch.arange(S, device=base_ids_after.device).unsqueeze(0)
+        >= m_lens_tok.unsqueeze(-1)
+    )                                                                          # (1, S)
+    base_padded = torch.where(
+        pad_mask,
+        torch.zeros_like(base_ids_after),
+        base_ids_after,
+    )
+    return torch.cat(
+        [base_padded.unsqueeze(-1), baseline_residual_ids],
+        dim=-1,
+    )
+
+
+# ============================================================================
 # Public entry point
 # ============================================================================
 
@@ -311,6 +350,8 @@ def guide_with_contact(
     guidance_temperature: float = 1.0,
     init_logit_scale: float = 3.0,
     loss_mode: str = "target",       # "target" or "metric"
+    residual_seed: int | None = None,
+    no_residual_rerun: bool = False,
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -328,6 +369,34 @@ def guide_with_contact(
     source values where possible. ``num_guidance_steps=30`` is a
     deliberate scope reduction vs MaskControl's ``iter_last=600``;
     increase if 30 doesn't move contact distance vs baseline.
+
+    ``residual_seed`` and ``no_residual_rerun`` (added 2026-04-28 v5):
+    diagnostic toggles for isolating the residual-rerun variance
+    surfaced by v4. Background: MoMask's ``ResidualTransformer.generate``
+    samples each of the 5 residual layers via ``gumbel_sample``
+    (transformer.py:949 + tools.py:90-95) using ``torch.uniform_(0, 1)``
+    on the global RNG. So calling it twice with identical inputs
+    produces different residual_ids — a "RNG drift" channel for
+    contact deltas. v4 plasticbox_014 (0/23 base flips, +7.3 cm
+    contact regression) is the smoking gun.
+
+    - ``residual_seed=N`` (default ``None``): if set, calls
+      ``torch.manual_seed(N)`` immediately before each
+      ``res_transformer.generate`` call (baseline + post-guidance).
+      Forces RNG-equivalence between the two calls so any contact
+      delta is attributable to base-token changes or autoregressive
+      feedback, NOT Gumbel-noise drift.
+    - ``no_residual_rerun=True`` (default ``False``): skip the
+      post-guidance ``res_transformer.generate`` call entirely;
+      decode using baseline residual_ids combined with new
+      ``base_ids_after``. Tests whether residual rerun itself is
+      the per-clip variance source. Cost: forfeits any "base
+      flip → residual self-adapts" gain (e.g., v4's
+      largebox_010 −14 cm may have come from this self-adaptation).
+
+    Side effect: ``residual_seed`` mutates the global ``torch`` RNG.
+    Callers wanting strict reproducibility of downstream code should
+    re-seed afterward.
     """
     # Lazy MoMask import (the inference module is also imported by
     # CPU-only test paths).
@@ -356,6 +425,12 @@ def guide_with_contact(
             torch.zeros_like(base_ids_baseline),
             base_ids_baseline,
         )
+        # Seed before residual generation so the post-guidance call (Step 4)
+        # can use the same seed and get RNG-identical Gumbel noise. Without
+        # this, gumbel_sample drift alone can change residual_ids even when
+        # base_ids_after == base_for_res bit-identical.
+        if residual_seed is not None:
+            torch.manual_seed(int(residual_seed))
         all_ids = res_transformer.generate(
             motion_ids=base_for_res,
             conds=[text],
@@ -376,7 +451,9 @@ def guide_with_contact(
             base_ids_baseline.squeeze(0).detach().cpu().numpy(),
             {"skipped": "no_contact_frames", "loss_initial": float("nan"),
              "loss_final": float("nan"), "steps_taken": 0,
-             "base_token_change_count": 0},
+             "base_token_change_count": 0,
+             "residual_seed": residual_seed,
+             "no_residual_rerun": bool(no_residual_rerun)},
         )
 
     # Pre-compute the world-frame loss reference ONCE (constant across
@@ -490,21 +567,37 @@ def guide_with_contact(
 
     loss_final = loss_trace[-1] if loss_trace else float("nan")
 
-    # --- Step 4: argmax + re-run residual on possibly-changed base ---
+    # --- Step 4: argmax + (optionally) re-run residual on possibly-changed base ---
     with torch.no_grad():
         base_ids_after = logits.argmax(dim=-1)                                 # (1, S)
         token_change_count = int(
             (base_ids_after != base_for_res).sum().item(),
         )
-        all_ids_after = res_transformer.generate(
-            motion_ids=base_ids_after,
-            conds=[text],
-            m_lens=m_lens_tok,
-            cond_scale=res_cond_scale,
-        )
-        all_for_decode_after = torch.where(
-            all_ids_after < 0, torch.zeros_like(all_ids_after), all_ids_after,
-        )
+
+        if no_residual_rerun:
+            # Skip res_transformer.generate; reuse baseline residual_ids
+            # (already detached; pad already 0).
+            all_for_decode_after = _build_decode_ids_with_baseline_residuals(
+                base_ids_after=base_ids_after,
+                baseline_residual_ids=residual_ids,
+                m_lens_tok=m_lens_tok,
+            )
+        else:
+            # Existing path: re-run residual on the post-guidance base.
+            # Re-seed (same value as Step 1) so any contact delta is NOT
+            # attributable to Gumbel-noise drift between the two calls.
+            if residual_seed is not None:
+                torch.manual_seed(int(residual_seed))
+            all_ids_after = res_transformer.generate(
+                motion_ids=base_ids_after,
+                conds=[text],
+                m_lens=m_lens_tok,
+                cond_scale=res_cond_scale,
+            )
+            all_for_decode_after = torch.where(
+                all_ids_after < 0, torch.zeros_like(all_ids_after), all_ids_after,
+            )
+
         motion = vq_model.forward_decoder(all_for_decode_after)
         motion = motion.squeeze(0) * motion_std + motion_mean
 
@@ -518,5 +611,7 @@ def guide_with_contact(
             "steps_taken": len(loss_trace),
             "base_token_change_count": token_change_count,
             "base_token_total": int(S),
+            "residual_seed": residual_seed,
+            "no_residual_rerun": bool(no_residual_rerun),
         },
     )

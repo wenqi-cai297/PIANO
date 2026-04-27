@@ -499,6 +499,28 @@ def main() -> int:
              "showed 'target' produced per-clip mixed results (largebox "
              "-13 cm BUT plasticbox_037 +14 cm).",
     )
+    parser.add_argument(
+        "--guidance-residual-seed", type=int, default=None,
+        help="If set, calls torch.manual_seed(N) before each "
+             "res_transformer.generate call (baseline + post-guidance). "
+             "Forces RNG-equivalence between the two residual generations "
+             "so any contact delta is attributable to base-token changes "
+             "or autoregressive feedback, NOT Gumbel-noise drift. "
+             "Default None = no extra seeding (legacy v3+v4 behavior). "
+             "Background: ResidualTransformer.generate samples each layer "
+             "via gumbel_sample which uses uniform_(0,1) on global RNG; "
+             "v4 plasticbox_014 (0/23 base flips, +7.3cm regression) is "
+             "the smoking gun for this drift.",
+    )
+    parser.add_argument(
+        "--guidance-no-residual-rerun", action="store_true",
+        help="If set, skip the post-guidance res_transformer.generate "
+             "call entirely and decode using baseline residual_ids "
+             "combined with new base_ids_after. Tests whether residual "
+             "rerun itself is the per-clip variance source. Cost: "
+             "forfeits any 'base flip → residual self-adapts' gain "
+             "(e.g., v4 largebox_010 -14cm may have come from this).",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument("--device", type=str, default=None)
@@ -664,7 +686,10 @@ def main() -> int:
 
         print(
             f"\n=== Generating 'full_guided' condition with contact guidance "
-            f"({args.guidance_steps} steps, lr={args.guidance_lr}) ===",
+            f"({args.guidance_steps} steps, lr={args.guidance_lr}, "
+            f"init_scale={args.guidance_init_scale}, loss={args.guidance_loss}, "
+            f"residual_seed={args.guidance_residual_seed}, "
+            f"no_residual_rerun={args.guidance_no_residual_rerun}) ===",
         )
         per_clip_guided: list[dict[str, dict]] = []
         for i in range(len(samples)):
@@ -710,6 +735,8 @@ def main() -> int:
                 guidance_lr=args.guidance_lr,
                 init_logit_scale=args.guidance_init_scale,
                 loss_mode=args.guidance_loss,
+                residual_seed=args.guidance_residual_seed,
+                no_residual_rerun=args.guidance_no_residual_rerun,
                 device=device,
             )
             print(
@@ -749,6 +776,13 @@ def main() -> int:
         guidance_trace = {
             "guidance_steps": int(args.guidance_steps),
             "guidance_lr": float(args.guidance_lr),
+            "guidance_init_scale": float(args.guidance_init_scale),
+            "guidance_loss": str(args.guidance_loss),
+            "residual_seed": (
+                None if args.guidance_residual_seed is None
+                else int(args.guidance_residual_seed)
+            ),
+            "no_residual_rerun": bool(args.guidance_no_residual_rerun),
             "per_clip": [
                 {
                     "seq_id": seq_ids[i],

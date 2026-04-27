@@ -333,3 +333,112 @@ def test_guide_with_contact_full_pipeline_skipped_without_momask():
     ``qual_eval.py --guidance-steps 30 --ckpt runs/training/generator_v06_per_head_gamma/best_val.pt``.
     """
     pytest.skip("Full guide_with_contact integration is server-only; see qual_eval.py")
+
+
+def test_build_decode_ids_with_baseline_residuals_shape_and_content():
+    """no-residual-rerun helper: cat [base_after, baseline_residuals] and pad."""
+    from piano.inference.contact_guidance import (
+        _build_decode_ids_with_baseline_residuals,
+    )
+
+    # 1 sample, S=5, Q=6 (1 base + 5 residuals). Real seq_len = 3, so
+    # positions [3, 4] are padding and should be zeroed in base.
+    base_ids_after = torch.tensor([[7, 11, 13, 17, 19]])               # (1, 5)
+    baseline_residual_ids = torch.tensor([[
+        [101, 102, 103, 104, 105],
+        [201, 202, 203, 204, 205],
+        [301, 302, 303, 304, 305],
+        [401, 402, 403, 404, 405],
+        [501, 502, 503, 504, 505],
+    ]])                                                                # (1, 5, 5)
+    m_lens_tok = torch.tensor([3])                                     # actual length
+
+    out = _build_decode_ids_with_baseline_residuals(
+        base_ids_after=base_ids_after,
+        baseline_residual_ids=baseline_residual_ids,
+        m_lens_tok=m_lens_tok,
+    )
+
+    assert out.shape == (1, 5, 6)
+    # Real positions: base preserved.
+    assert out[0, 0, 0].item() == 7
+    assert out[0, 1, 0].item() == 11
+    assert out[0, 2, 0].item() == 13
+    # Pad positions (s=3, s=4): base zeroed.
+    assert out[0, 3, 0].item() == 0
+    assert out[0, 4, 0].item() == 0
+    # Residuals preserved verbatim at every position; the cat lays out
+    # quantizer layer at the LAST dim, so out[0, s, q+1] == baseline[0, s, q].
+    # (Caller invariant: baseline residuals are 0 at pad via the where
+    # clause in guide_with_contact, so we don't re-zero them here.)
+    for s in range(5):
+        for q in range(5):  # 5 residual layers
+            assert out[0, s, q + 1].item() == baseline_residual_ids[0, s, q].item()
+
+
+def test_build_decode_ids_no_pad():
+    """When m_lens_tok == S, no positions are zeroed."""
+    from piano.inference.contact_guidance import (
+        _build_decode_ids_with_baseline_residuals,
+    )
+
+    # base: (1, S=3), residual: (1, S=3, Q-1=2). Quantizer layer at last dim.
+    base_ids_after = torch.tensor([[7, 11, 13]])
+    baseline_residual_ids = torch.tensor([[
+        [101, 201],   # position 0: residual layer 0 = 101, layer 1 = 201
+        [102, 202],   # position 1
+        [103, 203],   # position 2
+    ]])                                                                  # (1, 3, 2)
+    m_lens_tok = torch.tensor([3])
+
+    out = _build_decode_ids_with_baseline_residuals(
+        base_ids_after=base_ids_after,
+        baseline_residual_ids=baseline_residual_ids,
+        m_lens_tok=m_lens_tok,
+    )
+
+    assert out.shape == (1, 3, 3)
+    # Base preserved at all positions.
+    torch.testing.assert_close(out[0, :, 0], base_ids_after[0])
+    # Residuals laid out as expected.
+    assert out[0, 0, 1].item() == 101 and out[0, 0, 2].item() == 201
+    assert out[0, 2, 1].item() == 103 and out[0, 2, 2].item() == 203
+
+
+def test_build_decode_ids_all_pad():
+    """When m_lens_tok=0 (degenerate), all base positions are zeroed.
+
+    Residuals are still preserved as-is (caller invariant: baseline
+    residuals are 0 at pad already).
+    """
+    from piano.inference.contact_guidance import (
+        _build_decode_ids_with_baseline_residuals,
+    )
+
+    base_ids_after = torch.tensor([[7, 11, 13]])
+    baseline_residual_ids = torch.zeros(1, 3, 2, dtype=torch.long)        # (1, S=3, Q-1=2)
+    m_lens_tok = torch.tensor([0])
+
+    out = _build_decode_ids_with_baseline_residuals(
+        base_ids_after=base_ids_after,
+        baseline_residual_ids=baseline_residual_ids,
+        m_lens_tok=m_lens_tok,
+    )
+
+    assert (out[0, :, 0] == 0).all()
+
+
+def test_guide_with_contact_signature_accepts_new_kwargs():
+    """v5 added residual_seed + no_residual_rerun kwargs; signature smoke test.
+
+    Doesn't run the function (requires MoMask) — just confirms the kwargs
+    exist with the documented defaults via inspect.signature.
+    """
+    import inspect
+    from piano.inference.contact_guidance import guide_with_contact
+
+    sig = inspect.signature(guide_with_contact)
+    assert "residual_seed" in sig.parameters
+    assert sig.parameters["residual_seed"].default is None
+    assert "no_residual_rerun" in sig.parameters
+    assert sig.parameters["no_residual_rerun"].default is False
