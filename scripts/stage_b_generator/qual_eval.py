@@ -713,6 +713,34 @@ def main() -> int:
             world_T_xz=[x[1] for x in source_canon_xforms],
         )
 
+        # Persist the per-clip guidance trace (loss_initial/final +
+        # token-change count) to a sibling JSON. This is the
+        # ground-truth signal that the new code path ran. If this file
+        # is absent or empty, the server's git pull didn't deploy the
+        # current commit. If it's present with non-trivial loss values
+        # but contact distance is unchanged, the optimization itself
+        # converges to the same fixed point — that's a different debug
+        # path (likely AdamW lr or step count needs tuning).
+        guidance_trace_path = args.output_dir / "full_guided" / "guidance_trace.json"
+        guidance_trace = {
+            "guidance_steps": int(args.guidance_steps),
+            "guidance_lr": float(args.guidance_lr),
+            "per_clip": [
+                {
+                    "seq_id": seq_ids[i],
+                    "info": {
+                        k: (v if not isinstance(v, list) else v)
+                        for k, v in per_clip_guided[i]["full"]["guidance_info"].items()
+                    },
+                }
+                for i in range(len(samples))
+            ],
+        }
+        with guidance_trace_path.open("w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump(guidance_trace, f, indent=2)
+        print(f"  Wrote {guidance_trace_path}")
+
     # Diff metrics for the default run.
     diffs_default = _summarise_diffs(per_clip_default, seq_lens_tok, seq_lens_frames)
     print("\n=== Diff metrics @ w_int =", args.w_int, "===")
