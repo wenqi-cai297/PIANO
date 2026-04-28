@@ -222,6 +222,7 @@ def run_training_loop(
     for epoch in range(num_epochs):
         model.train()
         epoch_losses: dict[str, float] = {}
+        epoch_counts: dict[str, int] = {}
         epoch_start = time.time()
 
         for batch in dataloader:
@@ -254,6 +255,7 @@ def run_training_loop(
                         continue
                     val = val.item()
                 epoch_losses[key] = epoch_losses.get(key, 0.0) + val
+                epoch_counts[key] = epoch_counts.get(key, 0) + 1
 
             global_step += 1
 
@@ -284,7 +286,10 @@ def run_training_loop(
         epoch_time = time.time() - epoch_start
         n_batches = len(dataloader)
         if accelerator.is_main_process:
-            avg = {k: v / n_batches for k, v in epoch_losses.items()}
+            avg = {
+                k: v / max(epoch_counts.get(k, n_batches), 1)
+                for k, v in epoch_losses.items()
+            }
             lr = optimizer.param_groups[0]["lr"]
             msg = f"Epoch {epoch+1}/{num_epochs} ({epoch_time:.0f}s)"
             for key, val in avg.items():

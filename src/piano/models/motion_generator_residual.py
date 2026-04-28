@@ -60,9 +60,48 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from piano.models.motion_generator import MaskTransformerEncoderWithInteraction
+
+
+def _residual_layer_metrics(
+    logits: Tensor,
+    labels: Tensor,
+    active_q_layers: Tensor,
+    *,
+    pad_id: int,
+    num_quant_layers: int,
+) -> dict[str, Tensor]:
+    """Compute per-residual-layer CE/accuracy for sampled active layers."""
+    with torch.no_grad():
+        logits_f = logits.detach().float()
+        labels_d = labels.detach()
+        active_q = active_q_layers.detach()
+        valid = labels_d.ne(pad_id)
+        per_token_loss = F.cross_entropy(
+            logits_f, labels_d, ignore_index=pad_id, reduction="none",
+        )
+        pred = logits_f.argmax(dim=1)
+
+        metrics: dict[str, Tensor] = {}
+        for q in range(1, int(num_quant_layers)):
+            q_mask = active_q.eq(q).view(-1, 1)
+            mask = valid & q_mask
+            count = mask.sum()
+            if int(count.item()) == 0:
+                continue
+            count_f = count.to(dtype=logits_f.dtype)
+            suffix = f"q{q}"
+            metrics[f"loss_residual_{suffix}"] = (
+                per_token_loss.masked_select(mask).sum() / count_f
+            )
+            metrics[f"acc_residual_{suffix}"] = (
+                pred.eq(labels_d).masked_select(mask).float().mean()
+            )
+            metrics[f"tokens_residual_{suffix}"] = count_f
+        return metrics
 
 
 class ResidualTransformerWithInteraction(nn.Module):
@@ -337,7 +376,8 @@ class ResidualTransformerWithInteraction(nn.Module):
         *,
         int_kv: Tensor | None = None,
         int_padding_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_layer_metrics: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """Z_int-aware mirror of ``ResidualTransformer.forward``.
 
         Returns ``(ce_loss, pred_id, acc)`` for the active-quantizer-layer
@@ -395,6 +435,15 @@ class ResidualTransformerWithInteraction(nn.Module):
         ce_loss, pred_id, acc = cal_performance(
             logits, active_indices, ignore_index=r.pad_id,
         )
+        if return_layer_metrics:
+            layer_metrics = _residual_layer_metrics(
+                logits,
+                active_indices,
+                active_q_layers,
+                pad_id=int(r.pad_id),
+                num_quant_layers=int(num_quant_layers),
+            )
+            return ce_loss, pred_id, acc, layer_metrics
         return ce_loss, pred_id, acc
 
     @torch.no_grad()

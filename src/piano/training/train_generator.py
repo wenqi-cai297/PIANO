@@ -274,6 +274,61 @@ def build_two_group_optimizer(
 # Step function
 # ============================================================================
 
+def _trainable_params(module: nn.Module) -> tuple[nn.Parameter, ...]:
+    seen: set[int] = set()
+    params: list[nn.Parameter] = []
+    for p in module.parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        params.append(p)
+    return tuple(params)
+
+
+def _grad_l2_norm(loss: Tensor, params: tuple[nn.Parameter, ...]) -> Tensor:
+    if not loss.requires_grad or not params:
+        return loss.detach().new_zeros(())
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    sq = loss.detach().new_zeros((), dtype=torch.float32)
+    for grad in grads:
+        if grad is None:
+            continue
+        sq = sq + grad.detach().float().pow(2).sum()
+    return sq.sqrt()
+
+
+def _weighted_grad_norm_metrics(
+    losses: dict[str, Tensor],
+    params: tuple[nn.Parameter, ...],
+) -> dict[str, Tensor]:
+    active = {
+        name: loss
+        for name, loss in losses.items()
+        if isinstance(loss, torch.Tensor) and loss.requires_grad
+    }
+    if not active:
+        return {}
+
+    total = sum(active.values())
+    total_norm = _grad_l2_norm(total, params)
+    denom = total_norm.clamp(min=1e-12)
+
+    metrics: dict[str, Tensor] = {"grad_norm_total_probe": total_norm}
+    for name, loss in active.items():
+        norm = _grad_l2_norm(loss, params)
+        metrics[f"grad_norm_{name}"] = norm
+        metrics[f"grad_ratio_{name}"] = norm / denom
+    return metrics
+
+
 def build_generator_step_fn(
     transformer: InteractionMaskTransformer,
     vq_model: nn.Module,
@@ -289,6 +344,8 @@ def build_generator_step_fn(
     token_stride: int = 4,
     motion_mean: torch.Tensor | None = None,
     motion_std: torch.Tensor | None = None,
+    residual_layer_diagnostics: bool = False,
+    gradient_diagnostics_every_steps: int = 0,
 ):
     """Build the Stage B training step.
 
@@ -326,9 +383,20 @@ def build_generator_step_fn(
         frozen VQ-VAE. ``base_gt_residual`` preserves the v0.9 path
         (soft base + GT residual ids); ``full_prediction`` is C2b
         (soft base + differentiable residual rollout).
+    residual_layer_diagnostics
+        When true, log active-layer CE/accuracy for residual RVQ layers
+        q1..q5. This uses the same sampled active layer as training.
+    gradient_diagnostics_every_steps
+        If positive, compute weighted per-loss gradient L2 norms every N
+        optimizer steps and log them as sparse epoch-averaged metrics.
     """
+    grad_diag_params = _trainable_params(transformer)
 
-    def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
+    def step_fn(
+        _model: nn.Module,
+        batch: dict,
+        global_step: int | None = None,
+    ) -> dict[str, Tensor]:
         device = next(transformer.parameters()).device
 
         motion = batch["motion"].to(device).float()       # (B, T, 263) raw
@@ -395,21 +463,32 @@ def build_generator_step_fn(
             return_logits=decoded_contact_aux_weight > 0.0,
         )
         out["loss_base"] = out["loss"]
+        out["loss_weighted_base"] = out["loss_base"]
+        weighted_losses: dict[str, Tensor] = {"base": out["loss_base"]}
 
         if residual_transformer is not None and residual_loss_weight > 0.0:
             res_int_kv = int_tokens_bf.transpose(0, 1).contiguous()
-            res_loss, _res_pred, res_acc = residual_transformer.forward_with_int(
+            res_out = residual_transformer.forward_with_int(
                 all_indices=code_idx.long(),
                 y=text,
                 m_lens=m_lens_tok,
                 int_kv=res_int_kv,
                 int_padding_mask=int_pad_mask_bf,
+                return_layer_metrics=residual_layer_diagnostics,
             )
+            if residual_layer_diagnostics:
+                res_loss, _res_pred, res_acc, res_layer_metrics = res_out
+                out.update(res_layer_metrics)
+            else:
+                res_loss, _res_pred, res_acc = res_out
+            weighted_res_loss = float(residual_loss_weight) * res_loss
             out["loss_residual"] = res_loss
+            out["loss_weighted_residual"] = weighted_res_loss
             out["acc_residual"] = torch.as_tensor(
                 res_acc, device=device, dtype=out["loss"].dtype,
             )
-            out["loss"] = out["loss"] + float(residual_loss_weight) * res_loss
+            out["loss"] = out["loss"] + weighted_res_loss
+            weighted_losses["residual_weighted"] = weighted_res_loss
 
         if decoded_contact_aux_weight > 0.0:
             aux_loss, aux_metrics = decoded_contact_aux_loss(
@@ -432,12 +511,23 @@ def build_generator_step_fn(
                 ),
                 int_padding_mask=int_pad_mask_bf,
             )
+            weighted_aux_loss = float(decoded_contact_aux_weight) * aux_loss
             out["loss_decoded_contact"] = aux_loss
+            out["loss_weighted_decoded_contact"] = weighted_aux_loss
             out.update(aux_metrics)
-            out["loss"] = out["loss"] + float(decoded_contact_aux_weight) * aux_loss
+            out["loss"] = out["loss"] + weighted_aux_loss
+            weighted_losses["decoded_contact_weighted"] = weighted_aux_loss
             out.pop("logits", None)
             out.pop("labels", None)
             out.pop("non_pad_mask", None)
+
+        if (
+            gradient_diagnostics_every_steps > 0
+            and global_step is not None
+            and global_step % gradient_diagnostics_every_steps == 0
+            and torch.is_grad_enabled()
+        ):
+            out.update(_weighted_grad_norm_metrics(weighted_losses, grad_diag_params))
         # Diagnostic: mean γ_int across the 8 layers — useful to track
         # whether the new IntXAttn sublayers are actually learning to
         # contribute. Per design §6 decision tree: if γ_int stays at 0
@@ -707,6 +797,28 @@ def run(config_path: str) -> None:
             f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}",
         )
 
+    diagnostics_cfg = cfg.training.get("diagnostics", None)
+    grad_diag_every = 0
+    residual_layer_diagnostics = False
+    if diagnostics_cfg is not None:
+        grad_diag_cfg = diagnostics_cfg.get("gradient_norms", None)
+        if grad_diag_cfg is not None and bool(grad_diag_cfg.get("enabled", False)):
+            grad_diag_every = int(grad_diag_cfg.get("every_n_steps", 0))
+            if grad_diag_every <= 0:
+                grad_diag_every = len(train_dataloader)
+            accelerator.print(
+                "Gradient diagnostics enabled: "
+                f"every_n_steps={grad_diag_every}",
+            )
+
+        residual_layer_cfg = diagnostics_cfg.get("residual_layers", None)
+        residual_layer_diagnostics = (
+            residual_layer_cfg is not None
+            and bool(residual_layer_cfg.get("enabled", False))
+        )
+        if residual_layer_diagnostics:
+            accelerator.print("Residual per-RVQ-layer diagnostics enabled")
+
     step_fn = build_generator_step_fn(
         transformer=inner_transformer,
         vq_model=vq_model,
@@ -733,6 +845,8 @@ def run(config_path: str) -> None:
         token_stride=token_stride,
         motion_mean=motion_mean_t,
         motion_std=motion_std_t,
+        residual_layer_diagnostics=residual_layer_diagnostics,
+        gradient_diagnostics_every_steps=grad_diag_every,
     )
 
     # ---- Wandb ----

@@ -365,6 +365,47 @@ def test_param_accounting_no_double_count():
     )
 
 
+def test_residual_layer_metrics_group_by_active_q_layer():
+    from piano.models.motion_generator_residual import _residual_layer_metrics
+
+    # logits shape follows MoMask CE convention: (B, vocab, S).
+    logits = torch.tensor([
+        [[5.0, 0.0], [0.0, 5.0], [0.0, 0.0], [0.0, 0.0]],
+        [[0.0, 5.0], [5.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+        [[0.0, 5.0], [5.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+    ])
+    labels = torch.tensor([
+        [0, 1],
+        [0, 1],
+        [1, -1],
+    ])
+    active_q_layers = torch.tensor([1, 2, 2])
+
+    metrics = _residual_layer_metrics(
+        logits,
+        labels,
+        active_q_layers,
+        pad_id=-1,
+        num_quant_layers=4,
+    )
+
+    assert set(metrics) == {
+        "loss_residual_q1",
+        "acc_residual_q1",
+        "tokens_residual_q1",
+        "loss_residual_q2",
+        "acc_residual_q2",
+        "tokens_residual_q2",
+    }
+    assert metrics["tokens_residual_q1"].item() == 2
+    assert metrics["tokens_residual_q2"].item() == 3
+    assert metrics["acc_residual_q1"].item() == 1.0
+    torch.testing.assert_close(
+        metrics["acc_residual_q2"],
+        torch.tensor(1.0 / 3.0),
+    )
+
+
 def test_gamma_kind_scalar_vs_per_head_dofs():
     """gamma_kind controls the dof count: scalar=1 per layer, per_head=NUM_HEADS."""
     from piano.models.motion_generator_residual import (
