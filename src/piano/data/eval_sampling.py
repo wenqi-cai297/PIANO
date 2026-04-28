@@ -93,6 +93,30 @@ def select_eval_clip_indices(
     return selected[:num_clips]
 
 
+def resolve_eval_clip_count(
+    dataset: Any,
+    *,
+    num_clips: int | None = None,
+    num_clips_per_subset: int | None = None,
+) -> int:
+    """Resolve an absolute clip count for fixed-set evaluation.
+
+    ``num_clips`` is the legacy total-count knob used by offline eval.
+    ``num_clips_per_subset`` is better for checkpoint selection because it
+    keeps the per-subset sample size stable when the number of dataset
+    subsets changes. If metadata is unavailable, fall back to ``num_clips``.
+    """
+    if num_clips_per_subset is not None and num_clips_per_subset > 0:
+        candidates = _collect_candidates(dataset)
+        if candidates:
+            subsets = {cand.subset for cand in candidates}
+            return min(len(candidates), int(num_clips_per_subset) * len(subsets))
+
+    if num_clips is None:
+        return 0
+    return max(0, int(num_clips))
+
+
 def describe_eval_clip_selection(dataset: Any, indices: list[int]) -> list[dict[str, str]]:
     """Return lightweight provenance rows for logging selected clips."""
     by_index = {cand.index: cand for cand in _collect_candidates(dataset)}

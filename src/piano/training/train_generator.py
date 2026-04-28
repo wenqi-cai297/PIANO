@@ -47,6 +47,7 @@ from piano.data.dataset import (
 )
 from piano.data.eval_sampling import (
     describe_eval_clip_selection,
+    resolve_eval_clip_count,
     select_eval_clip_indices,
 )
 from piano.data.humanml3d_repr import load_motion_stats
@@ -284,6 +285,7 @@ def build_generator_step_fn(
     decoded_contact_aux_mode: str = "metric",
     decoded_contact_aux_temperature: float = 1.0,
     decoded_contact_aux_num_object_points: int = 256,
+    decoded_contact_aux_rvq_path: str = "base_gt_residual",
     token_stride: int = 4,
     motion_mean: torch.Tensor | None = None,
     motion_std: torch.Tensor | None = None,
@@ -320,9 +322,10 @@ def build_generator_step_fn(
         input). Apply ``(motion - mean) / std`` before ``vq_model.encode``.
     decoded_contact_aux_weight
         C2 decoded-space auxiliary loss weight. When positive, the step
-        requests base logits, decodes relaxed base tokens + GT residual
-        RVQ codes through the frozen VQ-VAE, and adds a differentiable
-        canonical-frame body-to-object min-distance term.
+        requests base logits and decodes a relaxed RVQ stack through the
+        frozen VQ-VAE. ``base_gt_residual`` preserves the v0.9 path
+        (soft base + GT residual ids); ``full_prediction`` is C2b
+        (soft base + differentiable residual rollout).
     """
 
     def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
@@ -420,6 +423,14 @@ def build_generator_step_fn(
                 num_object_points=decoded_contact_aux_num_object_points,
                 temperature=decoded_contact_aux_temperature,
                 mode=decoded_contact_aux_mode,
+                rvq_path=decoded_contact_aux_rvq_path,
+                residual_transformer=residual_transformer,
+                text=text,
+                int_kv=(
+                    int_tokens_bf.transpose(0, 1).contiguous()
+                    if residual_transformer is not None else None
+                ),
+                int_padding_mask=int_pad_mask_bf,
             )
             out["loss_decoded_contact"] = aux_loss
             out.update(aux_metrics)
@@ -691,6 +702,7 @@ def run(config_path: str) -> None:
             "Decoded contact aux enabled: "
             f"weight={decoded_aux_weight}, "
             f"mode={decoded_aux_cfg.get('mode', 'metric')}, "
+            f"rvq_path={decoded_aux_cfg.get('rvq_path', 'base_gt_residual')}, "
             f"temperature={float(decoded_aux_cfg.get('temperature', 1.0))}, "
             f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}",
         )
@@ -713,6 +725,10 @@ def run(config_path: str) -> None:
         decoded_contact_aux_num_object_points=(
             int(decoded_aux_cfg.get("num_object_points", 256))
             if decoded_aux_cfg is not None else 256
+        ),
+        decoded_contact_aux_rvq_path=(
+            str(decoded_aux_cfg.get("rvq_path", "base_gt_residual"))
+            if decoded_aux_cfg is not None else "base_gt_residual"
         ),
         token_stride=token_stride,
         motion_mean=motion_mean_t,
@@ -778,7 +794,18 @@ def run(config_path: str) -> None:
         # Build a deterministic, type-diverse fixed batch. The sampler
         # balances by dataset subset first and object id second so the
         # best-contact checkpoint is not selected on one narrow slice.
-        num_clips = int(contact_eval_cfg.get("num_clips", 20))
+        # Training-time checkpoint selection should use a larger sample
+        # than the 20-clip offline visualization set; configs can specify
+        # num_clips_per_subset (e.g. 20 x 4 subsets = 80 clips).
+        num_clips = resolve_eval_clip_count(
+            val_dataset,
+            num_clips=int(contact_eval_cfg.get("num_clips", 20)),
+            num_clips_per_subset=(
+                int(contact_eval_cfg.get("num_clips_per_subset"))
+                if contact_eval_cfg.get("num_clips_per_subset", None) is not None
+                else None
+            ),
+        )
         selected_idx = select_eval_clip_indices(
             val_dataset,
             num_clips,
