@@ -105,7 +105,8 @@ training:
 
   contact_eval:
     enabled: true
-    num_clips: 5
+    num_clips: 20
+    seed: 42
     w_text: 4.0
     w_int: 2.0
     best_key: "mean_min_dist"

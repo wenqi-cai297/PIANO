@@ -33,7 +33,7 @@ Usage::
     python scripts/stage_b_generator/qual_eval.py \\
         --config configs/training/generator.yaml \\
         --ckpt runs/training/generator/best_val.pt \\
-        --num-clips 5 \\
+        --num-clips 20 \\
         --output-dir runs/eval/stageB_v0_1_qual \\
         [--w-int-sweep]
 
@@ -58,6 +58,10 @@ from torch import Tensor
 from torch.utils.data import ConcatDataset
 
 from piano.data.dataset import HOIDataset
+from piano.data.eval_sampling import (
+    describe_eval_clip_selection,
+    select_eval_clip_indices,
+)
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import (
@@ -489,7 +493,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path, default=Path("configs/training/generator.yaml"))
     parser.add_argument("--ckpt", type=Path, default=Path("runs/training/generator/best_val.pt"))
-    parser.add_argument("--num-clips", type=int, default=5)
+    parser.add_argument(
+        "--num-clips", type=int, default=20,
+        help="number of stratified val clips to generate (default 20).",
+    )
     parser.add_argument("--output-dir", type=Path,
                         default=Path("runs/eval/stageB_v0_1_qual"))
     parser.add_argument("--seed", type=int, default=42)
@@ -580,12 +587,24 @@ def main() -> int:
     motion_mean, motion_std = load_motion_stats(cfg.model.checkpoints.vq_vae)
     print(f"Loaded HumanML3D mean/std: shape={motion_mean.shape}")
 
-    # Build val dataset, sample N clips (deterministic).
+    # Build val dataset, sample N clips (deterministic, subset/object balanced).
     val_dataset = _build_val_dataset(cfg)
-    pool = list(range(len(val_dataset)))
-    random.shuffle(pool)
-    sampled_idx = pool[: args.num_clips]
-    print(f"Sampled {len(sampled_idx)} clips out of {len(val_dataset)} val clips: {sampled_idx}")
+    sampled_idx = select_eval_clip_indices(
+        val_dataset,
+        args.num_clips,
+        seed=args.seed,
+    )
+    selected_rows = describe_eval_clip_selection(val_dataset, sampled_idx)
+    print(
+        f"Sampled {len(sampled_idx)} stratified clips out of "
+        f"{len(val_dataset)} val clips: {sampled_idx}",
+    )
+    for row in selected_rows:
+        print(
+            "  "
+            f"idx={row['index']} subset={row['subset']} "
+            f"object={row['object_id']} seq={row['seq_id']}",
+        )
 
     samples = [val_dataset[i] for i in sampled_idx]
     seq_lens_frames = [int(s["seq_len"].item()) for s in samples]
@@ -845,6 +864,7 @@ def main() -> int:
         "seed": args.seed,
         "num_clips": len(samples),
         "clip_ids": seq_ids,
+        "clip_selection": selected_rows,
         "texts": texts,
         "seq_lens_frames": seq_lens_frames,
         "seq_lens_tokens": seq_lens_tok,

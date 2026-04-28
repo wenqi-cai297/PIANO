@@ -186,7 +186,7 @@ def run_training_loop(
         e.g. ``"loss_target"`` to select on a specific component.
     contact_eval_fn : optional ``Callable[[], dict[str, float]]`` that
         returns a contact metrics dict (e.g.
-        ``{"mean_min_dist": 0.16, "n_clips": 5}``) when called with no
+        ``{"mean_min_dist": 0.16, "n_clips": 20}``) when called with no
         args. Invoked at the same cadence as ``val_dataloader``. Stage B
         uses this to save ``best_contact.pt`` alongside ``best_val.pt``,
         because val_loss and contact distance are empirically

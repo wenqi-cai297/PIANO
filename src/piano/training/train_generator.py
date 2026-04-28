@@ -45,6 +45,10 @@ from piano.data.dataset import (
     collate_hoi,
     extract_subject_id,
 )
+from piano.data.eval_sampling import (
+    describe_eval_clip_selection,
+    select_eval_clip_indices,
+)
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.models.backbones.momask_adapter import (
     load_momask_mask_transformer,
@@ -771,22 +775,27 @@ def run(config_path: str) -> None:
             )
         res_transformer.eval()
 
-        # Build a fixed mini-batch from the first N val clips. shuffle=False
-        # in val_dataloader makes this deterministic.
-        num_clips = int(contact_eval_cfg.get("num_clips", 5))
-        # Build a single-shot loader for the fixed batch (don't go through
-        # accelerator.prepare — eval runs on main process only, and we want
-        # the un-sharded view of val_dataset).
-        fixed_loader = DataLoader(
-            val_dataset, batch_size=num_clips,
-            shuffle=False, collate_fn=collate_hoi,
-            num_workers=0, drop_last=False,
+        # Build a deterministic, type-diverse fixed batch. The sampler
+        # balances by dataset subset first and object id second so the
+        # best-contact checkpoint is not selected on one narrow slice.
+        num_clips = int(contact_eval_cfg.get("num_clips", 20))
+        selected_idx = select_eval_clip_indices(
+            val_dataset,
+            num_clips,
+            seed=int(contact_eval_cfg.get("seed", cfg.training.get("seed", 42))),
         )
-        fixed_val_batch = next(iter(fixed_loader))
+        fixed_val_batch = collate_hoi([val_dataset[i] for i in selected_idx])
+        selected_rows = describe_eval_clip_selection(val_dataset, selected_idx)
         accelerator.print(
-            f"Contact eval: {num_clips} fixed val clips "
-            f"(seq_ids={fixed_val_batch.get('seq_id', '?')[:num_clips]})",
+            f"Contact eval: {len(selected_idx)} stratified fixed val clips "
+            f"(seq_ids={fixed_val_batch.get('seq_id', '?')[:len(selected_idx)]})",
         )
+        for row in selected_rows:
+            accelerator.print(
+                "  contact eval clip "
+                f"idx={row['index']} subset={row['subset']} "
+                f"object={row['object_id']} seq={row['seq_id']}",
+            )
 
         contact_eval_fn = build_contact_eval_fn(
             transformer=inner_transformer,

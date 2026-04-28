@@ -17,7 +17,7 @@ could be in either:
   mismatch.
 
 This diagnostic isolates the two by saving two parallel motion versions
-for the same 5 qual_eval val clips:
+for the same stratified qual_eval val clips:
 
 - ``gt_original/``: real GT motion_263 from HOIDataset (no VQ touch). The
   upper bound on motion fidelity given perfect generation.
@@ -51,7 +51,7 @@ Usage::
 
     python scripts/stage_b_generator/gt_vq_roundtrip.py \\
         --config configs/training/generator_v04_normalize.yaml \\
-        --num-clips 5 \\
+        --num-clips 20 \\
         --output-dir runs/eval/stageB_v0_4_gt_roundtrip
 
 Then render both:
@@ -67,7 +67,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +76,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import ConcatDataset
 
 from piano.data.dataset import HOIDataset
+from piano.data.eval_sampling import (
+    describe_eval_clip_selection,
+    select_eval_clip_indices,
+)
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import load_momask_vqvae
@@ -84,7 +87,7 @@ from piano.utils.io_utils import ensure_dir, load_json
 
 
 # ============================================================================
-# Dataset + sampling (mirror qual_eval so we hit the SAME 5 clips)
+# Dataset + sampling (mirror qual_eval so we hit the same stratified clips)
 # ============================================================================
 
 def _read_metadata(roots: list) -> list[tuple[str, dict]]:
@@ -272,7 +275,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path,
                         default=Path("configs/training/generator_v04_normalize.yaml"))
-    parser.add_argument("--num-clips", type=int, default=5,
+    parser.add_argument("--num-clips", type=int, default=20,
                         help="match qual_eval default to compare same clips.")
     parser.add_argument("--seed", type=int, default=42,
                         help="match qual_eval seed to hit identical sample.")
@@ -307,11 +310,19 @@ def main() -> int:
     print(f"  motion stats: mean.shape={motion_mean.shape}")
 
     val_dataset = _build_val_dataset(cfg)
-    pool = list(range(len(val_dataset)))
-    random.seed(args.seed)
-    random.shuffle(pool)
-    sampled_idx = pool[: args.num_clips]
-    print(f"Sampling {args.num_clips} clips from {len(val_dataset)} val: {sampled_idx}")
+    sampled_idx = select_eval_clip_indices(
+        val_dataset,
+        args.num_clips,
+        seed=args.seed,
+    )
+    selected_rows = describe_eval_clip_selection(val_dataset, sampled_idx)
+    print(f"Sampling {len(sampled_idx)} stratified clips from {len(val_dataset)} val: {sampled_idx}")
+    for row in selected_rows:
+        print(
+            "  "
+            f"idx={row['index']} subset={row['subset']} "
+            f"object={row['object_id']} seq={row['seq_id']}",
+        )
 
     samples = [val_dataset[i] for i in sampled_idx]
     seq_lens_frames = [int(s["seq_len"].item()) for s in samples]

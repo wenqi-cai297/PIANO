@@ -17,7 +17,7 @@ averaged across the mini-batch). The trainer hooks this into
 existing ``best_val.pt``.
 
 Cost: ~1 sec per clip on bf16 / 2× A6000 (10-step base + 10-step
-residual MaskGIT decoding + VQ decode). For 5 clips × every val
+residual MaskGIT decoding + VQ decode). For 20 clips × every val
 interval (default 5 epochs) over an 80-epoch run = ~80 sec total
 overhead, vs ~13 min per run. Negligible.
 
@@ -240,7 +240,7 @@ def build_contact_eval_fn(
     """Build a no-arg callable that evaluates contact distance on a fixed batch.
 
     The callable runs in eval mode + ``torch.no_grad`` and returns a dict
-    with at least ``mean_min_dist`` (5-clip mean of
+    with at least ``mean_min_dist`` (fixed-subset mean of
     ``mean_min_dist_per_frame``). The trainer uses
     ``mean_min_dist`` as the best-checkpoint key.
 

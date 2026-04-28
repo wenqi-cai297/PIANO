@@ -60,6 +60,10 @@ from torch import Tensor
 from torch.utils.data import ConcatDataset
 
 from piano.data.dataset import HOIDataset
+from piano.data.eval_sampling import (
+    describe_eval_clip_selection,
+    select_eval_clip_indices,
+)
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.data.split import build_subject_split, extract_subject_id
 from piano.models.backbones.momask_adapter import load_momask_vqvae
@@ -302,7 +306,7 @@ def _verdict(per_clip: list[dict[str, Any]]) -> dict[str, Any]:
             "recommendation": (
                 "All sampled clips were either too short (< 4 frames) or "
                 "had near-zero GT root drift (static interactions). Re-run "
-                "with --num-clips 50 or seed-shuffle to get clips with "
+                "with --num-clips 50 or a different seed to get clips with "
                 "meaningful translation."
             ),
         }
@@ -466,12 +470,20 @@ def main() -> int:
     val_dataset = _build_val_dataset(cfg)
     print(f"  val: {len(val_dataset)} clips total; sampling {args.num_clips}.")
 
-    rng = np.random.default_rng(args.seed)
-    pool = list(range(len(val_dataset)))
-    rng.shuffle(pool)
-    sampled = pool[: args.num_clips]
+    sampled = select_eval_clip_indices(
+        val_dataset,
+        args.num_clips,
+        seed=args.seed,
+    )
+    selected_rows = describe_eval_clip_selection(val_dataset, sampled)
 
-    print(f"Round-tripping {len(sampled)} clips ...")
+    print(f"Round-tripping {len(sampled)} stratified clips ...")
+    for row in selected_rows:
+        print(
+            "  "
+            f"idx={row['index']} subset={row['subset']} "
+            f"object={row['object_id']} seq={row['seq_id']}",
+        )
     per_clip: list[dict[str, Any]] = []
     for i, idx in enumerate(sampled):
         sample = val_dataset[idx]
