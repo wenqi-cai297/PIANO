@@ -5,16 +5,14 @@ source for Stage B memory.
 
 ## Current Conclusion
 
-Stage B has a real object/interaction control signal, but the current C2b
-training strategy is stuck around `32 cm` full contact on the matched 80-clip
-eval. GT VQ roundtrip is `18.47 cm`, so there is still a large generation gap.
+Stage B has a real object/interaction control signal. One-shot C2b/v12 sampling
+is stuck around `32 cm` full contact on the matched 80-clip eval, but the K=16
+oracle reaches `17.93 cm`, essentially the GT VQ roundtrip band (`18.47 cm`).
 
-Do not continue blind parameter sweeps. Run no-retrain diagnostics:
-
-1. K-sample oracle.
-2. Soft-hard gap diagnostic.
-3. RVQ mixed oracle.
-4. Subset-specific codebook audit.
+Do not continue blind parameter sweeps. The main path is now no-retrain
+contact-aware sample selection/guidance, plus visual review of the selected
+samples. Keep soft-hard/RVQ mixed/codebook diagnostics as secondary tools for
+remaining outliers.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
@@ -44,9 +42,11 @@ runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt
 | full | 31.82 cm |
 | text_only | 64.85 cm |
 | swap | 74.01 cm |
+| K=16 best-of-K oracle | 17.93 cm |
 
-Interpretation: `z_int` matters, but prediction/decoding still loses about
-`13.35 cm` beyond GT roundtrip.
+Saved K=16 best samples re-measured with `measure_contact_distance.py` at
+`18.70 cm`. Interpretation: `z_int` matters and the distribution contains
+good-contact samples, but ordinary sampling misses them.
 
 ## External Evidence That Shaped The Design
 
@@ -94,6 +94,7 @@ motion recovery or VQ decode logic unless no upstream function exists.
 | C2b/v0.10 | decoded loss through full soft RVQ | improved 20-clip result, not enough |
 | v0.11 | gradient/loss diagnostics | weight 0.10 too small |
 | v0.12 | decoded-contact weight sweep | all useful ckpts tied near 32 cm |
+| K=16 oracle | contact reranking over 16 samples | 17.93 cm best-of-K on 80 clips |
 
 ## Key Positive Results
 
@@ -187,6 +188,34 @@ loss, but not generated contact:
 
 This is strong evidence against more blind contact-weight tuning.
 
+### K=16 sample oracle
+
+The K-sample oracle sampled 16 variants per matched eval clip from
+`runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt` and
+selected the lowest contact-distance variant using the existing metric.
+
+| metric | value |
+|---|---:|
+| single-sample mean | 32.22 cm |
+| K=16 sample mean | 31.64 cm |
+| K=16 best-of-K mean | 17.93 cm |
+| K=16 best-of-K median | 14.50 cm |
+| best under 22 cm | 70% |
+| best under 25 cm | 80% |
+
+Per-subset:
+
+| subset | single | best-of-K | under 25 cm |
+|---|---:|---:|---:|
+| chairs | 18.51 | 8.44 | 95% |
+| imhd | 42.90 | 29.38 | 70% |
+| neuraldome | 37.87 | 21.66 | 60% |
+| omomo_correct_v2 | 29.60 | 12.23 | 95% |
+
+This is decisive evidence that the learned distribution already has good
+contact modes. The immediate Stage B problem is selecting/guiding samples, not
+making the decoded-contact loss larger.
+
 ## v0.12 Full Table
 
 | ckpt | full | text_only | swap |
@@ -246,20 +275,39 @@ Core code:
 - `src/piano/models/backbones/momask_adapter.py`
 - `src/piano/data/eval_sampling.py`
 
-## Next Diagnostics
+## Next Work
 
-### 1. K-sample oracle
+### 1. Visual review of selected best samples
 
-Question: does the current generator already place good-contact samples in the
-distribution?
+Question: are the metric-selected K=16 samples visually valid motions, or are
+they exploiting the contact metric?
 
-Expected output:
+Run the existing visualizer on:
 
-- best-of-K contact per clip;
-- mean/median and per-subset summary;
-- comparison to single-sample v12 w02 best_val and GT roundtrip.
+```text
+runs/eval/stageB_v0_12_w02_bv_k16_oracle/best
+```
 
-### 2. Soft-hard gap diagnostic
+If the videos are acceptable, treat contact-aware best-of-K reranking as the
+Stage B baseline.
+
+### 2. Hard-case follow-up
+
+Question: which remaining failures are search failures, representation
+failures, or metric/semantic mismatches?
+
+Start with the clips that remain above `25 cm` after K=16, especially:
+
+- `20230901_wangwzh_suitcase_suitcase_lefthand_carry_3_0`: `116.76 cm`
+- `subject03_tennis_926`: `59.05 cm`
+- `20230825_wangwzh_bat_bat_lefthand_swing_11_0_0`: `58.81 cm`
+- `20230901_wangwzh_suitcase_suitcase_lift_0_1328`: `46.54 cm`
+- `subject04_baseball_0`: `37.20 cm`
+
+Try higher K or targeted diagnostics on IMHD/NeuralDome before changing
+training.
+
+### 3. Soft-hard gap diagnostic
 
 Question: is the decoded auxiliary loss optimistic relative to hard generation?
 
@@ -276,7 +324,7 @@ Decision:
   ST-Gumbel/DES-style consistency or sample-time logits/embedding optimization.
 - If soft is also bad, change the learned contact representation/distribution.
 
-### 3. RVQ mixed oracle
+### 4. RVQ mixed oracle
 
 Question: where does the error enter the discrete RVQ stack?
 
@@ -287,7 +335,7 @@ Rows:
 - GT base + predicted residual;
 - predicted base + GT residual.
 
-### 4. Subset codebook audit
+### 5. Subset codebook audit
 
 Question: which clips/subsets have large GT original -> GT roundtrip drift?
 
@@ -295,8 +343,10 @@ Start with IMHD because its 80-clip codebook gap is `14.13 cm`.
 
 ## Decision Rules
 
-- If K-sample oracle works: add reranking/guidance/scoring.
-- If K-sample oracle fails: change the learned distribution.
+- K-sample oracle worked: add reranking/guidance/scoring.
+- If visual review passes: make reranking the Stage B baseline.
+- If visual review fails: fix the metric loophole, then run soft-hard/RVQ
+  mixed diagnostics before more training.
 - If soft-hard gap is large: use hard/ST-Gumbel consistency or full-RVQ
   logits/embedding optimization.
 - If base mixed oracle fails: base MaskTransformer/conditioning is the target.

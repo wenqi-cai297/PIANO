@@ -4,15 +4,13 @@ Compact project memory as of 2026-04-29.
 
 ## Current Snapshot
 
-Latest pushed commit:
+Recent Stage B diagnostic code commit:
 
 ```text
-c058c8b Add Stage B contact weight sweep script
+52bdc16 Add Stage B K-sample oracle diagnostic
 ```
 
-Tracked git state was clean at compaction time. Root memory docs and
-`analyses/` are ignored locally, so edits there do not appear in normal
-`git status`.
+Tracked git state was clean before the K-sample result documentation update.
 
 Current Stage B best server checkpoint identifier. The local workspace may only
 have eval summaries, not the `.pt` file:
@@ -30,10 +28,12 @@ Matched 80-clip contact eval:
 | v12 w02 best_val full | 31.82 cm |
 | v12 w02 best_val text_only | 64.85 cm |
 | v12 w02 best_val swap | 74.01 cm |
+| v12 w02 K=16 best-of-K oracle | 17.93 cm |
 
-Bottom line: Stage B has a real `z_int` signal, but current training strategy is
-stuck far above GT roundtrip. The next step is diagnosis, not another contact
-weight tweak.
+Bottom line: Stage B has a real `z_int` signal, and the v12 generator
+distribution already contains good-contact samples. The core gap is now
+sample-time selection/guidance: one-shot sampling is around `32 cm`, while
+K=16 contact reranking reaches the GT roundtrip band.
 
 2026-04-29 follow-up analysis: the problem is likely not missing contact
 supervision. The current loss already includes base CE, residual CE, and a
@@ -64,7 +64,7 @@ Stage A Interaction Predictor:
 
 Stage B Motion Generator:
 
-- Active bottleneck.
+- Active sample-selection/guidance bottleneck.
 - Current implementation includes residual `z_int` conditioning and decoded
   contact auxiliary loss through full soft RVQ prediction.
 - Main training script: `src/piano/training/train_generator.py`.
@@ -79,7 +79,8 @@ Stage B Motion Generator:
 Stage C Joint Finetune:
 
 - Not started.
-- Do not start until Stage B diagnostic bottleneck is understood.
+- Do not start until the Stage B reranking/guidance baseline passes metric and
+  visual review.
 
 ## Stage B Evidence Timeline
 
@@ -100,6 +101,7 @@ Stage C Joint Finetune:
 | C2b/v0.10 | full-RVQ path: 25.27 full on 20 clips | partial gain |
 | v0.11 | diagnostics showed weight 0.10 had small gradient share | motivated sweep |
 | v0.12 | weights 0.20/0.30/0.50/0.80 all near 32 cm on 80 clips | stop blind weight sweeps |
+| K=16 oracle | best-of-K 17.93 cm on 80 clips | reranking/guidance becomes main path |
 
 ## v0.12 Details
 
@@ -136,6 +138,34 @@ Gradient diagnostic:
 Conclusion: decoded-contact surrogate optimization is working mechanically, but
 it does not translate monotonically to sample-time contact.
 
+K-sample oracle on v12 w02 best_val:
+
+| metric | value |
+|---|---:|
+| single-sample mean | 32.22 cm |
+| K=16 sample mean | 31.64 cm |
+| K=16 best-of-K mean | 17.93 cm |
+| K=16 best-of-K median | 14.50 cm |
+| best under 22 cm | 70% |
+| best under 25 cm | 80% |
+
+Saved best samples re-measured with `measure_contact_distance.py` at
+`18.70 cm`, close to the oracle score. This confirms the selected saved output
+is in the GT VQ roundtrip band.
+
+Per-subset K=16 best-of-K:
+
+| subset | single | best-of-K |
+|---|---:|---:|
+| chairs | 18.51 | 8.44 |
+| imhd | 42.90 | 29.38 |
+| neuraldome | 37.87 | 21.66 |
+| omomo_correct_v2 | 29.60 | 12.23 |
+
+IMHD remains the hardest subset; the worst outlier is
+`20230901_wangwzh_suitcase_suitcase_lefthand_carry_3_0` at `116.76 cm` even
+after K=16 reranking.
+
 Subset decomposition for v12 w02 best_val:
 
 | subset | GT orig | GT roundtrip | full | codebook gap | model gap |
@@ -150,22 +180,18 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 ## Next Work
 
-Implement and run no-retrain diagnostics:
+Immediate:
 
-1. K-sample oracle on v12 w02 best_val.
-2. Soft-hard gap diagnostic between decoded training surrogate and discrete
-   generated contact.
-3. RVQ mixed oracle.
-4. Subset-specific codebook audit, with IMHD first.
+1. Render/review the K=16 saved best samples for visual quality and collisions.
+2. Establish contact-aware best-of-K reranking as the no-retrain Stage B
+   baseline.
+3. Run larger-K or targeted analysis for IMHD/NeuralDome hard cases if needed.
 
-After those results:
+Secondary diagnostics:
 
-- If K-sample oracle finds good contact, add sampling/reranking or guidance.
-- If GT base + predicted residual fails but predicted base + GT residual works,
-  focus base-token prediction.
-- If predicted base + GT residual fails, focus residual/full-RVQ path.
-- If GT roundtrip is bad on a subset, investigate codebook/representation for
-  that subset before more generator training.
+- Soft-hard gap diagnostic if reranking exposes visual cheating or instability.
+- RVQ mixed oracle if outliers suggest base/residual token bottlenecks.
+- Subset-specific codebook audit if IMHD remains poor after higher-K search.
 
 ## Environment
 

@@ -4,36 +4,30 @@ Compact action plan as of 2026-04-29.
 
 ## Immediate Priority
 
-Stage B is stuck around `32 cm` full contact on the matched 80-clip eval, while
-GT roundtrip is `18.47 cm`. Do not launch another blind decoded-contact weight
-sweep. The next step is to identify where the gap enters the pipeline.
+Stage B single-sample generation is stuck around `32 cm` full contact on the
+matched 80-clip eval, while GT VQ roundtrip is `18.47 cm`. The K-sample oracle
+now shows the current generator distribution already contains good-contact
+samples: K=16 best-of-K reaches `17.93 cm` mean contact, with `70%` of clips
+under `22 cm` and `80%` under `25 cm`.
 
-Current diagnosis: `z_int` is active, but the full soft-RVQ decoded contact
-surrogate is not closing the discrete sample-time contact gap. This matches
-recent HOI/control literature: OMOMO uses hand positions as an intermediate
-representation, InterDiff inserts interaction correction during denoising,
-CHOIS applies contact guidance during sampling, and MaskControl uses
+Current diagnosis: `z_int` is active, and the learned distribution is not
+fundamentally incapable of contact. The immediate problem is sample-time
+selection/guidance: ordinary one-shot sampling often misses the good modes.
+This matches recent HOI/control literature: OMOMO uses hand positions as an
+intermediate representation, InterDiff inserts interaction correction during
+denoising, CHOIS applies contact guidance during sampling, and MaskControl uses
 training-time differentiable sampling plus inference-time logits/codebook
-optimization. For PIANO, start with no-retrain oracles before changing
-training.
+optimization.
 
 ### 1. K-sample oracle
 
-Goal: test whether the current generator distribution already contains
-good-contact samples.
+Result: succeeded on the v12 w02 best-val checkpoint.
 
-Input checkpoint identifier on the server:
+Checkpoint identifier on the server:
 
 ```text
 runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt
 ```
-
-Suggested measurement:
-
-- sample K variants per eval clip with fixed prompts/object conditions;
-- score each variant using the existing contact-distance metric;
-- report mean, median, best-of-K, and per-subset best-of-K;
-- keep the same 80-clip stratified set used by v0.12.
 
 Runner:
 
@@ -49,10 +43,11 @@ python scripts/stage_b_generator/k_sample_oracle.py \
 
 Decision:
 
-- If oracle best approaches GT roundtrip, use reranking/guidance.
-- If oracle best remains near 32 cm, the model distribution itself is wrong.
-
-### 2. RVQ mixed oracle
+- K=16 best-of-K mean: `17.93 cm`, essentially the GT roundtrip band.
+- Single sample mean: `32.22 cm`, matching the previous v12 contact band.
+- Saved best samples re-measured at `18.70 cm` by `measure_contact_distance.py`.
+- Next branch: make contact-aware reranking/guidance the Stage B baseline, then
+  inspect visual quality and the remaining hard subsets.
 
 ### 2. Soft-hard gap diagnostic
 
@@ -112,22 +107,24 @@ Decision:
   may be justified for that subset.
 - If roundtrip is fine but prediction is poor, keep focus on generator.
 
-## After Diagnostics
+## After K-Sample Oracle
 
-Only choose the next training direction after the diagnostics above.
+Immediate branch:
 
-Possible branches:
+- Treat contact-aware best-of-K reranking as the no-retrain Stage B baseline.
+- Render/review the saved best samples for visual quality and collision/cheating.
+- Try larger K or targeted reranking on IMHD/NeuralDome hard cases.
+- If pure metric reranking looks visually acceptable, implement a practical
+  scorer/reranker path for Stage B eval and later Stage C.
 
-- Distribution contains good samples: add contact-aware reranking, improve
-  inference guidance, or train a lightweight scorer.
-- Soft-hard gap is large: move decoded-contact supervision closer to hard
-  sampling via ST-Gumbel/DES-style training, and revisit MaskControl-style
-  logits or embedding optimization.
-- Base-token bottleneck: revise base MaskTransformer supervision/conditioning.
-- Residual bottleneck: strengthen residual `z_int` path or residual training
-  objective.
-- Codebook bottleneck: subset-specific VQ audit, then consider representation
-  fixes instead of generator-only training.
+Secondary diagnostics, only if reranked samples fail visually or hard subsets
+remain unacceptable:
+
+- Soft-hard gap: measure whether the decoded training path is optimistic
+  relative to hard generation.
+- RVQ mixed oracle: locate whether base tokens or residual RVQ tokens dominate
+  remaining outliers.
+- Codebook bottleneck: subset-specific VQ audit, especially IMHD.
 
 ## Do Not Prioritize Now
 

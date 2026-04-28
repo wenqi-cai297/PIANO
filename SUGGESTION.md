@@ -5,19 +5,19 @@ Compact recommendation memo as of 2026-04-29.
 ## Executive Position
 
 Do not continue tuning decoded-contact loss weight or checkpoint selection as
-the main Stage B strategy. v0.12 shows the training surrogate can be strengthened
-without moving generated contact below the same roughly `32 cm` band.
+the main Stage B strategy. v0.12 shows the training surrogate can be
+strengthened without moving one-shot generated contact below the same roughly
+`32 cm` band.
 
-The next correct move is no-retrain diagnosis:
+The K-sample oracle changes the active plan: the current generator distribution
+already contains good-contact samples. K=16 best-of-K reaches `17.93 cm`, close
+to GT VQ roundtrip `18.47 cm`. The next correct move is contact-aware
+reranking/guidance, with visual review to make sure the metric-selected samples
+are usable motions.
 
-1. K-sample oracle.
-2. Soft-hard gap diagnostic.
-3. RVQ mixed oracle.
-4. Subset-specific codebook audit.
-
-Current framing: this is not simply "contact loss too weak." The likely failure
-is a mismatch between the soft decoded auxiliary path used in training and the
-hard sample-time RVQ path used in evaluation.
+Current framing: this is not simply "contact loss too weak" and not primarily
+"the model cannot generate contact." The failure is that ordinary sampling does
+not reliably choose the good contact modes.
 
 ## Evidence
 
@@ -44,6 +44,29 @@ Decoded-contact weight sweep:
 
 The surrogate behaves as intended, but sample-time contact does not follow.
 
+K=16 oracle on v12 w02 best_val:
+
+| metric | value |
+|---|---:|
+| single-sample mean | 32.22 cm |
+| K=16 sample mean | 31.64 cm |
+| K=16 best-of-K mean | 17.93 cm |
+| K=16 best-of-K median | 14.50 cm |
+| best under 22 cm | 70% |
+| best under 25 cm | 80% |
+
+Per-subset K=16 best-of-K:
+
+| subset | best-of-K |
+|---|---:|
+| chairs | 8.44 cm |
+| imhd | 29.38 cm |
+| neuraldome | 21.66 cm |
+| omomo_correct_v2 | 12.23 cm |
+
+This is strong evidence for a reranking/guidance branch. IMHD still needs
+targeted analysis.
+
 ## What Already Worked
 
 - MoMask encoder normalization fix: repaired token/body collapse.
@@ -64,23 +87,26 @@ The surrogate behaves as intended, but sample-time contact does not follow.
 
 ## Recommended Next Implementation
 
-Add diagnostic scripts under `scripts/stage_b_generator/` and reuse library
-helpers from `src/piano/`:
+Build the next Stage B path under `scripts/stage_b_generator/` and reuse
+library helpers from `src/piano/`:
 
 - use existing eval sampling so the 80-clip set is matched;
 - use upstream MoMask/VQ decode and `recover_from_ric` paths;
 - use existing contact-distance code rather than reimplementing geometry;
 - output small `summary.json` files, not large generated arrays unless needed.
 
-First script landed:
+Current script:
 
 - `scripts/stage_b_generator/k_sample_oracle.py`
 
 Decision rules:
 
-- K-sample oracle succeeds: build reranking/guidance around the existing
+- K-sample oracle succeeded: build reranking/guidance around the existing
   distribution.
-- K-sample oracle fails: revise model/training distribution.
+- Visual review passes: make contact-aware best-of-K reranking the Stage B
+  baseline.
+- Visual review fails: diagnose metric loopholes, then use soft-hard/RVQ mixed
+  diagnostics before more training.
 - Soft-hard gap is large: move decoded contact closer to hard sampling with
   ST-Gumbel/DES-style consistency or full-RVQ logits/embedding optimization.
 - RVQ mixed oracle identifies base bottleneck: focus MaskTransformer/base
