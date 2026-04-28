@@ -31,9 +31,9 @@ Matched 80-clip contact eval:
 | v12 w02 K=16 best-of-K oracle | 17.93 cm |
 
 Bottom line: Stage B has a real `z_int` signal, and the v12 generator
-distribution already contains good-contact samples. The core gap is now
-sample-time selection/guidance: one-shot sampling is around `32 cm`, while
-K=16 contact reranking reaches the GT roundtrip band.
+distribution already contains close-to-object samples. The remaining gap is
+temporal/physical binding: contact-distance reranking puts the body near the
+object, but videos show the generated body often does not move with the object.
 
 2026-04-29 follow-up analysis: the problem is likely not missing contact
 supervision. The current loss already includes base CE, residual CE, and a
@@ -102,6 +102,8 @@ Stage C Joint Finetune:
 | v0.11 | diagnostics showed weight 0.10 had small gradient share | motivated sweep |
 | v0.12 | weights 0.20/0.30/0.50/0.80 all near 32 cm on 80 clips | stop blind weight sweeps |
 | K=16 oracle | best-of-K 17.93 cm on 80 clips | reranking/guidance becomes main path |
+| K=16 visual review | body is near object but weakly synchronized to object motion | distance-only reranking is insufficient |
+| temporal coupling metric | moving coupled frame frac 0.323 | optimize/rerank for coupling, not only distance |
 
 ## v0.12 Details
 
@@ -166,6 +168,44 @@ IMHD remains the hardest subset; the worst outlier is
 `20230901_wangwzh_suitcase_suitcase_lefthand_carry_3_0` at `116.76 cm` even
 after K=16 reranking.
 
+Visual review of the K=16 best samples: the positive signal is real
+object-position conditioning. The body is usually near the object and often
+oriented/moving in the same broad direction. The failure is stronger: body
+motion is often only colocated with the object trajectory, not temporally bound
+to it. In object-moving clips, the person may perform a plausible action near
+the object while the object's move timing does not match and no stable contact
+is visible.
+
+New diagnostic:
+
+```bash
+python scripts/stage_b_generator/measure_temporal_coupling.py \
+  --input-dir runs/eval/stageB_v0_12_w02_bv_k16_oracle/best \
+  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_oracle/temporal_coupling
+```
+
+Result on K=16 distance-reranked best:
+
+| metric | value |
+|---|---:|
+| ordinary mean contact distance | 0.187 m |
+| moving-object frame fraction | 0.555 |
+| moving frames with any close tracked body part | 0.475 |
+| moving frames with kinematic coupling | 0.323 |
+| moving frames close but uncoupled | 0.245 |
+
+Subset coupling:
+
+| subset | moving coupled frame frac |
+|---|---:|
+| chairs | 0.665 |
+| imhd | 0.134 |
+| neuraldome | 0.277 |
+| omomo_correct_v2 | 0.379 |
+
+This supports the user's visual assessment: distance-only contact is not a
+strong enough proxy for "the person is actually manipulating the object."
+
 Subset decomposition for v12 w02 best_val:
 
 | subset | GT orig | GT roundtrip | full | codebook gap | model gap |
@@ -182,14 +222,32 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Render/review the K=16 saved best samples for visual quality and collisions.
-2. Establish contact-aware best-of-K reranking as the no-retrain Stage B
-   baseline.
-3. Run larger-K or targeted analysis for IMHD/NeuralDome hard cases if needed.
+1. Run the new composite K-sample reranker, which scores both contact distance
+   and temporal coupling during moving-object frames.
+2. Compare distance-only K=16 vs composite K=16 on the same 80 clips.
+3. If composite reranking improves videos, use it as the no-retrain Stage B
+   baseline and then decide whether to train a lightweight scorer or add a
+   decoded kinematic-coupling objective.
+
+Composite runner:
+
+```bash
+python scripts/stage_b_generator/k_sample_oracle.py \
+  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
+  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
+  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
+  --num-clips-per-subset 20 \
+  --k 16 \
+  --selection-metric composite \
+  --coupling-weight 0.12 \
+  --uncoupled-penalty 0.05 \
+  --save-best
+```
 
 Secondary diagnostics:
 
-- Soft-hard gap diagnostic if reranking exposes visual cheating or instability.
+- Soft-hard gap diagnostic if composite reranking still exposes visual cheating
+  or instability.
 - RVQ mixed oracle if outliers suggest base/residual token bottlenecks.
 - Subset-specific codebook audit if IMHD remains poor after higher-K search.
 

@@ -9,10 +9,11 @@ Stage B has a real object/interaction control signal. One-shot C2b/v12 sampling
 is stuck around `32 cm` full contact on the matched 80-clip eval, but the K=16
 oracle reaches `17.93 cm`, essentially the GT VQ roundtrip band (`18.47 cm`).
 
-Do not continue blind parameter sweeps. The main path is now no-retrain
-contact-aware sample selection/guidance, plus visual review of the selected
-samples. Keep soft-hard/RVQ mixed/codebook diagnostics as secondary tools for
-remaining outliers.
+Do not continue blind parameter sweeps. The K=16 result solved only spatial
+proximity. Visual review shows a more specific remaining failure: the generated
+body is near the object, but its action is often not temporally bound to the
+object's motion. The main path is now no-retrain composite reranking/guidance
+that scores both contact distance and moving-object kinematic coupling.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
@@ -46,7 +47,8 @@ runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt
 
 Saved K=16 best samples re-measured with `measure_contact_distance.py` at
 `18.70 cm`. Interpretation: `z_int` matters and the distribution contains
-good-contact samples, but ordinary sampling misses them.
+close-to-object samples, but distance-only selection does not guarantee true
+manipulation.
 
 ## External Evidence That Shaped The Design
 
@@ -95,6 +97,7 @@ motion recovery or VQ decode logic unless no upstream function exists.
 | v0.11 | gradient/loss diagnostics | weight 0.10 too small |
 | v0.12 | decoded-contact weight sweep | all useful ckpts tied near 32 cm |
 | K=16 oracle | contact reranking over 16 samples | 17.93 cm best-of-K on 80 clips |
+| temporal coupling | kinematic-coupling diagnostic on K=16 best | only 0.323 coupled on moving frames |
 
 ## Key Positive Results
 
@@ -213,8 +216,47 @@ Per-subset:
 | omomo_correct_v2 | 29.60 | 12.23 | 95% |
 
 This is decisive evidence that the learned distribution already has good
-contact modes. The immediate Stage B problem is selecting/guiding samples, not
-making the decoded-contact loss larger.
+spatial contact modes. The immediate Stage B problem is selecting/guiding
+samples for temporally correct manipulation, not making the decoded-contact
+loss larger.
+
+### K=16 visual review and temporal coupling
+
+Human review of the saved K=16 best videos:
+
+- Positive: generated bodies are much closer to objects; motion direction often
+  broadly aligns with object trajectory; the model clearly uses object
+  coordinates.
+- Negative: action timing is weakly tied to object motion. For moving objects,
+  the body can perform a plausible text action near the object without visibly
+  touching it or carrying/pushing it through the object's movement.
+
+`measure_temporal_coupling.py` quantifies this using the same kinematic
+coupling criterion as pseudo-label extraction: during moving-object frames, a
+body part should stay stable in the object's local frame.
+
+Result on distance-reranked K=16 best:
+
+| metric | value |
+|---|---:|
+| ordinary mean contact distance | 0.187 m |
+| moving-object frame fraction | 0.555 |
+| moving frames with any close tracked body part | 0.475 |
+| moving frames with kinematic coupling | 0.323 |
+| moving frames close but uncoupled | 0.245 |
+
+Subset moving-coupled frame fraction:
+
+| subset | value |
+|---|---:|
+| chairs | 0.665 |
+| imhd | 0.134 |
+| neuraldome | 0.277 |
+| omomo_correct_v2 | 0.379 |
+
+This confirms the visual assessment. Distance-only contact is not a sufficient
+proxy for "the person is manipulating the object." IMHD is the clearest failure
+mode.
 
 ## v0.12 Full Table
 
@@ -264,7 +306,9 @@ Configs:
 Script:
 
 - `scripts/stage_b_generator/run_v12_contact_weight_sweep.sh`
-- `scripts/stage_b_generator/k_sample_oracle.py`
+- `scripts/stage_b_generator/k_sample_oracle.py` (`--selection-metric composite`
+  selects by contact distance plus moving-object coupling)
+- `scripts/stage_b_generator/measure_temporal_coupling.py`
 
 Core code:
 
@@ -277,19 +321,36 @@ Core code:
 
 ## Next Work
 
-### 1. Visual review of selected best samples
+### 1. Composite K-sample reranking
 
-Question: are the metric-selected K=16 samples visually valid motions, or are
-they exploiting the contact metric?
+Question: can no-retrain selection pick samples that are both close to the
+object and temporally coupled to object motion?
 
-Run the existing visualizer on:
+Compare on the same 80 clips:
 
-```text
-runs/eval/stageB_v0_12_w02_bv_k16_oracle/best
+- distance-only K=16 selection;
+- composite K=16 selection: contact distance + moving-object kinematic
+  coupling;
+- optional K=32 on IMHD/NeuralDome hard cases.
+
+Runner:
+
+```bash
+python scripts/stage_b_generator/k_sample_oracle.py \
+  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
+  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
+  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
+  --num-clips-per-subset 20 \
+  --k 16 \
+  --selection-metric composite \
+  --coupling-weight 0.12 \
+  --uncoupled-penalty 0.05 \
+  --save-best
 ```
 
-If the videos are acceptable, treat contact-aware best-of-K reranking as the
-Stage B baseline.
+If composite selection improves videos, make it the no-retrain Stage B
+baseline and use it to decide whether a learned scorer or decoded coupling
+objective is worth training.
 
 ### 2. Hard-case follow-up
 
@@ -343,10 +404,12 @@ Start with IMHD because its 80-clip codebook gap is `14.13 cm`.
 
 ## Decision Rules
 
-- K-sample oracle worked: add reranking/guidance/scoring.
-- If visual review passes: make reranking the Stage B baseline.
-- If visual review fails: fix the metric loophole, then run soft-hard/RVQ
-  mixed diagnostics before more training.
+- K-sample oracle worked spatially: add reranking/guidance/scoring.
+- Distance-only visual review failed temporally: do not ship distance-only
+  reranking as Stage B.
+- If composite reranking passes visual review: make it the Stage B baseline.
+- If composite reranking also fails: run soft-hard/RVQ mixed diagnostics before
+  more training.
 - If soft-hard gap is large: use hard/ST-Gumbel consistency or full-RVQ
   logits/embedding optimization.
 - If base mixed oracle fails: base MaskTransformer/conditioning is the target.

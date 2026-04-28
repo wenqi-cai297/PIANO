@@ -29,7 +29,6 @@ from piano.data.eval_sampling import (
     select_eval_clip_indices,
 )
 from piano.data.humanml3d_repr import load_motion_stats
-from piano.training.contact_eval import compute_clip_contact_distance
 from piano.utils.io_utils import ensure_dir, save_json
 
 # Reuse the load-bearing Stage B offline eval helpers. This file lives in the
@@ -43,6 +42,7 @@ from qual_eval import (  # type: ignore
     _save_condition_dir,
     _tokenize_z_int,
 )
+from measure_temporal_coupling import score_motion_temporal_coupling  # type: ignore
 
 
 def _set_all_seeds(seed: int) -> None:
@@ -113,6 +113,34 @@ def _aggregate_by_subset(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _selection_score(
+    *,
+    dist_m: float,
+    temporal: dict[str, Any],
+    metric: str,
+    coupling_weight: float,
+    uncoupled_penalty: float,
+    min_moving_frame_frac: float,
+) -> float:
+    if metric == "distance":
+        return float(dist_m)
+
+    moving_frac = temporal.get("moving_frame_frac")
+    coupled = temporal.get("moving_coupled_frame_frac")
+    uncoupled = temporal.get("moving_close_but_uncoupled_frac")
+    if moving_frac is None or float(moving_frac) < float(min_moving_frame_frac):
+        return float(dist_m)
+    if coupled is None:
+        return float(dist_m)
+
+    uncoupled_term = float(uncoupled) if uncoupled is not None else 0.0
+    return (
+        float(dist_m)
+        + float(coupling_weight) * (1.0 - float(coupled))
+        + float(uncoupled_penalty) * uncoupled_term
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -144,6 +172,34 @@ def main() -> int:
     parser.add_argument("--w-int", type=float, default=2.0)
     parser.add_argument("--timesteps", type=int, default=10)
     parser.add_argument("--res-cond-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("distance", "composite"),
+        default="distance",
+        help="How to choose the saved best sample. 'distance' preserves the original oracle. "
+             "'composite' adds a penalty for weak moving-object kinematic coupling.",
+    )
+    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--coupling-threshold", type=float, default=0.5)
+    parser.add_argument("--moving-speed-threshold", type=float, default=None)
+    parser.add_argument(
+        "--min-moving-frame-frac",
+        type=float,
+        default=0.05,
+        help="Use distance-only scoring when fewer than this fraction of frames have moving objects.",
+    )
+    parser.add_argument(
+        "--coupling-weight",
+        type=float,
+        default=0.12,
+        help="Composite penalty in meters for no moving-object kinematic coupling.",
+    )
+    parser.add_argument(
+        "--uncoupled-penalty",
+        type=float,
+        default=0.05,
+        help="Composite penalty in meters for moving frames that are close but uncoupled.",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--save-best",
@@ -187,8 +243,6 @@ def main() -> int:
             f"object={row['object_id']} seq={row['seq_id']}"
         )
 
-    from utils.motion_process import recover_from_ric
-
     per_clip: list[dict[str, Any]] = []
     best_save_rows: list[dict[str, dict[str, Any]]] = []
     texts: list[str] = []
@@ -231,6 +285,7 @@ def main() -> int:
         sample_rows: list[dict[str, Any]] = []
         best_motion: np.ndarray | None = None
         best_base: np.ndarray | None = None
+        best_score = float("inf")
         best_dist = float("inf")
         best_sample_idx = -1
         best_seed = -1
@@ -255,7 +310,7 @@ def main() -> int:
                 res_cond_scale=float(args.res_cond_scale),
                 device=device,
             )
-            dist_m = compute_clip_contact_distance(
+            temporal = score_motion_temporal_coupling(
                 motion_263_generated=motion_gen,
                 R_y_angle=R_y,
                 T_xz=T_xz,
@@ -263,15 +318,32 @@ def main() -> int:
                 object_positions=obj_pos,
                 object_rotations=obj_rot,
                 seq_len=seq_len,
-                recover_from_ric_fn=recover_from_ric,
+                fps=float(args.fps),
+                coupling_threshold=float(args.coupling_threshold),
+                moving_speed_threshold=args.moving_speed_threshold,
+            )
+            dist_m = float(temporal["mean_min_dist_m"])
+            score = _selection_score(
+                dist_m=dist_m,
+                temporal=temporal,
+                metric=str(args.selection_metric),
+                coupling_weight=float(args.coupling_weight),
+                uncoupled_penalty=float(args.uncoupled_penalty),
+                min_moving_frame_frac=float(args.min_moving_frame_frac),
             )
             sample_rows.append({
                 "sample_index": k_i,
                 "seed": sample_seed,
                 "dist_m": round(float(dist_m), 6),
                 "dist_cm": _cm(float(dist_m)),
+                "selection_score": round(float(score), 6),
+                "moving_frame_frac": temporal.get("moving_frame_frac"),
+                "moving_close_frame_frac": temporal.get("moving_close_frame_frac"),
+                "moving_coupled_frame_frac": temporal.get("moving_coupled_frame_frac"),
+                "moving_close_but_uncoupled_frac": temporal.get("moving_close_but_uncoupled_frac"),
             })
-            if dist_m < best_dist:
+            if score < best_score:
+                best_score = float(score)
                 best_dist = float(dist_m)
                 best_sample_idx = k_i
                 best_seed = sample_seed
@@ -279,6 +351,9 @@ def main() -> int:
                 best_base = base_ids
 
         dists = [float(r["dist_m"]) for r in sample_rows]
+        scores = [float(r["selection_score"]) for r in sample_rows]
+        min_dist_idx = int(np.argmin(dists))
+        best_sample_row = sample_rows[best_sample_idx]
         row = {
             "index": int(selected_rows[clip_i]["index"]),
             "subset": subset,
@@ -294,10 +369,20 @@ def main() -> int:
             "sample_mean_dist_cm": _cm(float(np.mean(dists))),
             "sample_median_dist_m": round(float(np.median(dists)), 6),
             "sample_median_dist_cm": _cm(float(np.median(dists))),
+            "selection_metric": str(args.selection_metric),
             "best_sample_index": int(best_sample_idx),
             "best_seed": int(best_seed),
+            "best_selection_score": round(float(best_score), 6),
             "best_dist_m": round(float(best_dist), 6),
             "best_dist_cm": _cm(float(best_dist)),
+            "best_moving_frame_frac": best_sample_row.get("moving_frame_frac"),
+            "best_moving_close_frame_frac": best_sample_row.get("moving_close_frame_frac"),
+            "best_moving_coupled_frame_frac": best_sample_row.get("moving_coupled_frame_frac"),
+            "best_moving_close_but_uncoupled_frac": best_sample_row.get("moving_close_but_uncoupled_frac"),
+            "min_dist_sample_index": int(min_dist_idx),
+            "min_dist_m": round(float(dists[min_dist_idx]), 6),
+            "min_dist_cm": _cm(float(dists[min_dist_idx])),
+            "min_selection_score": round(float(np.min(scores)), 6),
             "improvement_single_minus_best_m": round(float(dists[0] - best_dist), 6),
             "improvement_single_minus_best_cm": _cm(float(dists[0] - best_dist)),
         }
@@ -306,6 +391,7 @@ def main() -> int:
             f"    single={row['single_sample_dist_cm']:.2f}cm "
             f"mean={row['sample_mean_dist_cm']:.2f}cm "
             f"best={row['best_dist_cm']:.2f}cm "
+            f"score={row['best_selection_score']:.3f} "
             f"(sample {best_sample_idx}, seed {best_seed})"
         )
 
@@ -341,6 +427,13 @@ def main() -> int:
         "w_int": float(args.w_int),
         "timesteps": int(args.timesteps),
         "res_cond_scale": float(args.res_cond_scale),
+        "selection_metric": str(args.selection_metric),
+        "fps": float(args.fps),
+        "coupling_threshold": float(args.coupling_threshold),
+        "moving_speed_threshold": args.moving_speed_threshold,
+        "min_moving_frame_frac": float(args.min_moving_frame_frac),
+        "coupling_weight": float(args.coupling_weight),
+        "uncoupled_penalty": float(args.uncoupled_penalty),
         "clip_selection": selected_rows,
         "aggregate": _aggregate_rows(per_clip),
         "by_subset": _aggregate_by_subset(per_clip),

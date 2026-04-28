@@ -6,14 +6,16 @@ Compact action plan as of 2026-04-29.
 
 Stage B single-sample generation is stuck around `32 cm` full contact on the
 matched 80-clip eval, while GT VQ roundtrip is `18.47 cm`. The K-sample oracle
-now shows the current generator distribution already contains good-contact
-samples: K=16 best-of-K reaches `17.93 cm` mean contact, with `70%` of clips
-under `22 cm` and `80%` under `25 cm`.
+shows the current generator distribution contains close-to-object samples:
+K=16 best-of-K reaches `17.93 cm` mean contact, with `70%` of clips under
+`22 cm` and `80%` under `25 cm`.
 
 Current diagnosis: `z_int` is active, and the learned distribution is not
-fundamentally incapable of contact. The immediate problem is sample-time
-selection/guidance: ordinary one-shot sampling often misses the good modes.
-This matches recent HOI/control literature: OMOMO uses hand positions as an
+fundamentally blind to object position. However, visual review shows
+distance-only reranking is not enough: the body is near the object, but its
+action timing often does not bind to the object's motion. The next problem is
+sample-time temporal coupling/guidance, not just spatial proximity. This
+matches recent HOI/control literature: OMOMO uses hand positions as an
 intermediate representation, InterDiff inserts interaction correction during
 denoising, CHOIS applies contact guidance during sampling, and MaskControl uses
 training-time differentiable sampling plus inference-time logits/codebook
@@ -46,10 +48,37 @@ Decision:
 - K=16 best-of-K mean: `17.93 cm`, essentially the GT roundtrip band.
 - Single sample mean: `32.22 cm`, matching the previous v12 contact band.
 - Saved best samples re-measured at `18.70 cm` by `measure_contact_distance.py`.
-- Next branch: make contact-aware reranking/guidance the Stage B baseline, then
-  inspect visual quality and the remaining hard subsets.
+- Visual review: distance-reranked samples are close to objects but often not
+  temporally bound to object motion.
+- Next branch: composite reranking/guidance using both spatial distance and
+  moving-object kinematic coupling.
 
-### 2. Soft-hard gap diagnostic
+### 2. Temporal coupling diagnostic
+
+Goal: test whether low-distance samples actually move with the object.
+
+Runner:
+
+```bash
+python scripts/stage_b_generator/measure_temporal_coupling.py \
+  --input-dir runs/eval/stageB_v0_12_w02_bv_k16_oracle/best \
+  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_oracle/temporal_coupling
+```
+
+Result on K=16 distance-reranked best:
+
+| metric | value |
+|---|---:|
+| ordinary mean contact distance | 0.187 m |
+| moving frames with any close tracked body part | 0.475 |
+| moving frames with kinematic coupling | 0.323 |
+| moving frames close but uncoupled | 0.245 |
+
+Decision: distance-only reranking is insufficient as the final baseline. The
+next no-retrain baseline should rerank samples by a composite of contact
+distance and kinematic coupling.
+
+### 3. Soft-hard gap diagnostic
 
 Goal: directly measure whether C2b's soft decoded path is optimistic relative
 to the hard generated RVQ path.
@@ -68,7 +97,7 @@ Decision:
 - soft and hard both bad: change the learned distribution or contact
   representation, not only the relaxation.
 
-### 3. RVQ mixed oracle
+### 4. RVQ mixed oracle
 
 Goal: locate whether base tokens or residual RVQ tokens dominate the gap.
 
@@ -88,7 +117,7 @@ Decision:
 - both mixed paths good but predicted all-RVQ bad: autoregressive coupling or
   sampling instability is the bottleneck.
 
-### 4. Subset-specific codebook audit
+### 5. Subset-specific codebook audit
 
 Goal: explain why 80-clip GT roundtrip has a nontrivial gap, especially IMHD.
 
@@ -111,11 +140,25 @@ Decision:
 
 Immediate branch:
 
-- Treat contact-aware best-of-K reranking as the no-retrain Stage B baseline.
-- Render/review the saved best samples for visual quality and collision/cheating.
-- Try larger K or targeted reranking on IMHD/NeuralDome hard cases.
-- If pure metric reranking looks visually acceptable, implement a practical
-  scorer/reranker path for Stage B eval and later Stage C.
+- Implement composite best-of-K reranking: distance + moving-object kinematic
+  coupling.
+- Compare distance-only K=16 vs composite K=16 on the same 80 clips.
+- Prioritize IMHD and NeuralDome hard cases, where temporal coupling is weakest.
+
+Composite rerank runner:
+
+```bash
+python scripts/stage_b_generator/k_sample_oracle.py \
+  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
+  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
+  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
+  --num-clips-per-subset 20 \
+  --k 16 \
+  --selection-metric composite \
+  --coupling-weight 0.12 \
+  --uncoupled-penalty 0.05 \
+  --save-best
+```
 
 Secondary diagnostics, only if reranked samples fail visually or hard subsets
 remain unacceptable:

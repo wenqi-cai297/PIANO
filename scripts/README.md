@@ -30,6 +30,12 @@ library code.
 ## Stage B Diagnostics
 
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
-  full-condition variants per fixed validation clip, scores each with the
-  existing contact-distance metric, and reports single-sample versus best-of-K
-  contact. Use this before adding new Stage B training runs.
+  full-condition variants per fixed validation clip, scores each sample, and
+  saves best-of-K outputs for visualization. Default selection is the existing
+  contact-distance metric; `--selection-metric composite` adds a moving-object
+  kinematic-coupling penalty for the temporal-binding failure mode.
+- `stage_b_generator/measure_temporal_coupling.py`: post-process diagnostic for
+  generated runs. Measures whether moving-object frames have a body part that
+  is stable in object-local coordinates, reusing the pseudo-label extractor's
+  kinematic-coupling criterion. Use it when contact distance is low but videos
+  look temporally unbound from the object trajectory.
