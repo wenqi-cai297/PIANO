@@ -669,6 +669,7 @@ class InteractionMaskTransformer(nn.Module):
         drop_text_mask: Tensor | None = None,       # (B,) bool — explicit text drops
         drop_int_mask: Tensor | None = None,        # (B,) bool — explicit interaction drops
         cfg_drop_buckets: tuple[float, float, float] | None = None,
+        return_logits: bool = False,
     ) -> dict[str, Tensor]:
         """Training forward: BERT-style mask + masked-CE loss.
 
@@ -693,9 +694,10 @@ class InteractionMaskTransformer(nn.Module):
           - ``loss``: scalar masked-CE loss (only at masked positions)
           - ``acc``: scalar mean accuracy at masked positions
 
-        The full ``pred_id`` tensor (B, S) is NOT returned — it's
-        not consumed by the training loop, and including non-scalar
-        tensors in this dict would crash the per-step logger.
+        When ``return_logits=True``, the dict also includes non-scalar
+        ``logits`` / ``labels`` / ``non_pad_mask`` for decoded-space
+        auxiliary losses. Callers should remove them before returning
+        to the generic trainer.
         """
         # MoMask's own helpers — re-imported here to keep the wrapper
         # self-contained (the tools module path is set up by
@@ -755,10 +757,15 @@ class InteractionMaskTransformer(nn.Module):
         ce_loss, _pred_id, acc = cal_performance(
             logits, labels, ignore_index=mt.mask_id,
         )
-        return {
+        out = {
             "loss": ce_loss,
             "acc": torch.tensor(acc, device=device),
         }
+        if return_logits:
+            out["logits"] = logits
+            out["labels"] = labels
+            out["non_pad_mask"] = non_pad_mask
+        return out
 
     # ------------------------------------------------------------------
     # Inference

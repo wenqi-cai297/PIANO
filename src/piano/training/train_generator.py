@@ -55,6 +55,7 @@ from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.motion_generator import InteractionMaskTransformer
 from piano.models.motion_generator_residual import ResidualTransformerWithInteraction
 from piano.training.contact_eval import build_contact_eval_fn
+from piano.training.decoded_contact_loss import decoded_contact_aux_loss
 from piano.training.trainer import build_scheduler, run_training_loop
 from piano.utils.io_utils import load_json
 
@@ -275,6 +276,10 @@ def build_generator_step_fn(
     cfg_drop_buckets: tuple[float, float, float],
     residual_transformer: ResidualTransformerWithInteraction | None = None,
     residual_loss_weight: float = 0.0,
+    decoded_contact_aux_weight: float = 0.0,
+    decoded_contact_aux_mode: str = "metric",
+    decoded_contact_aux_temperature: float = 1.0,
+    decoded_contact_aux_num_object_points: int = 256,
     token_stride: int = 4,
     motion_mean: torch.Tensor | None = None,
     motion_std: torch.Tensor | None = None,
@@ -309,6 +314,11 @@ def build_generator_step_fn(
         encoder inputs that quantize to the wrong codes (only 44.5% of
         GT path length preserved on round-trip vs 94.7% with normalized
         input). Apply ``(motion - mean) / std`` before ``vq_model.encode``.
+    decoded_contact_aux_weight
+        C2 decoded-space auxiliary loss weight. When positive, the step
+        requests base logits, decodes relaxed base tokens + GT residual
+        RVQ codes through the frozen VQ-VAE, and adds a differentiable
+        canonical-frame body-to-object min-distance term.
     """
 
     def step_fn(_model: nn.Module, batch: dict) -> dict[str, Tensor]:
@@ -375,6 +385,7 @@ def build_generator_step_fn(
             int_tokens_bf=int_tokens_bf,
             int_padding_mask_bf=int_pad_mask_bf,
             cfg_drop_buckets=cfg_drop_buckets,
+            return_logits=decoded_contact_aux_weight > 0.0,
         )
         out["loss_base"] = out["loss"]
 
@@ -392,6 +403,26 @@ def build_generator_step_fn(
                 res_acc, device=device, dtype=out["loss"].dtype,
             )
             out["loss"] = out["loss"] + float(residual_loss_weight) * res_loss
+
+        if decoded_contact_aux_weight > 0.0:
+            aux_loss, aux_metrics = decoded_contact_aux_loss(
+                base_logits=out["logits"],
+                all_indices=code_idx.long(),
+                vq_model=vq_model,
+                motion_mean=motion_mean,
+                motion_std=motion_std,
+                batch=batch,
+                m_lens_tok=m_lens_tok,
+                num_object_points=decoded_contact_aux_num_object_points,
+                temperature=decoded_contact_aux_temperature,
+                mode=decoded_contact_aux_mode,
+            )
+            out["loss_decoded_contact"] = aux_loss
+            out.update(aux_metrics)
+            out["loss"] = out["loss"] + float(decoded_contact_aux_weight) * aux_loss
+            out.pop("logits", None)
+            out.pop("labels", None)
+            out.pop("non_pad_mask", None)
         # Diagnostic: mean γ_int across the 8 layers — useful to track
         # whether the new IntXAttn sublayers are actually learning to
         # contribute. Per design §6 decision tree: if γ_int stays at 0
@@ -642,12 +673,43 @@ def run(config_path: str) -> None:
         f"std range [{motion_std_np.min():.3f}, {motion_std_np.max():.3f}]",
     )
 
+    decoded_aux_cfg = cfg.training.get("decoded_contact_aux", None)
+    decoded_aux_enabled = (
+        decoded_aux_cfg is not None
+        and bool(decoded_aux_cfg.get("enabled", False))
+    )
+    decoded_aux_weight = (
+        float(decoded_aux_cfg.get("weight", 0.0))
+        if decoded_aux_enabled else 0.0
+    )
+    if decoded_aux_weight > 0.0:
+        accelerator.print(
+            "Decoded contact aux enabled: "
+            f"weight={decoded_aux_weight}, "
+            f"mode={decoded_aux_cfg.get('mode', 'metric')}, "
+            f"temperature={float(decoded_aux_cfg.get('temperature', 1.0))}, "
+            f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}",
+        )
+
     step_fn = build_generator_step_fn(
         transformer=inner_transformer,
         vq_model=vq_model,
         cfg_drop_buckets=cfg_drop_buckets,
         residual_transformer=inner_residual,
         residual_loss_weight=float(cfg.training.get("residual_loss_weight", 0.0)),
+        decoded_contact_aux_weight=decoded_aux_weight,
+        decoded_contact_aux_mode=(
+            str(decoded_aux_cfg.get("mode", "metric"))
+            if decoded_aux_cfg is not None else "metric"
+        ),
+        decoded_contact_aux_temperature=(
+            float(decoded_aux_cfg.get("temperature", 1.0))
+            if decoded_aux_cfg is not None else 1.0
+        ),
+        decoded_contact_aux_num_object_points=(
+            int(decoded_aux_cfg.get("num_object_points", 256))
+            if decoded_aux_cfg is not None else 256
+        ),
         token_stride=token_stride,
         motion_mean=motion_mean_t,
         motion_std=motion_std_t,
