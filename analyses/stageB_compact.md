@@ -354,6 +354,8 @@ Configs:
 
 Script:
 
+- `scripts/stage_b_generator/run_v13_rvq_diagnostics.sh`
+- `scripts/stage_b_generator/diagnose_rvq_paths.py`
 - `scripts/stage_b_generator/run_v13_target_trajectory.sh`
 - `scripts/stage_b_generator/run_v12_contact_weight_sweep.sh`
 - `scripts/stage_b_generator/k_sample_oracle.py` (`--selection-metric composite`
@@ -383,9 +385,35 @@ Current implementation:
   target tracking plus moving-object local-frame velocity supervision.
 - Use contact distance and temporal coupling as paired readouts.
 
-Remaining options if v13 fails:
+v13 outcome after syncing results:
+
+| run | contact | moving close | moving coupled | close but uncoupled |
+|---|---:|---:|---:|---:|
+| v12 w02 best_val | 31.82 cm | 0.296 | 0.264 | 0.140 |
+| v13 best_val | 31.57 cm | 0.334 | 0.265 | 0.171 |
+| v12 K16 composite | 18.86 cm | 0.473 | 0.351 | 0.222 |
+| GT roundtrip | 18.47 cm | - | - | - |
+
+The v13 soft decoded auxiliary objective did optimize internally
+(`decoded_contact_aux_mean_min_dist` about `0.413 -> 0.125`), but hard
+sampled output stayed on the same 31-32 cm / 0.26 moving-coupled line as v12.
+The current working hypothesis is a soft-hard / discrete-RVQ path gap, not
+underweighted contact loss.
+
+Immediate diagnostic implementation:
+
+- `scripts/stage_b_generator/diagnose_rvq_paths.py`
+- `scripts/stage_b_generator/run_v13_rvq_diagnostics.sh`
+
+These produce `soft_train_full`, `hard_train_argmax_full`,
+`hard_train_argmax_gt_residual`, `mixed_gt_all`, `mixed_pred_all`,
+`mixed_gt_base_pred_residual`, and `mixed_pred_base_gt_residual`, then score
+them with the existing contact-distance and temporal-coupling scripts.
+
+Remaining options after diagnostics:
 
 - full-RVQ sample-time guidance through decoded motion, not base logits only.
+- hard/ST-Gumbel decoded contact training if the soft-hard gap is confirmed.
 
 Use composite K-sample reranking only as the readout after these changes.
 
