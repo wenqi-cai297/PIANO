@@ -20,6 +20,7 @@ TRAIN="${TRAIN:-1}"
 EVAL="${EVAL:-1}"
 DUMP_WANDB="${DUMP_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-piano}"
+WANDB_OUTPUT="${WANDB_OUTPUT:-runs/wandb_logs/wandb_history_genB_v13_target_trajectory.csv}"
 SUMMARY_DETAIL="${SUMMARY_DETAIL:-compact}"
 WANDB_COLUMNS="${WANDB_COLUMNS:-epoch,loss,loss_base,loss_residual,loss_decoded_contact,loss_weighted_decoded_contact,acc,acc_residual,decoded_contact_aux_target_position,decoded_contact_aux_target_velocity,decoded_contact_aux_mean_min_dist,gamma_int_abs_mean,gamma_int_res_abs_mean,val_loss,val_loss_base,val_loss_residual,val_loss_decoded_contact,val_loss_weighted_decoded_contact,val_acc,val_acc_residual,val_decoded_contact_aux_target_position,val_decoded_contact_aux_target_velocity,val_decoded_contact_aux_mean_min_dist,contact_composite_contact_score,contact_mean_min_dist,contact_moving_close_frame_frac,contact_moving_coupled_frame_frac,contact_moving_close_but_uncoupled_frac,contact_n_clips,lr,epoch_time_sec}"
 
@@ -116,7 +117,7 @@ else
 fi
 
 if [[ "$DUMP_WANDB" == "1" ]]; then
-  out_csv="runs/wandb_logs/wandb_history_genB_v13_target_trajectory.csv"
+  out_csv="$WANDB_OUTPUT"
   echo
   echo "============================================================"
   echo "[wandb] ${RUN_NAME} -> ${out_csv}"
@@ -153,4 +154,4 @@ for ckpt_name in $CKPTS; do
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_contact_dist/summary.json"
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_temporal_coupling/summary.json"
 done
-echo "  runs/wandb_logs/wandb_history_genB_v13_target_trajectory.csv"
+echo "  ${WANDB_OUTPUT}"

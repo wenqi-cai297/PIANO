@@ -6,9 +6,11 @@ frozen RVQ-VAE decoder, recovering SMPL-22 joints with MoMask's upstream
 ``recover_from_ric``, and measuring body-to-object distance in the same
 HumanML3D canonical frame as ``z_int``.
 
-C2b extends that path through the residual transformer: soft base logits are
-rolled through MoMask's residual RVQ predictor layer by layer, and the full
-relaxed RVQ stack is decoded before measuring contact.
+C2b extends that path through the residual transformer: base logits are rolled
+through MoMask's residual RVQ predictor layer by layer, and the full RVQ stack
+is decoded before measuring contact. C2c can use straight-through hard
+categorical samples for the codebook lookup so the forward pass no longer
+optimizes only an interpolated "soft codebook" motion.
 """
 from __future__ import annotations
 
@@ -19,7 +21,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from piano.inference.contact_guidance import _decode_relaxed_base
 from piano.utils.smpl_utils import BODY_PART_INDICES
 
 
@@ -273,6 +274,44 @@ def _force_pad_to_token_zero(logits_bsv: Tensor, token_mask: Tensor) -> Tensor:
     return torch.where(token_mask[:, :, None], logits_bsv, pad_logits)
 
 
+def _maybe_top_k_logits(logits_bsv: Tensor, topk_filter_thres: float) -> Tensor:
+    """Apply MoMask's top-k logit filter when requested."""
+    thres = float(topk_filter_thres)
+    if thres >= 1.0:
+        return logits_bsv
+    if thres < 0.0:
+        raise ValueError(f"topk_filter_thres must be >= 0, got {thres}")
+
+    from piano.models.backbones.momask.models.mask_transformer.tools import top_k
+
+    return top_k(logits_bsv, thres, dim=-1)
+
+
+def _categorical_probs(
+    logits_bsv: Tensor,
+    *,
+    temperature: float,
+    decode_mode: str,
+) -> Tensor:
+    """Return soft or straight-through categorical probabilities."""
+    tau = max(float(temperature), 1e-6)
+    if decode_mode == "soft":
+        return F.softmax(logits_bsv / tau, dim=-1)
+    if decode_mode == "st_gumbel":
+        return F.gumbel_softmax(logits_bsv, tau=tau, hard=True, dim=-1)
+    if decode_mode == "st_argmax":
+        soft = F.softmax(logits_bsv / tau, dim=-1)
+        hard = F.one_hot(
+            soft.argmax(dim=-1),
+            num_classes=int(soft.shape[-1]),
+        ).to(dtype=soft.dtype, device=soft.device)
+        return hard + soft - soft.detach()
+    raise ValueError(
+        "decode_mode must be one of {'soft', 'st_argmax', 'st_gumbel'}, "
+        f"got {decode_mode!r}",
+    )
+
+
 def _valid_residual_ids(all_indices: Tensor, m_lens_tok: Tensor) -> Tensor:
     residual_ids = all_indices[..., 1:].long()
     _, S, _ = residual_ids.shape
@@ -281,6 +320,45 @@ def _valid_residual_ids(all_indices: Tensor, m_lens_tok: Tensor) -> Tensor:
         < m_lens_tok.to(device=residual_ids.device).long().clamp(min=1).unsqueeze(1)
     )
     return torch.where(token_mask[:, :, None], residual_ids, torch.zeros_like(residual_ids))
+
+
+def _decode_base_prediction(
+    *,
+    base_logits: Tensor,
+    residual_ids: Tensor,
+    vq_model: nn.Module,
+    token_mask: Tensor,
+    temperature: float,
+    decode_mode: str,
+    topk_filter_thres: float,
+) -> Tensor:
+    """Decode base logits plus fixed residual ids with optional ST base tokens."""
+    quantizer = vq_model.quantizer
+    codebooks = quantizer.codebooks
+    Q, V = int(codebooks.shape[0]), int(codebooks.shape[1])
+
+    B, S = int(base_logits.shape[0]), int(base_logits.shape[1])
+    base_logits_bsv = _logits_to_codebook_vocab(base_logits, V)
+    base_logits_bsv = _maybe_top_k_logits(base_logits_bsv, topk_filter_thres)
+    base_logits_bsv = _force_pad_to_token_zero(base_logits_bsv, token_mask)
+    base_probs = _categorical_probs(
+        base_logits_bsv,
+        temperature=temperature,
+        decode_mode=decode_mode,
+    )
+    base_emb = base_probs @ codebooks[0]
+
+    if residual_ids.shape[-1] != Q - 1:
+        raise ValueError(
+            f"residual_ids should have {Q - 1} layers (got {residual_ids.shape[-1]})",
+        )
+    with torch.no_grad():
+        full_ids = torch.zeros((B, S, Q), dtype=torch.long, device=base_logits.device)
+        full_ids[..., 1:] = residual_ids
+        all_codes = quantizer.get_codes_from_indices(full_ids)
+        residual_emb_sum = all_codes[1:].sum(dim=0)
+
+    return vq_model.decoder((base_emb + residual_emb_sum).permute(0, 2, 1))
 
 
 def _decode_relaxed_full_rvq_prediction(
@@ -293,11 +371,18 @@ def _decode_relaxed_full_rvq_prediction(
     int_kv: Tensor | None = None,
     int_padding_mask: Tensor | None = None,
     temperature: float = 1.0,
+    decode_mode: str = "soft",
+    topk_filter_thres: float = 1.0,
+    residual_cond_scale: float = 1.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Decode soft base logits through a differentiable residual RVQ rollout.
+    """Decode base logits through a differentiable residual RVQ rollout.
 
     This mirrors ``ResidualTransformer.generate`` but replaces argmax/Gumbel
-    ids with soft codebook expectations. Two embedding spaces are involved:
+    ids with differentiable categorical probabilities. With
+    ``decode_mode='soft'`` these are ordinary soft expectations; with an
+    ``st_*`` mode the forward codebook lookup is hard one-hot while gradients
+    flow through the categorical probabilities. Two embedding spaces are
+    involved:
 
     - residual-transformer inputs use MoMask's learned
       ``token_embed_weight`` (same as upstream residual training/generation);
@@ -314,6 +399,8 @@ def _decode_relaxed_full_rvq_prediction(
         torch.arange(S, device=base_logits.device).unsqueeze(0)
         < m_lens_tok.to(device=base_logits.device).long().clamp(min=1).unsqueeze(1)
     )
+    base_logits_bsv = _force_pad_to_token_zero(base_logits_bsv, token_mask)
+    base_logits_bsv = _maybe_top_k_logits(base_logits_bsv, topk_filter_thres)
     base_logits_bsv = _force_pad_to_token_zero(base_logits_bsv, token_mask)
 
     r = getattr(residual_transformer, "residual", residual_transformer)
@@ -337,7 +424,11 @@ def _decode_relaxed_full_rvq_prediction(
         raise NotImplementedError(f"Unsupported cond_mode {r.cond_mode!r}")
     cond_vector = cond_vector.to(base_logits.device).float()
 
-    base_probs = F.softmax(base_logits_bsv / max(temperature, 1e-6), dim=-1)
+    base_probs = _categorical_probs(
+        base_logits_bsv,
+        temperature=temperature,
+        decode_mode=decode_mode,
+    )
     decode_emb_sum = base_probs @ codebooks[0]
 
     token_embed_weight = r.token_embed_weight
@@ -358,21 +449,41 @@ def _decode_relaxed_full_rvq_prediction(
 
     for q in range(1, Q):
         qids = torch.full((B,), q, dtype=torch.long, device=base_logits.device)
-        logits_code = residual_transformer.trans_forward_with_int(
-            history_sum,
-            qids,
-            cond_vector,
-            padding_mask,
-            int_kv=int_kv,
-            int_padding_mask=int_padding_mask,
-        )
-        logits_bvs = r.output_project(logits_code, qids - 1)
+        if (
+            float(residual_cond_scale) != 1.0
+            and hasattr(residual_transformer, "forward_with_cond_scale_with_int")
+        ):
+            logits_bvs = residual_transformer.forward_with_cond_scale_with_int(
+                history_sum,
+                q,
+                cond_vector,
+                padding_mask,
+                int_kv=int_kv,
+                int_padding_mask=int_padding_mask,
+                cond_scale=float(residual_cond_scale),
+            )
+        else:
+            logits_code = residual_transformer.trans_forward_with_int(
+                history_sum,
+                qids,
+                cond_vector,
+                padding_mask,
+                int_kv=int_kv,
+                int_padding_mask=int_padding_mask,
+            )
+            logits_bvs = r.output_project(logits_code, qids - 1)
         logits_bsv = _base_logits_to_bsv(logits_bvs, token_count=S)
         logits_bsv = _logits_to_codebook_vocab(logits_bsv, V)
         logits_bsv = _force_pad_to_token_zero(logits_bsv, token_mask)
+        logits_bsv = _maybe_top_k_logits(logits_bsv, topk_filter_thres)
+        logits_bsv = _force_pad_to_token_zero(logits_bsv, token_mask)
         residual_logits.append(logits_bsv)
 
-        probs = F.softmax(logits_bsv / max(temperature, 1e-6), dim=-1)
+        probs = _categorical_probs(
+            logits_bsv,
+            temperature=temperature,
+            decode_mode=decode_mode,
+        )
         decode_emb_sum = decode_emb_sum + probs @ codebooks[q]
         if q < Q - 1:
             history_sum = history_sum + probs @ token_embed_weight[q, :V]
@@ -381,6 +492,11 @@ def _decode_relaxed_full_rvq_prediction(
     metrics = {
         "decoded_contact_aux_residual_layers": torch.as_tensor(
             len(residual_logits),
+            device=base_logits.device,
+            dtype=base_logits.dtype,
+        ),
+        "decoded_contact_aux_hard_forward": torch.as_tensor(
+            0.0 if decode_mode == "soft" else 1.0,
             device=base_logits.device,
             dtype=base_logits.dtype,
         ),
@@ -399,6 +515,8 @@ def decoded_contact_aux_loss(
     m_lens_tok: Tensor,
     num_object_points: int = 256,
     temperature: float = 1.0,
+    decode_mode: str = "soft",
+    topk_filter_thres: float = 1.0,
     mode: str = "metric",
     rvq_path: str = "base_gt_residual",
     target_position_weight: float = 1.0,
@@ -412,6 +530,7 @@ def decoded_contact_aux_loss(
     moving_speed_threshold: float = 0.15,
     kin_radius_proxy: float = 0.3,
     residual_transformer: nn.Module | None = None,
+    residual_cond_scale: float = 1.0,
     text: Any = None,
     int_kv: Tensor | None = None,
     int_padding_mask: Tensor | None = None,
@@ -434,6 +553,19 @@ def decoded_contact_aux_loss(
         raise ValueError(
             f"decoded contact aux supports modes {sorted(supported_modes)}, got {mode!r}",
         )
+    supported_decode_modes = {"soft", "st_argmax", "st_gumbel"}
+    if decode_mode not in supported_decode_modes:
+        raise ValueError(
+            "decoded contact aux decode_mode must be one of "
+            f"{sorted(supported_decode_modes)}, got {decode_mode!r}",
+        )
+    # Keep validation/checkpoint loss deterministic; training still uses
+    # Gumbel noise when gradients are enabled.
+    effective_decode_mode = (
+        "st_argmax"
+        if decode_mode == "st_gumbel" and not torch.is_grad_enabled()
+        else decode_mode
+    )
 
     required = ("object_pc", "obj_com_canonical", "obj_rot6d_canonical", "seq_len")
     if mode == "target_trajectory":
@@ -455,12 +587,22 @@ def decoded_contact_aux_loss(
     extra_metrics: dict[str, Tensor] = {}
     if rvq_path == "base_gt_residual":
         residual_ids = _valid_residual_ids(all_indices.to(device), m_lens_tok.to(device))
-        motion_norm = _decode_relaxed_base(
+        motion_norm = _decode_base_prediction(
             base_logits=base_logits_bsv,
             residual_ids=residual_ids,
             vq_model=vq_model,
+            token_mask=token_mask,
             temperature=temperature,
+            decode_mode=effective_decode_mode,
+            topk_filter_thres=topk_filter_thres,
         )
+        extra_metrics = {
+            "decoded_contact_aux_hard_forward": torch.as_tensor(
+                0.0 if effective_decode_mode == "soft" else 1.0,
+                device=device,
+                dtype=base_logits_bsv.dtype,
+            ),
+        }
     elif rvq_path == "full_prediction":
         if residual_transformer is None:
             raise ValueError("rvq_path='full_prediction' requires residual_transformer")
@@ -476,6 +618,9 @@ def decoded_contact_aux_loss(
             int_kv=int_kv,
             int_padding_mask=int_padding_mask,
             temperature=temperature,
+            decode_mode=effective_decode_mode,
+            topk_filter_thres=topk_filter_thres,
+            residual_cond_scale=residual_cond_scale,
         )
     else:
         raise ValueError(

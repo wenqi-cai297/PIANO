@@ -346,6 +346,7 @@ subset-specific representation issues must be checked.
 Configs:
 
 - `configs/training/generator_v13_target_trajectory_contact.yaml`
+- `configs/training/generator_v14_sampled_st_contact.yaml`
 - `configs/training/generator_v10_full_rvq_decoded_contact_aux.yaml`
 - `configs/training/generator_v11_diagnostics.yaml`
 - `configs/training/generator_v12_decoded_contact_w03_diagnostics.yaml`
@@ -354,6 +355,7 @@ Configs:
 
 Script:
 
+- `scripts/stage_b_generator/run_v14_sampled_st_contact.sh`
 - `scripts/stage_b_generator/run_v13_rvq_diagnostics.sh`
 - `scripts/stage_b_generator/diagnose_rvq_paths.py`
 - `scripts/stage_b_generator/run_v13_target_trajectory.sh`
@@ -427,8 +429,13 @@ them with the existing contact-distance and temporal-coupling scripts.
 
 Remaining options after diagnostics:
 
-- full-RVQ sample-time guidance through decoded motion, not base logits only.
-- hard/ST-Gumbel decoded contact training if the soft-hard gap is confirmed.
+- v14/C2c implements hard/ST-Gumbel decoded contact training from the
+  all-mask MaskGIT first-step logits. This directly targets the two measured
+  gaps: soft decoded motion to hard codebook motion, and teacher-forced train
+  logits to generation-entry logits. The decoded aux path samples at most 8
+  clips per train batch to control the extra CFG/residual compute.
+- If v14 still leaves the full sampled path near 30 cm, move to full-RVQ
+  sample-time guidance through decoded motion, not base logits only.
 
 Use composite K-sample reranking only as the readout after these changes.
 

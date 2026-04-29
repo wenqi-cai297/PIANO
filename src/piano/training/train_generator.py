@@ -297,6 +297,70 @@ def _cfg_str_list(cfg_section, key: str) -> list[str] | None:
     return [str(item) for item in list(raw)]
 
 
+def _maskgit_first_step_logits(
+    transformer: InteractionMaskTransformer,
+    *,
+    token_count: int,
+    cond_vector: Tensor,
+    m_lens_tok: Tensor,
+    int_tokens_bf: Tensor | None,
+    int_padding_mask_bf: Tensor | None,
+    w_text: float,
+    w_int: float,
+) -> Tensor:
+    """Return generation-style all-mask CFG base logits for decoded aux."""
+    mt = transformer.mask_transformer
+    device = cond_vector.device
+    B = int(cond_vector.shape[0])
+    S = int(token_count)
+    non_pad_mask = (
+        torch.arange(S, device=device).unsqueeze(0)
+        < m_lens_tok.to(device=device).long().clamp(min=1).unsqueeze(1)
+    )
+    padding_mask = ~non_pad_mask
+    ids = torch.where(
+        padding_mask,
+        torch.full((B, S), int(mt.pad_id), dtype=torch.long, device=device),
+        torch.full((B, S), int(mt.mask_id), dtype=torch.long, device=device),
+    )
+    return transformer.forward_with_cond_scale(
+        motion_ids=ids,
+        cond_vector=cond_vector,
+        token_padding_mask=padding_mask,
+        int_tokens_bf=int_tokens_bf,
+        int_padding_mask_bf=int_padding_mask_bf,
+        w_text=float(w_text),
+        w_int=float(w_int),
+    )
+
+
+def _slice_batch_for_aux(batch: dict, indices: Tensor, *, batch_size: int) -> dict:
+    """Slice batch fields that carry a leading batch dimension."""
+    idx_cpu = indices.detach().cpu().tolist()
+    out: dict = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            out[key] = value.index_select(0, indices.to(device=value.device))
+        elif isinstance(value, list) and len(value) == batch_size:
+            out[key] = [value[i] for i in idx_cpu]
+        else:
+            out[key] = value
+    return out
+
+
+def _select_aux_indices(
+    *,
+    batch_size: int,
+    max_batch_size: int,
+    device: torch.device,
+) -> Tensor:
+    if max_batch_size <= 0 or batch_size <= max_batch_size:
+        return torch.arange(batch_size, device=device)
+    if torch.is_grad_enabled():
+        return torch.randperm(batch_size, device=device)[:max_batch_size]
+    return torch.arange(max_batch_size, device=device)
+
+
 def _grad_l2_norm(loss: Tensor, params: tuple[nn.Parameter, ...]) -> Tensor:
     if not loss.requires_grad or not params:
         return loss.detach().new_zeros(())
@@ -348,6 +412,13 @@ def build_generator_step_fn(
     decoded_contact_aux_weight: float = 0.0,
     decoded_contact_aux_mode: str = "metric",
     decoded_contact_aux_temperature: float = 1.0,
+    decoded_contact_aux_decode_mode: str = "soft",
+    decoded_contact_aux_logit_source: str = "train_forward",
+    decoded_contact_aux_topk_filter_thres: float = 1.0,
+    decoded_contact_aux_w_text: float = 4.0,
+    decoded_contact_aux_w_int: float = 2.0,
+    decoded_contact_aux_res_cond_scale: float = 1.0,
+    decoded_contact_aux_max_batch_size: int = 0,
     decoded_contact_aux_num_object_points: int = 256,
     decoded_contact_aux_rvq_path: str = "base_gt_residual",
     decoded_contact_aux_target_position_weight: float = 1.0,
@@ -398,10 +469,18 @@ def build_generator_step_fn(
         input). Apply ``(motion - mean) / std`` before ``vq_model.encode``.
     decoded_contact_aux_weight
         C2 decoded-space auxiliary loss weight. When positive, the step
-        requests base logits and decodes a relaxed RVQ stack through the
-        frozen VQ-VAE. ``base_gt_residual`` preserves the v0.9 path
-        (soft base + GT residual ids); ``full_prediction`` is C2b
-        (soft base + differentiable residual rollout).
+        decodes a differentiable RVQ stack through the frozen VQ-VAE.
+        ``base_gt_residual`` preserves the v0.9 path; ``full_prediction``
+        is C2b/C2c. ``decode_mode='soft'`` uses codebook expectations;
+        ``st_argmax`` / ``st_gumbel`` use hard straight-through codebook
+        lookups. ``logit_source='maskgit_first_step'`` takes base logits
+        from the all-mask CFG generation entry point instead of the
+        teacher-forced BERT-mask training forward.
+    decoded_contact_aux_max_batch_size
+        If positive, run the expensive decoded auxiliary path on a random
+        subset of each train batch (deterministic first-N subset under
+        validation/no-grad). The CE/residual objectives still use the full
+        batch.
     residual_layer_diagnostics
         When true, log active-layer CE/accuracy for residual RVQ layers
         q1..q5. This uses the same sampled active layer as training.
@@ -472,6 +551,10 @@ def build_generator_step_fn(
         )
 
         # ---- Forward + masked-CE loss with bucketed CFG drops ----
+        need_train_logits = (
+            decoded_contact_aux_weight > 0.0
+            and decoded_contact_aux_logit_source == "train_forward"
+        )
         out = transformer(
             ids=base_ids,
             cond_vector=cond_vector,
@@ -479,7 +562,7 @@ def build_generator_step_fn(
             int_tokens_bf=int_tokens_bf,
             int_padding_mask_bf=int_pad_mask_bf,
             cfg_drop_buckets=cfg_drop_buckets,
-            return_logits=decoded_contact_aux_weight > 0.0,
+            return_logits=need_train_logits,
         )
         out["loss_base"] = out["loss"]
         out["loss_weighted_base"] = out["loss_base"]
@@ -510,16 +593,59 @@ def build_generator_step_fn(
             weighted_losses["residual_weighted"] = weighted_res_loss
 
         if decoded_contact_aux_weight > 0.0:
+            aux_idx = _select_aux_indices(
+                batch_size=int(base_ids.shape[0]),
+                max_batch_size=int(decoded_contact_aux_max_batch_size),
+                device=device,
+            )
+            batch_size = int(base_ids.shape[0])
+            aux_batch = _slice_batch_for_aux(
+                batch,
+                aux_idx,
+                batch_size=batch_size,
+            )
+            aux_code_idx = code_idx.index_select(0, aux_idx)
+            aux_m_lens_tok = m_lens_tok.index_select(0, aux_idx)
+            aux_cond_vector = cond_vector.index_select(0, aux_idx)
+            aux_int_tokens_bf = (
+                None if int_tokens_bf is None else int_tokens_bf.index_select(0, aux_idx)
+            )
+            aux_int_pad_mask_bf = (
+                None if int_pad_mask_bf is None else int_pad_mask_bf.index_select(0, aux_idx)
+            )
+            aux_text = [text[int(i)] for i in aux_idx.detach().cpu().tolist()]
+
+            if decoded_contact_aux_logit_source == "train_forward":
+                aux_base_logits = out["logits"].index_select(0, aux_idx)
+            elif decoded_contact_aux_logit_source == "maskgit_first_step":
+                aux_base_logits = _maskgit_first_step_logits(
+                    transformer,
+                    token_count=int(aux_code_idx.shape[1]),
+                    cond_vector=aux_cond_vector,
+                    m_lens_tok=aux_m_lens_tok,
+                    int_tokens_bf=aux_int_tokens_bf,
+                    int_padding_mask_bf=aux_int_pad_mask_bf,
+                    w_text=decoded_contact_aux_w_text,
+                    w_int=decoded_contact_aux_w_int,
+                )
+            else:
+                raise ValueError(
+                    "decoded_contact_aux.logit_source must be 'train_forward' "
+                    "or 'maskgit_first_step', got "
+                    f"{decoded_contact_aux_logit_source!r}",
+                )
             aux_loss, aux_metrics = decoded_contact_aux_loss(
-                base_logits=out["logits"],
-                all_indices=code_idx.long(),
+                base_logits=aux_base_logits,
+                all_indices=aux_code_idx.long(),
                 vq_model=vq_model,
                 motion_mean=motion_mean,
                 motion_std=motion_std,
-                batch=batch,
-                m_lens_tok=m_lens_tok,
+                batch=aux_batch,
+                m_lens_tok=aux_m_lens_tok,
                 num_object_points=decoded_contact_aux_num_object_points,
                 temperature=decoded_contact_aux_temperature,
+                decode_mode=decoded_contact_aux_decode_mode,
+                topk_filter_thres=decoded_contact_aux_topk_filter_thres,
                 mode=decoded_contact_aux_mode,
                 rvq_path=decoded_contact_aux_rvq_path,
                 target_position_weight=decoded_contact_aux_target_position_weight,
@@ -533,12 +659,14 @@ def build_generator_step_fn(
                 moving_speed_threshold=decoded_contact_aux_moving_speed_threshold,
                 kin_radius_proxy=decoded_contact_aux_kin_radius_proxy,
                 residual_transformer=residual_transformer,
-                text=text,
+                residual_cond_scale=decoded_contact_aux_res_cond_scale,
+                text=aux_text,
                 int_kv=(
-                    int_tokens_bf.transpose(0, 1).contiguous()
-                    if residual_transformer is not None else None
+                    aux_int_tokens_bf.transpose(0, 1).contiguous()
+                    if residual_transformer is not None and aux_int_tokens_bf is not None
+                    else None
                 ),
-                int_padding_mask=int_pad_mask_bf,
+                int_padding_mask=aux_int_pad_mask_bf,
             )
             weighted_aux_loss = float(decoded_contact_aux_weight) * aux_loss
             out["loss_decoded_contact"] = aux_loss
@@ -823,6 +951,9 @@ def run(config_path: str) -> None:
             f"mode={decoded_aux_cfg.get('mode', 'metric')}, "
             f"rvq_path={decoded_aux_cfg.get('rvq_path', 'base_gt_residual')}, "
             f"temperature={float(decoded_aux_cfg.get('temperature', 1.0))}, "
+            f"decode_mode={decoded_aux_cfg.get('decode_mode', 'soft')}, "
+            f"logit_source={decoded_aux_cfg.get('logit_source', 'train_forward')}, "
+            f"max_batch_size={int(decoded_aux_cfg.get('max_batch_size', 0))}, "
             f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}, "
             f"target_position_weight={float(decoded_aux_cfg.get('target_position_weight', 1.0))}, "
             f"target_velocity_weight={float(decoded_aux_cfg.get('target_velocity_weight', 0.5))}, "
@@ -865,6 +996,34 @@ def run(config_path: str) -> None:
         decoded_contact_aux_temperature=(
             float(decoded_aux_cfg.get("temperature", 1.0))
             if decoded_aux_cfg is not None else 1.0
+        ),
+        decoded_contact_aux_decode_mode=(
+            str(decoded_aux_cfg.get("decode_mode", "soft"))
+            if decoded_aux_cfg is not None else "soft"
+        ),
+        decoded_contact_aux_logit_source=(
+            str(decoded_aux_cfg.get("logit_source", "train_forward"))
+            if decoded_aux_cfg is not None else "train_forward"
+        ),
+        decoded_contact_aux_topk_filter_thres=(
+            float(decoded_aux_cfg.get("topk_filter_thres", 1.0))
+            if decoded_aux_cfg is not None else 1.0
+        ),
+        decoded_contact_aux_w_text=(
+            float(decoded_aux_cfg.get("w_text", 4.0))
+            if decoded_aux_cfg is not None else 4.0
+        ),
+        decoded_contact_aux_w_int=(
+            float(decoded_aux_cfg.get("w_int", 2.0))
+            if decoded_aux_cfg is not None else 2.0
+        ),
+        decoded_contact_aux_res_cond_scale=(
+            float(decoded_aux_cfg.get("res_cond_scale", 1.0))
+            if decoded_aux_cfg is not None else 1.0
+        ),
+        decoded_contact_aux_max_batch_size=(
+            int(decoded_aux_cfg.get("max_batch_size", 0))
+            if decoded_aux_cfg is not None else 0
         ),
         decoded_contact_aux_num_object_points=(
             int(decoded_aux_cfg.get("num_object_points", 256))

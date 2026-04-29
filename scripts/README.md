@@ -34,6 +34,10 @@ library code.
   contact target trajectory and logs temporal-coupling metrics. Defaults to
   compact wandb CSV / eval JSON output; set `SUMMARY_DETAIL=full` for per-clip
   debug summaries.
+- `stage_b_generator/run_v14_sampled_st_contact.sh`: v14 runner for the C2c
+  sampled-path variant. It keeps v13's target-trajectory loss but takes decoded
+  aux logits from the all-mask MaskGIT/CFG first step and decodes with
+  straight-through Gumbel hard codebook samples.
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing

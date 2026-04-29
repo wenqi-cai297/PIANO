@@ -1,0 +1,198 @@
+# Stage B v0.14 / C2c: sampled-path straight-through contact trajectory loss.
+#
+# Why this exists:
+#   v0.12 + K=16 showed the model distribution contains spatially close samples
+#   but rarely contains temporally coupled manipulation samples. The old decoded
+#   loss minimized "any tracked body part to any object point", so it could
+#   reward being near the object without learning which body part should stay
+#   attached to which object-local contact target.
+#
+# Delta from v0.13:
+#   - keep target_trajectory supervision, but decode with ST-Gumbel hard
+#     categorical codebook lookups instead of soft codebook interpolation.
+#   - take decoded-aux base logits from the all-mask MaskGIT/CFG first step
+#     instead of BERT teacher-forced train logits.
+#   - pass the residual stack through cond_scale=2.0 during decoded aux so the
+#     residual path matches eval-time generation more closely.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_generator \
+#     --config configs/training/generator_v14_sampled_st_contact.yaml
+
+model:
+  config: configs/model/motion_generator.yaml
+  text_encoder: "ViT-B/32"
+  gamma_kind: "per_head"
+  residual_int_xattn:
+    enabled: true
+    zero_init_gamma: true
+    gamma_kind: "per_head"
+    dropout: 0.1
+  checkpoints:
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+    residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  force_world_frame: false
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  seed: 42
+  batch_size: 32
+  num_epochs: 80
+  num_workers: 4
+  mixed_precision: "bf16"
+
+  optimizer:
+    name: "adamw"
+    new_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  cfg_drop_buckets:
+    drop_both: 0.10
+    drop_int_only: 0.10
+    drop_text_only: 0.05
+
+  residual_loss_weight: 1.0
+
+  decoded_contact_aux:
+    enabled: true
+    weight: 1.0
+    mode: "target_trajectory"
+    rvq_path: "full_prediction"
+    temperature: 1.0
+    decode_mode: "st_gumbel"
+    logit_source: "maskgit_first_step"
+    topk_filter_thres: 0.9
+    w_text: 4.0
+    w_int: 2.0
+    res_cond_scale: 2.0
+    max_batch_size: 8
+    num_object_points: 256
+    target_position_weight: 1.0
+    target_velocity_weight: 0.5
+    metric_weight: 0.0
+    moving_frame_extra_weight: 2.0
+    contact_threshold: 0.5
+    use_soft_contact_weights: true
+    velocity_moving_only: true
+    fps: 20.0
+    moving_speed_threshold: 0.15
+    kin_radius_proxy: 0.3
+
+  diagnostics:
+    gradient_norms:
+      # Expensive one-off diagnostic; keep off by default so wandb/history
+      # only carries decision metrics.
+      enabled: false
+      # 0 means once per epoch (resolved to train dataloader length).
+      every_n_steps: 0
+    residual_layers:
+      # Per-RVQ-layer loss/acc/tokens are useful only when debugging the
+      # residual stack specifically. The aggregate residual loss/acc below is
+      # the stable default signal.
+      enabled: false
+
+  val_every_epochs: 5
+  val_best_key: "loss"
+
+  contact_eval:
+    enabled: true
+    num_clips: 80
+    num_clips_per_subset: 20
+    seed: 42
+    w_text: 4.0
+    w_int: 2.0
+    fps: 20.0
+    coupling_threshold: 0.5
+    moving_speed_threshold: 0.15
+    composite_coupling_weight: 0.12
+    composite_uncoupled_penalty: 0.05
+    composite_min_moving_frame_frac: 0.05
+    best_key: "composite_contact_score"
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageB_v14_sampled_st_contact"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+  train_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_mean_min_dist
+    - decoded_contact_aux_hard_forward
+    - gamma_int_abs_mean
+    - gamma_int_res_abs_mean
+  val_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_mean_min_dist
+    - decoded_contact_aux_hard_forward
+  contact_report_keys:
+    - composite_contact_score
+    - mean_min_dist
+    - moving_close_frame_frac
+    - moving_coupled_frame_frac
+    - moving_close_but_uncoupled_frac
+    - n_clips
+
+output_dir: "runs/training/generator_v14_sampled_st_contact"

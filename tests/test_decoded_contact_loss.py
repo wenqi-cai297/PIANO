@@ -78,6 +78,27 @@ def test_target_trajectory_loss_uses_part_specific_contact_targets():
     assert body.grad[0, 0, 1].abs().sum() == 0
 
 
+def test_st_argmax_categorical_probs_use_hard_forward_soft_backward():
+    from piano.training.decoded_contact_loss import _categorical_probs
+
+    logits = torch.tensor(
+        [[[0.0, 4.0, 1.0], [3.0, 0.0, 1.0]]],
+        requires_grad=True,
+    )
+    probs = _categorical_probs(logits, temperature=1.0, decode_mode="st_argmax")
+
+    expected_hard = torch.tensor([[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]])
+    torch.testing.assert_close(probs.detach(), expected_hard)
+
+    weights = torch.tensor([[[1.0, -2.0, 0.5], [0.25, 2.0, -1.0]]])
+    loss = (probs * weights).sum()
+    loss.backward()
+
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().sum() > 0
+
+
 def test_decoded_contact_aux_loss_gradient_flows_to_base_logits():
     from piano.training.decoded_contact_loss import decoded_contact_aux_loss
 
