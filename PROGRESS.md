@@ -4,13 +4,11 @@ Compact project memory as of 2026-04-29.
 
 ## Current Snapshot
 
-Recent Stage B diagnostic code commit:
+Recent Stage B implementation:
 
 ```text
-c4b2f50 Add Stage B temporal coupling rerank diagnostic
+v13 target-trajectory contact loss
 ```
-
-Tracked git state was clean before the K-sample result documentation update.
 
 Current Stage B best server checkpoint identifier. The local workspace may only
 have eval summaries, not the `.pt` file:
@@ -67,14 +65,18 @@ Stage A Interaction Predictor:
 
 Stage B Motion Generator:
 
-- Active sample-selection/guidance bottleneck.
+- Active training-loss bottleneck: the generator must learn temporally bound
+  manipulation, not only spatial proximity.
 - Current implementation includes residual `z_int` conditioning and decoded
   contact auxiliary loss through full soft RVQ prediction.
+- New v13 path replaces the old arbitrary min-distance decoded loss with a
+  part-specific object-local contact-target trajectory objective plus a
+  moving-object local-velocity term.
 - Main training script: `src/piano/training/train_generator.py`.
 - Main model wrapper: `src/piano/models/motion_generator.py`.
 - Decoded contact loss: `src/piano/training/decoded_contact_loss.py`.
-- Current sweep runner:
-  `scripts/stage_b_generator/run_v12_contact_weight_sweep.sh`.
+- Current training runner:
+  `scripts/stage_b_generator/run_v13_target_trajectory.sh`.
 - Current no-retrain diagnostic runner:
   `scripts/stage_b_generator/k_sample_oracle.py`.
 - Durable doc: `analyses/stageB_compact.md`.
@@ -108,6 +110,7 @@ Stage C Joint Finetune:
 | K=16 visual review | body is near object but weakly synchronized to object motion | distance-only reranking is insufficient |
 | temporal coupling metric | moving coupled frame frac 0.323 | optimize/rerank for coupling, not only distance |
 | K=16 composite oracle | coupled frac 0.351, contact 18.08 cm | only modest gain; K=16 pool lacks enough coupled samples |
+| v13 target trajectory loss | code/config added | train with part-specific object-local target and temporal metrics |
 
 ## v0.12 Details
 
@@ -264,11 +267,13 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Do not continue rerank-weight sweeps as the main path.
-2. Add a decoded kinematic-coupling / local-frame stability objective or an
-   inference-time full-RVQ coupling guidance step.
-3. Use composite reranking as a diagnostic/readout, not as the final Stage B
-   solution.
+1. Train `configs/training/generator_v13_target_trajectory_contact.yaml`.
+2. Watch wandb for `decoded_contact_aux_target_position`,
+   `decoded_contact_aux_target_velocity`,
+   `decoded_contact_aux_moving_contact_part_frac`, and
+   `contact_moving_coupled_frame_frac`.
+3. Compare best_contact/best_val/final with contact distance and temporal
+   coupling summaries.
 
 Secondary diagnostics:
 

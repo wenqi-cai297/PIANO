@@ -50,6 +50,11 @@ from piano.utils.canonical_frame import (
     y_rotation_matrix,
 )
 from piano.utils.smpl_utils import BODY_PART_INDICES
+from piano.data.pseudo_labels.extract_contact import (
+    ContactConfig,
+    _kinematic_contact_score,
+)
+from piano.utils.smpl_utils import BODY_PART_NAMES
 
 
 # ============================================================================
@@ -98,6 +103,35 @@ def _per_frame_body_to_object_distance(
     diff = body_joints_world[:, :, None, :] - pc_world[:, None, :, :]
     d = np.linalg.norm(diff, axis=-1)
     return d.min(axis=-1)
+
+
+def _object_motion_speed(
+    object_positions: np.ndarray,
+    object_rotations: np.ndarray | None,
+    cfg: ContactConfig,
+) -> np.ndarray:
+    """Match the object-speed proxy used by `_kinematic_contact_score`."""
+    T = len(object_positions)
+    trans_vel = np.zeros(T, dtype=np.float32)
+    if T > 1:
+        trans_vel[1:] = (
+            np.linalg.norm(np.diff(object_positions, axis=0), axis=-1) * cfg.fps
+        )
+
+    ang_vel = np.zeros(T, dtype=np.float32)
+    if object_rotations is not None and T > 1:
+        ang_vel[1:] = (
+            np.linalg.norm(np.diff(object_rotations, axis=0), axis=-1) * cfg.fps
+        )
+
+    return trans_vel + float(cfg.kin_radius_proxy) * ang_vel
+
+
+def _mean_finite(values: list[float | None]) -> float | None:
+    xs = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if not xs:
+        return None
+    return float(np.mean(xs))
 
 
 # ============================================================================
@@ -154,6 +188,97 @@ def compute_clip_contact_distance(
     )                                                                        # (T, 5)
     min_per_frame = d.min(axis=1)                                            # (T,)
     return float(min_per_frame.mean())
+
+
+def compute_clip_contact_and_temporal_metrics(
+    motion_263_generated: np.ndarray,
+    R_y_angle: float,
+    T_xz: np.ndarray,
+    object_pc_local: np.ndarray,
+    object_positions: np.ndarray,
+    object_rotations: np.ndarray,
+    seq_len: int,
+    *,
+    recover_from_ric_fn: Callable,
+    fps: float = 20.0,
+    coupling_threshold: float = 0.5,
+    moving_speed_threshold: float | None = None,
+) -> dict[str, float | None]:
+    """Return distance plus moving-object temporal-coupling metrics."""
+    T = min(int(seq_len), int(motion_263_generated.shape[0]))
+    if T < 1:
+        return {
+            "mean_min_dist": float("inf"),
+            "moving_frame_frac": None,
+            "moving_close_frame_frac": None,
+            "moving_coupled_frame_frac": None,
+            "moving_close_but_uncoupled_frac": None,
+            "moving_mean_best_kin_score": None,
+        }
+
+    cfg = ContactConfig(fps=float(fps))
+    speed_threshold = (
+        float(moving_speed_threshold)
+        if moving_speed_threshold is not None
+        else float(cfg.kin_world_eps)
+    )
+
+    motion_t = torch.from_numpy(motion_263_generated[:T]).float().unsqueeze(0)
+    canon_gen = (
+        recover_from_ric_fn(motion_t, 22)
+        .squeeze(0)
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+    world_joints_gen = _lift_canonical_to_world(canon_gen, R_y_angle, T_xz)
+    body_joints = world_joints_gen[:, BODY_PART_INDICES, :]
+
+    obj_pos = object_positions[:T]
+    obj_rot = object_rotations[:T] if object_rotations is not None else None
+    d = _per_frame_body_to_object_distance(
+        body_joints,
+        object_pc_local,
+        obj_pos,
+        obj_rot if obj_rot is not None else np.zeros((T, 3), dtype=np.float32),
+    )
+    min_per_frame = d.min(axis=1)
+    close_thresholds = np.array(
+        [cfg.distance_thresholds[name] for name in BODY_PART_NAMES],
+        dtype=np.float32,
+    )
+    close_any = (d <= close_thresholds[None, :]).any(axis=1)
+
+    kin_scores = np.stack([
+        _kinematic_contact_score(body_joints[:, p, :], obj_pos, obj_rot, cfg)
+        for p in range(len(BODY_PART_NAMES))
+    ], axis=1)
+    best_kin = kin_scores.max(axis=1)
+    coupled_any = best_kin >= float(coupling_threshold)
+
+    speed = _object_motion_speed(obj_pos, obj_rot, cfg)
+    moving = speed >= speed_threshold
+    n_moving = int(moving.sum())
+    if n_moving > 0:
+        moving_close = float(close_any[moving].mean())
+        moving_coupled = float(coupled_any[moving].mean())
+        moving_close_uncoupled = float((close_any[moving] & ~coupled_any[moving]).mean())
+        moving_best_kin = float(best_kin[moving].mean())
+    else:
+        moving_close = None
+        moving_coupled = None
+        moving_close_uncoupled = None
+        moving_best_kin = None
+
+    return {
+        "mean_min_dist": float(min_per_frame.mean()),
+        "moving_frame_frac": float(n_moving / T),
+        "close_frame_frac": float(close_any.mean()),
+        "moving_close_frame_frac": moving_close,
+        "moving_coupled_frame_frac": moving_coupled,
+        "moving_close_but_uncoupled_frac": moving_close_uncoupled,
+        "moving_mean_best_kin_score": moving_best_kin,
+    }
 
 
 # ============================================================================
@@ -236,6 +361,12 @@ def build_contact_eval_fn(
     token_stride: int = 4,
     w_text: float = 4.0,
     w_int: float = 2.0,
+    fps: float = 20.0,
+    coupling_threshold: float = 0.5,
+    moving_speed_threshold: float | None = None,
+    composite_coupling_weight: float = 0.12,
+    composite_uncoupled_penalty: float = 0.05,
+    composite_min_moving_frame_frac: float = 0.05,
 ) -> Callable[[], dict[str, float]]:
     """Build a no-arg callable that evaluates contact distance on a fixed batch.
 
@@ -273,7 +404,7 @@ def build_contact_eval_fn(
     Returns
     -------
     Callable[[], dict[str, float]]
-        ``eval_fn() -> {"mean_min_dist": float, "n_clips": int}``.
+        ``eval_fn() -> {"mean_min_dist": float, "n_clips": int, ...}``.
     """
     # Lazy import to avoid forcing MoMask sys.path setup at module import
     # (the trainer module is loaded by Stage A predictor too, which
@@ -319,7 +450,7 @@ def build_contact_eval_fn(
         vq_model.eval()
         res_transformer.eval()
 
-        per_clip_dists: list[float] = []
+        per_clip_metrics: list[dict[str, float | None]] = []
         for i in range(n_clips):
             T = int(seq_lens_cpu[i])
             if T < token_stride:    # need at least one VQ token
@@ -348,10 +479,10 @@ def build_contact_eval_fn(
                 device=device,
             )                                                              # (T_dec, 263)
 
-            # Compute body-to-object distance against source clip's
-            # world-frame anchor + object trajectory. Anchors are
-            # pre-computed at factory time (fixed across val intervals).
-            d = compute_clip_contact_distance(
+            # Compute distance and temporal binding against the source clip's
+            # world-frame anchor + object trajectory. Anchors are pre-computed
+            # at factory time (fixed across val intervals).
+            metrics = compute_clip_contact_and_temporal_metrics(
                 motion_263_generated=motion_gen,
                 R_y_angle=src_R_y[i],
                 T_xz=src_T_xz[i],
@@ -360,15 +491,44 @@ def build_contact_eval_fn(
                 object_rotations=object_rotations_cpu[i],
                 seq_len=T,
                 recover_from_ric_fn=recover_from_ric,
+                fps=float(fps),
+                coupling_threshold=float(coupling_threshold),
+                moving_speed_threshold=moving_speed_threshold,
             )
-            per_clip_dists.append(d)
+            per_clip_metrics.append(metrics)
 
-        if not per_clip_dists:
+        if not per_clip_metrics:
             return {"mean_min_dist": float("inf"), "n_clips": 0}
 
-        return {
-            "mean_min_dist": float(np.mean(per_clip_dists)),
-            "n_clips": float(len(per_clip_dists)),
+        out: dict[str, float] = {
+            "mean_min_dist": float(np.mean([
+                float(m["mean_min_dist"]) for m in per_clip_metrics
+            ])),
+            "n_clips": float(len(per_clip_metrics)),
         }
+        for key in (
+            "moving_frame_frac",
+            "close_frame_frac",
+            "moving_close_frame_frac",
+            "moving_coupled_frame_frac",
+            "moving_close_but_uncoupled_frac",
+            "moving_mean_best_kin_score",
+        ):
+            mean = _mean_finite([m.get(key) for m in per_clip_metrics])
+            if mean is not None:
+                out[key] = float(mean)
+
+        moving_frac = out.get("moving_frame_frac", 0.0)
+        coupled = out.get("moving_coupled_frame_frac", None)
+        uncoupled = out.get("moving_close_but_uncoupled_frac", 0.0)
+        if coupled is not None and moving_frac >= float(composite_min_moving_frame_frac):
+            out["composite_contact_score"] = (
+                out["mean_min_dist"]
+                + float(composite_coupling_weight) * (1.0 - float(coupled))
+                + float(composite_uncoupled_penalty) * float(uncoupled)
+            )
+        else:
+            out["composite_contact_score"] = out["mean_min_dist"]
+        return out
 
     return eval_fn

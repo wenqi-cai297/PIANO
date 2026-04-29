@@ -29,6 +29,9 @@ library code.
 
 ## Stage B Diagnostics
 
+- `stage_b_generator/run_v13_target_trajectory.sh`: train/eval runner for the
+  v13 loss that tracks the named contact body part against its object-local
+  contact target trajectory and logs temporal-coupling metrics.
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing

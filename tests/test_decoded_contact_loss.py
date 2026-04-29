@@ -25,6 +25,59 @@ def test_object_pc_to_canonical_torch_identity_pose():
     assert torch.allclose(out[0, 1, 1], torch.tensor([20.0, 1.0, -5.0]), atol=1e-6)
 
 
+def test_body_canonical_to_object_local_torch_identity_pose():
+    from piano.training.decoded_contact_loss import body_canonical_to_object_local_torch
+
+    body = torch.tensor([[[[11.0, 2.0, -2.0], [20.0, 1.0, -5.0]]]])
+    com = torch.tensor([[[10.0, 0.0, -5.0]]])
+    rot6d = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).view(1, 1, 6)
+
+    out = body_canonical_to_object_local_torch(body, com, rot6d)
+    expected = torch.tensor([[[[1.0, 2.0, 3.0], [10.0, 1.0, 0.0]]]])
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_target_trajectory_loss_uses_part_specific_contact_targets():
+    from piano.training.decoded_contact_loss import _target_trajectory_loss_canonical
+
+    rot6d_identity = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).view(1, 1, 6)
+    body = torch.tensor(
+        [[[
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ]]],
+        requires_grad=True,
+    )
+    contact = torch.tensor([[[1.0, 0.0]]])
+    target = torch.tensor([[[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]]])
+
+    loss, metrics = _target_trajectory_loss_canonical(
+        body_canonical=body,
+        obj_com_canonical=torch.zeros(1, 1, 3),
+        obj_rot6d_canonical=rot6d_identity,
+        contact_state=contact,
+        contact_target_xyz=target,
+        frame_mask=torch.tensor([[True]]),
+        position_weight=1.0,
+        velocity_weight=0.0,
+        metric_loss=torch.zeros(()),
+        metric_weight=0.0,
+        moving_frame_extra_weight=0.0,
+        contact_threshold=0.5,
+        use_soft_contact_weights=True,
+        velocity_moving_only=True,
+        fps=20.0,
+        moving_speed_threshold=0.15,
+        kin_radius_proxy=0.3,
+    )
+
+    assert torch.allclose(metrics["decoded_contact_aux_target_position"], torch.tensor(1.0))
+    loss.backward()
+    assert body.grad is not None
+    assert body.grad[0, 0, 0].abs().sum() > 0
+    assert body.grad[0, 0, 1].abs().sum() == 0
+
+
 def test_decoded_contact_aux_loss_gradient_flows_to_base_logits():
     from piano.training.decoded_contact_loss import decoded_contact_aux_loss
 
@@ -75,6 +128,8 @@ def test_decoded_contact_aux_loss_gradient_flows_to_base_logits():
         "object_pc": torch.ones(B, 12, 3),
         "obj_com_canonical": torch.zeros(B, T, 3),
         "obj_rot6d_canonical": rot6d_identity.repeat(B, T, 1),
+        "contact_state": torch.ones(B, T, 5),
+        "contact_target_xyz": torch.zeros(B, T, 5, 3),
         "seq_len": torch.tensor([T - 1]),
     }
 
@@ -100,6 +155,28 @@ def test_decoded_contact_aux_loss_gradient_flows_to_base_logits():
     assert torch.isfinite(base_logits.grad).all()
     assert base_logits.grad.abs().sum() > 0
     assert base_logits.grad[:, :, -1].abs().sum() == 0
+
+    base_logits_target = torch.randn(B, V, S, requires_grad=True)
+    target_loss, target_metrics = decoded_contact_aux_loss(
+        base_logits=base_logits_target,
+        all_indices=all_indices,
+        vq_model=vq,
+        motion_mean=motion_mean,
+        motion_std=motion_std,
+        batch=batch,
+        m_lens_tok=torch.tensor([S - 1]),
+        num_object_points=8,
+        temperature=1.0,
+        mode="target_trajectory",
+        target_position_weight=1.0,
+        target_velocity_weight=0.5,
+    )
+    assert torch.isfinite(target_loss)
+    assert target_metrics["decoded_contact_aux_target_position"].dim() == 0
+    assert target_metrics["decoded_contact_aux_target_velocity"].dim() == 0
+    target_loss.backward()
+    assert base_logits_target.grad is not None
+    assert base_logits_target.grad.abs().sum() > 0
 
 
 def test_decoded_contact_aux_loss_full_prediction_flows_to_residual_path():

@@ -341,6 +341,16 @@ def build_generator_step_fn(
     decoded_contact_aux_temperature: float = 1.0,
     decoded_contact_aux_num_object_points: int = 256,
     decoded_contact_aux_rvq_path: str = "base_gt_residual",
+    decoded_contact_aux_target_position_weight: float = 1.0,
+    decoded_contact_aux_target_velocity_weight: float = 0.5,
+    decoded_contact_aux_metric_weight: float = 0.0,
+    decoded_contact_aux_moving_frame_extra_weight: float = 2.0,
+    decoded_contact_aux_contact_threshold: float = 0.5,
+    decoded_contact_aux_use_soft_contact_weights: bool = True,
+    decoded_contact_aux_velocity_moving_only: bool = True,
+    decoded_contact_aux_fps: float = 20.0,
+    decoded_contact_aux_moving_speed_threshold: float = 0.15,
+    decoded_contact_aux_kin_radius_proxy: float = 0.3,
     token_stride: int = 4,
     motion_mean: torch.Tensor | None = None,
     motion_std: torch.Tensor | None = None,
@@ -503,6 +513,16 @@ def build_generator_step_fn(
                 temperature=decoded_contact_aux_temperature,
                 mode=decoded_contact_aux_mode,
                 rvq_path=decoded_contact_aux_rvq_path,
+                target_position_weight=decoded_contact_aux_target_position_weight,
+                target_velocity_weight=decoded_contact_aux_target_velocity_weight,
+                metric_weight=decoded_contact_aux_metric_weight,
+                moving_frame_extra_weight=decoded_contact_aux_moving_frame_extra_weight,
+                contact_threshold=decoded_contact_aux_contact_threshold,
+                use_soft_contact_weights=decoded_contact_aux_use_soft_contact_weights,
+                velocity_moving_only=decoded_contact_aux_velocity_moving_only,
+                fps=decoded_contact_aux_fps,
+                moving_speed_threshold=decoded_contact_aux_moving_speed_threshold,
+                kin_radius_proxy=decoded_contact_aux_kin_radius_proxy,
                 residual_transformer=residual_transformer,
                 text=text,
                 int_kv=(
@@ -794,7 +814,10 @@ def run(config_path: str) -> None:
             f"mode={decoded_aux_cfg.get('mode', 'metric')}, "
             f"rvq_path={decoded_aux_cfg.get('rvq_path', 'base_gt_residual')}, "
             f"temperature={float(decoded_aux_cfg.get('temperature', 1.0))}, "
-            f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}",
+            f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}, "
+            f"target_position_weight={float(decoded_aux_cfg.get('target_position_weight', 1.0))}, "
+            f"target_velocity_weight={float(decoded_aux_cfg.get('target_velocity_weight', 0.5))}, "
+            f"metric_weight={float(decoded_aux_cfg.get('metric_weight', 0.0))}",
         )
 
     diagnostics_cfg = cfg.training.get("diagnostics", None)
@@ -841,6 +864,46 @@ def run(config_path: str) -> None:
         decoded_contact_aux_rvq_path=(
             str(decoded_aux_cfg.get("rvq_path", "base_gt_residual"))
             if decoded_aux_cfg is not None else "base_gt_residual"
+        ),
+        decoded_contact_aux_target_position_weight=(
+            float(decoded_aux_cfg.get("target_position_weight", 1.0))
+            if decoded_aux_cfg is not None else 1.0
+        ),
+        decoded_contact_aux_target_velocity_weight=(
+            float(decoded_aux_cfg.get("target_velocity_weight", 0.5))
+            if decoded_aux_cfg is not None else 0.5
+        ),
+        decoded_contact_aux_metric_weight=(
+            float(decoded_aux_cfg.get("metric_weight", 0.0))
+            if decoded_aux_cfg is not None else 0.0
+        ),
+        decoded_contact_aux_moving_frame_extra_weight=(
+            float(decoded_aux_cfg.get("moving_frame_extra_weight", 2.0))
+            if decoded_aux_cfg is not None else 2.0
+        ),
+        decoded_contact_aux_contact_threshold=(
+            float(decoded_aux_cfg.get("contact_threshold", 0.5))
+            if decoded_aux_cfg is not None else 0.5
+        ),
+        decoded_contact_aux_use_soft_contact_weights=(
+            bool(decoded_aux_cfg.get("use_soft_contact_weights", True))
+            if decoded_aux_cfg is not None else True
+        ),
+        decoded_contact_aux_velocity_moving_only=(
+            bool(decoded_aux_cfg.get("velocity_moving_only", True))
+            if decoded_aux_cfg is not None else True
+        ),
+        decoded_contact_aux_fps=(
+            float(decoded_aux_cfg.get("fps", cfg.data.get("fps", 20)))
+            if decoded_aux_cfg is not None else float(cfg.data.get("fps", 20))
+        ),
+        decoded_contact_aux_moving_speed_threshold=(
+            float(decoded_aux_cfg.get("moving_speed_threshold", 0.15))
+            if decoded_aux_cfg is not None else 0.15
+        ),
+        decoded_contact_aux_kin_radius_proxy=(
+            float(decoded_aux_cfg.get("kin_radius_proxy", 0.3))
+            if decoded_aux_cfg is not None else 0.3
         ),
         token_stride=token_stride,
         motion_mean=motion_mean_t,
@@ -949,6 +1012,22 @@ def run(config_path: str) -> None:
             token_stride=token_stride,
             w_text=float(contact_eval_cfg.get("w_text", 4.0)),
             w_int=float(contact_eval_cfg.get("w_int", 2.0)),
+            fps=float(contact_eval_cfg.get("fps", cfg.data.get("fps", 20))),
+            coupling_threshold=float(contact_eval_cfg.get("coupling_threshold", 0.5)),
+            moving_speed_threshold=(
+                float(contact_eval_cfg.get("moving_speed_threshold"))
+                if contact_eval_cfg.get("moving_speed_threshold", None) is not None
+                else None
+            ),
+            composite_coupling_weight=float(
+                contact_eval_cfg.get("composite_coupling_weight", 0.12),
+            ),
+            composite_uncoupled_penalty=float(
+                contact_eval_cfg.get("composite_uncoupled_penalty", 0.05),
+            ),
+            composite_min_moving_frame_frac=float(
+                contact_eval_cfg.get("composite_min_moving_frame_frac", 0.05),
+            ),
         )
 
     # ---- Train ----

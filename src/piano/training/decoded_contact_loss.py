@@ -60,10 +60,27 @@ def object_pc_to_canonical_torch(
     return pc + obj_com_canonical[:, :, None, :]
 
 
+def body_canonical_to_object_local_torch(
+    body_canonical: Tensor,       # (B, T, P, 3)
+    obj_com_canonical: Tensor,    # (B, T, 3)
+    obj_rot6d_canonical: Tensor,  # (B, T, 6)
+) -> Tensor:
+    """Transform canonical-frame body points into the object's local frame."""
+    R = rotation_6d_to_matrix_torch(obj_rot6d_canonical)             # (B, T, 3, 3)
+    centered = body_canonical - obj_com_canonical[:, :, None, :]
+    return torch.einsum("btij,btpj->btpi", R.transpose(-1, -2), centered)
+
+
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     mask_f = mask.to(device=values.device, dtype=values.dtype)
     denom = mask_f.sum().clamp(min=1.0)
     return (values * mask_f).sum() / denom
+
+
+def _weighted_mean(values: Tensor, weights: Tensor) -> Tensor:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    denom = weights.sum().clamp(min=1e-6)
+    return (values * weights).sum() / denom
 
 
 def _eval_metric_loss_canonical(
@@ -78,6 +95,147 @@ def _eval_metric_loss_canonical(
     d_min_parts = d_min_pc.min(dim=-1).values                        # (B, T)
     loss = _masked_mean(d_min_parts, frame_mask)
     return loss, d_min_parts
+
+
+def _object_motion_speed_from_canonical(
+    obj_com_canonical: Tensor,     # (B, T, 3)
+    obj_rot6d_canonical: Tensor,   # (B, T, 6)
+    *,
+    fps: float,
+    radius_proxy: float,
+) -> Tensor:
+    """Object speed proxy matching pseudo-label kinematic coupling."""
+    B, T, _ = obj_com_canonical.shape
+    speed = torch.zeros(B, T, device=obj_com_canonical.device, dtype=obj_com_canonical.dtype)
+    if T <= 1:
+        return speed
+
+    trans_speed = torch.linalg.vector_norm(
+        obj_com_canonical[:, 1:] - obj_com_canonical[:, :-1],
+        dim=-1,
+    ) * float(fps)
+
+    R = rotation_6d_to_matrix_torch(obj_rot6d_canonical)
+    R_rel = torch.matmul(R[:, 1:], R[:, :-1].transpose(-1, -2))
+    trace = R_rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cos = ((trace - 1.0) * 0.5).clamp(min=-1.0, max=1.0)
+    ang_speed = torch.acos(cos) * float(fps)
+
+    speed[:, 1:] = trans_speed + float(radius_proxy) * ang_speed
+    return speed
+
+
+def _target_trajectory_loss_canonical(
+    *,
+    body_canonical: Tensor,        # (B, T, P, 3)
+    obj_com_canonical: Tensor,     # (B, T, 3)
+    obj_rot6d_canonical: Tensor,   # (B, T, 6)
+    contact_state: Tensor,         # (B, T, P)
+    contact_target_xyz: Tensor,    # (B, T, P, 3), object-local
+    frame_mask: Tensor,            # (B, T)
+    position_weight: float,
+    velocity_weight: float,
+    metric_loss: Tensor,
+    metric_weight: float,
+    moving_frame_extra_weight: float,
+    contact_threshold: float,
+    use_soft_contact_weights: bool,
+    velocity_moving_only: bool,
+    fps: float,
+    moving_speed_threshold: float,
+    kin_radius_proxy: float,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Part-specific contact-target and object-local trajectory objective.
+
+    Unlike the legacy metric loss, this loss never minimises over arbitrary
+    body parts or arbitrary object points. It supervises the body part named by
+    ``contact_state`` against that part's object-local ``contact_target_xyz``,
+    and it adds a local-frame velocity term on moving-object contact frames.
+    """
+    dtype = body_canonical.dtype
+    body_local = body_canonical_to_object_local_torch(
+        body_canonical,
+        obj_com_canonical,
+        obj_rot6d_canonical,
+    )
+    contact = contact_state.to(device=body_canonical.device, dtype=dtype).clamp(0.0, 1.0)
+    target = contact_target_xyz.to(device=body_canonical.device, dtype=dtype)
+    frame_mask_f = frame_mask.to(device=body_canonical.device, dtype=dtype)
+    contact_binary = contact >= float(contact_threshold)
+
+    obj_speed = _object_motion_speed_from_canonical(
+        obj_com_canonical,
+        obj_rot6d_canonical,
+        fps=float(fps),
+        radius_proxy=float(kin_radius_proxy),
+    )
+    moving = obj_speed >= float(moving_speed_threshold)
+    moving_f = moving.to(dtype=dtype)
+
+    contact_strength = contact if use_soft_contact_weights else contact_binary.to(dtype=dtype)
+    valid_part = contact_binary.to(dtype=dtype) * frame_mask_f[:, :, None]
+    moving_boost = 1.0 + float(moving_frame_extra_weight) * moving_f[:, :, None]
+    pos_weights = valid_part * contact_strength * moving_boost
+
+    pos_dist = torch.linalg.vector_norm(body_local - target, dim=-1)
+    target_position = _weighted_mean(pos_dist, pos_weights)
+
+    if body_local.shape[1] > 1:
+        pred_delta = body_local[:, 1:] - body_local[:, :-1]
+        target_delta = target[:, 1:] - target[:, :-1]
+        vel_dist = torch.linalg.vector_norm(pred_delta - target_delta, dim=-1)
+        pair_frame = (frame_mask[:, 1:] & frame_mask[:, :-1]).to(dtype=dtype)
+        pair_contact = torch.minimum(contact_strength[:, 1:], contact_strength[:, :-1])
+        pair_binary = contact_binary[:, 1:] & contact_binary[:, :-1]
+        vel_weights = pair_frame[:, :, None] * pair_binary.to(dtype=dtype) * pair_contact
+        if velocity_moving_only:
+            pair_moving = moving[:, 1:] | moving[:, :-1]
+            vel_weights = vel_weights * pair_moving.to(dtype=dtype)[:, :, None]
+        target_velocity = _weighted_mean(vel_dist, vel_weights)
+    else:
+        vel_weights = torch.zeros_like(pos_weights[:, :0])
+        target_velocity = body_canonical.new_zeros(())
+
+    total = (
+        float(position_weight) * target_position
+        + float(velocity_weight) * target_velocity
+        + float(metric_weight) * metric_loss
+    )
+
+    valid_frames = frame_mask_f.sum().clamp(min=1.0)
+    valid_part_slots = (frame_mask_f[:, :, None].expand_as(contact)).sum().clamp(min=1.0)
+    contact_part_count = valid_part.sum()
+    moving_frames = (moving_f * frame_mask_f).sum()
+    moving_contact_parts = (valid_part * moving_f[:, :, None]).sum()
+    moving_pos_loss = _weighted_mean(
+        pos_dist,
+        valid_part * contact_strength * moving_f[:, :, None],
+    )
+    static_pos_loss = _weighted_mean(
+        pos_dist,
+        valid_part * contact_strength * (1.0 - moving_f[:, :, None]),
+    )
+
+    metrics = {
+        "decoded_contact_aux_target_position": target_position.detach(),
+        "decoded_contact_aux_target_velocity": target_velocity.detach(),
+        "decoded_contact_aux_metric_component": metric_loss.detach(),
+        "decoded_contact_aux_target_position_moving": moving_pos_loss.detach(),
+        "decoded_contact_aux_target_position_static": static_pos_loss.detach(),
+        "decoded_contact_aux_contact_part_frac": (
+            contact_part_count / valid_part_slots
+        ).detach(),
+        "decoded_contact_aux_moving_frame_frac": (
+            moving_frames / valid_frames
+        ).detach(),
+        "decoded_contact_aux_moving_contact_part_frac": (
+            moving_contact_parts / contact_part_count.clamp(min=1.0)
+        ).detach(),
+        "decoded_contact_aux_target_position_weight_sum": pos_weights.sum().detach(),
+        "decoded_contact_aux_target_velocity_weight_sum": vel_weights.sum().detach(),
+        "decoded_contact_aux_object_speed_mean": _masked_mean(obj_speed, frame_mask).detach(),
+    }
+    return total, metrics
 
 
 def _base_logits_to_bsv(base_logits: Tensor, token_count: int) -> Tensor:
@@ -243,6 +401,16 @@ def decoded_contact_aux_loss(
     temperature: float = 1.0,
     mode: str = "metric",
     rvq_path: str = "base_gt_residual",
+    target_position_weight: float = 1.0,
+    target_velocity_weight: float = 0.5,
+    metric_weight: float = 0.0,
+    moving_frame_extra_weight: float = 2.0,
+    contact_threshold: float = 0.5,
+    use_soft_contact_weights: bool = True,
+    velocity_moving_only: bool = True,
+    fps: float = 20.0,
+    moving_speed_threshold: float = 0.15,
+    kin_radius_proxy: float = 0.3,
     residual_transformer: nn.Module | None = None,
     text: Any = None,
     int_kv: Tensor | None = None,
@@ -251,14 +419,25 @@ def decoded_contact_aux_loss(
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute C2 decoded contact auxiliary loss.
 
-    ``mode="metric"`` matches the offline contact-distance selector: for each
-    frame, take the closest object point to each candidate body part, then the
-    closest body part, then average over valid frames.
+    ``mode="metric"`` matches the legacy offline contact-distance selector: for
+    each frame, take the closest object point to each candidate body part, then
+    the closest body part, then average over valid frames.
+
+    ``mode="target_trajectory"`` is the v0.13 objective. It supervises the
+    predicted body part in object-local coordinates against that exact part's
+    ``contact_target_xyz`` trajectory under the ``contact_state`` mask, with an
+    optional moving-object local-velocity term. This removes the old shortcut
+    where any body point could satisfy the loss by approaching any object point.
     """
-    if mode != "metric":
-        raise ValueError(f"decoded contact aux currently supports mode='metric', got {mode!r}")
+    supported_modes = {"metric", "target_trajectory"}
+    if mode not in supported_modes:
+        raise ValueError(
+            f"decoded contact aux supports modes {sorted(supported_modes)}, got {mode!r}",
+        )
 
     required = ("object_pc", "obj_com_canonical", "obj_rot6d_canonical", "seq_len")
+    if mode == "target_trajectory":
+        required = required + ("contact_state", "contact_target_xyz")
     missing = [k for k in required if k not in batch]
     if missing:
         raise KeyError(f"decoded contact aux requires batch keys {missing}")
@@ -329,6 +508,8 @@ def decoded_contact_aux_loss(
     T = min(int(body.shape[1]), int(pc.shape[1]))
     body = body[:, :T]
     pc = pc[:, :T]
+    obj_com = obj_com[:, :T]
+    obj_rot6d = obj_rot6d[:, :T]
     frames_per_token = max(1, T_dec // max(S, 1))
     decoded_valid_frames = (
         m_lens_tok.to(device=device).long().clamp(min=1) * frames_per_token
@@ -337,10 +518,40 @@ def decoded_contact_aux_loss(
     valid_frames = torch.minimum(seq_len, decoded_valid_frames).clamp(min=1, max=T)
     frame_mask = torch.arange(T, device=device).unsqueeze(0) < valid_frames.unsqueeze(1)
 
-    loss, _per_frame = _eval_metric_loss_canonical(body, pc, frame_mask)
-    metrics = {
-        "decoded_contact_aux_mean_min_dist": loss.detach(),
+    metric_loss, _per_frame = _eval_metric_loss_canonical(body, pc, frame_mask)
+    if mode == "metric":
+        loss = metric_loss
+        metrics = {
+            "decoded_contact_aux_mean_min_dist": metric_loss.detach(),
+            "decoded_contact_aux_valid_frames": frame_mask.float().sum().detach(),
+        }
+    else:
+        contact_state = batch["contact_state"].to(device=device, dtype=body.dtype)[:, :T]
+        contact_target_xyz = batch["contact_target_xyz"].to(device=device, dtype=body.dtype)[:, :T]
+        loss, metrics = _target_trajectory_loss_canonical(
+            body_canonical=body,
+            obj_com_canonical=obj_com,
+            obj_rot6d_canonical=obj_rot6d,
+            contact_state=contact_state,
+            contact_target_xyz=contact_target_xyz,
+            frame_mask=frame_mask,
+            position_weight=target_position_weight,
+            velocity_weight=target_velocity_weight,
+            metric_loss=metric_loss,
+            metric_weight=metric_weight,
+            moving_frame_extra_weight=moving_frame_extra_weight,
+            contact_threshold=contact_threshold,
+            use_soft_contact_weights=use_soft_contact_weights,
+            velocity_moving_only=velocity_moving_only,
+            fps=fps,
+            moving_speed_threshold=moving_speed_threshold,
+            kin_radius_proxy=kin_radius_proxy,
+        )
+        metrics.update({
+            "decoded_contact_aux_mean_min_dist": metric_loss.detach(),
+        })
+    metrics.update({
         "decoded_contact_aux_valid_frames": frame_mask.float().sum().detach(),
-    }
+    })
     metrics.update({k: v.detach() for k, v in extra_metrics.items()})
     return loss, metrics

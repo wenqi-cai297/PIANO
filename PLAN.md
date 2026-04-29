@@ -22,6 +22,13 @@ denoising, CHOIS applies contact guidance during sampling, and MaskControl uses
 training-time differentiable sampling plus inference-time logits/codebook
 optimization.
 
+Current implementation branch: v13 changes the decoded auxiliary loss from
+arbitrary body/object min-distance to a part-specific object-local
+`contact_target_xyz` trajectory loss, with an additional local-frame velocity
+term on moving-object contact frames. Training-time contact eval now logs
+temporal coupling and can select `best_contact.pt` by
+`composite_contact_score`.
+
 ### 1. K-sample oracle
 
 Result: succeeded on the v12 w02 best-val checkpoint.
@@ -155,12 +162,13 @@ Decision:
 
 Immediate branch:
 
-- Stop treating reranking as the main lever; use it as a diagnostic readout.
-- Add a training or inference mechanism that increases temporally coupled
-  samples in the distribution.
-- First target IMHD baseball/suitcase and NeuralDome racket/object-carry cases.
-- Candidate mechanisms: decoded kinematic-coupling loss, contact target
-  trajectory loss in object-local coordinates, or full-RVQ sample-time guidance
+- Run v13 target-trajectory training:
+  `configs/training/generator_v13_target_trajectory_contact.yaml`.
+- Use `scripts/stage_b_generator/run_v13_target_trajectory.sh` for train,
+  offline contact-distance eval, temporal-coupling eval, and wandb export.
+- Judge success by both contact distance and moving-object coupling; do not
+  promote a checkpoint that only improves distance.
+- If v13 still lacks coupled samples, escalate to full-RVQ sample-time guidance
   through decoded motion.
 
 Secondary diagnostics, only if reranked samples fail visually or hard subsets

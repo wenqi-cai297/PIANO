@@ -27,6 +27,11 @@ Current framing: this is not simply "contact loss too weak" and not primarily
 distance-only selection do not reliably choose samples where the body part moves
 with the object during manipulation.
 
+The next training branch is now v13: replace the old decoded loss's arbitrary
+min over body parts and object points with object-local `contact_target_xyz`
+tracking for the same contact body part, plus a local-frame velocity term on
+moving-object contact frames.
+
 ## Evidence
 
 v12 matched 80-clip eval:
@@ -142,12 +147,14 @@ library helpers from `src/piano/`:
 
 Current script:
 
+- `scripts/stage_b_generator/run_v13_target_trajectory.sh`
 - `scripts/stage_b_generator/k_sample_oracle.py`
 - `scripts/stage_b_generator/measure_temporal_coupling.py`
 
-`k_sample_oracle.py` now supports `--selection-metric composite`, which keeps
-the same K-sample generation path but selects by contact distance plus penalties
-for weak moving-object coupling and close-but-uncoupled frames.
+`run_v13_target_trajectory.sh` is the next train/eval runner. It trains the new
+loss, evaluates contact distance, evaluates temporal coupling, and exports the
+wandb history. `k_sample_oracle.py` remains a diagnostic readout and supports
+`--selection-metric composite`.
 
 Decision rules:
 
@@ -155,8 +162,9 @@ Decision rules:
 - Distance-only visual review failed temporally: spatial proximity is not enough.
 - Composite reranking only modestly improved coupling: do not spend another
   main iteration on rerank-weight sweeps.
-- Next main path: change training/inference so generated samples are temporally
-  coupled to object motion, then keep composite reranking as the readout.
+- Next main path: run v13 and verify whether the generated distribution now
+  contains more temporally coupled samples; keep composite reranking as the
+  readout, not the training target.
 - Soft-hard gap is large: move decoded contact closer to hard sampling with
   ST-Gumbel/DES-style consistency or full-RVQ logits/embedding optimization.
 - RVQ mixed oracle identifies base bottleneck: focus MaskTransformer/base

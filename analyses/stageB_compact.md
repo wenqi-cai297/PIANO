@@ -300,6 +300,12 @@ needs a temporal-binding mechanism: decoded kinematic-coupling/local-frame
 stability loss, contact-target trajectory loss in object-local coordinates, or
 full-RVQ sample-time guidance through decoded motion.
 
+v13 implements the training-loss branch: the decoded auxiliary loss now has
+`mode="target_trajectory"`, which tracks the same contact body part against its
+object-local `contact_target_xyz` and adds a moving-object local-frame velocity
+term. Training-time contact eval now logs temporal coupling and exposes
+`composite_contact_score` for best-contact checkpoint selection.
+
 ## v0.12 Full Table
 
 | ckpt | full | text_only | swap |
@@ -339,6 +345,7 @@ subset-specific representation issues must be checked.
 
 Configs:
 
+- `configs/training/generator_v13_target_trajectory_contact.yaml`
 - `configs/training/generator_v10_full_rvq_decoded_contact_aux.yaml`
 - `configs/training/generator_v11_diagnostics.yaml`
 - `configs/training/generator_v12_decoded_contact_w03_diagnostics.yaml`
@@ -347,6 +354,7 @@ Configs:
 
 Script:
 
+- `scripts/stage_b_generator/run_v13_target_trajectory.sh`
 - `scripts/stage_b_generator/run_v12_contact_weight_sweep.sh`
 - `scripts/stage_b_generator/k_sample_oracle.py` (`--selection-metric composite`
   selects by contact distance plus moving-object coupling)
@@ -369,11 +377,14 @@ Question: can training or inference make the generated distribution contain
 samples where the relevant body part is stable in the moving object's local
 frame?
 
-Most promising options:
+Current implementation:
 
-- decoded kinematic-coupling/local-frame stability objective on moving-object
-  frames;
-- contact-target trajectory loss in object-local coordinates;
+- v13 decoded `target_trajectory` loss: part-specific object-local contact
+  target tracking plus moving-object local-frame velocity supervision.
+- Use contact distance and temporal coupling as paired readouts.
+
+Remaining options if v13 fails:
+
 - full-RVQ sample-time guidance through decoded motion, not base logits only.
 
 Use composite K-sample reranking only as the readout after these changes.
