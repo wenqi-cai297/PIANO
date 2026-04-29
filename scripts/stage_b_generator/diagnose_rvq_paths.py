@@ -382,7 +382,10 @@ def main() -> int:
             cfg_drop_buckets=None,
             return_logits=True,
         )
-        base_logits = train_out["logits"]
+        base_logits = _base_logits_to_bsv(
+            train_out["logits"],
+            token_count=int(gt_ids.shape[1]),
+        )
         res_int_kv = int_kv.transpose(0, 1).contiguous()
         soft_norm, _ = _decode_relaxed_full_rvq_prediction(
             base_logits=base_logits,
