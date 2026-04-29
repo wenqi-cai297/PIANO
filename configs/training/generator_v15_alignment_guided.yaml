@@ -1,0 +1,204 @@
+# Stage B v0.15: alignment-aware contact distribution + full-RVQ guidance eval.
+#
+# Evidence basis:
+#   - v14 K64 alignment oracle found that the candidate pool rarely contains
+#     the correct GT body part on the correct object-local patch, so K/rerank
+#     is exhausted.
+#   - OMOMO/CHOIS use explicit contact anchors/labels instead of only
+#     body-object distance; MaskControl-style guidance optimizes sampled
+#     motion tokens in decoded geometric space.
+#   - This config therefore changes the learned distribution with
+#     part-margin + segment-consistency terms and selects best_contact on
+#     strict alignment_contact_score.
+
+model:
+  config: configs/model/motion_generator.yaml
+  text_encoder: "ViT-B/32"
+  gamma_kind: "per_head"
+  residual_int_xattn:
+    enabled: true
+    zero_init_gamma: true
+    gamma_kind: "per_head"
+    dropout: 0.1
+  checkpoints:
+    vq_vae: "checkpoints/momask/t2m/rvq_nq6_dc512_nc512_noshare_qdp0.2/model/net_best_fid.tar"
+    masked_transformer: "checkpoints/momask/t2m/t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns/model/latest.tar"
+    residual_transformer: "checkpoints/momask/t2m/tres_nlayer8_ld384_ff1024_rvq6ns_cdp0.2_sw/model/net_best_fid.tar"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  force_world_frame: false
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  seed: 42
+  batch_size: 32
+  num_epochs: 80
+  num_workers: 4
+  mixed_precision: "bf16"
+
+  optimizer:
+    name: "adamw"
+    new_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  cfg_drop_buckets:
+    drop_both: 0.10
+    drop_int_only: 0.10
+    drop_text_only: 0.05
+
+  residual_loss_weight: 1.0
+
+  decoded_contact_aux:
+    enabled: true
+    weight: 1.0
+    mode: "target_trajectory"
+    rvq_path: "full_prediction"
+    temperature: 1.0
+    decode_mode: "st_gumbel"
+    logit_source: "maskgit_first_step"
+    topk_filter_thres: 0.9
+    w_text: 4.0
+    w_int: 2.0
+    res_cond_scale: 2.0
+    max_batch_size: 8
+    num_object_points: 256
+    target_position_weight: 1.0
+    target_velocity_weight: 0.5
+    metric_weight: 0.05
+    # Wrong-part negative: the GT contact body part must beat all other
+    # tracked parts on that same object-local target by 8 cm.
+    part_margin_weight: 0.35
+    part_margin_m: 0.08
+    # Contact segment binding: keep the GT part's object-local target offset
+    # stable across consecutive contact frames, including static segments.
+    segment_consistency_weight: 0.5
+    segment_consistency_moving_only: false
+    moving_frame_extra_weight: 2.0
+    contact_threshold: 0.5
+    use_soft_contact_weights: true
+    velocity_moving_only: true
+    fps: 20.0
+    moving_speed_threshold: 0.15
+    kin_radius_proxy: 0.3
+
+  diagnostics:
+    gradient_norms:
+      enabled: false
+      every_n_steps: 0
+    residual_layers:
+      enabled: false
+
+  val_every_epochs: 5
+  val_best_key: "loss"
+
+  contact_eval:
+    enabled: true
+    num_clips: 80
+    num_clips_per_subset: 20
+    seed: 42
+    w_text: 4.0
+    w_int: 2.0
+    fps: 20.0
+    coupling_threshold: 0.5
+    moving_speed_threshold: 0.15
+    composite_coupling_weight: 0.12
+    composite_uncoupled_penalty: 0.05
+    composite_min_moving_frame_frac: 0.05
+    alignment_recall_penalty: 0.25
+    alignment_distance_weight: 0.05
+    alignment_coupling_weight: 0.0
+    best_key: "alignment_contact_score"
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageB_v15_alignment_guided"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+  train_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_part_margin
+    - decoded_contact_aux_part_margin_active_frac
+    - decoded_contact_aux_segment_consistency
+    - decoded_contact_aux_mean_min_dist
+    - decoded_contact_aux_hard_forward
+    - gamma_int_abs_mean
+    - gamma_int_res_abs_mean
+  val_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_part_margin
+    - decoded_contact_aux_part_margin_active_frac
+    - decoded_contact_aux_segment_consistency
+    - decoded_contact_aux_mean_min_dist
+    - decoded_contact_aux_hard_forward
+  contact_report_keys:
+    - alignment_contact_score
+    - alignment_primary_error
+    - alignment_moving_target_error
+    - alignment_moving_same_part_recall
+    - alignment_same_part_recall
+    - composite_contact_score
+    - mean_min_dist
+    - moving_close_frame_frac
+    - moving_coupled_frame_frac
+    - moving_close_but_uncoupled_frac
+    - n_clips
+
+output_dir: "runs/training/generator_v15_alignment_guided"

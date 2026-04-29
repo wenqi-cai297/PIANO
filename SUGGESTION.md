@@ -12,7 +12,9 @@ improves spatial contact rather than temporal binding.
 
 The K-sample oracle changed the active plan: the current generator distribution
 contains close-to-object samples. K=16 best-of-K reaches `17.93 cm`, close to
-GT VQ roundtrip `18.47 cm`.
+GT VQ roundtrip `18.47 cm`. The later K64 alignment oracle refines that
+conclusion: close-to-object modes exist, but GT-aligned contact-part/patch
+modes are still rare.
 
 The visual review then sharpened the diagnosis: distance-only reranking is not
 enough. The body is near the object and roughly aware of its coordinates, but
@@ -24,15 +26,23 @@ stays near GT roundtrip (`17.93 cm` -> `18.08 cm`). Even offline max-coupled
 selection over the same K=16 candidates reaches only about `0.390`.
 
 Current framing: this is not simply "contact loss too weak" and not primarily
-"the model cannot generate contact." The failure is that ordinary sampling and
-distance-only selection do not reliably choose samples where the body part moves
-with the object during manipulation.
+"the model cannot get near the object." The failure is that the generated
+distribution does not contain enough samples where the correct body part moves
+with the correct object-local patch during manipulation.
 
 v14 is a partial positive result: `best_contact` reaches `27.37 cm` one-shot
 contact, improving over v12/v13, but moving-coupled frame fraction is only
-`0.277`. The next step is not another loss-weight sweep; it is to test whether
-v14 improved the K-sample candidate pool and whether the RVQ soft/hard gaps
-remain.
+`0.277`. K16 confirmed a better spatial candidate pool; K64 alignment confirmed
+that pool is still semantically weak. The next step is a distribution/guidance
+change that explicitly targets body part, object-local patch, and coupling.
+
+That next step is now implemented as v15, pending server results. v15 adds a
+wrong-part margin and contact-segment consistency term to the decoded
+target-trajectory loss, changes train-time contact checkpointing to monitor
+strict alignment, and adds full-RVQ sampling-time target guidance. This is the
+right next experiment because it attacks the K64 failure directly: candidates
+were near the object but rarely used the GT body part/patch over the GT contact
+segment.
 
 ## Evidence
 
@@ -174,6 +184,22 @@ local position error. Therefore the user's visual assessment is correct:
 distance/composite can reach the GT roundtrip distance band while still missing
 the GT contact part, timing, and object-local patch by a large margin.
 
+The v14 K=64 alignment-aware oracle confirms this is not just a low-K or
+rerank-weight problem:
+
+| selection | contact remeasure | moving coupled | moving IoU | correct GT-part recall | same-part local pos error |
+|---|---:|---:|---:|---:|---:|
+| K=16 composite | 17.94 cm | 0.3715 | 0.4472 | 0.2378 | 46.32 cm |
+| K=64 alignment | 18.71 cm | 0.3339 | 0.4516 | 0.2496 | 40.30 cm |
+
+K=64 alignment selection buys about `6 cm` of same-part local-position error
+but worsens contact/coupling and barely moves temporal IoU. Looking across all
+64 candidates per clip, the best primary alignment error is still `37.0 cm` on
+average and the best moving same-part recall is only `0.165`. Only about `9%`
+of clips with finite moving-contact recall have any candidate with recall >=
+`0.5`; NeuralDome and OMOMO have none. This is evidence against continuing with
+pure reranking as the next main strategy.
+
 ## What Already Worked
 
 - MoMask encoder normalization fix: repaired token/body collapse.
@@ -206,15 +232,17 @@ library helpers from `src/piano/`:
 
 Current scripts:
 
+- `scripts/stage_b_generator/run_v15_alignment_guided.sh`
 - `scripts/stage_b_generator/run_v14_sampled_st_contact.sh`
 - `scripts/stage_b_generator/run_v13_target_trajectory.sh`
 - `scripts/stage_b_generator/k_sample_oracle.py`
 - `scripts/stage_b_generator/measure_temporal_coupling.py`
 - `scripts/stage_b_generator/measure_contact_alignment.py`
 
-`run_v14_sampled_st_contact.sh` is the latest train/eval runner. It wraps the
-v13 runner with v14 defaults. `k_sample_oracle.py` remains the key next
-diagnostic readout and supports `--selection-metric composite`.
+`run_v15_alignment_guided.sh` is the latest train/eval runner. It wraps the
+v13 runner with v15 defaults and enables `full_guided` eval via
+`GUIDANCE_LAYERS=full_rvq`. `run_v14_sampled_st_contact.sh` remains the latest
+completed-result runner and the baseline to beat.
 
 Decision rules:
 
@@ -222,12 +250,16 @@ Decision rules:
 - Distance-only visual review failed temporally: spatial proximity is not enough.
 - Composite reranking only modestly improved coupling: do not spend another
   main iteration on rerank-weight sweeps.
+- K=64 alignment-aware selection still lacks enough aligned candidates: the
+  next iteration should change the generated distribution or use stronger
+  decoded-motion guidance, not merely increase K.
 - v14 K=16 candidate quality is spatially strong but semantically misaligned:
-  prioritize full-RVQ logits/embedding optimization or decoded-motion
-  sample-time guidance using the predicted contact body part and object-local
-  target trajectory.
-- Use v14 K=16 composite as the baseline to beat: `17.94 cm`, moving coupled
-  `0.3715`, moving contact IoU `0.4472`, correct GT-part recall `0.2378`.
+  run the implemented v15 alignment/coupling training branch and full-RVQ
+  decoded-motion sample-time guidance using the predicted contact body part,
+  object-local target trajectory, and local-frame coupling.
+- Use v14 K=16 composite and K=64 alignment as baselines to beat:
+  `17.94 cm`/`0.3715` coupled/`0.4472` moving IoU/`0.2378` correct-part recall,
+  and `18.71 cm`/`0.3339`/`0.4516`/`0.2496` with `40.30 cm` local error.
 - If v14 RVQ diagnostics still show a large base-token gap: focus
   MaskTransformer/base conditioning.
 - RVQ mixed oracle identifies base bottleneck: focus MaskTransformer/base

@@ -78,6 +78,49 @@ def test_target_trajectory_loss_uses_part_specific_contact_targets():
     assert body.grad[0, 0, 1].abs().sum() == 0
 
 
+def test_target_trajectory_loss_part_margin_penalizes_wrong_part_shortcut():
+    from piano.training.decoded_contact_loss import _target_trajectory_loss_canonical
+
+    rot6d_identity = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).view(1, 1, 6)
+    body = torch.tensor(
+        [[[
+            [1.0, 0.0, 0.0],   # GT contact part is 1m from target.
+            [0.02, 0.0, 0.0],  # Wrong part is close to the GT target.
+        ]]],
+        requires_grad=True,
+    )
+    contact = torch.tensor([[[1.0, 0.0]]])
+    target = torch.zeros(1, 1, 2, 3)
+
+    loss, metrics = _target_trajectory_loss_canonical(
+        body_canonical=body,
+        obj_com_canonical=torch.zeros(1, 1, 3),
+        obj_rot6d_canonical=rot6d_identity,
+        contact_state=contact,
+        contact_target_xyz=target,
+        frame_mask=torch.tensor([[True]]),
+        position_weight=0.0,
+        velocity_weight=0.0,
+        metric_loss=torch.zeros(()),
+        metric_weight=0.0,
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        moving_frame_extra_weight=0.0,
+        contact_threshold=0.5,
+        use_soft_contact_weights=True,
+        velocity_moving_only=True,
+        fps=20.0,
+        moving_speed_threshold=0.15,
+        kin_radius_proxy=0.3,
+    )
+
+    assert metrics["decoded_contact_aux_part_margin"].item() > 0.0
+    loss.backward()
+    assert body.grad is not None
+    assert body.grad[0, 0, 0].abs().sum() > 0
+    assert body.grad[0, 0, 1].abs().sum() > 0
+
+
 def test_st_argmax_categorical_probs_use_hard_forward_soft_backward():
     from piano.training.decoded_contact_loss import _categorical_probs
 

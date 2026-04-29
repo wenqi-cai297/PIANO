@@ -138,6 +138,10 @@ def _target_trajectory_loss_canonical(
     velocity_weight: float,
     metric_loss: Tensor,
     metric_weight: float,
+    part_margin_weight: float = 0.0,
+    part_margin_m: float = 0.08,
+    segment_consistency_weight: float = 0.0,
+    segment_consistency_moving_only: bool = False,
     moving_frame_extra_weight: float,
     contact_threshold: float,
     use_soft_contact_weights: bool,
@@ -197,10 +201,58 @@ def _target_trajectory_loss_canonical(
         vel_weights = torch.zeros_like(pos_weights[:, :0])
         target_velocity = body_canonical.new_zeros(())
 
+    part_margin = body_canonical.new_zeros(())
+    part_margin_active = body_canonical.new_zeros(())
+    if float(part_margin_weight) > 0.0 and body_local.shape[2] > 1:
+        # For every GT contact target p, require the GT body part p to be
+        # closer than any other tracked body part. This is the key
+        # alignment-aware negative: distance-only objectives can be satisfied
+        # by "some" part touching the object, while the diagnostic failure is
+        # specifically wrong-part/wrong-patch contact.
+        part_to_target = torch.linalg.vector_norm(
+            body_local[:, :, :, None, :] - target[:, :, None, :, :],
+            dim=-1,
+        )                                                                    # (B, T, P_pred, P_target)
+        eye = torch.eye(
+            body_local.shape[2],
+            device=body_local.device,
+            dtype=torch.bool,
+        ).view(1, 1, body_local.shape[2], body_local.shape[2])
+        wrong_min = part_to_target.masked_fill(eye, float("inf")).min(dim=2).values
+        margin_violation = F.relu(pos_dist + float(part_margin_m) - wrong_min)
+        part_margin = _weighted_mean(margin_violation, pos_weights)
+        part_margin_active = _weighted_mean(
+            (margin_violation > 0).to(dtype=dtype),
+            pos_weights,
+        )
+
+    segment_consistency = body_canonical.new_zeros(())
+    if (
+        float(segment_consistency_weight) > 0.0
+        and body_local.shape[1] > 1
+    ):
+        # Keep the object-local offset to the GT patch stable throughout a
+        # contact segment. This is the segment-level counterpart to
+        # per-frame target L2 and follows the OMOMO/CHOIS pattern of treating
+        # contact as a persistent anchor, not independent framewise proximity.
+        local_offset = body_local - target
+        offset_delta = local_offset[:, 1:] - local_offset[:, :-1]
+        segment_dist = torch.linalg.vector_norm(offset_delta, dim=-1)
+        pair_frame = (frame_mask[:, 1:] & frame_mask[:, :-1]).to(dtype=dtype)
+        pair_contact = torch.minimum(contact_strength[:, 1:], contact_strength[:, :-1])
+        pair_binary = contact_binary[:, 1:] & contact_binary[:, :-1]
+        segment_weights = pair_frame[:, :, None] * pair_binary.to(dtype=dtype) * pair_contact
+        if segment_consistency_moving_only:
+            pair_moving = moving[:, 1:] | moving[:, :-1]
+            segment_weights = segment_weights * pair_moving.to(dtype=dtype)[:, :, None]
+        segment_consistency = _weighted_mean(segment_dist, segment_weights)
+
     total = (
         float(position_weight) * target_position
         + float(velocity_weight) * target_velocity
         + float(metric_weight) * metric_loss
+        + float(part_margin_weight) * part_margin
+        + float(segment_consistency_weight) * segment_consistency
     )
 
     valid_frames = frame_mask_f.sum().clamp(min=1.0)
@@ -221,6 +273,9 @@ def _target_trajectory_loss_canonical(
         "decoded_contact_aux_target_position": target_position.detach(),
         "decoded_contact_aux_target_velocity": target_velocity.detach(),
         "decoded_contact_aux_metric_component": metric_loss.detach(),
+        "decoded_contact_aux_part_margin": part_margin.detach(),
+        "decoded_contact_aux_part_margin_active_frac": part_margin_active.detach(),
+        "decoded_contact_aux_segment_consistency": segment_consistency.detach(),
         "decoded_contact_aux_target_position_moving": moving_pos_loss.detach(),
         "decoded_contact_aux_target_position_static": static_pos_loss.detach(),
         "decoded_contact_aux_contact_part_frac": (
@@ -522,6 +577,10 @@ def decoded_contact_aux_loss(
     target_position_weight: float = 1.0,
     target_velocity_weight: float = 0.5,
     metric_weight: float = 0.0,
+    part_margin_weight: float = 0.0,
+    part_margin_m: float = 0.08,
+    segment_consistency_weight: float = 0.0,
+    segment_consistency_moving_only: bool = False,
     moving_frame_extra_weight: float = 2.0,
     contact_threshold: float = 0.5,
     use_soft_contact_weights: bool = True,
@@ -684,6 +743,10 @@ def decoded_contact_aux_loss(
             velocity_weight=target_velocity_weight,
             metric_loss=metric_loss,
             metric_weight=metric_weight,
+            part_margin_weight=part_margin_weight,
+            part_margin_m=part_margin_m,
+            segment_consistency_weight=segment_consistency_weight,
+            segment_consistency_moving_only=segment_consistency_moving_only,
             moving_frame_extra_weight=moving_frame_extra_weight,
             contact_threshold=contact_threshold,
             use_soft_contact_weights=use_soft_contact_weights,

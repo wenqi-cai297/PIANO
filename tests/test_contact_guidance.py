@@ -258,6 +258,52 @@ def test_decode_relaxed_base_shape_and_gradient():
     # Residual ids are integer (no grad attribute) — confirm no crash.
 
 
+def test_decode_relaxed_full_rvq_shape_and_gradient():
+    from piano.inference.contact_guidance import _decode_relaxed_full_rvq
+
+    B, S, Q, V, code_dim = 1, 4, 3, 8, 16
+    T_decoded = S * 4
+
+    class FakeQuantizer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._codebooks = nn.Parameter(torch.randn(Q, V, code_dim) * 0.1)
+            self.num_quantizers = Q
+
+        @property
+        def codebooks(self):
+            return self._codebooks
+
+    class FakeDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.ConvTranspose1d(code_dim, 263, kernel_size=4, stride=4)
+
+        def forward(self, x):
+            return self.conv(x).permute(0, 2, 1)
+
+    class FakeRVQVAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quantizer = FakeQuantizer()
+            self.decoder = FakeDecoder()
+
+    logits = torch.randn(B, S, Q, V, requires_grad=True)
+    motion_norm = _decode_relaxed_full_rvq(
+        logits,
+        FakeRVQVAE(),
+        token_mask=torch.tensor([[True, True, True, False]]),
+        temperature=1.0,
+    )
+
+    assert motion_norm.shape == (B, T_decoded, 263)
+    motion_norm.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[:, :3].abs().sum() > 0
+    assert logits.grad[:, 3].abs().sum() == 0
+
+
 def test_decode_relaxed_base_invariant_under_one_hot_init():
     """When base_logits is one-hot, relaxed embedding ≈ codebook[gt] (low-temp limit).
 
@@ -442,3 +488,5 @@ def test_guide_with_contact_signature_accepts_new_kwargs():
     assert sig.parameters["residual_seed"].default is None
     assert "no_residual_rerun" in sig.parameters
     assert sig.parameters["no_residual_rerun"].default is False
+    assert "guidance_layers" in sig.parameters
+    assert sig.parameters["guidance_layers"].default == "base"

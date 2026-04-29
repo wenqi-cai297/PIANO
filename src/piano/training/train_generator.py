@@ -424,6 +424,10 @@ def build_generator_step_fn(
     decoded_contact_aux_target_position_weight: float = 1.0,
     decoded_contact_aux_target_velocity_weight: float = 0.5,
     decoded_contact_aux_metric_weight: float = 0.0,
+    decoded_contact_aux_part_margin_weight: float = 0.0,
+    decoded_contact_aux_part_margin_m: float = 0.08,
+    decoded_contact_aux_segment_consistency_weight: float = 0.0,
+    decoded_contact_aux_segment_consistency_moving_only: bool = False,
     decoded_contact_aux_moving_frame_extra_weight: float = 2.0,
     decoded_contact_aux_contact_threshold: float = 0.5,
     decoded_contact_aux_use_soft_contact_weights: bool = True,
@@ -651,6 +655,12 @@ def build_generator_step_fn(
                 target_position_weight=decoded_contact_aux_target_position_weight,
                 target_velocity_weight=decoded_contact_aux_target_velocity_weight,
                 metric_weight=decoded_contact_aux_metric_weight,
+                part_margin_weight=decoded_contact_aux_part_margin_weight,
+                part_margin_m=decoded_contact_aux_part_margin_m,
+                segment_consistency_weight=decoded_contact_aux_segment_consistency_weight,
+                segment_consistency_moving_only=(
+                    decoded_contact_aux_segment_consistency_moving_only
+                ),
                 moving_frame_extra_weight=decoded_contact_aux_moving_frame_extra_weight,
                 contact_threshold=decoded_contact_aux_contact_threshold,
                 use_soft_contact_weights=decoded_contact_aux_use_soft_contact_weights,
@@ -957,7 +967,9 @@ def run(config_path: str) -> None:
             f"num_object_points={int(decoded_aux_cfg.get('num_object_points', 256))}, "
             f"target_position_weight={float(decoded_aux_cfg.get('target_position_weight', 1.0))}, "
             f"target_velocity_weight={float(decoded_aux_cfg.get('target_velocity_weight', 0.5))}, "
-            f"metric_weight={float(decoded_aux_cfg.get('metric_weight', 0.0))}",
+            f"metric_weight={float(decoded_aux_cfg.get('metric_weight', 0.0))}, "
+            f"part_margin_weight={float(decoded_aux_cfg.get('part_margin_weight', 0.0))}, "
+            f"segment_consistency_weight={float(decoded_aux_cfg.get('segment_consistency_weight', 0.0))}",
         )
 
     diagnostics_cfg = cfg.training.get("diagnostics", None)
@@ -1044,6 +1056,22 @@ def run(config_path: str) -> None:
         decoded_contact_aux_metric_weight=(
             float(decoded_aux_cfg.get("metric_weight", 0.0))
             if decoded_aux_cfg is not None else 0.0
+        ),
+        decoded_contact_aux_part_margin_weight=(
+            float(decoded_aux_cfg.get("part_margin_weight", 0.0))
+            if decoded_aux_cfg is not None else 0.0
+        ),
+        decoded_contact_aux_part_margin_m=(
+            float(decoded_aux_cfg.get("part_margin_m", 0.08))
+            if decoded_aux_cfg is not None else 0.08
+        ),
+        decoded_contact_aux_segment_consistency_weight=(
+            float(decoded_aux_cfg.get("segment_consistency_weight", 0.0))
+            if decoded_aux_cfg is not None else 0.0
+        ),
+        decoded_contact_aux_segment_consistency_moving_only=(
+            bool(decoded_aux_cfg.get("segment_consistency_moving_only", False))
+            if decoded_aux_cfg is not None else False
         ),
         decoded_contact_aux_moving_frame_extra_weight=(
             float(decoded_aux_cfg.get("moving_frame_extra_weight", 2.0))
@@ -1195,6 +1223,15 @@ def run(config_path: str) -> None:
             ),
             composite_min_moving_frame_frac=float(
                 contact_eval_cfg.get("composite_min_moving_frame_frac", 0.05),
+            ),
+            alignment_recall_penalty=float(
+                contact_eval_cfg.get("alignment_recall_penalty", 0.25),
+            ),
+            alignment_distance_weight=float(
+                contact_eval_cfg.get("alignment_distance_weight", 0.05),
+            ),
+            alignment_coupling_weight=float(
+                contact_eval_cfg.get("alignment_coupling_weight", 0.0),
             ),
         )
 

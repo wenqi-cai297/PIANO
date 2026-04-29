@@ -38,6 +38,11 @@ library code.
   sampled-path variant. It keeps v13's target-trajectory loss but takes decoded
   aux logits from the all-mask MaskGIT/CFG first step and decodes with
   straight-through Gumbel hard codebook samples.
+- `stage_b_generator/run_v15_alignment_guided.sh`: v15 runner for the
+  alignment-aware branch. It adds wrong-part margin and contact-segment
+  consistency to the decoded contact auxiliary loss, selects `best_contact.pt`
+  on strict alignment score, and enables full-RVQ target guidance during
+  offline eval by default (`GUIDANCE_STEPS=30`, `GUIDANCE_LAYERS=full_rvq`).
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing

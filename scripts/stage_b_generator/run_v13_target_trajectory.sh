@@ -22,7 +22,14 @@ DUMP_WANDB="${DUMP_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-piano}"
 WANDB_OUTPUT="${WANDB_OUTPUT:-runs/wandb_logs/wandb_history_genB_v13_target_trajectory.csv}"
 SUMMARY_DETAIL="${SUMMARY_DETAIL:-compact}"
-WANDB_COLUMNS="${WANDB_COLUMNS:-epoch,loss,loss_base,loss_residual,loss_decoded_contact,loss_weighted_decoded_contact,acc,acc_residual,decoded_contact_aux_target_position,decoded_contact_aux_target_velocity,decoded_contact_aux_mean_min_dist,gamma_int_abs_mean,gamma_int_res_abs_mean,val_loss,val_loss_base,val_loss_residual,val_loss_decoded_contact,val_loss_weighted_decoded_contact,val_acc,val_acc_residual,val_decoded_contact_aux_target_position,val_decoded_contact_aux_target_velocity,val_decoded_contact_aux_mean_min_dist,contact_composite_contact_score,contact_mean_min_dist,contact_moving_close_frame_frac,contact_moving_coupled_frame_frac,contact_moving_close_but_uncoupled_frac,contact_n_clips,lr,epoch_time_sec}"
+GUIDANCE_STEPS="${GUIDANCE_STEPS:-0}"
+GUIDANCE_LAYERS="${GUIDANCE_LAYERS:-base}"
+GUIDANCE_LOSS="${GUIDANCE_LOSS:-metric}"
+GUIDANCE_LR="${GUIDANCE_LR:-6e-2}"
+GUIDANCE_INIT_SCALE="${GUIDANCE_INIT_SCALE:-3.0}"
+GUIDANCE_RESIDUAL_SEED="${GUIDANCE_RESIDUAL_SEED:-}"
+GUIDANCE_NO_RESIDUAL_RERUN="${GUIDANCE_NO_RESIDUAL_RERUN:-0}"
+WANDB_COLUMNS="${WANDB_COLUMNS:-epoch,loss,loss_base,loss_residual,loss_decoded_contact,loss_weighted_decoded_contact,acc,acc_residual,decoded_contact_aux_target_position,decoded_contact_aux_target_velocity,decoded_contact_aux_part_margin,decoded_contact_aux_part_margin_active_frac,decoded_contact_aux_segment_consistency,decoded_contact_aux_mean_min_dist,gamma_int_abs_mean,gamma_int_res_abs_mean,val_loss,val_loss_base,val_loss_residual,val_loss_decoded_contact,val_loss_weighted_decoded_contact,val_acc,val_acc_residual,val_decoded_contact_aux_target_position,val_decoded_contact_aux_target_velocity,val_decoded_contact_aux_part_margin,val_decoded_contact_aux_part_margin_active_frac,val_decoded_contact_aux_segment_consistency,val_decoded_contact_aux_mean_min_dist,contact_alignment_contact_score,contact_alignment_primary_error,contact_alignment_moving_target_error,contact_alignment_moving_same_part_recall,contact_composite_contact_score,contact_mean_min_dist,contact_moving_close_frame_frac,contact_moving_coupled_frame_frac,contact_moving_close_but_uncoupled_frac,contact_n_clips,lr,epoch_time_sec}"
 
 if [[ ! -f "$CFG" ]]; then
   echo "ERROR: config not found: $CFG" >&2
@@ -78,29 +85,58 @@ if [[ "$EVAL" == "1" ]]; then
     qual_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_qual"
     dist_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_contact_dist"
     temporal_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_temporal_coupling"
+    guided_temporal_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_temporal_coupling"
+    alignment_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_alignment_to_gt_roundtrip"
+    guided_alignment_dir="runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_alignment_to_gt_roundtrip"
 
     echo
     echo "============================================================"
     echo "[eval:${ckpt_name}] qual_eval -> ${qual_dir}"
     echo "============================================================"
-    python scripts/stage_b_generator/qual_eval.py \
+    qual_cmd=(
+      python scripts/stage_b_generator/qual_eval.py
       --config "$CFG" \
       --ckpt "$ckpt_path" \
       --output-dir "$qual_dir" \
       --num-clips "$NUM_CLIPS" \
       --seed "$SEED" \
       --summary-detail "$SUMMARY_DETAIL"
+    )
+    if [[ "$GUIDANCE_STEPS" != "0" ]]; then
+      qual_cmd+=(
+        --guidance-steps "$GUIDANCE_STEPS"
+        --guidance-layers "$GUIDANCE_LAYERS"
+        --guidance-loss "$GUIDANCE_LOSS"
+        --guidance-lr "$GUIDANCE_LR"
+        --guidance-init-scale "$GUIDANCE_INIT_SCALE"
+      )
+      if [[ -n "$GUIDANCE_RESIDUAL_SEED" ]]; then
+        qual_cmd+=(--guidance-residual-seed "$GUIDANCE_RESIDUAL_SEED")
+      fi
+      if [[ "$GUIDANCE_NO_RESIDUAL_RERUN" == "1" ]]; then
+        qual_cmd+=(--guidance-no-residual-rerun)
+      fi
+    fi
+    "${qual_cmd[@]}"
 
     echo
     echo "[eval:${ckpt_name}] contact distance -> ${dist_dir}"
-    python scripts/stage_b_generator/measure_contact_distance.py \
-      --input-dir "${qual_dir}/full" \
-      --input-dir "${qual_dir}/text_only" \
-      --input-dir "${qual_dir}/swap" \
-      --input-dir "${gt_dir}/gt_original" \
-      --input-dir "${gt_dir}/gt_roundtrip" \
-      --output-dir "$dist_dir" \
+    dist_cmd=(
+      python scripts/stage_b_generator/measure_contact_distance.py
+      --input-dir "${qual_dir}/full"
+      --input-dir "${qual_dir}/text_only"
+      --input-dir "${qual_dir}/swap"
+    )
+    if [[ -d "${qual_dir}/full_guided" ]]; then
+      dist_cmd+=(--input-dir "${qual_dir}/full_guided")
+    fi
+    dist_cmd+=(
+      --input-dir "${gt_dir}/gt_original"
+      --input-dir "${gt_dir}/gt_roundtrip"
+      --output-dir "$dist_dir"
       --detail "$SUMMARY_DETAIL"
+    )
+    "${dist_cmd[@]}"
 
     echo
     echo "[eval:${ckpt_name}] temporal coupling -> ${temporal_dir}"
@@ -111,6 +147,38 @@ if [[ "$EVAL" == "1" ]]; then
       --coupling-threshold 0.5 \
       --moving-speed-threshold 0.15 \
       --detail "$SUMMARY_DETAIL"
+
+    if [[ -d "${qual_dir}/full_guided" ]]; then
+      echo
+      echo "[eval:${ckpt_name}] guided temporal coupling -> ${guided_temporal_dir}"
+      python scripts/stage_b_generator/measure_temporal_coupling.py \
+        --input-dir "${qual_dir}/full_guided" \
+        --output-dir "$guided_temporal_dir" \
+        --fps 20 \
+        --coupling-threshold 0.5 \
+        --moving-speed-threshold 0.15 \
+        --detail "$SUMMARY_DETAIL"
+    fi
+
+    echo
+    echo "[eval:${ckpt_name}] alignment to GT roundtrip -> ${alignment_dir}"
+    python scripts/stage_b_generator/measure_contact_alignment.py \
+      --generated-dir "${qual_dir}/full" \
+      --gt-dir "${gt_dir}/gt_roundtrip" \
+      --output-dir "$alignment_dir" \
+      --fps 20 \
+      --detail "$SUMMARY_DETAIL"
+
+    if [[ -d "${qual_dir}/full_guided" ]]; then
+      echo
+      echo "[eval:${ckpt_name}] guided alignment to GT roundtrip -> ${guided_alignment_dir}"
+      python scripts/stage_b_generator/measure_contact_alignment.py \
+        --generated-dir "${qual_dir}/full_guided" \
+        --gt-dir "${gt_dir}/gt_roundtrip" \
+        --output-dir "$guided_alignment_dir" \
+        --fps 20 \
+        --detail "$SUMMARY_DETAIL"
+    fi
   done
 else
   echo "EVAL=0, skipping offline eval."
@@ -153,5 +221,11 @@ for ckpt_name in $CKPTS; do
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_qual/summary.json"
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_contact_dist/summary.json"
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_temporal_coupling/summary.json"
+  echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_alignment_to_gt_roundtrip/summary.json"
+  if [[ "$GUIDANCE_STEPS" != "0" ]]; then
+    echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_qual/full_guided/{summary.json,guidance_trace.json,generated.npz}"
+    echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_temporal_coupling/summary.json"
+    echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_alignment_to_gt_roundtrip/summary.json"
+  fi
 done
 echo "  ${WANDB_OUTPUT}"

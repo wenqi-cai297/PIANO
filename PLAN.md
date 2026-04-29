@@ -13,14 +13,22 @@ GT VQ roundtrip is still `18.47 cm`, and temporal coupling barely moves
 Current diagnosis: `z_int` is active, and v14 proves that making the decoded
 auxiliary path harder and closer to sampling improves both one-shot spatial
 contact and the K-sample candidate pool. However, ordinary one-shot sampling
-still often fails to bind to the object's motion. v14 K=16 composite reaches
-`17.94 cm` after remeasure with moving-coupled `0.3715`, while v14 one-shot is
-`27.37 cm` / `0.2765`, so the next lever is selection or sample-time guidance.
+still often fails to bind to the object's motion, and K=64 alignment-aware
+selection shows the v14 pool usually lacks truly GT-aligned manipulation
+samples. The next lever is no longer pure reranking; it is the newly
+implemented v15 alignment/coupling branch plus full-RVQ decoded-motion
+guidance eval.
 
 Latest evaluated branch: v14 keeps v13's object-local `contact_target_xyz`
 trajectory loss, but takes decoded-aux logits from the all-mask MaskGIT/CFG
 first step and decodes with straight-through Gumbel hard codebook samples
 through the full residual RVQ path.
+
+Latest implemented branch, pending server results: v15 adds wrong-part margin
+and contact-segment consistency to the decoded target-trajectory loss, logs
+alignment metrics in train-time contact eval, selects `best_contact.pt` on
+`alignment_contact_score`, and runs `qual_eval.py --guidance-layers full_rvq`
+for sampling-time target guidance.
 
 ### 1. K-sample oracle
 
@@ -132,6 +140,25 @@ v14 K=16 diagnostics:
 | distance | 16.80 cm | 17.60 cm | 0.326 |
 | composite | 17.17 cm | 17.94 cm | 0.3715 |
 
+v14 K=64 alignment-aware oracle:
+
+| selection | saved-best remeasure | moving coupled | moving IoU | correct GT-part recall | same-part local pos error |
+|---|---:|---:|---:|---:|---:|
+| K=16 distance | 17.60 cm | 0.3260 | 0.4505 | 0.2305 | 46.42 cm |
+| K=16 composite | 17.94 cm | 0.3715 | 0.4472 | 0.2378 | 46.32 cm |
+| K=64 alignment | 18.71 cm | 0.3339 | 0.4516 | 0.2496 | 40.30 cm |
+
+The K=64 alignment oracle is a partial negative result. It lowers same-part
+object-local position error by about `6 cm` relative to K=16 composite, but
+does not improve moving contact IoU and worsens moving-coupled frame fraction.
+The candidate-capacity check is more important: the per-clip minimum primary
+alignment error over all 64 candidates is still `37.0 cm` on average, and the
+best moving same-part recall available in the K=64 pool is only `0.165` on
+average. Only about `9%` of clips with finite moving contact recall have any
+candidate reaching recall >= `0.5`; NeuralDome and OMOMO have none. This means
+the v14 distribution usually does not contain a GT-aligned manipulation sample,
+even with K=64.
+
 v14 K=16 composite by subset:
 
 | subset | contact | moving coupled |
@@ -187,7 +214,41 @@ neither selection aligns the generated body to the GT object-local contact
 trajectory. Guidance/reranking must become body-part and contact-target aware,
 not only "any tracked part near any object point."
 
-### 4. Soft-hard gap diagnostic
+### 4. v15 alignment-aware train/guidance branch
+
+Implementation is in place and should be the next server run.
+
+Runner:
+
+```bash
+bash scripts/stage_b_generator/run_v15_alignment_guided.sh
+```
+
+Primary code/config changes:
+
+- `src/piano/training/decoded_contact_loss.py`: adds `part_margin_weight`,
+  `part_margin_m`, `segment_consistency_weight`, and
+  `segment_consistency_moving_only` to the target-trajectory decoded loss.
+- `src/piano/training/contact_eval.py`: logs strict GT-part/object-local
+  alignment metrics and computes `alignment_contact_score`.
+- `src/piano/inference/contact_guidance.py`: adds
+  `guidance_layers="full_rvq"` so sampling-time guidance can optimize the full
+  generated RVQ stack, not only base logits.
+- `configs/training/generator_v15_alignment_guided.yaml`: enables the new loss
+  terms and uses `training.contact_eval.best_key: alignment_contact_score`.
+
+Decision criteria for success:
+
+- raw `best_contact` should improve v14's strict alignment baseline, especially
+  moving same-part recall (`0.2496`) and same-part local error (`40.30 cm`).
+- guided `full_guided` should improve alignment without destroying contact
+  distance/coupling; compare full vs full_guided on contact distance, temporal
+  coupling, and alignment-to-GT-roundtrip summaries.
+- If raw v15 improves but full-RVQ guidance does not, continue training-side
+  alignment. If guidance improves but raw v15 does not, treat sampling-time
+  decoded constraints as the active route.
+
+### 5. Soft-hard gap diagnostic
 
 Goal: directly measure whether C2b's soft decoded path is optimistic relative
 to the hard generated RVQ path.
@@ -249,13 +310,17 @@ Decision:
 
 Immediate branch:
 
-- Treat v14 K=16 composite as a strong spatial baseline but not a successful
-  interaction baseline: `17.94 cm`, moving-coupled `0.3715`, moving GT-contact
-  IoU `0.4472`, correct GT-part recall `0.2378`.
-- Use v14 `best_contact.pt` as the base checkpoint for full-RVQ sample-time
-  guidance through decoded motion, but guide against the predicted/conditioned
-  contact body part and object-local target trajectory rather than the old
-  any-part min-distance.
+- Treat v14 K=16 composite and K=64 alignment as strong diagnostic baselines,
+  not successful interaction baselines. K=64 alignment reaches `18.71 cm`
+  contact, moving-coupled `0.3339`, moving GT-contact IoU `0.4516`, correct
+  GT-part recall `0.2496`, and `40.30 cm` local error.
+- Do not spend the next iteration on more K/rerank-weight tuning alone. K=64
+  shows the v14 candidate distribution itself lacks enough aligned samples,
+  especially outside chairs.
+- Use v14 `best_contact.pt` as the base checkpoint for a v15 training or
+  full-RVQ sample-time-guidance branch that directly optimizes the
+  predicted/conditioned contact body part, object-local target trajectory, and
+  kinematic coupling rather than the old any-part min-distance.
 - Keep `measure_contact_alignment.py` as the paired readout with contact
   distance and temporal coupling. A real win must improve GT-aligned contact,
   not only lower mean-min distance.

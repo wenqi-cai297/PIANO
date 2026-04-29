@@ -11,10 +11,12 @@ the wrong checkpoint for the ship metric.
 
 This module provides a callable that, given a fixed mini-batch of val
 clips and the trained generator's components, returns a dict of
-contact metrics (the headline being ``mean_min_dist_per_frame``,
-averaged across the mini-batch). The trainer hooks this into
-``_run_validation`` so that ``best_contact.pt`` is saved alongside the
-existing ``best_val.pt``.
+contact metrics. Early Stage B used ``mean_min_dist_per_frame`` as the
+headline; v15 additionally reports strict GT-part/object-local alignment
+metrics so ``best_contact.pt`` can be selected by
+``alignment_contact_score`` when the visual failure is wrong part/patch.
+The trainer hooks this into ``_run_validation`` so that
+``best_contact.pt`` is saved alongside the existing ``best_val.pt``.
 
 Cost: ~1 sec per clip on bf16 / 2× A6000 (10-step base + 10-step
 residual MaskGIT decoding + VQ decode). For 20 clips × every val
@@ -55,6 +57,10 @@ from piano.data.pseudo_labels.extract_contact import (
     _kinematic_contact_score,
 )
 from piano.utils.smpl_utils import BODY_PART_NAMES
+from piano.training.decoded_contact_loss import (
+    _object_motion_speed_from_canonical,
+    body_canonical_to_object_local_torch,
+)
 
 
 # ============================================================================
@@ -281,6 +287,117 @@ def compute_clip_contact_and_temporal_metrics(
     }
 
 
+def _weighted_mean_or_none_torch(values: Tensor, weights: Tensor) -> float | None:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    denom = weights.sum()
+    if float(denom.detach().cpu()) <= 1e-6:
+        return None
+    return float(((values * weights).sum() / denom.clamp(min=1e-6)).detach().cpu())
+
+
+def _fraction_or_none_torch(mask: Tensor, denom_mask: Tensor) -> float | None:
+    denom = int(denom_mask.sum().detach().cpu())
+    if denom <= 0:
+        return None
+    num = int((mask & denom_mask).sum().detach().cpu())
+    return float(num) / float(denom)
+
+
+def compute_clip_contact_alignment_metrics(
+    motion_263_generated: np.ndarray,
+    contact_state: np.ndarray,
+    contact_target_xyz: np.ndarray,
+    obj_com_canonical: np.ndarray,
+    obj_rot6d_canonical: np.ndarray,
+    seq_len: int,
+    *,
+    recover_from_ric_fn: Callable,
+    fps: float = 20.0,
+    moving_speed_threshold: float = 0.15,
+    kin_radius_proxy: float = 0.3,
+    contact_threshold: float = 0.5,
+) -> dict[str, float | None]:
+    """Strict part/patch alignment metric for in-training contact eval.
+
+    This mirrors ``k_sample_oracle.py``'s alignment score: the generated body
+    part named by GT ``contact_state`` must reach that same part's
+    ``contact_target_xyz`` in object-local coordinates. It deliberately does
+    not minimize over arbitrary body parts or arbitrary object points.
+    """
+    T = min(
+        int(seq_len),
+        int(motion_263_generated.shape[0]),
+        int(contact_state.shape[0]),
+        int(contact_target_xyz.shape[0]),
+        int(obj_com_canonical.shape[0]),
+        int(obj_rot6d_canonical.shape[0]),
+    )
+    if T < 1:
+        return {
+            "alignment_primary_error": None,
+            "alignment_target_error": None,
+            "alignment_moving_target_error": None,
+            "alignment_same_part_recall": None,
+            "alignment_moving_same_part_recall": None,
+        }
+
+    motion_t = torch.from_numpy(motion_263_generated[:T]).float().unsqueeze(0)
+    joints = recover_from_ric_fn(motion_t, 22).float()
+    body_idx = torch.as_tensor(BODY_PART_INDICES, dtype=torch.long)
+    body = joints.index_select(dim=2, index=body_idx)
+
+    obj_com = torch.from_numpy(obj_com_canonical[:T]).float().unsqueeze(0)
+    obj_rot6d = torch.from_numpy(obj_rot6d_canonical[:T]).float().unsqueeze(0)
+    body_local = body_canonical_to_object_local_torch(body, obj_com, obj_rot6d)
+
+    target = torch.from_numpy(contact_target_xyz[:T]).float().unsqueeze(0)
+    contact = torch.from_numpy(contact_state[:T]).float().unsqueeze(0).clamp(0.0, 1.0)
+    contact_binary = contact >= float(contact_threshold)
+    frame_mask = torch.arange(T).view(1, T, 1) < int(seq_len)
+    valid_part = contact_binary & frame_mask
+    weights = contact * valid_part.to(dtype=body_local.dtype)
+
+    pos_dist = torch.linalg.vector_norm(body_local - target, dim=-1)
+    thresholds = torch.tensor(
+        [ContactConfig(fps=float(fps)).distance_thresholds[name] for name in BODY_PART_NAMES],
+        dtype=body_local.dtype,
+    ).view(1, 1, -1)
+    same_part_hit = pos_dist <= thresholds
+
+    obj_speed = _object_motion_speed_from_canonical(
+        obj_com,
+        obj_rot6d,
+        fps=float(fps),
+        radius_proxy=float(kin_radius_proxy),
+    )
+    moving = obj_speed >= float(moving_speed_threshold)
+    moving_valid = valid_part & moving[:, :, None]
+    moving_weights = weights * moving[:, :, None].to(dtype=body_local.dtype)
+
+    target_error = _weighted_mean_or_none_torch(pos_dist, weights)
+    moving_target_error = _weighted_mean_or_none_torch(pos_dist, moving_weights)
+    same_part_recall = _fraction_or_none_torch(same_part_hit, valid_part)
+    moving_same_part_recall = _fraction_or_none_torch(same_part_hit, moving_valid)
+
+    valid_frames = torch.any(valid_part, dim=-1)
+    moving_valid_frames = torch.any(moving_valid, dim=-1)
+    moving_frames = moving & (torch.arange(T).view(1, T) < int(seq_len))
+
+    return {
+        "alignment_primary_error": (
+            moving_target_error if moving_target_error is not None else target_error
+        ),
+        "alignment_target_error": target_error,
+        "alignment_moving_target_error": moving_target_error,
+        "alignment_same_part_recall": same_part_recall,
+        "alignment_moving_same_part_recall": moving_same_part_recall,
+        "alignment_contact_part_frame_frac": float(valid_frames.float().mean().item()),
+        "alignment_moving_contact_part_frame_frac": (
+            float(moving_valid_frames.sum().item()) / max(int(moving_frames.sum().item()), 1)
+        ),
+    }
+
+
 # ============================================================================
 # Generation (bf16-friendly, single-clip)
 # ============================================================================
@@ -367,6 +484,9 @@ def build_contact_eval_fn(
     composite_coupling_weight: float = 0.12,
     composite_uncoupled_penalty: float = 0.05,
     composite_min_moving_frame_frac: float = 0.05,
+    alignment_recall_penalty: float = 0.25,
+    alignment_distance_weight: float = 0.05,
+    alignment_coupling_weight: float = 0.0,
 ) -> Callable[[], dict[str, float]]:
     """Build a no-arg callable that evaluates contact distance on a fixed batch.
 
@@ -420,6 +540,10 @@ def build_contact_eval_fn(
     object_pc_cpu = fixed_val_batch["object_pc"].cpu().numpy().astype(np.float32)      # (N, N_pc, 3)
     object_positions_cpu = fixed_val_batch["object_positions"].cpu().numpy().astype(np.float32)
     object_rotations_cpu = fixed_val_batch["object_rotations"].cpu().numpy().astype(np.float32)
+    contact_state_cpu = fixed_val_batch["contact_state"].cpu().numpy().astype(np.float32)
+    contact_target_cpu = fixed_val_batch["contact_target_xyz"].cpu().numpy().astype(np.float32)
+    obj_com_canon_cpu = fixed_val_batch["obj_com_canonical"].cpu().numpy().astype(np.float32)
+    obj_rot6d_canon_cpu = fixed_val_batch["obj_rot6d_canonical"].cpu().numpy().astype(np.float32)
     texts: list[str] = list(fixed_val_batch["text"])
     n_clips = len(texts)
 
@@ -495,6 +619,22 @@ def build_contact_eval_fn(
                 coupling_threshold=float(coupling_threshold),
                 moving_speed_threshold=moving_speed_threshold,
             )
+            metrics.update(compute_clip_contact_alignment_metrics(
+                motion_263_generated=motion_gen,
+                contact_state=contact_state_cpu[i],
+                contact_target_xyz=contact_target_cpu[i],
+                obj_com_canonical=obj_com_canon_cpu[i],
+                obj_rot6d_canonical=obj_rot6d_canon_cpu[i],
+                seq_len=T,
+                recover_from_ric_fn=recover_from_ric,
+                fps=float(fps),
+                moving_speed_threshold=(
+                    float(moving_speed_threshold)
+                    if moving_speed_threshold is not None
+                    else 0.15
+                ),
+                kin_radius_proxy=float(ContactConfig(fps=float(fps)).kin_radius_proxy),
+            ))
             per_clip_metrics.append(metrics)
 
         if not per_clip_metrics:
@@ -513,6 +653,13 @@ def build_contact_eval_fn(
             "moving_coupled_frame_frac",
             "moving_close_but_uncoupled_frac",
             "moving_mean_best_kin_score",
+            "alignment_primary_error",
+            "alignment_target_error",
+            "alignment_moving_target_error",
+            "alignment_same_part_recall",
+            "alignment_moving_same_part_recall",
+            "alignment_contact_part_frame_frac",
+            "alignment_moving_contact_part_frame_frac",
         ):
             mean = _mean_finite([m.get(key) for m in per_clip_metrics])
             if mean is not None:
@@ -529,6 +676,24 @@ def build_contact_eval_fn(
             )
         else:
             out["composite_contact_score"] = out["mean_min_dist"]
+        primary = out.get("alignment_primary_error")
+        if primary is not None and np.isfinite(float(primary)):
+            recall = out.get("alignment_moving_same_part_recall")
+            if recall is None or not np.isfinite(float(recall)):
+                recall = out.get("alignment_same_part_recall", 0.0)
+            coupling_term = (
+                1.0 - float(coupled)
+                if coupled is not None and np.isfinite(float(coupled))
+                else 0.0
+            )
+            out["alignment_contact_score"] = (
+                float(primary)
+                + float(alignment_recall_penalty) * (1.0 - float(recall or 0.0))
+                + float(alignment_distance_weight) * float(out["mean_min_dist"])
+                + float(alignment_coupling_weight) * coupling_term
+            )
+        else:
+            out["alignment_contact_score"] = out["composite_contact_score"]
         return out
 
     return eval_fn

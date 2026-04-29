@@ -22,6 +22,11 @@ generator, optimize the base-token logits in *decoded geometric space*
 against `contact_target_xyz_gt`, then argmax + standard residual decode.
 No model weight changes; runs on `v0.6 best_val.pt` as-is.
 
+v15 adds `guidance_layers="full_rvq"` for the current alignment failure mode:
+the optimized variable can be the complete generated base+residual RVQ stack,
+then the full stack is argmax-decoded directly. This is the final-stage
+full-RVQ counterpart to MaskControl-style decoded-space guidance.
+
 Recipe (verified from `exitudio/ControlMM` source)
 --------------------------------------------------
 
@@ -144,6 +149,44 @@ def _decode_relaxed_base(
     x = x_emb.permute(0, 2, 1)                                                # (B, d, S)
 
     return vq_model.decoder(x)                                                # (B, T, 263)
+
+
+def _force_pad_logits_to_zero_token(logits: Tensor, token_mask: Tensor) -> Tensor:
+    """Force padded token slots to code id 0 for every RVQ layer."""
+    pad_logits = torch.full_like(logits, -30.0)
+    pad_logits[..., 0] = 30.0
+    return torch.where(token_mask[..., None], logits, pad_logits)
+
+
+def _decode_relaxed_full_rvq(
+    rvq_logits: Tensor,              # (B, S, Q, V)
+    vq_model: torch.nn.Module,
+    *,
+    token_mask: Tensor,              # (B, S)
+    temperature: float = 1.0,
+) -> Tensor:
+    """Differentiably decode relaxed logits for every RVQ layer.
+
+    This is the final-stage full-RVQ analogue of MaskControl-style logit
+    optimization: all quantizer layers can move in decoded geometric space,
+    instead of freezing residual ids while only base ids are optimized.
+    """
+    quantizer = vq_model.quantizer
+    codebooks = quantizer.codebooks                                           # (Q, V, d)
+    Q, V = int(codebooks.shape[0]), int(codebooks.shape[1])
+    if rvq_logits.ndim != 4:
+        raise ValueError(f"rvq_logits must be (B, S, Q, V), got {tuple(rvq_logits.shape)}")
+    if int(rvq_logits.shape[2]) != Q:
+        raise ValueError(f"rvq_logits has Q={rvq_logits.shape[2]}, VQ model has Q={Q}")
+    if int(rvq_logits.shape[3]) < V:
+        raise ValueError(f"rvq_logits vocab {rvq_logits.shape[3]} is smaller than codebook {V}")
+
+    logits = rvq_logits[..., :V]
+    logits = _force_pad_logits_to_zero_token(logits, token_mask[:, :, None])
+    probs = F.softmax(logits / max(float(temperature), 1e-6), dim=-1)
+    layer_emb = torch.einsum("bsqv,qvd->bsqd", probs, codebooks)
+    x_emb = layer_emb.sum(dim=2)
+    return vq_model.decoder(x_emb.permute(0, 2, 1))
 
 
 # ============================================================================
@@ -384,6 +427,7 @@ def guide_with_contact(
     loss_mode: str = "target",       # "target" or "metric"
     residual_seed: int | None = None,
     no_residual_rerun: bool = False,
+    guidance_layers: str = "base",   # "base" or "full_rvq"
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -438,6 +482,10 @@ def guide_with_contact(
     transformer.eval()
     vq_model.eval()
     res_transformer.eval()
+    if guidance_layers not in {"base", "full_rvq"}:
+        raise ValueError(
+            f"guidance_layers must be 'base' or 'full_rvq', got {guidance_layers!r}",
+        )
 
     # --- Step 1: baseline generation (no grad) ---
     with torch.no_grad():
@@ -487,8 +535,10 @@ def guide_with_contact(
             {"skipped": "no_contact_frames", "loss_initial": float("nan"),
              "loss_final": float("nan"), "steps_taken": 0,
              "base_token_change_count": 0,
+             "rvq_token_change_count": 0,
              "residual_seed": residual_seed,
-             "no_residual_rerun": bool(no_residual_rerun)},
+             "no_residual_rerun": bool(no_residual_rerun),
+             "guidance_layers": guidance_layers},
         )
 
     # Pre-compute the world-frame loss reference ONCE (constant across
@@ -545,11 +595,27 @@ def guide_with_contact(
     # cheaper approximation).
     V = vq_model.quantizer.codebooks.shape[1]                                 # 512
     S = base_for_res.shape[-1]
-    logits = F.one_hot(base_for_res.long(), num_classes=V).float() * init_logit_scale
-    logits = logits.detach().clone().requires_grad_(True)                     # (1, S, V)
-
-    # Detached residual indices (Q-1 layers).
-    residual_ids = all_for_decode[..., 1:].detach()                           # (1, S, Q-1)
+    token_mask = (
+        torch.arange(S, device=device).unsqueeze(0)
+        < m_lens_tok.to(device=device).long().clamp(min=1).unsqueeze(1)
+    )
+    if guidance_layers == "base":
+        logits = F.one_hot(base_for_res.long(), num_classes=V).float() * init_logit_scale
+        logits = logits.detach().clone().requires_grad_(True)                 # (1, S, V)
+        # Detached residual indices (Q-1 layers).
+        residual_ids = all_for_decode[..., 1:].detach()                       # (1, S, Q-1)
+    else:
+        # Full-RVQ final-stage guidance. We initialize from the generated
+        # base+residual stack and let every quantizer layer move through the
+        # frozen VQ decoder. This is the path to use when residual layers are
+        # part of the observed contact misalignment.
+        logits = (
+            F.one_hot(all_for_decode.long().clamp(min=0, max=int(V) - 1), num_classes=V)
+            .float()
+            * init_logit_scale
+        )
+        logits = logits.detach().clone().requires_grad_(True)                 # (1, S, Q, V)
+        residual_ids = None
 
     # --- Step 3: optimization loop ---
     optimizer = torch.optim.AdamW(
@@ -560,12 +626,20 @@ def guide_with_contact(
     loss_initial: float = float("nan")
     loss_trace: list[float] = []
     for step in range(num_guidance_steps):
-        motion_norm = _decode_relaxed_base(
-            base_logits=logits,
-            residual_ids=residual_ids,
-            vq_model=vq_model,
-            temperature=guidance_temperature,
-        )                                                                      # (1, T, 263)
+        if guidance_layers == "base":
+            motion_norm = _decode_relaxed_base(
+                base_logits=logits,
+                residual_ids=residual_ids,
+                vq_model=vq_model,
+                temperature=guidance_temperature,
+            )                                                                  # (1, T, 263)
+        else:
+            motion_norm = _decode_relaxed_full_rvq(
+                rvq_logits=logits,
+                vq_model=vq_model,
+                token_mask=token_mask,
+                temperature=guidance_temperature,
+            )                                                                  # (1, T, 263)
         motion = motion_norm * motion_std + motion_mean
         joints_canon = recover_from_ric(motion, 22)                            # (1, T, 22, 3)
         joints_world = _lift_canonical_to_world_torch(joints_canon, R_y_angle, T_xz)
@@ -604,37 +678,54 @@ def guide_with_contact(
 
     # --- Step 4: argmax + (optionally) re-run residual on possibly-changed base ---
     with torch.no_grad():
-        base_ids_after = logits.argmax(dim=-1)                                 # (1, S)
-        token_change_count = int(
-            (base_ids_after != base_for_res).sum().item(),
-        )
+        if guidance_layers == "base":
+            base_ids_after = logits.argmax(dim=-1)                             # (1, S)
+            token_change_count = int(
+                ((base_ids_after != base_for_res) & token_mask).sum().item(),
+            )
+            rvq_token_change_count = token_change_count
 
-        if no_residual_rerun:
-            # Skip res_transformer.generate; reuse baseline residual_ids
-            # (already detached; pad already 0).
-            all_for_decode_after = _build_decode_ids_with_baseline_residuals(
-                base_ids_after=base_ids_after,
-                baseline_residual_ids=residual_ids,
-                m_lens_tok=m_lens_tok,
-            )
+            if no_residual_rerun:
+                # Skip res_transformer.generate; reuse baseline residual_ids
+                # (already detached; pad already 0).
+                all_for_decode_after = _build_decode_ids_with_baseline_residuals(
+                    base_ids_after=base_ids_after,
+                    baseline_residual_ids=residual_ids,
+                    m_lens_tok=m_lens_tok,
+                )
+            else:
+                # Existing path: re-run residual on the post-guidance base.
+                # Re-seed (same value as Step 1) so any contact delta is NOT
+                # attributable to Gumbel-noise drift between the two calls.
+                if residual_seed is not None:
+                    torch.manual_seed(int(residual_seed))
+                all_ids_after = _generate_residual_tokens(
+                    res_transformer,
+                    motion_ids=base_ids_after,
+                    text=text,
+                    m_lens_tok=m_lens_tok,
+                    int_kv=int_kv,
+                    int_pad=int_pad,
+                    res_cond_scale=res_cond_scale,
+                )
+                all_for_decode_after = torch.where(
+                    all_ids_after < 0, torch.zeros_like(all_ids_after), all_ids_after,
+                )
         else:
-            # Existing path: re-run residual on the post-guidance base.
-            # Re-seed (same value as Step 1) so any contact delta is NOT
-            # attributable to Gumbel-noise drift between the two calls.
-            if residual_seed is not None:
-                torch.manual_seed(int(residual_seed))
-            all_ids_after = _generate_residual_tokens(
-                res_transformer,
-                motion_ids=base_ids_after,
-                text=text,
-                m_lens_tok=m_lens_tok,
-                int_kv=int_kv,
-                int_pad=int_pad,
-                res_cond_scale=res_cond_scale,
+            all_ids_after = logits.argmax(dim=-1)                               # (1, S, Q)
+            all_ids_after = torch.where(
+                token_mask[:, :, None],
+                all_ids_after,
+                torch.zeros_like(all_ids_after),
             )
-            all_for_decode_after = torch.where(
-                all_ids_after < 0, torch.zeros_like(all_ids_after), all_ids_after,
+            base_ids_after = all_ids_after[..., 0]
+            token_change_count = int(
+                ((base_ids_after != base_for_res) & token_mask).sum().item(),
             )
+            rvq_token_change_count = int(
+                ((all_ids_after != all_for_decode) & token_mask[:, :, None]).sum().item(),
+            )
+            all_for_decode_after = all_ids_after
 
         motion = vq_model.forward_decoder(all_for_decode_after)
         motion = motion.squeeze(0) * motion_std + motion_mean
@@ -648,7 +739,10 @@ def guide_with_contact(
             "loss_trace": loss_trace,
             "steps_taken": len(loss_trace),
             "base_token_change_count": token_change_count,
+            "rvq_token_change_count": rvq_token_change_count,
             "base_token_total": int(S),
+            "rvq_token_total": int(S * all_for_decode.shape[-1]),
+            "guidance_layers": guidance_layers,
             "residual_seed": residual_seed,
             "no_residual_rerun": bool(no_residual_rerun),
         },

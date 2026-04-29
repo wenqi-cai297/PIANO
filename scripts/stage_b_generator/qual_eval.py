@@ -561,6 +561,15 @@ def main() -> int:
              "forfeits any 'base flip → residual self-adapts' gain "
              "(e.g., v4 largebox_010 -14cm may have come from this).",
     )
+    parser.add_argument(
+        "--guidance-layers",
+        choices=["base", "full_rvq"],
+        default="base",
+        help="Which token logits to optimize during contact guidance. "
+             "'base' preserves the original B3 path; 'full_rvq' optimizes "
+             "the full generated base+residual RVQ stack in decoded space "
+             "and decodes that stack directly.",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument(
@@ -750,6 +759,7 @@ def main() -> int:
             f"\n=== Generating 'full_guided' condition with contact guidance "
             f"({args.guidance_steps} steps, lr={args.guidance_lr}, "
             f"init_scale={args.guidance_init_scale}, loss={args.guidance_loss}, "
+            f"layers={args.guidance_layers}, "
             f"residual_seed={args.guidance_residual_seed}, "
             f"no_residual_rerun={args.guidance_no_residual_rerun}) ===",
         )
@@ -799,13 +809,16 @@ def main() -> int:
                 loss_mode=args.guidance_loss,
                 residual_seed=args.guidance_residual_seed,
                 no_residual_rerun=args.guidance_no_residual_rerun,
+                guidance_layers=args.guidance_layers,
                 device=device,
             )
             print(
                 f"    guidance: loss {info['loss_initial']:.4f} → "
                 f"{info['loss_final']:.4f} | "
                 f"tokens changed: {info['base_token_change_count']}/"
-                f"{info['base_token_total']}",
+                f"{info['base_token_total']} base, "
+                f"{info.get('rvq_token_change_count', 0)}/"
+                f"{info.get('rvq_token_total', info['base_token_total'])} rvq",
             )
             per_clip_guided.append({
                 "full": {
@@ -840,6 +853,7 @@ def main() -> int:
             "guidance_lr": float(args.guidance_lr),
             "guidance_init_scale": float(args.guidance_init_scale),
             "guidance_loss": str(args.guidance_loss),
+            "guidance_layers": str(args.guidance_layers),
             "residual_seed": (
                 None if args.guidance_residual_seed is None
                 else int(args.guidance_residual_seed)
