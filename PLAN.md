@@ -13,8 +13,9 @@ K=16 best-of-K reaches `17.93 cm` mean contact, with `70%` of clips under
 Current diagnosis: `z_int` is active, and the learned distribution is not
 fundamentally blind to object position. However, visual review shows
 distance-only reranking is not enough: the body is near the object, but its
-action timing often does not bind to the object's motion. The next problem is
-sample-time temporal coupling/guidance, not just spatial proximity. This
+action timing often does not bind to the object's motion. Composite K=16
+reranking improves this only modestly, so the next problem is temporal
+binding in generation/training, not just choosing a different rerank weight. This
 matches recent HOI/control literature: OMOMO uses hand positions as an
 intermediate representation, InterDiff inserts interaction correction during
 denoising, CHOIS applies contact guidance during sampling, and MaskControl uses
@@ -78,6 +79,20 @@ Decision: distance-only reranking is insufficient as the final baseline. The
 next no-retrain baseline should rerank samples by a composite of contact
 distance and kinematic coupling.
 
+Composite K=16 result:
+
+| metric | distance K=16 | composite K=16 |
+|---|---:|---:|
+| contact mean | 17.93 cm | 18.08 cm |
+| moving coupled frame frac | 0.323 | 0.351 |
+| close but uncoupled moving frac | 0.245 | 0.222 |
+
+Only `12/80` selections changed. Offline rescoring shows even a max-coupled
+oracle over the stored K=16 candidates reaches only about `0.390` moving
+coupled frame fraction, at `20.67 cm` contact. This means the K=16 pool itself
+does not contain enough strongly coupled samples. IMHD is the main blocker:
+only `2/20` moving IMHD clips have any K=16 candidate with coupling >= `0.5`.
+
 ### 3. Soft-hard gap diagnostic
 
 Goal: directly measure whether C2b's soft decoded path is optimistic relative
@@ -140,25 +155,13 @@ Decision:
 
 Immediate branch:
 
-- Implement composite best-of-K reranking: distance + moving-object kinematic
-  coupling.
-- Compare distance-only K=16 vs composite K=16 on the same 80 clips.
-- Prioritize IMHD and NeuralDome hard cases, where temporal coupling is weakest.
-
-Composite rerank runner:
-
-```bash
-python scripts/stage_b_generator/k_sample_oracle.py \
-  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
-  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
-  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
-  --num-clips-per-subset 20 \
-  --k 16 \
-  --selection-metric composite \
-  --coupling-weight 0.12 \
-  --uncoupled-penalty 0.05 \
-  --save-best
-```
+- Stop treating reranking as the main lever; use it as a diagnostic readout.
+- Add a training or inference mechanism that increases temporally coupled
+  samples in the distribution.
+- First target IMHD baseball/suitcase and NeuralDome racket/object-carry cases.
+- Candidate mechanisms: decoded kinematic-coupling loss, contact target
+  trajectory loss in object-local coordinates, or full-RVQ sample-time guidance
+  through decoded motion.
 
 Secondary diagnostics, only if reranked samples fail visually or hard subsets
 remain unacceptable:

@@ -12,8 +12,10 @@ oracle reaches `17.93 cm`, essentially the GT VQ roundtrip band (`18.47 cm`).
 Do not continue blind parameter sweeps. The K=16 result solved only spatial
 proximity. Visual review shows a more specific remaining failure: the generated
 body is near the object, but its action is often not temporally bound to the
-object's motion. The main path is now no-retrain composite reranking/guidance
-that scores both contact distance and moving-object kinematic coupling.
+object's motion. Composite K=16 reranking improves moving-object coupling only
+modestly, so it should be treated as a diagnostic readout rather than the main
+solution. The next main path is to change training or inference so the generated
+distribution contains more temporally coupled manipulation samples.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
@@ -258,6 +260,46 @@ This confirms the visual assessment. Distance-only contact is not a sufficient
 proxy for "the person is manipulating the object." IMHD is the clearest failure
 mode.
 
+Composite K=16 reranking result:
+
+| metric | distance K=16 | composite K=16 |
+|---|---:|---:|
+| contact mean | 17.93 cm | 18.08 cm |
+| contact median | 14.50 cm | 14.74 cm |
+| under 22 cm | 70% | 70% |
+| under 25 cm | 80% | 80% |
+| moving coupled frame frac | 0.323 | 0.351 |
+| close but uncoupled moving frac | 0.245 | 0.222 |
+
+Composite reranking changed only `12/80` selected samples. Among changed clips,
+average contact distance worsened by about `0.99 cm`, while moving-coupled
+frame fraction improved strongly on those clips. The aggregate gain remains
+small because most selected samples are unchanged and the K=16 pool rarely
+contains strongly coupled candidates for IMHD.
+
+Offline rescoring of the stored K=16 candidates gives the practical ceiling:
+
+| selection rule | contact mean | moving coupled frac |
+|---|---:|---:|
+| distance-only | 17.93 cm | 0.325 |
+| current composite | 18.08 cm | 0.354 |
+| high coupling weight ~1.0 | 19.36 cm | 0.386 |
+| max-coupled oracle | 20.67 cm | 0.390 |
+
+Per-subset max-coupled capacity within K=16:
+
+| subset | max-coupled mean | contact at max-coupled | clips with any >=0.5 |
+|---|---:|---:|---:|
+| chairs | 0.838 | 6.99 cm | 3/3 moving clips |
+| imhd | 0.180 | 37.53 cm | 2/20 |
+| neuraldome | 0.368 | 27.91 cm | 5/17 |
+| omomo_correct_v2 | 0.456 | 18.27 cm | 7/20 |
+
+Conclusion: more rerank-weight sweeps are unlikely to solve Stage B. The model
+needs a temporal-binding mechanism: decoded kinematic-coupling/local-frame
+stability loss, contact-target trajectory loss in object-local coordinates, or
+full-RVQ sample-time guidance through decoded motion.
+
 ## v0.12 Full Table
 
 | ckpt | full | text_only | swap |
@@ -321,36 +363,20 @@ Core code:
 
 ## Next Work
 
-### 1. Composite K-sample reranking
+### 1. Temporal-binding mechanism
 
-Question: can no-retrain selection pick samples that are both close to the
-object and temporally coupled to object motion?
+Question: can training or inference make the generated distribution contain
+samples where the relevant body part is stable in the moving object's local
+frame?
 
-Compare on the same 80 clips:
+Most promising options:
 
-- distance-only K=16 selection;
-- composite K=16 selection: contact distance + moving-object kinematic
-  coupling;
-- optional K=32 on IMHD/NeuralDome hard cases.
+- decoded kinematic-coupling/local-frame stability objective on moving-object
+  frames;
+- contact-target trajectory loss in object-local coordinates;
+- full-RVQ sample-time guidance through decoded motion, not base logits only.
 
-Runner:
-
-```bash
-python scripts/stage_b_generator/k_sample_oracle.py \
-  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
-  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
-  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
-  --num-clips-per-subset 20 \
-  --k 16 \
-  --selection-metric composite \
-  --coupling-weight 0.12 \
-  --uncoupled-penalty 0.05 \
-  --save-best
-```
-
-If composite selection improves videos, make it the no-retrain Stage B
-baseline and use it to decide whether a learned scorer or decoded coupling
-objective is worth training.
+Use composite K-sample reranking only as the readout after these changes.
 
 ### 2. Hard-case follow-up
 
@@ -404,12 +430,13 @@ Start with IMHD because its 80-clip codebook gap is `14.13 cm`.
 
 ## Decision Rules
 
-- K-sample oracle worked spatially: add reranking/guidance/scoring.
+- K-sample oracle worked spatially: the model can place bodies near objects.
 - Distance-only visual review failed temporally: do not ship distance-only
   reranking as Stage B.
-- If composite reranking passes visual review: make it the Stage B baseline.
-- If composite reranking also fails: run soft-hard/RVQ mixed diagnostics before
-  more training.
+- Composite reranking only modestly improves coupling: do not spend the next
+  main iteration on rerank-weight sweeps.
+- Next main path: change training/inference so generated samples are temporally
+  coupled to object motion, then keep composite reranking as the readout.
 - If soft-hard gap is large: use hard/ST-Gumbel consistency or full-RVQ
   logits/embedding optimization.
 - If base mixed oracle fails: base MaskTransformer/conditioning is the target.

@@ -17,6 +17,11 @@ The visual review then sharpened the diagnosis: distance-only reranking is not
 enough. The body is near the object and roughly aware of its coordinates, but
 the action is often not temporally bound to the object's motion.
 
+The composite K=16 reranker confirms this is not just a rerank-weight issue:
+moving-coupled frame fraction rises only from `0.323` to `0.351`, while contact
+stays near GT roundtrip (`17.93 cm` -> `18.08 cm`). Even offline max-coupled
+selection over the same K=16 candidates reaches only about `0.390`.
+
 Current framing: this is not simply "contact loss too weak" and not primarily
 "the model cannot generate contact." The failure is that ordinary sampling and
 distance-only selection do not reliably choose samples where the body part moves
@@ -85,6 +90,26 @@ By subset, moving-coupled frame fraction is `0.665` chairs, `0.134` IMHD,
 distance alone can select "near the object" samples without selecting true
 manipulation.
 
+Composite K=16:
+
+| metric | distance K=16 | composite K=16 |
+|---|---:|---:|
+| contact mean | 17.93 cm | 18.08 cm |
+| moving coupled frame frac | 0.323 | 0.351 |
+| close but uncoupled moving frac | 0.245 | 0.222 |
+
+K=16 pool capacity check:
+
+| subset | max-coupled mean | clips with any >=0.5 |
+|---|---:|---:|
+| chairs | 0.838 | 3/3 moving |
+| imhd | 0.180 | 2/20 |
+| neuraldome | 0.368 | 5/17 |
+| omomo_correct_v2 | 0.456 | 7/20 |
+
+This is evidence against spending the next iteration on more rerank-weight
+tuning. The distribution must produce more temporally coupled samples.
+
 ## What Already Worked
 
 - MoMask encoder normalization fix: repaired token/body collapse.
@@ -126,13 +151,12 @@ for weak moving-object coupling and close-but-uncoupled frames.
 
 Decision rules:
 
-- K-sample oracle succeeded spatially: build reranking/guidance around the
-  existing distribution.
-- Distance-only visual review failed temporally: replace distance-only
-  reranking with composite distance + kinematic-coupling reranking.
-- Composite reranking passes: make it the no-retrain Stage B baseline.
-- Composite reranking fails: use soft-hard/RVQ mixed diagnostics before more
-  training.
+- K-sample oracle succeeded spatially: the model can place bodies near objects.
+- Distance-only visual review failed temporally: spatial proximity is not enough.
+- Composite reranking only modestly improved coupling: do not spend another
+  main iteration on rerank-weight sweeps.
+- Next main path: change training/inference so generated samples are temporally
+  coupled to object motion, then keep composite reranking as the readout.
 - Soft-hard gap is large: move decoded contact closer to hard sampling with
   ST-Gumbel/DES-style consistency or full-RVQ logits/embedding optimization.
 - RVQ mixed oracle identifies base bottleneck: focus MaskTransformer/base

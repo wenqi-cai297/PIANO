@@ -7,7 +7,7 @@ Compact project memory as of 2026-04-29.
 Recent Stage B diagnostic code commit:
 
 ```text
-52bdc16 Add Stage B K-sample oracle diagnostic
+c4b2f50 Add Stage B temporal coupling rerank diagnostic
 ```
 
 Tracked git state was clean before the K-sample result documentation update.
@@ -28,12 +28,15 @@ Matched 80-clip contact eval:
 | v12 w02 best_val full | 31.82 cm |
 | v12 w02 best_val text_only | 64.85 cm |
 | v12 w02 best_val swap | 74.01 cm |
-| v12 w02 K=16 best-of-K oracle | 17.93 cm |
+| v12 w02 K=16 distance oracle | 17.93 cm |
+| v12 w02 K=16 composite oracle | 18.08 cm |
 
 Bottom line: Stage B has a real `z_int` signal, and the v12 generator
 distribution already contains close-to-object samples. The remaining gap is
-temporal/physical binding: contact-distance reranking puts the body near the
-object, but videos show the generated body often does not move with the object.
+temporal/physical binding: distance reranking puts the body near the object,
+but composite K=16 only modestly improves moving-object coupling. This is now
+evidence that the K=16 sample pool itself rarely contains strongly coupled
+manipulation, especially on IMHD.
 
 2026-04-29 follow-up analysis: the problem is likely not missing contact
 supervision. The current loss already includes base CE, residual CE, and a
@@ -104,6 +107,7 @@ Stage C Joint Finetune:
 | K=16 oracle | best-of-K 17.93 cm on 80 clips | reranking/guidance becomes main path |
 | K=16 visual review | body is near object but weakly synchronized to object motion | distance-only reranking is insufficient |
 | temporal coupling metric | moving coupled frame frac 0.323 | optimize/rerank for coupling, not only distance |
+| K=16 composite oracle | coupled frac 0.351, contact 18.08 cm | only modest gain; K=16 pool lacks enough coupled samples |
 
 ## v0.12 Details
 
@@ -206,6 +210,44 @@ Subset coupling:
 This supports the user's visual assessment: distance-only contact is not a
 strong enough proxy for "the person is actually manipulating the object."
 
+Composite K=16 reranking result:
+
+| metric | distance K=16 | composite K=16 |
+|---|---:|---:|
+| contact mean | 17.93 cm | 18.08 cm |
+| contact median | 14.50 cm | 14.74 cm |
+| under 22 cm | 70% | 70% |
+| under 25 cm | 80% | 80% |
+| moving coupled frame frac | 0.323 | 0.351 |
+| close but uncoupled moving frac | 0.245 | 0.222 |
+
+Composite reranking changed only `12/80` selected samples. Among changed clips,
+average contact distance worsened by only `0.99 cm`, while moving-coupled frame
+fraction improved by `0.554`. The aggregate gain is small because most clips
+kept the same sample and IMHD has weak coupled candidates in the K=16 pool.
+
+Offline rerank over the stored K=16 candidate scores shows the ceiling:
+
+| selection rule | contact mean | moving coupled frac |
+|---|---:|---:|
+| distance-only | 17.93 cm | 0.325 |
+| current composite | 18.08 cm | 0.354 |
+| high coupling weight ~1.0 | 19.36 cm | 0.386 |
+| max-coupled oracle | 20.67 cm | 0.390 |
+
+Per-subset max-coupled capacity within K=16:
+
+| subset | max-coupled mean | contact at max-coupled | clips with any >=0.5 |
+|---|---:|---:|---:|
+| chairs | 0.838 | 6.99 cm | 3/3 moving clips |
+| imhd | 0.180 | 37.53 cm | 2/20 |
+| neuraldome | 0.368 | 27.91 cm | 5/17 |
+| omomo_correct_v2 | 0.456 | 18.27 cm | 7/20 |
+
+Conclusion: tuning rerank weights is not enough. The model distribution needs
+stronger temporal-binding generation or training; IMHD/baseball/suitcase cases
+are the clearest blockers.
+
 Subset decomposition for v12 w02 best_val:
 
 | subset | GT orig | GT roundtrip | full | codebook gap | model gap |
@@ -222,27 +264,11 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Run the new composite K-sample reranker, which scores both contact distance
-   and temporal coupling during moving-object frames.
-2. Compare distance-only K=16 vs composite K=16 on the same 80 clips.
-3. If composite reranking improves videos, use it as the no-retrain Stage B
-   baseline and then decide whether to train a lightweight scorer or add a
-   decoded kinematic-coupling objective.
-
-Composite runner:
-
-```bash
-python scripts/stage_b_generator/k_sample_oracle.py \
-  --config runs/sweeps/stageB_v12_decoded_contact_weight_sweep/configs/generator_v12_decoded_contact_w02_diagnostics.yaml \
-  --ckpt runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt \
-  --output-dir runs/eval/stageB_v0_12_w02_bv_k16_composite_oracle \
-  --num-clips-per-subset 20 \
-  --k 16 \
-  --selection-metric composite \
-  --coupling-weight 0.12 \
-  --uncoupled-penalty 0.05 \
-  --save-best
-```
+1. Do not continue rerank-weight sweeps as the main path.
+2. Add a decoded kinematic-coupling / local-frame stability objective or an
+   inference-time full-RVQ coupling guidance step.
+3. Use composite reranking as a diagnostic/readout, not as the final Stage B
+   solution.
 
 Secondary diagnostics:
 
