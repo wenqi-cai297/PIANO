@@ -362,6 +362,21 @@ Script:
   selects by contact distance plus moving-object coupling)
 - `scripts/stage_b_generator/measure_temporal_coupling.py`
 
+Logging/eval hygiene:
+
+- v13 training now reports only decision metrics by default: total/base/
+  residual/decoded losses, aggregate base/residual accuracy, decoded target
+  position/velocity/soft-distance, gate magnitudes, and contact eval
+  `composite_contact_score`, `mean_min_dist`, `moving_close`,
+  `moving_coupled`, `close_uncoupled`, `n_clips`.
+- Per-RVQ-layer residual metrics and gradient-norm probes are disabled in
+  `generator_v13_target_trajectory_contact.yaml`; re-enable them only for a
+  targeted residual-stack or gradient-scale diagnostic.
+- `qual_eval.py`, `measure_contact_distance.py`,
+  `measure_temporal_coupling.py`, and `diagnose_rvq_paths.py` write compact
+  JSON by default. Use `--detail full` or `--summary-detail full` when per-clip
+  rows are needed.
+
 Core code:
 
 - `src/piano/training/train_generator.py`

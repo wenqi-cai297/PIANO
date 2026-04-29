@@ -288,6 +288,15 @@ def _trainable_params(module: nn.Module) -> tuple[nn.Parameter, ...]:
     return tuple(params)
 
 
+def _cfg_str_list(cfg_section, key: str) -> list[str] | None:
+    raw = cfg_section.get(key, None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return [str(item) for item in list(raw)]
+
+
 def _grad_l2_norm(loss: Tensor, params: tuple[nn.Parameter, ...]) -> Tensor:
     if not loss.requires_grad or not params:
         return loss.detach().new_zeros(())
@@ -1052,6 +1061,9 @@ def run(config_path: str) -> None:
             contact_eval_cfg.get("best_key", "mean_min_dist")
             if contact_eval_cfg is not None else "mean_min_dist"
         ),
+        train_report_keys=_cfg_str_list(cfg.logging, "train_report_keys"),
+        val_report_keys=_cfg_str_list(cfg.logging, "val_report_keys"),
+        contact_report_keys=_cfg_str_list(cfg.logging, "contact_report_keys"),
     )
 
 

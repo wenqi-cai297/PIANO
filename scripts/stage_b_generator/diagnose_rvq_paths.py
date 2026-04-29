@@ -299,6 +299,15 @@ def main() -> int:
         default=1234,
         help="Seed before standard residual sampling; use -1 to leave RNG free.",
     )
+    parser.add_argument(
+        "--detail",
+        choices=["compact", "full"],
+        default="compact",
+        help=(
+            "diagnostic_summary.json detail level. compact stores aggregate "
+            "path-gap metrics only; full also stores clip selection and per-clip rows."
+        ),
+    )
     args = parser.parse_args()
 
     if args.device is None:
@@ -496,6 +505,7 @@ def main() -> int:
         )
 
     summary = {
+        "schema": f"stage_b_rvq_path_diagnostics_{args.detail}_v1",
         "config": str(args.config),
         "ckpt": str(args.ckpt),
         "num_clips": len(samples),
@@ -503,8 +513,6 @@ def main() -> int:
         "w_text": float(args.w_text),
         "w_int": float(args.w_int),
         "conditions": CONDITION_NAMES,
-        "clip_selection": selected_rows,
-        "per_clip": per_clip_report,
         "aggregate": {
             key: float(np.mean([row[key] for row in per_clip_report]))
             for key in [
@@ -520,6 +528,9 @@ def main() -> int:
             ]
         },
     }
+    if args.detail == "full":
+        summary["clip_selection"] = selected_rows
+        summary["per_clip"] = per_clip_report
     with (args.output_dir / "diagnostic_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

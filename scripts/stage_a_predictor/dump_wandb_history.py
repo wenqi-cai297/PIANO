@@ -52,6 +52,20 @@ def _parse_run_path(s: str) -> str:
     )
 
 
+def _parse_columns(raw: list[str] | None) -> list[str]:
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw:
+        for col in chunk.split(","):
+            col = col.strip()
+            if col and col not in seen:
+                out.append(col)
+                seen.add(col)
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -84,6 +98,15 @@ def main() -> int:
     parser.add_argument(
         "--samples", type=int, default=None,
         help="cap on number of history rows fetched (default: all)",
+    )
+    parser.add_argument(
+        "--columns",
+        action="append",
+        default=None,
+        help=(
+            "comma-separated allow-list of columns to write. Can be repeated. "
+            "When omitted, the full wandb history is exported."
+        ),
     )
     parser.add_argument(
         "--print-summary", action="store_true",
@@ -149,6 +172,19 @@ def main() -> int:
     if args.samples is not None:
         history_kwargs["samples"] = args.samples
     df = run.history(**history_kwargs)
+    columns = _parse_columns(args.columns)
+    if columns:
+        keep = [c for c in columns if c in df.columns]
+        if "_step" in df.columns and "_step" not in keep:
+            keep.insert(0, "_step")
+        missing = [c for c in columns if c not in df.columns]
+        df = df.loc[:, keep]
+        if missing:
+            print(
+                "Warning: requested columns absent from run history: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
@@ -160,8 +196,11 @@ def main() -> int:
         print(f"  state:    {run.state}")
         print(f"  runtime:  {run.summary.get('_runtime', 'n/a')} s")
         print(f"  step:     {run.summary.get('_step', 'n/a')}")
+        summary_filter = set(columns)
         for k in sorted(run.summary.keys()):
             if k.startswith("_"):
+                continue
+            if summary_filter and k not in summary_filter:
                 continue
             v = run.summary[k]
             print(f"  {k:<28s} {v}")

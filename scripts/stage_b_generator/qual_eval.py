@@ -563,6 +563,16 @@ def main() -> int:
     )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
+    parser.add_argument(
+        "--summary-detail",
+        choices=["compact", "full"],
+        default="compact",
+        help=(
+            "overall summary.json detail level. compact keeps run metadata and "
+            "aggregate diff means; full also stores clip/text selection and "
+            "per-clip diff arrays."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -857,19 +867,27 @@ def main() -> int:
     _print_diff_block(diffs_default)
 
     full_summary: dict[str, Any] = {
+        "schema": f"stage_b_qual_eval_{args.summary_detail}_v1",
         "ckpt": str(args.ckpt),
         "config": str(args.config),
         "w_text": args.w_text,
         "default_w_int": args.w_int,
         "seed": args.seed,
         "num_clips": len(samples),
-        "clip_ids": seq_ids,
-        "clip_selection": selected_rows,
-        "texts": texts,
-        "seq_lens_frames": seq_lens_frames,
-        "seq_lens_tokens": seq_lens_tok,
-        "diffs_default": diffs_default,
+        "diffs_default": (
+            diffs_default
+            if args.summary_detail == "full"
+            else _compact_diffs(diffs_default)
+        ),
     }
+    if args.summary_detail == "full":
+        full_summary.update({
+            "clip_ids": seq_ids,
+            "clip_selection": selected_rows,
+            "texts": texts,
+            "seq_lens_frames": seq_lens_frames,
+            "seq_lens_tokens": seq_lens_tok,
+        })
 
     # Optional: w_int sweep on a single shared clip set.
     if args.w_int_sweep:
@@ -880,7 +898,9 @@ def main() -> int:
             print(f"  -- w_int = {w} --")
             per_clip_sw = [_run_three(i, w) for i in range(len(samples))]
             d = _summarise_diffs(per_clip_sw, seq_lens_tok, seq_lens_frames)
-            sweep[f"w_int_{w:g}"] = d
+            sweep[f"w_int_{w:g}"] = (
+                d if args.summary_detail == "full" else _compact_diffs(d)
+            )
             _print_diff_block(d)
         full_summary["w_int_sweep"] = sweep
 
@@ -996,6 +1016,16 @@ def _summarise_diffs(
             "motion_rms_mean":          round(float(np.mean(l2)), 4),
         }
     return out
+
+
+def _compact_diffs(diffs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: {
+            "token_hamming_mean": values["token_hamming_mean"],
+            "motion_rms_mean": values["motion_rms_mean"],
+        }
+        for name, values in diffs.items()
+    }
 
 
 def _print_diff_block(d: dict[str, Any]) -> None:

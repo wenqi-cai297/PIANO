@@ -231,6 +231,17 @@ def _condition_label(input_dir: Path) -> str:
     return f"{input_dir.parent.name}/{input_dir.name}"
 
 
+def _compact_condition(info: dict) -> dict:
+    agg = info.get("agg", {})
+    if not agg:
+        return {"n_clips": 0}
+    return {
+        "n_clips": int(agg["n_clips"]),
+        "mean_min_dist_m": float(agg["agg_mean_min_dist_per_frame"]),
+        "min_min_dist_m": float(agg["agg_min_min_dist"]),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -243,18 +254,33 @@ def main() -> int:
         default=Path("runs/eval/stageB_v0_4_contact_dist"),
         help="directory to write summary.json (created if absent).",
     )
+    parser.add_argument(
+        "--detail",
+        choices=["compact", "full"],
+        default="compact",
+        help=(
+            "summary.json detail level. compact keeps only aggregate decision "
+            "metrics; full preserves per-clip/body-part diagnostics."
+        ),
+    )
     args = parser.parse_args()
 
     out: dict = {
-        "body_part_names": BODY_PART_NAMES,
-        "body_part_indices": BODY_PART_INDICES,
+        "schema": f"stage_b_contact_distance_{args.detail}_v1",
         "conditions": {},
     }
+    if args.detail == "full":
+        out["body_part_names"] = BODY_PART_NAMES
+        out["body_part_indices"] = BODY_PART_INDICES
+
     for raw in args.input_dir:
         in_dir = Path(raw)
         label = _condition_label(in_dir)
         print(f"  {label} ...", flush=True)
-        out["conditions"][label] = _measure_condition(in_dir)
+        measured = _measure_condition(in_dir)
+        out["conditions"][label] = (
+            measured if args.detail == "full" else _compact_condition(measured)
+        )
 
     ensure_dir(args.output_dir)
     summary_path = args.output_dir / "summary.json"
@@ -268,14 +294,20 @@ def main() -> int:
     print(header)
     print("  " + "-" * (len(header) - 2))
     for label, info in out["conditions"].items():
-        agg = info.get("agg", {})
-        if not agg:
+        if args.detail == "full":
+            agg = info.get("agg", {})
+            mean_min = agg.get("agg_mean_min_dist_per_frame")
+            min_min = agg.get("agg_min_min_dist")
+        else:
+            mean_min = info.get("mean_min_dist_m")
+            min_min = info.get("min_min_dist_m")
+        if mean_min is None or min_min is None:
             print(f"  {label:<55s} {'(no clips)':>14s}")
             continue
         print(
             f"  {label:<55s} "
-            f"{agg['agg_mean_min_dist_per_frame']:>13.3f} m "
-            f"{agg['agg_min_min_dist']:>11.3f} m"
+            f"{mean_min:>13.3f} m "
+            f"{min_min:>11.3f} m"
         )
     print()
     print("  Interpretation:")

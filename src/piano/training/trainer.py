@@ -148,6 +148,9 @@ def run_training_loop(
     val_best_key: str = "loss",
     contact_eval_fn: Callable[[], dict[str, float]] | None = None,
     contact_best_key: str = "mean_min_dist",
+    train_report_keys: list[str] | tuple[str, ...] | None = None,
+    val_report_keys: list[str] | tuple[str, ...] | None = None,
+    contact_report_keys: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -195,6 +198,11 @@ def run_training_loop(
         ``None`` disables contact eval (Stage A predictor doesn't need it).
     contact_best_key : which key in the contact metrics dict to minimise.
         Defaults to ``"mean_min_dist"``.
+    train_report_keys, val_report_keys, contact_report_keys : optional
+        allow-lists for console/wandb reporting. The full metric dict is
+        still computed internally and validation/checkpoint decisions still
+        use ``val_best_key`` / ``contact_best_key``. ``None`` preserves the
+        historical "report everything" behaviour.
     """
     output_dir = ensure_dir(output_dir)
     global_step = 0
@@ -267,7 +275,9 @@ def run_training_loop(
             if global_step % log_every == 0 and accelerator.is_main_process:
                 lr = optimizer.param_groups[0]["lr"]
                 msg = f"  step {global_step} | lr={lr:.2e}"
-                for key, val in loss_dict.items():
+                for key, val in _select_report_metrics(
+                    loss_dict, train_report_keys,
+                ).items():
                     if isinstance(val, torch.Tensor):
                         if val.numel() != 1:
                             continue
@@ -290,14 +300,15 @@ def run_training_loop(
                 k: v / max(epoch_counts.get(k, n_batches), 1)
                 for k, v in epoch_losses.items()
             }
+            avg_report = _select_report_metrics(avg, train_report_keys)
             lr = optimizer.param_groups[0]["lr"]
             msg = f"Epoch {epoch+1}/{num_epochs} ({epoch_time:.0f}s)"
-            for key, val in avg.items():
+            for key, val in avg_report.items():
                 msg += f" | {key}={val:.4f}"
             accelerator.print(msg)
 
             if wandb_run is not None:
-                log_dict = dict(avg)
+                log_dict = dict(avg_report)
                 log_dict["lr"] = lr
                 log_dict["epoch"] = epoch + 1
                 log_dict["epoch_time_sec"] = epoch_time
@@ -316,13 +327,14 @@ def run_training_loop(
                 global_step=global_step,
             )
             if accelerator.is_main_process:
+                val_report = _select_report_metrics(val_means, val_report_keys)
                 msg = f"  Val @ epoch {epoch+1}"
-                for key, val in val_means.items():
+                for key, val in val_report.items():
                     msg += f" | val_{key}={val:.4f}"
                 accelerator.print(msg)
                 if wandb_run is not None:
                     wandb_run.log(
-                        {f"val_{k}": v for k, v in val_means.items()},
+                        {f"val_{k}": v for k, v in val_report.items()},
                         step=epoch + 1,
                     )
 
@@ -369,13 +381,16 @@ def run_training_loop(
                 cur_contact = float(cur_contact_t.item())
 
                 if accelerator.is_main_process:
+                    contact_report = _select_report_metrics(
+                        contact_metrics, contact_report_keys,
+                    )
                     msg = f"  Contact @ epoch {epoch+1}"
-                    for k, v in contact_metrics.items():
+                    for k, v in contact_report.items():
                         msg += f" | contact_{k}={v:.4f}"
                     accelerator.print(msg)
                     if wandb_run is not None:
                         wandb_run.log(
-                            {f"contact_{k}": v for k, v in contact_metrics.items()},
+                            {f"contact_{k}": v for k, v in contact_report.items()},
                             step=epoch + 1,
                         )
 
@@ -405,6 +420,16 @@ def run_training_loop(
         name="final", extra_modules=extra_modules,
     )
     accelerator.print("Training complete.")
+
+
+def _select_report_metrics(
+    metrics: dict[str, Any],
+    keys: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Return only the metrics intended for human-facing reporting."""
+    if keys is None:
+        return dict(metrics)
+    return {key: metrics[key] for key in keys if key in metrics}
 
 
 @torch.no_grad()

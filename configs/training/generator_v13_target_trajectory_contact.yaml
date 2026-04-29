@@ -120,11 +120,16 @@ training:
 
   diagnostics:
     gradient_norms:
-      enabled: true
+      # Expensive one-off diagnostic; keep off by default so wandb/history
+      # only carries decision metrics.
+      enabled: false
       # 0 means once per epoch (resolved to train dataloader length).
       every_n_steps: 0
     residual_layers:
-      enabled: true
+      # Per-RVQ-layer loss/acc/tokens are useful only when debugging the
+      # residual stack specifically. The aggregate residual loss/acc below is
+      # the stable default signal.
+      enabled: false
 
   val_every_epochs: 5
   val_best_key: "loss"
@@ -149,5 +154,36 @@ logging:
   run_name: "predictor_stageB_v13_target_trajectory_contact"
   log_every_n_steps: 50
   save_every_n_epochs: 5
+  train_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_mean_min_dist
+    - gamma_int_abs_mean
+    - gamma_int_res_abs_mean
+  val_report_keys:
+    - loss
+    - loss_base
+    - loss_residual
+    - loss_decoded_contact
+    - loss_weighted_decoded_contact
+    - acc
+    - acc_residual
+    - decoded_contact_aux_target_position
+    - decoded_contact_aux_target_velocity
+    - decoded_contact_aux_mean_min_dist
+  contact_report_keys:
+    - composite_contact_score
+    - mean_min_dist
+    - moving_close_frame_frac
+    - moving_coupled_frame_frac
+    - moving_close_but_uncoupled_frac
+    - n_clips
 
 output_dir: "runs/training/generator_v13_target_trajectory_contact"

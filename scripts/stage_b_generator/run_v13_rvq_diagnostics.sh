@@ -20,6 +20,7 @@ DEVICE="${DEVICE:-cuda}"
 W_TEXT="${W_TEXT:-4.0}"
 W_INT="${W_INT:-2.0}"
 RESIDUAL_SEED="${RESIDUAL_SEED:-1234}"
+SUMMARY_DETAIL="${SUMMARY_DETAIL:-compact}"
 
 conditions=(
   soft_train_full
@@ -43,7 +44,8 @@ python scripts/stage_b_generator/diagnose_rvq_paths.py \
   --device "$DEVICE" \
   --w-text "$W_TEXT" \
   --w-int "$W_INT" \
-  --residual-seed "$RESIDUAL_SEED"
+  --residual-seed "$RESIDUAL_SEED" \
+  --detail "$SUMMARY_DETAIL"
 
 contact_args=()
 temporal_args=()
@@ -58,7 +60,8 @@ echo "[measure] contact distance"
 echo "============================================================"
 python scripts/stage_b_generator/measure_contact_distance.py \
   "${contact_args[@]}" \
-  --output-dir "${OUT_DIR}/contact_dist"
+  --output-dir "${OUT_DIR}/contact_dist" \
+  --detail "$SUMMARY_DETAIL"
 
 echo
 echo "============================================================"
@@ -69,7 +72,8 @@ python scripts/stage_b_generator/measure_temporal_coupling.py \
   --output-dir "${OUT_DIR}/temporal_coupling" \
   --fps 20 \
   --coupling-threshold 0.5 \
-  --moving-speed-threshold 0.15
+  --moving-speed-threshold 0.15 \
+  --detail "$SUMMARY_DETAIL"
 
 echo
 echo "Done:"

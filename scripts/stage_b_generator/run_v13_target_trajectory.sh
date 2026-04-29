@@ -20,6 +20,8 @@ TRAIN="${TRAIN:-1}"
 EVAL="${EVAL:-1}"
 DUMP_WANDB="${DUMP_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-piano}"
+SUMMARY_DETAIL="${SUMMARY_DETAIL:-compact}"
+WANDB_COLUMNS="${WANDB_COLUMNS:-epoch,loss,loss_base,loss_residual,loss_decoded_contact,loss_weighted_decoded_contact,acc,acc_residual,decoded_contact_aux_target_position,decoded_contact_aux_target_velocity,decoded_contact_aux_mean_min_dist,gamma_int_abs_mean,gamma_int_res_abs_mean,val_loss,val_loss_base,val_loss_residual,val_loss_decoded_contact,val_loss_weighted_decoded_contact,val_acc,val_acc_residual,val_decoded_contact_aux_target_position,val_decoded_contact_aux_target_velocity,val_decoded_contact_aux_mean_min_dist,contact_composite_contact_score,contact_mean_min_dist,contact_moving_close_frame_frac,contact_moving_coupled_frame_frac,contact_moving_close_but_uncoupled_frac,contact_n_clips,lr,epoch_time_sec}"
 
 if [[ ! -f "$CFG" ]]; then
   echo "ERROR: config not found: $CFG" >&2
@@ -85,7 +87,8 @@ if [[ "$EVAL" == "1" ]]; then
       --ckpt "$ckpt_path" \
       --output-dir "$qual_dir" \
       --num-clips "$NUM_CLIPS" \
-      --seed "$SEED"
+      --seed "$SEED" \
+      --summary-detail "$SUMMARY_DETAIL"
 
     echo
     echo "[eval:${ckpt_name}] contact distance -> ${dist_dir}"
@@ -95,7 +98,8 @@ if [[ "$EVAL" == "1" ]]; then
       --input-dir "${qual_dir}/swap" \
       --input-dir "${gt_dir}/gt_original" \
       --input-dir "${gt_dir}/gt_roundtrip" \
-      --output-dir "$dist_dir"
+      --output-dir "$dist_dir" \
+      --detail "$SUMMARY_DETAIL"
 
     echo
     echo "[eval:${ckpt_name}] temporal coupling -> ${temporal_dir}"
@@ -104,7 +108,8 @@ if [[ "$EVAL" == "1" ]]; then
       --output-dir "$temporal_dir" \
       --fps 20 \
       --coupling-threshold 0.5 \
-      --moving-speed-threshold 0.15
+      --moving-speed-threshold 0.15 \
+      --detail "$SUMMARY_DETAIL"
   done
 else
   echo "EVAL=0, skipping offline eval."
@@ -116,11 +121,17 @@ if [[ "$DUMP_WANDB" == "1" ]]; then
   echo "============================================================"
   echo "[wandb] ${RUN_NAME} -> ${out_csv}"
   echo "============================================================"
-  python scripts/stage_a_predictor/dump_wandb_history.py \
-    --name "$RUN_NAME" \
-    --project "$WANDB_PROJECT" \
-    --output "$out_csv" \
+  wandb_cmd=(
+    python scripts/stage_a_predictor/dump_wandb_history.py
+    --name "$RUN_NAME"
+    --project "$WANDB_PROJECT"
+    --output "$out_csv"
     --print-summary
+  )
+  if [[ -n "$WANDB_COLUMNS" ]]; then
+    wandb_cmd+=(--columns "$WANDB_COLUMNS")
+  fi
+  "${wandb_cmd[@]}"
 else
   echo "DUMP_WANDB=0, skipping wandb history export."
 fi

@@ -31,7 +31,9 @@ library code.
 
 - `stage_b_generator/run_v13_target_trajectory.sh`: train/eval runner for the
   v13 loss that tracks the named contact body part against its object-local
-  contact target trajectory and logs temporal-coupling metrics.
+  contact target trajectory and logs temporal-coupling metrics. Defaults to
+  compact wandb CSV / eval JSON output; set `SUMMARY_DETAIL=full` for per-clip
+  debug summaries.
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing
@@ -40,5 +42,5 @@ library code.
 - `stage_b_generator/measure_temporal_coupling.py`: post-process diagnostic for
   generated runs. Measures whether moving-object frames have a body part that
   is stable in object-local coordinates, reusing the pseudo-label extractor's
-  kinematic-coupling criterion. Use it when contact distance is low but videos
-  look temporally unbound from the object trajectory.
+  kinematic-coupling criterion. Defaults to compact aggregate JSON; pass
+  `--detail full` when the per-clip/worst-case rows are needed.

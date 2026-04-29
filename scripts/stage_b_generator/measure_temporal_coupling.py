@@ -231,6 +231,7 @@ def _measure_condition(
     fps: float,
     coupling_threshold: float,
     moving_speed_threshold: float | None,
+    detail: str,
 ) -> dict[str, Any]:
     npz_path = input_dir / "generated.npz"
     if not npz_path.exists():
@@ -300,6 +301,19 @@ def _measure_condition(
         ),
     )[:20]
 
+    aggregate = _aggregate(per_clip)
+    if detail == "compact":
+        return {
+            "n_clips": aggregate.get("n_clips"),
+            "n_moving_clips": aggregate.get("n_moving_clips"),
+            "mean_min_dist_m": aggregate.get("mean_min_dist_m"),
+            "close_frame_frac": aggregate.get("close_frame_frac"),
+            "moving_close_frame_frac": aggregate.get("moving_close_frame_frac"),
+            "moving_coupled_frame_frac": aggregate.get("moving_coupled_frame_frac"),
+            "moving_close_but_uncoupled_frac": aggregate.get(
+                "moving_close_but_uncoupled_frac",
+            ),
+        }
     return {
         "input_dir": str(input_dir),
         "fps": float(fps),
@@ -307,7 +321,7 @@ def _measure_condition(
         "moving_speed_threshold": float(speed_threshold),
         "body_part_names": BODY_PART_NAMES,
         "body_part_indices": BODY_PART_INDICES,
-        "aggregate": _aggregate(per_clip),
+        "aggregate": aggregate,
         "by_subset": by_subset,
         "worst_temporal_coupling": worst_temporal,
         "per_clip": per_clip,
@@ -341,9 +355,21 @@ def main() -> int:
         default=None,
         help="object speed threshold in m/s; default uses ContactConfig.kin_world_eps",
     )
+    parser.add_argument(
+        "--detail",
+        choices=["compact", "full"],
+        default="compact",
+        help=(
+            "summary.json detail level. compact keeps only aggregate decision "
+            "metrics; full preserves per-clip, by-subset, and worst-case rows."
+        ),
+    )
     args = parser.parse_args()
 
-    out = {"conditions": {}}
+    out = {
+        "schema": f"stage_b_temporal_coupling_{args.detail}_v1",
+        "conditions": {},
+    }
     for raw in args.input_dir:
         input_dir = Path(raw)
         label = _condition_label(input_dir)
@@ -353,6 +379,7 @@ def main() -> int:
             fps=args.fps,
             coupling_threshold=args.coupling_threshold,
             moving_speed_threshold=args.moving_speed_threshold,
+            detail=args.detail,
         )
 
     ensure_dir(args.output_dir)
@@ -368,7 +395,7 @@ def main() -> int:
     )
     print("  " + "-" * 106)
     for label, info in out["conditions"].items():
-        agg = info.get("aggregate", {})
+        agg = info.get("aggregate", info)
         print(
             f"  {label:<55s} "
             f"{agg.get('mean_min_dist_m', None)!s:>8s} "
