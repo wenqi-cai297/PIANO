@@ -42,9 +42,15 @@ library code.
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing
   contact-distance metric; `--selection-metric composite` adds a moving-object
-  kinematic-coupling penalty for the temporal-binding failure mode.
+  kinematic-coupling penalty for the temporal-binding failure mode;
+  `--selection-metric alignment` selects by the GT contact body part's
+  object-local target trajectory.
 - `stage_b_generator/measure_temporal_coupling.py`: post-process diagnostic for
   generated runs. Measures whether moving-object frames have a body part that
   is stable in object-local coordinates, reusing the pseudo-label extractor's
   kinematic-coupling criterion. Defaults to compact aggregate JSON; pass
   `--detail full` when the per-clip/worst-case rows are needed.
+- `stage_b_generator/measure_contact_alignment.py`: post-process diagnostic for
+  generated-vs-GT runs. Measures temporal contact overlap, correct body-part
+  contact recall, and object-local contact-point/part-position errors. Use it
+  when contact distance looks good but visual contact is still misaligned.

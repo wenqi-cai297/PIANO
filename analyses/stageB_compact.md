@@ -5,17 +5,28 @@ source for Stage B memory.
 
 ## Current Conclusion
 
-Stage B has a real object/interaction control signal. One-shot C2b/v12 sampling
-is stuck around `32 cm` full contact on the matched 80-clip eval, but the K=16
-oracle reaches `17.93 cm`, essentially the GT VQ roundtrip band (`18.47 cm`).
+Stage B has a real object/interaction control signal. One-shot C2b/v12 and
+v13 sampling sat around `31-32 cm` full contact on the matched 80-clip eval.
+v14 sampled-ST is the first clear single-sample contact improvement, with
+`best_contact` at `27.37 cm`. More importantly, v14 K=16 reaches the GT VQ
+roundtrip band: distance oracle `16.80 cm`, composite oracle `17.17 cm`
+(`17.94 cm` after saved-best remeasure) versus GT roundtrip `18.47 cm`.
 
-Do not continue blind parameter sweeps. The K=16 result solved only spatial
-proximity. Visual review shows a more specific remaining failure: the generated
-body is near the object, but its action is often not temporally bound to the
-object's motion. Composite K=16 reranking improves moving-object coupling only
-modestly, so it should be treated as a diagnostic readout rather than the main
-solution. The next main path is to change training or inference so the generated
-distribution contains more temporally coupled manipulation samples.
+Do not continue blind parameter sweeps. v14 confirms that hard/ST sampled-path
+training improves spatial contact and candidate-pool quality, but ordinary
+one-shot sampling still rarely picks the coupled candidate. v14 K=16 composite
+raises moving-coupled frame fraction to `0.3715`, above v12 composite `0.351`.
+The next main path is full-RVQ sample-time guidance or reranking through
+decoded motion, not another contact-loss weight or checkpoint-selection sweep.
+
+2026-04-30 visual/alignment update: v14 K=16 composite looks much better than
+earlier generations, but the user's visual assessment is correct that it is
+still not GT-quality interaction. A new contact-alignment diagnostic shows
+distance/composite metrics are now too weak: v14 K=16 composite has moving
+contact IoU `0.4472`, moving GT-contact recall `0.5438`, correct GT body-part
+recall `0.2378`, and same-part object-local position error `46.32 cm` against
+GT roundtrip. The next guidance/reranking objective must use the conditioned
+contact body part and object-local contact target, not only any-part distance.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
@@ -29,11 +40,11 @@ sampling consistency with inference-time logits/codebook optimization.
 
 ## Current Best
 
-Best checkpoint identifier on the server. The local workspace may only contain
+Best one-shot contact checkpoint identifier on the server. The local workspace may only contain
 eval summaries:
 
 ```text
-runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt
+runs/training/generator_v14_sampled_st_contact/best_contact.pt
 ```
 
 80-clip matched eval:
@@ -42,15 +53,20 @@ runs/training/generator_v12_decoded_contact_w02_diagnostics/best_val.pt
 |---|---:|
 | GT original | 13.09 cm |
 | GT roundtrip | 18.47 cm |
-| full | 31.82 cm |
-| text_only | 64.85 cm |
-| swap | 74.01 cm |
+| v12 w02 best_val full | 31.82 cm |
+| v13 best_val full | 31.57 cm |
+| v14 best_contact full | 27.37 cm |
+| v14 best_contact text_only | 57.82 cm |
+| v14 best_contact swap | 74.79 cm |
 | K=16 best-of-K oracle | 17.93 cm |
+| K=16 composite oracle | 18.08 cm |
+| v14 K=16 distance oracle | 16.80 cm |
+| v14 K=16 composite oracle | 17.17 cm |
 
-Saved K=16 best samples re-measured with `measure_contact_distance.py` at
-`18.70 cm`. Interpretation: `z_int` matters and the distribution contains
-close-to-object samples, but distance-only selection does not guarantee true
-manipulation.
+Saved v14 K=16 composite samples re-measured with `measure_contact_distance.py`
+at `17.94 cm`, with moving-coupled `0.3715`. Interpretation: `z_int` matters
+and v14 improves both single-sample spatial contact and the K-sample candidate
+pool. The remaining problem is reliable selection/guidance of those candidates.
 
 ## External Evidence That Shaped The Design
 
@@ -100,6 +116,10 @@ motion recovery or VQ decode logic unless no upstream function exists.
 | v0.12 | decoded-contact weight sweep | all useful ckpts tied near 32 cm |
 | K=16 oracle | contact reranking over 16 samples | 17.93 cm best-of-K on 80 clips |
 | temporal coupling | kinematic-coupling diagnostic on K=16 best | only 0.323 coupled on moving frames |
+| v13 | object-local target-trajectory loss | hard sampling stayed near 31.57 cm / 0.265 coupled |
+| v14 | sampled-ST full-RVQ decoded auxiliary path | best_contact improved to 27.37 cm but only 0.277 coupled |
+| v14 K=16 | distance 16.80 cm; composite remeasured 17.94 cm / 0.3715 coupled | candidate pool is good enough; selection/guidance is the lever |
+| v14 contact alignment | composite moving IoU 0.447; correct GT-part recall 0.238; local part error 46 cm | distance/composite can look good while visual contact remains wrong |
 
 ## Key Positive Results
 
@@ -300,11 +320,12 @@ needs a temporal-binding mechanism: decoded kinematic-coupling/local-frame
 stability loss, contact-target trajectory loss in object-local coordinates, or
 full-RVQ sample-time guidance through decoded motion.
 
-v13 implements the training-loss branch: the decoded auxiliary loss now has
-`mode="target_trajectory"`, which tracks the same contact body part against its
-object-local `contact_target_xyz` and adds a moving-object local-frame velocity
-term. Training-time contact eval now logs temporal coupling and exposes
-`composite_contact_score` for best-contact checkpoint selection.
+v13 implemented the training-loss branch: `mode="target_trajectory"` tracks the
+same contact body part against its object-local `contact_target_xyz` and adds a
+moving-object local-frame velocity term. v14 moved that objective closer to the
+hard sampled path with all-mask first-step logits and straight-through Gumbel
+full-RVQ decoding. This improved one-shot contact but did not solve temporal
+binding.
 
 ## v0.12 Full Table
 
@@ -408,36 +429,126 @@ v13 outcome after syncing results:
 |---|---:|---:|---:|---:|
 | v12 w02 best_val | 31.82 cm | 0.296 | 0.264 | 0.140 |
 | v13 best_val | 31.57 cm | 0.334 | 0.265 | 0.171 |
-| v12 K16 composite | 18.86 cm | 0.473 | 0.351 | 0.222 |
+| v14 best_contact | 27.37 cm | 0.343 | 0.277 | 0.172 |
+| v12 K=16 composite | 18.08 cm | 0.473 | 0.351 | 0.222 |
 | GT roundtrip | 18.47 cm | - | - | - |
 
 The v13 soft decoded auxiliary objective did optimize internally
 (`decoded_contact_aux_mean_min_dist` about `0.413 -> 0.125`), but hard
 sampled output stayed on the same 31-32 cm / 0.26 moving-coupled line as v12.
-The current working hypothesis is a soft-hard / discrete-RVQ path gap, not
-underweighted contact loss.
+The v13 RVQ diagnostic then showed `soft_train_full` at `14.78 cm` and
+moving-coupled `0.443`, while sampled/mixed prediction paths stayed much worse
+(`mixed_pred_all` `33.50 cm`; `mixed_pred_base_gt_residual` `35.92 cm`).
+
+v14/C2c addressed that gap by taking decoded-aux base logits from the all-mask
+MaskGIT/CFG first step and using straight-through Gumbel hard codebook lookups
+through the full residual RVQ path. Result: v14 best_contact is a partial
+positive result for spatial contact, but not temporal binding.
+
+Wandb history for v14 is synced at
+`runs/wandb_logs/wandb_history_genB_v14_sampled_st_contact.csv`. It confirms the
+sampled-ST auxiliary objective optimized: train decoded loss `1.303 -> 0.403`,
+validation decoded loss `0.898 -> 0.425`, and validation decoded mean-min-dist
+`0.564 m -> 0.153 m`. The train-time contact selector chose epoch 65
+(`26.33 cm`, moving coupled `0.308`, composite `0.3556`), while best-val is
+epoch 70 (`30.45 cm`, coupled `0.280`). Offline evaluation of the synced
+`best_contact` output measured `27.37 cm` and coupled `0.2765`, so generation
+sampling variance is nontrivial but the strategic conclusion is unchanged.
+
+v14 best_contact subset readout, using the matched 80 clips:
+
+| subset | contact | moving coupled |
+|---|---:|---:|
+| chairs | 15.45 cm | 0.646 |
+| imhd | 35.52 cm | 0.103 |
+| neuraldome | 33.87 cm | 0.248 |
+| omomo_correct_v2 | 24.64 cm | 0.289 |
+
+Worst v14 one-shot temporal-binding failures remain IMHD baseball/suitcase and
+NeuralDome tennis/baseball/trashcan/keyboard cases. The large IMHD suitcase
+outlier improved from v13 `120.33 cm` to v14 `67.24 cm`, but remains a hard
+one-shot failure.
+
+v14 K=16 diagnostics:
+
+| selection | oracle mean | saved-best remeasure | moving coupled |
+|---|---:|---:|---:|
+| distance | 16.80 cm | 17.60 cm | 0.326 |
+| composite | 17.17 cm | 17.94 cm | 0.3715 |
+
+v14 K=16 composite by subset:
+
+| subset | contact | moving coupled |
+|---|---:|---:|
+| chairs | 10.39 cm | 0.764 |
+| imhd | 23.28 cm | 0.218 |
+| neuraldome | 21.18 cm | 0.314 |
+| omomo_correct_v2 | 13.84 cm | 0.424 |
+
+The candidate pool improved compared with v12 composite. IMHD is still hard
+but much better spatially (`31.95 cm -> 23.28 cm`) and has slightly better
+coupled-candidate capacity (max-coupled mean `0.180 -> 0.238`; clips with any
+candidate >=0.5: `2/20 -> 3/20`). Composite selection changed `13/80` clips,
+increasing coupled fraction by `0.287` on changed clips at a `2.29 cm` contact
+cost.
+
+v14 RVQ-path diagnostics:
+
+| condition | v13 contact | v14 contact | v13 coupled | v14 coupled |
+|---|---:|---:|---:|---:|
+| mixed_pred_all | 33.50 cm | 29.31 cm | 0.289 | 0.296 |
+| mixed_pred_base_gt_residual | 35.92 cm | 29.81 cm | 0.234 | 0.279 |
+| mixed_gt_base_pred_residual | 27.30 cm | 26.96 cm | 0.349 | 0.306 |
+| hard_train_argmax_full | 22.47 cm | 28.98 cm | 0.349 | 0.324 |
+| soft_train_full | 14.78 cm | 29.41 cm | 0.443 | 0.324 |
+
+Interpretation: v14 improved the standard generated/mixed predicted paths,
+especially the predicted-base path. It did not improve the old teacher-forced
+soft diagnostic path, which is expected because v14 trains the decoded aux from
+the all-mask generation-entry path instead. The remaining bottleneck is not
+"no candidates"; it is sample-time selection/guidance and residual quality.
+
+v14 visual review and GT-alignment diagnostic:
+
+```bash
+python scripts/stage_b_generator/measure_contact_alignment.py \
+  --generated-dir runs/eval/stageB_v0_14_bc_k16_composite_oracle/best \
+  --gt-dir runs/eval/stageB_v0_14_sampled_st_contact_gt_roundtrip_80/gt_roundtrip \
+  --output-dir runs/eval/stageB_v0_14_bc_k16_composite_oracle/alignment_to_gt_roundtrip \
+  --detail full
+```
+
+| selection | moving contact IoU | moving GT-contact recall | correct GT-part recall | same-part local pos error |
+|---|---:|---:|---:|---:|
+| distance K=16 | 0.4505 | 0.5468 | 0.2305 | 46.42 cm |
+| composite K=16 | 0.4472 | 0.5438 | 0.2378 | 46.32 cm |
+
+The GT roundtrip self-check gives moving IoU/recall/correct-part recall `1.0`
+and same-part local position error `0.0`. Composite is slightly better on
+correct body-part recall, but it does not solve GT contact alignment. This
+confirms the qualitative review: even a low mean-min distance can be produced
+by the wrong part, wrong phase, or wrong object-local patch.
 
 Immediate diagnostic implementation:
 
 - `scripts/stage_b_generator/diagnose_rvq_paths.py`
 - `scripts/stage_b_generator/run_v13_rvq_diagnostics.sh`
+- `scripts/stage_b_generator/measure_contact_alignment.py`
 
 These produce `soft_train_full`, `hard_train_argmax_full`,
 `hard_train_argmax_gt_residual`, `mixed_gt_all`, `mixed_pred_all`,
 `mixed_gt_base_pred_residual`, and `mixed_pred_base_gt_residual`, then score
 them with the existing contact-distance and temporal-coupling scripts.
 
-Remaining options after diagnostics:
+Immediate next work:
 
-- v14/C2c implements hard/ST-Gumbel decoded contact training from the
-  all-mask MaskGIT first-step logits. This directly targets the two measured
-  gaps: soft decoded motion to hard codebook motion, and teacher-forced train
-  logits to generation-entry logits. The decoded aux path samples at most 8
-  clips per train batch to control the extra CFG/residual compute.
-- If v14 still leaves the full sampled path near 30 cm, move to full-RVQ
-  sample-time guidance through decoded motion, not base logits only.
-
-Use composite K-sample reranking only as the readout after these changes.
+- Use v14 `best_contact.pt` as the base checkpoint for full-RVQ sample-time
+  guidance through decoded motion. Beat the v14 K=16 composite baseline
+  (`17.94 cm`, coupled `0.3715`) and its GT-alignment baseline (moving IoU
+  `0.4472`, correct GT-part recall `0.2378`).
+- Guidance should use predicted/conditioned `contact_body_part` and
+  object-local `contact_target_xyz` trajectory rather than the any-part
+  min-distance objective that the current metrics can game.
 
 ### 2. Hard-case follow-up
 
@@ -496,10 +607,10 @@ Start with IMHD because its 80-clip codebook gap is `14.13 cm`.
   reranking as Stage B.
 - Composite reranking only modestly improves coupling: do not spend the next
   main iteration on rerank-weight sweeps.
-- Next main path: change training/inference so generated samples are temporally
-  coupled to object motion, then keep composite reranking as the readout.
-- If soft-hard gap is large: use hard/ST-Gumbel consistency or full-RVQ
-  logits/embedding optimization.
+- Next main path: test v14 K-sample capacity and RVQ-path gaps before choosing
+  another training change.
+- If v14 K-sample capacity remains weak: use full-RVQ logits/embedding
+  optimization or decoded-motion sample-time guidance.
 - If base mixed oracle fails: base MaskTransformer/conditioning is the target.
 - If residual mixed oracle fails: residual/full-RVQ prediction is the target.
 - If GT roundtrip fails by subset: address representation/codebook for that
