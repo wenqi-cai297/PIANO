@@ -603,16 +603,29 @@ def main() -> int:
              "signal is uniform-like).",
     )
     parser.add_argument(
-        "--per-step-gumbel-scale", type=float, default=1.0,
+        "--per-step-gumbel-scale", type=float, default=0.0,
         help="Gumbel-noise scale for the per-step inner loop's relaxed "
-             "decode (v17-F, MaskControl-equivalent). 1.0 = canonical "
-             "Gumbel-Softmax / Concrete relaxation, matches "
-             "exitudio/ControlMM's `each_iter` block "
-             "(softmax((logits/T) + gumbel_noise)). 0.0 = pre-v17-F PIANO "
-             "behaviour (pure softmax expectation, no noise). Set 0.0 to "
-             "ablate the Gumbel addition. Source-verified diff vs "
-             "MaskControl listed in "
-             "analyses/2026-05-01_per_step_guidance_design.md.",
+             "decode (v17-F ablation). 0.0 = pre-v17-F PIANO behaviour "
+             "(pure softmax expectation, RECOMMENDED on PIANO — v17-F "
+             "sweep showed Gumbel ON regresses every contact metric on "
+             "the multi-quantizer RVQ stack; default reverted to 0.0 on "
+             "2026-05-01). 1.0 = canonical Gumbel-Softmax / Concrete "
+             "relaxation, matches exitudio/ControlMM's `each_iter` block "
+             "(softmax((logits/T) + gumbel_noise)). Detail: "
+             "analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md.",
+    )
+    parser.add_argument(
+        "--gamma-int-boost", type=float, default=1.0,
+        help="v17-G IntXAttn gate inference-time scale factor. Multiplies "
+             "every gamma_int parameter (in both base and residual "
+             "transformer) by this constant immediately after model load. "
+             "1.0 = no change. boost=10 raises the typical PIANO "
+             "γ_int ≈ 0.02 to ≈ 0.20, closer to ControlNet-style typical "
+             "0.5–1.0. Mutates model parameters in-place (no restore — "
+             "process exits after eval). v17-G boost sweep: see "
+             "scripts/stage_b_generator/run_v17g_gamma_int_boost_sweep.sh "
+             "and analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md "
+             "for the decision rule.",
     )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
@@ -642,6 +655,29 @@ def main() -> int:
         cfg, args.ckpt, device,
     )
     print(f"Token stride: {token_stride}  (frame T → token S = T/{token_stride})")
+
+    # v17-G: optional inference-time IntXAttn gate boost. γ_int finished
+    # v14/v15/v16 training around 0.02 (D-A audit, ~1/25 of typical
+    # ControlNet-style strength). boost > 1 multiplies every gamma_int
+    # parameter in-place to test whether amplifying the structured-z_int
+    # cross-attention path improves contact alignment. Mutation is not
+    # restored — the eval process exits afterward, so no leakage. See
+    # analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md §"P1 design".
+    if float(args.gamma_int_boost) != 1.0:
+        n_scaled = 0
+        with torch.no_grad():
+            for _mod in (transformer, res_transformer):
+                if _mod is None:
+                    continue
+                for _name, _p in _mod.named_parameters():
+                    if _name.endswith("gamma_int"):
+                        _p.data.mul_(float(args.gamma_int_boost))
+                        n_scaled += 1
+        print(
+            f"  ✓ applied gamma_int_boost={args.gamma_int_boost} to "
+            f"{n_scaled} gamma_int parameter(s) "
+            f"(model now mutated in-place for the rest of this process).",
+        )
 
     # Load HumanML3D motion stats so generated motion gets denormalized
     # to real-world scale before being saved + visualized. See

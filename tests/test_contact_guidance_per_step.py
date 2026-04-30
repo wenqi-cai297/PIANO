@@ -1,4 +1,5 @@
-"""CPU-friendly tests for the v17 per-step guidance building blocks.
+"""CPU-friendly tests for the v17 per-step guidance building blocks
+and the v17-G γ_int inference-time boost helper.
 
 The full ``_generate_with_per_step_guidance`` integration test requires a
 ``InteractionMaskTransformer`` plus MoMask weights and is server-only.
@@ -234,3 +235,112 @@ def test_decode_with_relaxed_masked_base_gumbel_noise_changes_output():
     out.sum().backward()
     assert logits_param.grad is not None
     assert logits_param.grad.abs().sum().item() > 0.0
+
+
+# ============================================================================
+# v17-G γ_int boost context manager
+# ============================================================================
+
+def _make_fake_model_with_gamma_int():
+    """Build a tiny module with `gamma_int` and `gamma_int_other` parameters
+    at multiple nesting levels, mimicking the encoder-layers layout where
+    PIANO's IntXAttn lives.
+    """
+    class Block(nn.Module):
+        def __init__(self, init_value: float):
+            super().__init__()
+            self.gamma_int = nn.Parameter(torch.full((1,), init_value))
+            self.other_param = nn.Parameter(torch.zeros(3))
+
+    class Encoder(nn.Module):
+        def __init__(self, n_layers: int, init_value: float):
+            super().__init__()
+            self.layers = nn.ModuleList([Block(init_value) for _ in range(n_layers)])
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seqTransEncoder = Encoder(n_layers=4, init_value=0.02)
+
+    return Wrapper()
+
+
+def test_scaled_gamma_int_multiplies_and_restores():
+    from piano.inference.contact_guidance import _scaled_gamma_int
+
+    model = _make_fake_model_with_gamma_int()
+    originals = [
+        blk.gamma_int.data.clone() for blk in model.seqTransEncoder.layers
+    ]
+
+    with _scaled_gamma_int([model], boost=10.0):
+        for blk, original in zip(model.seqTransEncoder.layers, originals):
+            assert torch.allclose(blk.gamma_int.data, original * 10.0)
+
+    # After exit, restored exactly.
+    for blk, original in zip(model.seqTransEncoder.layers, originals):
+        assert torch.allclose(blk.gamma_int.data, original, atol=0.0, rtol=0.0)
+
+
+def test_scaled_gamma_int_skips_non_gamma_params():
+    """`other_param` (not ending in gamma_int) must NOT be scaled."""
+    from piano.inference.contact_guidance import _scaled_gamma_int
+
+    model = _make_fake_model_with_gamma_int()
+    other_originals = [
+        blk.other_param.data.clone() for blk in model.seqTransEncoder.layers
+    ]
+
+    with _scaled_gamma_int([model], boost=5.0):
+        for blk, original in zip(model.seqTransEncoder.layers, other_originals):
+            assert torch.allclose(blk.other_param.data, original, atol=0.0, rtol=0.0)
+
+
+def test_scaled_gamma_int_handles_none_modules():
+    """When residual_transformer is None, _scaled_gamma_int must skip it
+    silently (matches the optional-residual code path in qual_eval)."""
+    from piano.inference.contact_guidance import _scaled_gamma_int
+
+    model = _make_fake_model_with_gamma_int()
+    originals = [
+        blk.gamma_int.data.clone() for blk in model.seqTransEncoder.layers
+    ]
+
+    with _scaled_gamma_int([model, None], boost=3.0):
+        for blk, original in zip(model.seqTransEncoder.layers, originals):
+            assert torch.allclose(blk.gamma_int.data, original * 3.0)
+
+    for blk, original in zip(model.seqTransEncoder.layers, originals):
+        assert torch.allclose(blk.gamma_int.data, original, atol=0.0, rtol=0.0)
+
+
+def test_scaled_gamma_int_boost_one_is_no_op_fast_path():
+    """boost == 1.0 must not touch any parameters (saves a clone per gamma)."""
+    from piano.inference.contact_guidance import _scaled_gamma_int
+
+    model = _make_fake_model_with_gamma_int()
+    pre = [blk.gamma_int.data.clone() for blk in model.seqTransEncoder.layers]
+
+    with _scaled_gamma_int([model], boost=1.0):
+        for blk, original in zip(model.seqTransEncoder.layers, pre):
+            assert torch.allclose(blk.gamma_int.data, original, atol=0.0, rtol=0.0)
+
+
+def test_scaled_gamma_int_restores_after_exception():
+    """If the body raises, the context manager must still restore γ_int."""
+    from piano.inference.contact_guidance import _scaled_gamma_int
+
+    model = _make_fake_model_with_gamma_int()
+    originals = [blk.gamma_int.data.clone() for blk in model.seqTransEncoder.layers]
+
+    class _SentinelError(Exception):
+        pass
+
+    try:
+        with _scaled_gamma_int([model], boost=7.0):
+            raise _SentinelError("body raised")
+    except _SentinelError:
+        pass
+
+    for blk, original in zip(model.seqTransEncoder.layers, originals):
+        assert torch.allclose(blk.gamma_int.data, original, atol=0.0, rtol=0.0)

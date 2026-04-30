@@ -77,6 +77,31 @@ However v16 is still ~8-13 cm short of the v14 K=16 distance oracle
 prompt rule, mirror-doubling is worth keeping but not the breakthrough; next
 iteration moves to a different mechanism, not another data/loss-weight knob.
 
+2026-05-01 inference path summary (v17 family, on v16 best_contact ckpt):
+
+- v17-C (per_step=10, Gumbel OFF): contact 21.77 cm, correct-part 0.20.
+- v17-D (per_step=10 + post_hoc=30 stacked): WORSE than v17-C — post-hoc
+  full-RVQ optimisation on top of per-step regresses on PIANO's deeper
+  RVQ stack. Do not stack.
+- v17-E.20 (per_step=20): contact 18.62, correct-part 0.264, local 42.09 cm.
+- v17-E.50 (per_step=50): contact 16.50, correct-part 0.275, local 39.02 cm.
+  Below GT VQ roundtrip 18.47 — metric-gaming flag per user visual review.
+- v17-F (Gumbel ON): NEGATIVE at both budgets. Multi-quantizer residual
+  handling makes Gumbel noise ill-conditioned for PIANO. Default
+  `--per-step-gumbel-scale=0.0`.
+- D-A audit: γ_int final ≈ 0.02 (zero-init grew to 0.02 over 80 epochs;
+  ~1/25 of ControlNet typical) → IntXAttn underused architecturally.
+  v9–v16 training-time decoded contact loss helps via direct gradient on
+  decoded motion, not via the conditioning gate.
+- VQ codebook is NOT the bottleneck (MaskControl uses pretrained MoMask
+  VQ, source-verified 2026-05-01 from `exitudio/ControlMM`).
+
+**Ship configs**: v17-E.20 (recommended default) or v17-E.50 (best
+metrics, paired with motion-quality QA).
+
+**Next branch**: v17-G inference-time γ_int boost ablation. Detail:
+`analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
+
 2026-05-01 v17 implementation update: per-step decoded-geometric guidance
 landed locally. Inference-time only — runs on the existing v16 (or v14/v15)
 `best_contact.pt` unchanged. Closes MaskControl ICCV 2025's `each_iter` half

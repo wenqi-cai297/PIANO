@@ -173,11 +173,41 @@ wrong patch on the object surface (錯位). Detail:
   the per-step inner loop (matches MaskControl's `each_iter` block,
   source-verified diff). New `--per-step-gumbel-scale` CLI (default 1.0 =
   MaskControl-equivalent; 0.0 = pre-v17-F PIANO behaviour, back-compat).
-  Pending server eval as v17-F sweep
-  (`scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`):
-  v17-F.10 (per_step=10 Gumbel ON), v17-F.20 (per_step=20 Gumbel ON),
-  v17-C-ng / v17-E.20-ng (sanity Gumbel-OFF reproducers).
   Detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
+
+2026-05-01 v17-F sweep result (Gumbel **negative** on PIANO):
+
+| condition | contact | coupled | IoU | correct-part | local |
+|---|---:|---:|---:|---:|---:|
+| v17-C-ng (10, OFF, sanity) | 21.80 | 0.3422 | 0.439 | 0.206 | 45.94 |
+| v17-F.10 (10, **ON**)      | 23.53 | 0.3251 | 0.403 | 0.177 | 49.02 |
+| v17-E.20-ng (20, OFF, sanity) | 18.19 | 0.3550 | 0.475 | 0.271 | 41.90 |
+| v17-F.20 (20, **ON**)         | 19.36 | 0.3196 | 0.472 | 0.219 | 42.79 |
+
+Gumbel-OFF reruns sanity-match originals (v17-C / v17-E.20). Gumbel-ON
+regresses every metric at both budgets (correct-part −2.9 / −5.2 pp,
+contact +1.2 / +1.7 cm). Most likely root cause: PIANO's frozen baseline
+residual_emb_sum dominates the decode embedding magnitude, so adding
+Gumbel noise to the small base contribution makes inner-loop gradients
+noisy across iters; AdamW (β=0.5) doesn't average it out. MaskControl
+ignores residual entirely during per-iter so the same noise injection
+is well-conditioned in their setting. Same multi-quantizer-residual
+incompatibility that killed v17-D (post-hoc stacking).
+
+**Decision**: do not ship Gumbel on PIANO. Default
+`--per-step-gumbel-scale=0.0`. Keep flag for any single-quantizer reuse.
+Ship configs unchanged: **v17-E.20** (contact 18.62 / IoU 0.473 /
+correct-part 0.264 / local 42.09; ~80 min wallclock) or **v17-E.50**
+(contact 16.50 / IoU 0.504 / correct-part 0.275 / local 39.02;
+~140 min wallclock with metric-gaming caveat).
+
+**Inference path is now near-saturated**: post-hoc stacking, Gumbel
+noise both regress; budget sweep at diminishing returns. Remaining
+lever per D-A is the **architectural γ_int gate** (final value 0.02,
+~1/25 of ControlNet typical). Next branch is P1 inference-time γ_int
+boost ablation (`gamma_int_boost ∈ {1, 2, 5, 10, 20}` on top of
+v17-E.20 base config). Detail:
+`analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
 
 ## Stage Status
 

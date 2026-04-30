@@ -248,19 +248,35 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
-**Next runs (v17-F Gumbel sweep)**: launched via
-`scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`. Adds Gumbel-Softmax
-relaxation to the per-step inner loop (the last unmatched MaskControl
-recipe diff, source-verified 2026-05-01 from `exitudio/ControlMM`):
+**Next runs (v17-G γ_int boost sweep)**: launched via
+`scripts/stage_b_generator/run_v17g_gamma_int_boost_sweep.sh`. Tests
+whether the architecturally-underused IntXAttn gate (final γ_int ≈ 0.02
+in v14/v15/v16) is the residual contact-patch misalignment bottleneck.
+Per-step inference unchanged from v17-E.20 ship config:
 
-| variant | per_step | gumbel | role |
-|---|---:|---:|---|
-| v17-F.10 | 10 | 1.0 | canonical MaskControl `each_iter`; ship candidate |
-| v17-F.20 | 20 | 1.0 | does Gumbel + bigger budget compound? |
-| v17-C-ng | 10 | 0.0 | sanity: must reproduce v17-C 21.77 cm |
-| v17-E.20-ng | 20 | 0.0 | sanity: must reproduce v17-E.20 18.62 cm |
+| variant | gamma_int_boost | role |
+|---|---:|---|
+| v17-G.b1 | 1.0 | sanity reproducer of v17-E.20 |
+| v17-G.b2 | 2.0 | conservative — effective γ_int ≈ 0.04 |
+| v17-G.b5 | 5.0 | moderate — effective γ_int ≈ 0.10 |
+| v17-G.b10 | 10.0 | aggressive — effective γ_int ≈ 0.20 (still 1/2.5 of typical) |
+| v17-G.b20 | 20.0 | extreme — effective γ_int ≈ 0.40 (≈ ControlNet typical) |
 
-Detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
+Decision rule: monotone improvement → γ_int IS the bottleneck → P2
+(re-init γ_int + finetune Stage B). Plateau → γ_int helps but isn't
+sole bottleneck. Catastrophe at high boost → IntXAttn output magnitude
+is OOD for trained base path → P3 architectural rework.
+
+Detail: `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
+
+**Earlier runs (v17-F Gumbel sweep, 2026-05-01)**: NEGATIVE result.
+Gumbel-Softmax injection in per-step inner loop regressed every metric
+at both budgets (per_step ∈ {10, 20}). Multi-quantizer residual
+handling makes the noise injection ill-conditioned on PIANO's deeper
+RVQ stack — same incompatibility that killed v17-D (post-hoc stacking).
+**Do not ship Gumbel.** Default `--per-step-gumbel-scale=0.0`. Detail:
+`analyses/2026-05-01_v17_diagnostics_and_gumbel.md` (design) +
+`analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md` (result).
 
 **Earlier runs (v17-D + v17-E sweep, 2026-05-01)**: launched via
 `scripts/stage_b_generator/run_v17_sweep.sh`. Three eval conditions:

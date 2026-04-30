@@ -80,7 +80,8 @@ References
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
@@ -89,6 +90,54 @@ from torch import Tensor
 
 from piano.utils.canonical_frame import axis_angle_to_matrix_np, y_rotation_matrix
 from piano.utils.smpl_utils import BODY_PART_INDICES
+
+
+# ============================================================================
+# γ_int inference-time boost (P1, v17-G)
+# ============================================================================
+
+@contextmanager
+def _scaled_gamma_int(
+    modules: Iterable[torch.nn.Module | None],
+    boost: float,
+):
+    """Multiply every ``gamma_int`` parameter inside the given modules by
+    ``boost`` for the duration of the with-block; restore on exit.
+
+    Used by v17-G to test whether γ_int's small final value (≈ 0.02 in
+    v14/v15/v16; ~1/25 of ControlNet-style typical 0.5-1.0; D-A audit
+    in `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`) is the
+    contact-patch-misalignment bottleneck. ``boost > 1`` strengthens
+    the IntXAttn cross-attention path at inference, leaving the trained
+    weights untouched.
+
+    Touches both the base transformer's per-layer ``gamma_int`` and the
+    residual transformer's analog (parameter name still ``gamma_int``,
+    referred to as ``gamma_int_res`` only in metric names). Identifies
+    by ``name.endswith("gamma_int")`` against ``named_parameters`` —
+    works for both ``transformer.mask_transformer.seqTransEncoder.layers``
+    and ``residual_transformer.residual.seqTransEncoder.layers`` layouts.
+
+    No-ops at ``boost == 1.0`` (fast path).
+    """
+    if float(boost) == 1.0:
+        yield
+        return
+    saved: list[tuple[torch.nn.Parameter, Tensor]] = []
+    try:
+        with torch.no_grad():
+            for m in modules:
+                if m is None:
+                    continue
+                for name, p in m.named_parameters():
+                    if name.endswith("gamma_int"):
+                        saved.append((p, p.data.detach().clone()))
+                        p.data.mul_(float(boost))
+        yield
+    finally:
+        with torch.no_grad():
+            for p, original in saved:
+                p.data.copy_(original)
 
 
 # ============================================================================
@@ -504,7 +553,7 @@ def _generate_with_per_step_guidance(
     per_step_lr: float = 6e-2,
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
-    per_step_gumbel_scale: float = 1.0,  # 1.0 matches MaskControl; 0.0 = pre-v17-F PIANO behaviour
+    per_step_gumbel_scale: float = 0.0,  # PIANO default: 0.0 (v17-F result showed Gumbel hurts on multi-RVQ stack); set to 1.0 to match MaskControl exactly
     device: torch.device,
     log_progress: bool = False,
 ) -> tuple[Tensor, dict[str, Any]]:
@@ -724,7 +773,15 @@ def guide_with_contact(
     per_step_lr: float = 6e-2,
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
-    per_step_gumbel_scale: float = 1.0,  # 1.0 matches MaskControl; 0.0 = pre-v17-F PIANO
+    per_step_gumbel_scale: float = 0.0,  # PIANO default: 0.0 (v17-F: Gumbel hurts); set 1.0 for MaskControl-equivalent
+    # NOTE: gamma_int_boost (v17-G) is NOT a kwarg here. It is applied
+    # once to model parameters in qual_eval after model load (mutation,
+    # no restore) — see scripts/stage_b_generator/qual_eval.py
+    # `--gamma-int-boost`. Wrapping every per-clip call in a save/restore
+    # would touch the whole 270-line body of this function; we instead
+    # treat boost as a process-level configuration that applies to all
+    # generation conditions (full / text_only / swap / full_guided) the
+    # eval emits, which is the correct semantic anyway.
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,

@@ -147,16 +147,38 @@ Latest follow-up findings (2026-05-01):
   CE training → **VQ codebook is not the bottleneck**. Codebook re-training
   deprioritised.
 
-Latest implemented branch, pending server results (v17-F Gumbel sweep):
+Latest evaluated sweep (v17-F Gumbel, 2026-05-01) — NEGATIVE:
 
-- runner: `scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`
-- mechanism: Gumbel-Softmax / Concrete relaxation in per-step inner loop
-  (the last unmatched MaskControl `each_iter` diff). New CLI:
-  `--per-step-gumbel-scale FLOAT` (default 1.0 = MaskControl-equivalent;
-  0.0 = back-compat pre-v17-F).
-- variants: v17-F.10 / v17-F.20 (Gumbel ON), v17-C-ng / v17-E.20-ng
-  (Gumbel OFF sanity reproducers).
-- detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
+- v17-F.10 / v17-F.20 (Gumbel ON) regress every metric vs Gumbel-OFF
+  sanity reruns at both budgets. Root cause: PIANO's frozen baseline
+  residual_emb_sum dominates the decode embedding magnitude, so Gumbel
+  noise on the small base contribution destabilises inner-loop
+  gradients. MaskControl ignores residual during per-iter so same
+  injection works for them. Same multi-quantizer-residual
+  incompatibility that killed v17-D.
+- **Do not ship Gumbel on PIANO**. Default `--per-step-gumbel-scale=0.0`.
+- Sanity reruns (v17-C-ng / v17-E.20-ng, Gumbel OFF) match originals
+  within 0.5 cm — pipeline is consistent.
+
+**Inference path now near-saturated**: post-hoc stacking and Gumbel
+both regress; budget sweep at diminishing returns. Ship configs:
+**v17-E.20** (contact 18.62, correct-part 0.264, local 42.09 cm) or
+**v17-E.50** (contact 16.50, correct-part 0.275, local 39.02 cm; with
+metric-gaming caveat per visual review).
+
+Latest implemented branch, pending server results (v17-G γ_int boost):
+
+- runner: `scripts/stage_b_generator/run_v17g_gamma_int_boost_sweep.sh`
+- hypothesis: γ_int ≈ 0.02 final value (per D-A audit) is ~1/25 of
+  typical ControlNet-style strength → IntXAttn cross-attention is
+  underused → boost it at inference time and see if contact-patch
+  misalignment improves.
+- new CLI: `--gamma-int-boost FLOAT` (default 1.0 = no change). Boost
+  is applied as in-place ×scale to all gamma_int / gamma_int_res
+  parameters during the inference call, restored after.
+- variants: v17-G.b{1,2,5,10,20} on top of v17-E.20 base config
+  (per_step=20 Gumbel OFF).
+- detail: `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
 
 ## Current Decision
 

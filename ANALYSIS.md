@@ -13,7 +13,8 @@ merged on 2026-04-29 to reduce context load.
 | `analyses/early_setup.md` | Server/data/backbone setup facts that are easy to forget. |
 | `analyses/2026-05-01_per_step_guidance_design.md` | v17 per-step decoded-geometric guidance design — MaskControl source-code refs, PIANO-specific multi-quantizer adaptation, hyperparameter starting points, ablation matrix v17-A..E with decision rule, risk register. v17-C done; v17-D/E pending. |
 | `analyses/2026-05-01_v17_per_step_result.md` | v17-C result — single-sample SOTA on v16 best_contact ckpt. contact 21.77 cm; same-part local 46.13 cm matches v14 K=16 composite oracle; moving_coupled 0.3428 beats v14 K=64 alignment oracle. Per-step trace shows 60.67% base-token flip rate. |
-| `analyses/2026-05-01_v17_diagnostics_and_gumbel.md` | v17 follow-up — γ_int audit (final ≈ 0.02, IntXAttn heavily underused) + MaskControl source diff verification (VQ codebook is not the bottleneck) + Gumbel-Softmax relaxation added to per-step inner loop (matches MaskControl `each_iter`). v17-F sweep pending server. |
+| `analyses/2026-05-01_v17_diagnostics_and_gumbel.md` | v17 follow-up — γ_int audit (final ≈ 0.02, IntXAttn heavily underused) + MaskControl source diff verification (VQ codebook is not the bottleneck) + Gumbel-Softmax relaxation added to per-step inner loop (matches MaskControl `each_iter`). |
+| `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md` | v17-F result (Gumbel **negative** on PIANO — regresses every metric at both budgets; multi-quantizer residual incompatibility) + P1 γ_int inference-boost plan (v17-G sweep at boost ∈ {1, 2, 5, 10, 20}). Inference path near-saturated; remaining lever is architectural γ_int gate. |
 
 Root memory docs:
 
