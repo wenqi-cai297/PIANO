@@ -138,6 +138,47 @@ Decision-rule outcome (per design doc §4): "v17-C clearly beats v17-B" →
 proceed to v17-D (stacked per-step + post-hoc) and v17-E (per-step budget
 sweep at iters ∈ {20, 50}).
 
+2026-05-01 v17-D + v17-E sweep result: v17-E budget scales monotonically;
+v17-D (stacked per-step + post-hoc) is *worse* than v17-C, so MaskControl's
+canonical stack does not stack on PIANO's deeper RVQ stack. v17-E.50
+single-sample beats every K-oracle baseline:
+
+| variant | contact | coupled | IoU | correct-part | local-err |
+|---|---:|---:|---:|---:|---:|
+| v17-D stacked (10 + 30) | 22.91 | 0.3283 | 0.4380 | 0.1961 | 47.93 |
+| v17-E.20 (per-step 20 only) | 18.62 | 0.3559 | 0.4727 | 0.2639 | 42.09 |
+| v17-E.50 (per-step 50 only) | 16.50 | 0.3533 | 0.5038 | 0.2746 | 39.02 |
+
+v17-E.50 contact `16.50 cm` < GT VQ roundtrip `18.47 cm` is suspicious for
+metric gaming. User visual review confirms v17-E.50 visibly better than
+v17-E.20 / v16 raw at contact placement, but body parts are still at the
+wrong patch on the object surface (錯位). Detail:
+`analyses/2026-05-01_v17_per_step_result.md` (v17-D/E summary section).
+
+2026-05-01 v17 follow-up — γ_int audit + Gumbel addition (v17-F):
+- D-A audit of `gamma_int_abs_mean` from v14/v15/v16 wandb shows final
+  γ_int ≈ **0.02** (zero-init grew to 0.02 over 80 epochs). ControlNet-style
+  gates typically grow to 0.5–1.0 → IntXAttn is gated **1/25 of typical**.
+  Indicates Stage B is heavily **under-using** the structured z_int input;
+  the v9–v16 training-time decoded contact loss was helping via the direct
+  gradient on decoded motion, not via amplifying the cross-attention gate.
+  Architectural lever (re-init γ_int, hard-bypass channel for
+  contact_target_xyz) deferred until v17-F decides whether inference TTT is
+  enough.
+- MaskControl uses pretrained MoMask VQ + frozen base + train only the
+  control adapter with pure CE → **MoMask codebook is not the bottleneck**.
+  GT VQ roundtrip 18.47 cm is "vanilla MoMask training-objective
+  reconstruction quality", not a codebook capacity ceiling.
+- Route 1 implementation landed: Gumbel-Softmax / Concrete relaxation in
+  the per-step inner loop (matches MaskControl's `each_iter` block,
+  source-verified diff). New `--per-step-gumbel-scale` CLI (default 1.0 =
+  MaskControl-equivalent; 0.0 = pre-v17-F PIANO behaviour, back-compat).
+  Pending server eval as v17-F sweep
+  (`scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`):
+  v17-F.10 (per_step=10 Gumbel ON), v17-F.20 (per_step=20 Gumbel ON),
+  v17-C-ng / v17-E.20-ng (sanity Gumbel-OFF reproducers).
+  Detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
+
 ## Stage Status
 
 Stage 1 pseudo-labels:

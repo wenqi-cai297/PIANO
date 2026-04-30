@@ -152,3 +152,85 @@ def test_decode_with_relaxed_masked_base_all_masked_matches_pure_relaxed():
     soft = torch.softmax(logits, dim=-1) @ vq.quantizer.codebooks[0]
     expected = vq.decoder((soft + res_sum).permute(0, 2, 1))
     torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_decode_with_relaxed_masked_base_gumbel_noise_zero_matches_no_noise():
+    """gumbel_noise_scale=0 must be exactly equivalent to the
+    pre-v17-F path (pure softmax expectation).
+    """
+    from piano.inference.contact_guidance import (
+        _decode_with_relaxed_masked_base,
+    )
+
+    B, S, Q, V, code_dim = 1, 4, 3, 8, 16
+    vq = _make_fake_vq(B, S, Q, V, code_dim)
+
+    logits = torch.randn(B, S, V)
+    committed_ids = torch.zeros(B, S, dtype=torch.long)
+    differentiable_mask = torch.ones(B, S, dtype=torch.bool)
+    res_sum = torch.randn(B, S, code_dim)
+
+    no_noise = _decode_with_relaxed_masked_base(
+        base_logits=logits,
+        committed_ids=committed_ids,
+        differentiable_mask=differentiable_mask,
+        baseline_residual_emb_sum=res_sum,
+        vq_model=vq,
+        temperature=1.0,
+        gumbel_noise_scale=0.0,
+    )
+    explicit_zero = _decode_with_relaxed_masked_base(
+        base_logits=logits,
+        committed_ids=committed_ids,
+        differentiable_mask=differentiable_mask,
+        baseline_residual_emb_sum=res_sum,
+        vq_model=vq,
+        temperature=1.0,
+    )
+    torch.testing.assert_close(no_noise, explicit_zero, atol=0.0, rtol=0.0)
+
+
+def test_decode_with_relaxed_masked_base_gumbel_noise_changes_output():
+    """gumbel_noise_scale=1 must produce a different (stochastic) output
+    than gumbel_noise_scale=0 with the same logits, confirming the
+    noise injection is wired up.
+    """
+    from piano.inference.contact_guidance import (
+        _decode_with_relaxed_masked_base,
+    )
+
+    B, S, Q, V, code_dim = 1, 6, 3, 16, 16
+    vq = _make_fake_vq(B, S, Q, V, code_dim)
+
+    logits = torch.randn(B, S, V) * 2.0     # moderately peaked
+    committed_ids = torch.zeros(B, S, dtype=torch.long)
+    differentiable_mask = torch.ones(B, S, dtype=torch.bool)
+    res_sum = torch.zeros(B, S, code_dim)
+
+    torch.manual_seed(0)
+    no_noise = _decode_with_relaxed_masked_base(
+        base_logits=logits, committed_ids=committed_ids,
+        differentiable_mask=differentiable_mask,
+        baseline_residual_emb_sum=res_sum, vq_model=vq,
+        temperature=1.0, gumbel_noise_scale=0.0,
+    )
+    torch.manual_seed(0)
+    with_noise = _decode_with_relaxed_masked_base(
+        base_logits=logits, committed_ids=committed_ids,
+        differentiable_mask=differentiable_mask,
+        baseline_residual_emb_sum=res_sum, vq_model=vq,
+        temperature=1.0, gumbel_noise_scale=1.0,
+    )
+    diff = (with_noise - no_noise).abs().max()
+    assert diff > 1e-3, f"Gumbel noise injection had no observable effect (max diff={float(diff)})"
+    # Also: gradient still flows through logits when Gumbel noise is on.
+    logits_param = logits.clone().requires_grad_(True)
+    out = _decode_with_relaxed_masked_base(
+        base_logits=logits_param, committed_ids=committed_ids,
+        differentiable_mask=differentiable_mask,
+        baseline_residual_emb_sum=res_sum, vq_model=vq,
+        temperature=1.0, gumbel_noise_scale=1.0,
+    )
+    out.sum().backward()
+    assert logits_param.grad is not None
+    assert logits_param.grad.abs().sum().item() > 0.0

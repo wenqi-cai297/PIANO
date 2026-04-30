@@ -129,11 +129,34 @@ Latest evaluated branch (v17-C):
   beats v14 K=64 alignment oracle (0.3339). Per-step inner loop flips
   60.67% of base tokens vs naive baseline.
 
-Latest implemented branch, pending server results (v17-D + v17-E sweep):
+Latest evaluated sweep (v17-D + v17-E, 2026-05-01):
 
-- runner: `scripts/stage_b_generator/run_v17_sweep.sh`
-- variants: v17-D stacked (per_step=10, post_hoc=30); v17-E.20 (per_step=20);
-  v17-E.50 (per_step=50). Detailed in PLAN.md §4a.
+- v17-D stacked (per_step=10 + post_hoc=30) is *worse* than v17-C → MaskControl's
+  canonical stack does not stack on PIANO; do not pursue post-hoc.
+- v17-E.20 (per_step=20 only): contact `18.62 cm`, correct-part `0.2639`.
+- v17-E.50 (per_step=50 only): contact `16.50 cm` (below GT VQ roundtrip
+  18.47 — metric-gaming red flag), correct-part `0.2746`. User visual review:
+  visibly better than v16 raw, but contact patches still misaligned.
+
+Latest follow-up findings (2026-05-01):
+
+- D-A: γ_int ≈ 0.02 final after v14/v15/v16 training (zero-init grew to 0.02
+  over 80 epochs). IntXAttn is heavily underused — architectural lever
+  exists but deferred until v17-F decides whether inference TTT is enough.
+- MaskControl source-verified: pretrained MoMask VQ + frozen base + pure
+  CE training → **VQ codebook is not the bottleneck**. Codebook re-training
+  deprioritised.
+
+Latest implemented branch, pending server results (v17-F Gumbel sweep):
+
+- runner: `scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`
+- mechanism: Gumbel-Softmax / Concrete relaxation in per-step inner loop
+  (the last unmatched MaskControl `each_iter` diff). New CLI:
+  `--per-step-gumbel-scale FLOAT` (default 1.0 = MaskControl-equivalent;
+  0.0 = back-compat pre-v17-F).
+- variants: v17-F.10 / v17-F.20 (Gumbel ON), v17-C-ng / v17-E.20-ng
+  (Gumbel OFF sanity reproducers).
+- detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
 
 ## Current Decision
 

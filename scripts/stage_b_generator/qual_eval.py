@@ -602,6 +602,18 @@ def main() -> int:
              "still masked at low step indices, so the relaxed-decode "
              "signal is uniform-like).",
     )
+    parser.add_argument(
+        "--per-step-gumbel-scale", type=float, default=1.0,
+        help="Gumbel-noise scale for the per-step inner loop's relaxed "
+             "decode (v17-F, MaskControl-equivalent). 1.0 = canonical "
+             "Gumbel-Softmax / Concrete relaxation, matches "
+             "exitudio/ControlMM's `each_iter` block "
+             "(softmax((logits/T) + gumbel_noise)). 0.0 = pre-v17-F PIANO "
+             "behaviour (pure softmax expectation, no noise). Set 0.0 to "
+             "ablate the Gumbel addition. Source-verified diff vs "
+             "MaskControl listed in "
+             "analyses/2026-05-01_per_step_guidance_design.md.",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument(
@@ -797,7 +809,8 @@ def main() -> int:
             f"per_step_iters={args.per_step_iters}, "
             f"per_step_lr={args.per_step_lr}, "
             f"per_step_temperature={args.per_step_temperature}, "
-            f"per_step_start_step={args.per_step_start_step}) ===",
+            f"per_step_start_step={args.per_step_start_step}, "
+            f"per_step_gumbel_scale={args.per_step_gumbel_scale}) ===",
         )
         per_clip_guided: list[dict[str, dict]] = []
         for i in range(len(samples)):
@@ -850,6 +863,7 @@ def main() -> int:
                 per_step_lr=args.per_step_lr,
                 per_step_temperature=args.per_step_temperature,
                 per_step_start_step=args.per_step_start_step,
+                per_step_gumbel_scale=args.per_step_gumbel_scale,
                 device=device,
             )
             print(
@@ -919,6 +933,7 @@ def main() -> int:
             "per_step_lr": float(args.per_step_lr),
             "per_step_temperature": float(args.per_step_temperature),
             "per_step_start_step": int(args.per_step_start_step),
+            "per_step_gumbel_scale": float(args.per_step_gumbel_scale),
             "per_clip": [
                 {
                     "seq_id": seq_ids[i],

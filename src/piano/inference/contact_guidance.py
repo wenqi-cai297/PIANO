@@ -395,6 +395,7 @@ def _decode_with_relaxed_masked_base(
     vq_model: torch.nn.Module,
     *,
     temperature: float = 1.0,
+    gumbel_noise_scale: float = 0.0,
 ) -> Tensor:                              # (B, T, 263) normalised motion
     """Differentiable decode for per-step MaskGIT guidance.
 
@@ -405,12 +406,32 @@ def _decode_with_relaxed_masked_base(
     tokens won't change). Residual context is the frozen
     ``baseline_residual_emb_sum`` precomputed once from the baseline
     residual pass.
+
+    ``gumbel_noise_scale`` (added 2026-05-01 to match MaskControl's
+    canonical recipe; verified from
+    ``exitudio/ControlMM@models/mask_transformer/control_transformer.py``
+    `each_iter` block): when > 0, adds standard Gumbel(0, 1) noise to
+    ``logits`` before softmax. This is the Gumbel-Softmax / Concrete
+    relaxation: ``softmax((logits + scale*gumbel_noise) / T)`` is an
+    expected-loss-under-sampled-tokens estimator instead of a pure
+    softmax expectation. PIANO v17-C/D/E used 0.0 (pure softmax); v17-F
+    onwards uses 1.0 (matching MaskControl).
     """
     quantizer = vq_model.quantizer
     base_codebook = quantizer.codebooks[0]                                    # (V, d)
     V = int(base_codebook.shape[0])
 
-    soft_emb = F.softmax(base_logits / max(temperature, 1e-6), dim=-1) @ base_codebook
+    if gumbel_noise_scale > 0.0:
+        # Standard Gumbel(0, 1): -log(-log(U)). Inlined to keep this helper
+        # CPU-importable (MoMask's tools.gumbel_noise lives behind the
+        # backbone adapter which isn't on path during pure-CPU tests).
+        # Numerically identical to ``models.mask_transformer.tools.gumbel_noise``.
+        u = torch.rand_like(base_logits).clamp_(min=1e-20, max=1.0 - 1e-7)
+        gn = -torch.log(-torch.log(u))
+        noisy_logits = base_logits + float(gumbel_noise_scale) * gn
+    else:
+        noisy_logits = base_logits
+    soft_emb = F.softmax(noisy_logits / max(temperature, 1e-6), dim=-1) @ base_codebook
     safe_ids = committed_ids.clamp(min=0, max=V - 1)
     hard_emb = base_codebook[safe_ids]                                        # (B, S, d)
     relaxed_base = torch.where(
@@ -483,6 +504,7 @@ def _generate_with_per_step_guidance(
     per_step_lr: float = 6e-2,
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
+    per_step_gumbel_scale: float = 1.0,  # 1.0 matches MaskControl; 0.0 = pre-v17-F PIANO behaviour
     device: torch.device,
     log_progress: bool = False,
 ) -> tuple[Tensor, dict[str, Any]]:
@@ -595,6 +617,7 @@ def _generate_with_per_step_guidance(
                     baseline_residual_emb_sum=baseline_residual_emb_sum,
                     vq_model=vq_model,
                     temperature=per_step_temperature,
+                    gumbel_noise_scale=per_step_gumbel_scale,
                 )                                                              # (B, T, 263)
                 motion = motion_norm * motion_std + motion_mean
                 joints_canon = recover_from_ric(motion, 22)                    # (B, T, 22, 3)
@@ -655,6 +678,7 @@ def _generate_with_per_step_guidance(
         "per_step_lr": float(per_step_lr),
         "per_step_temperature": float(per_step_temperature),
         "per_step_start_step": int(per_step_start_step),
+        "per_step_gumbel_scale": float(per_step_gumbel_scale),
         "per_step_loss_initial": per_step_loss_initial,
         "per_step_loss_final": per_step_loss_final,
         "per_step_active": per_step_active,
@@ -700,6 +724,7 @@ def guide_with_contact(
     per_step_lr: float = 6e-2,
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
+    per_step_gumbel_scale: float = 1.0,  # 1.0 matches MaskControl; 0.0 = pre-v17-F PIANO
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -888,6 +913,7 @@ def guide_with_contact(
             per_step_lr=per_step_lr,
             per_step_temperature=per_step_temperature,
             per_step_start_step=per_step_start_step,
+            per_step_gumbel_scale=per_step_gumbel_scale,
             device=device,
             log_progress=log_progress,
         )

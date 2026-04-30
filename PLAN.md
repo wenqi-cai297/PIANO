@@ -248,7 +248,21 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
-**Next runs (v17-D + v17-E sweep)**: launched together via
+**Next runs (v17-F Gumbel sweep)**: launched via
+`scripts/stage_b_generator/run_v17f_gumbel_sweep.sh`. Adds Gumbel-Softmax
+relaxation to the per-step inner loop (the last unmatched MaskControl
+recipe diff, source-verified 2026-05-01 from `exitudio/ControlMM`):
+
+| variant | per_step | gumbel | role |
+|---|---:|---:|---|
+| v17-F.10 | 10 | 1.0 | canonical MaskControl `each_iter`; ship candidate |
+| v17-F.20 | 20 | 1.0 | does Gumbel + bigger budget compound? |
+| v17-C-ng | 10 | 0.0 | sanity: must reproduce v17-C 21.77 cm |
+| v17-E.20-ng | 20 | 0.0 | sanity: must reproduce v17-E.20 18.62 cm |
+
+Detail: `analyses/2026-05-01_v17_diagnostics_and_gumbel.md`.
+
+**Earlier runs (v17-D + v17-E sweep, 2026-05-01)**: launched via
 `scripts/stage_b_generator/run_v17_sweep.sh`. Three eval conditions:
 
 | variant | per_step_iters | guidance_steps | EVAL_PREFIX | hypothesis |
