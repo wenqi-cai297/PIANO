@@ -464,6 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen = subs.add_parser("generated", help="Visualize generated motions from a run dir")
     p_gen.add_argument("--run-dir", type=Path, required=True,
                        help="A smoke-test or inference run directory containing generated.npz")
+    p_gen.add_argument("--seq-ids", nargs="*", default=None,
+                       help="Render only these sequence ids (default: render all clips). "
+                            "Use this to spot-check a focused subset (worst clips, "
+                            "historical hard cases, etc.) instead of rendering the full "
+                            "80-clip eval matrix.")
+    p_gen.add_argument("--num-samples", type=int, default=None,
+                       help="If --seq-ids is not set, render only the first N clips. "
+                            "Default: render all.")
 
     for p in (p_real, p_gen):
         p.add_argument("--output-dir", type=Path, default=None,
@@ -497,6 +505,15 @@ def main() -> None:
         samples = load_real_samples(args.data_dir, args.seq_ids, args.num_samples)
     else:
         samples = load_generated_samples(args.run_dir)
+        if args.seq_ids:
+            wanted = set(args.seq_ids)
+            selected = [s for s in samples if s["seq_id"] in wanted]
+            missing = wanted - {s["seq_id"] for s in selected}
+            if missing:
+                print(f"  [warn] missing seq_ids in generated.npz: {sorted(missing)}")
+            samples = selected
+        elif args.num_samples is not None:
+            samples = samples[: args.num_samples]
 
     run_visualization(
         samples, output_dir, args.source, fps=args.fps,
