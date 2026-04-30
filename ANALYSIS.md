@@ -52,22 +52,25 @@ average and the best moving same-part recall is only `0.165`. So this is not
 just an underpowered K=16 reranking issue; v14 usually does not contain a truly
 GT-aligned manipulation sample to select.
 
-Latest implementation:
+Latest result and implementation:
 
-- v15 branch added in `configs/training/generator_v15_alignment_guided.yaml`
-  and `scripts/stage_b_generator/run_v15_alignment_guided.sh`.
-- Training loss now includes wrong-part margin and contact-segment consistency
-  on top of part-specific `contact_target_xyz`.
-- Contact eval now logs strict alignment metrics and can select
-  `best_contact.pt` by `alignment_contact_score`.
-- `qual_eval.py`/`contact_guidance.py` now support `--guidance-layers full_rvq`
-  for sampling-time decoded target guidance over the full RVQ token stack.
+- v15 has been evaluated and is negative/neutral: `best_contact` raw full is
+  `27.62 cm`, moving contact IoU is `0.3804`, moving correct GT-part recall is
+  `0.1684`, and same-part local error is `55.09 cm`. `full_guided` worsens
+  contact to `31.57 cm`.
+- v15's code remains as the alignment-loss baseline: wrong-part margin,
+  contact-segment consistency, strict contact-eval alignment metrics, and
+  `--guidance-layers full_rvq`.
+- v16 is now the active next implementation in
+  `configs/training/generator_v16_alignment_mirror.yaml` and
+  `scripts/stage_b_generator/run_v16_alignment_mirror.sh`: it keeps v15's
+  objective and enables deterministic original+mirror training-set doubling.
 
 Next analysis should be:
 
-1. Run v15 on the server and compare raw `full` vs guided `full_guided`, using
-   predicted/conditioned contact body part, object-local target, and local-frame
-   coupling.
+1. Run v16 on the server and compare raw `full` vs guided `full_guided`, using
+   predicted/conditioned contact body part, object-local target, local-frame
+   coupling, and the mirror-doubled training distribution.
 2. Evaluate with contact distance, temporal coupling, and
    `scripts/stage_b_generator/measure_contact_alignment.py`.
 3. Subset/hard-case review, especially IMHD and NeuralDome moving-object

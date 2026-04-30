@@ -36,13 +36,14 @@ contact, improving over v12/v13, but moving-coupled frame fraction is only
 that pool is still semantically weak. The next step is a distribution/guidance
 change that explicitly targets body part, object-local patch, and coupling.
 
-That next step is now implemented as v15, pending server results. v15 adds a
-wrong-part margin and contact-segment consistency term to the decoded
-target-trajectory loss, changes train-time contact checkpointing to monitor
-strict alignment, and adds full-RVQ sampling-time target guidance. This is the
-right next experiment because it attacks the K64 failure directly: candidates
-were near the object but rarely used the GT body part/patch over the GT contact
-segment.
+v15 attacked that failure directly, but the synced result is not good enough:
+`best_contact` raw full is `27.62 cm` and `full_guided` worsens to `31.57 cm`;
+moving correct GT-part recall is only `0.1684` and moving same-part local error
+is `55.09 cm`. Visual review in the local `piano` env confirms visible
+human-object offsets remain. The next experiment should therefore be v16:
+keep v15's alignment objective but train on deterministic original+mirror
+pairs, matching the MoMask/HumanML3D mirrored-data assumption before we abandon
+this loss family.
 
 ## Evidence
 
@@ -232,6 +233,7 @@ library helpers from `src/piano/`:
 
 Current scripts:
 
+- `scripts/stage_b_generator/run_v16_alignment_mirror.sh`
 - `scripts/stage_b_generator/run_v15_alignment_guided.sh`
 - `scripts/stage_b_generator/run_v14_sampled_st_contact.sh`
 - `scripts/stage_b_generator/run_v13_target_trajectory.sh`
@@ -239,10 +241,12 @@ Current scripts:
 - `scripts/stage_b_generator/measure_temporal_coupling.py`
 - `scripts/stage_b_generator/measure_contact_alignment.py`
 
-`run_v15_alignment_guided.sh` is the latest train/eval runner. It wraps the
-v13 runner with v15 defaults and enables `full_guided` eval via
-`GUIDANCE_LAYERS=full_rvq`. `run_v14_sampled_st_contact.sh` remains the latest
-completed-result runner and the baseline to beat.
+`run_v16_alignment_mirror.sh` is the latest train/eval runner. It wraps the
+v13 runner with v16 defaults, keeps v15's `full_guided` eval via
+`GUIDANCE_LAYERS=full_rvq`, and trains with deterministic mirror duplication.
+`run_v15_alignment_guided.sh` remains the negative/neutral alignment-loss
+baseline; `run_v14_sampled_st_contact.sh` remains the best one-shot contact
+baseline to beat.
 
 Decision rules:
 
@@ -253,10 +257,11 @@ Decision rules:
 - K=64 alignment-aware selection still lacks enough aligned candidates: the
   next iteration should change the generated distribution or use stronger
   decoded-motion guidance, not merely increase K.
-- v14 K=16 candidate quality is spatially strong but semantically misaligned:
-  run the implemented v15 alignment/coupling training branch and full-RVQ
-  decoded-motion sample-time guidance using the predicted contact body part,
-  object-local target trajectory, and local-frame coupling.
+- If v16 does not improve strict alignment, do not keep tuning mirror settings;
+  treat data symmetry as tested and move to a stronger sampling/training route.
+- v14 K=16 candidate quality is spatially strong but semantically misaligned,
+  and v15 did not fix it. Run v16 mirror-doubled alignment training before
+  moving away from this loss family.
 - Use v14 K=16 composite and K=64 alignment as baselines to beat:
   `17.94 cm`/`0.3715` coupled/`0.4472` moving IoU/`0.2378` correct-part recall,
   and `18.71 cm`/`0.3339`/`0.4516`/`0.2496` with `40.30 cm` local error.

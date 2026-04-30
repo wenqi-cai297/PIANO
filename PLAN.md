@@ -15,20 +15,21 @@ auxiliary path harder and closer to sampling improves both one-shot spatial
 contact and the K-sample candidate pool. However, ordinary one-shot sampling
 still often fails to bind to the object's motion, and K=64 alignment-aware
 selection shows the v14 pool usually lacks truly GT-aligned manipulation
-samples. The next lever is no longer pure reranking; it is the newly
-implemented v15 alignment/coupling branch plus full-RVQ decoded-motion
-guidance eval.
+samples. v15 then tested the direct alignment-loss/full-RVQ-guidance idea and
+did not improve the learned raw distribution: `best_contact` full is
+`27.62 cm`, essentially tied with v14, while moving correct GT-part recall is
+only `0.1684` and same-part local error is `55.09 cm`.
 
 Latest evaluated branch: v14 keeps v13's object-local `contact_target_xyz`
 trajectory loss, but takes decoded-aux logits from the all-mask MaskGIT/CFG
 first step and decodes with straight-through Gumbel hard codebook samples
 through the full residual RVQ path.
 
-Latest implemented branch, pending server results: v15 adds wrong-part margin
-and contact-segment consistency to the decoded target-trajectory loss, logs
-alignment metrics in train-time contact eval, selects `best_contact.pt` on
-`alignment_contact_score`, and runs `qual_eval.py --guidance-layers full_rvq`
-for sampling-time target guidance.
+Latest implemented branch, pending server results: v16 keeps the v15 alignment
+objective but changes the train data to deterministic mirror doubling
+(`augmentation.mirror_duplicate=true`). This matches the MoMask/HumanML3D
+mirrored-data assumption and is deliberately separate from the older stochastic
+v0.7 `mirror_prob=0.5` experiment.
 
 ### 1. K-sample oracle
 
@@ -214,18 +215,42 @@ neither selection aligns the generated body to the GT object-local contact
 trajectory. Guidance/reranking must become body-part and contact-target aware,
 not only "any tracked part near any object point."
 
-### 4. v15 alignment-aware train/guidance branch
+### 4. v15 result and v16 mirror-doubled branch
 
-Implementation is in place and should be the next server run.
+v15 has been run and is not a win. Local synced metrics:
+
+| row | contact | moving coupled | moving IoU | correct moving GT-part recall | same-part local error |
+|---|---:|---:|---:|---:|---:|
+| v15 bc full | 27.62 cm | 0.2837 | 0.3804 | 0.1684 | 55.09 cm |
+| v15 bc full_guided | 31.57 cm | 0.2991 | 0.3998 | 0.1603 | 59.95 cm |
+| v15 bv full | 30.73 cm | 0.2811 | 0.3617 | 0.1606 | 59.92 cm |
+| v15 bv full_guided | 29.50 cm | 0.2854 | 0.3749 | 0.1538 | 54.98 cm |
+| v15 final full | 29.68 cm | 0.2733 | 0.3653 | 0.1697 | 54.24 cm |
+| v15 final full_guided | 31.01 cm | 0.2705 | 0.3865 | 0.1681 | 56.40 cm |
+
+Visual review using local `piano` env wrote videos to
+`runs/visualizations/stageB_v0_15_bc_review/{full,full_guided}`. Trolley and
+suitcase hard cases still have obvious human-object offsets; `full_guided`
+does not rescue them and can increase separation.
+
+v16 is now the next server run. It keeps the v15 objective and changes only the
+training data path to deterministic mirror doubling.
 
 Runner:
 
 ```bash
-bash scripts/stage_b_generator/run_v15_alignment_guided.sh
+bash scripts/stage_b_generator/run_v16_alignment_mirror.sh
 ```
 
 Primary code/config changes:
 
+- `src/piano/data/dataset.py`: `AugmentConfig.mirror_duplicate` doubles train
+  dataset length and pairs each source clip with a forced mirrored copy.
+- `src/piano/training/train_generator.py`: forwards `mirror_duplicate` from
+  YAML to `HOIDataset`.
+- `configs/training/generator_v16_alignment_mirror.yaml`: enables
+  `augmentation.enabled=true`, `mirror_prob=0.0`, and
+  `mirror_duplicate=true`.
 - `src/piano/training/decoded_contact_loss.py`: adds `part_margin_weight`,
   `part_margin_m`, `segment_consistency_weight`, and
   `segment_consistency_moving_only` to the target-trajectory decoded loss.
@@ -234,19 +259,20 @@ Primary code/config changes:
 - `src/piano/inference/contact_guidance.py`: adds
   `guidance_layers="full_rvq"` so sampling-time guidance can optimize the full
   generated RVQ stack, not only base logits.
-- `configs/training/generator_v15_alignment_guided.yaml`: enables the new loss
-  terms and uses `training.contact_eval.best_key: alignment_contact_score`.
+- `configs/training/generator_v15_alignment_guided.yaml`: baseline v15 config
+  retained for reproducibility; v16 copies its loss/monitoring settings.
 
 Decision criteria for success:
 
-- raw `best_contact` should improve v14's strict alignment baseline, especially
-  moving same-part recall (`0.2496`) and same-part local error (`40.30 cm`).
+- raw v16 `best_contact` must beat v15 raw (`27.62 cm`) and improve strict
+  alignment toward the v14 K64 alignment reference (`0.2496` moving correct
+  GT-part recall, `40.30 cm` same-part local error).
 - guided `full_guided` should improve alignment without destroying contact
-  distance/coupling; compare full vs full_guided on contact distance, temporal
-  coupling, and alignment-to-GT-roundtrip summaries.
-- If raw v15 improves but full-RVQ guidance does not, continue training-side
-  alignment. If guidance improves but raw v15 does not, treat sampling-time
-  decoded constraints as the active route.
+  distance/coupling; if it repeats v15's contact/local-error regression, do
+  not keep tuning full-RVQ final-stage guidance.
+- If v16 still matches v15/v14, data symmetry is not the main blocker and the
+  next route should be a stronger sampling/training mechanism, not another
+  mirror or loss-weight sweep.
 
 ### 5. Soft-hard gap diagnostic
 
@@ -317,10 +343,9 @@ Immediate branch:
 - Do not spend the next iteration on more K/rerank-weight tuning alone. K=64
   shows the v14 candidate distribution itself lacks enough aligned samples,
   especially outside chairs.
-- Use v14 `best_contact.pt` as the base checkpoint for a v15 training or
-  full-RVQ sample-time-guidance branch that directly optimizes the
-  predicted/conditioned contact body part, object-local target trajectory, and
-  kinematic coupling rather than the old any-part min-distance.
+- Run v16 mirror-doubled training next. It keeps the v15 alignment objective
+  but fixes the remaining MoMask/HumanML3D data mismatch by pairing each
+  training clip with a deterministic mirrored copy.
 - Keep `measure_contact_alignment.py` as the paired readout with contact
   distance and temporal coupling. A real win must improve GT-aligned contact,
   not only lower mean-min distance.

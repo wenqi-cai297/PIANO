@@ -72,10 +72,12 @@ Stage B: Motion Generator.
   - full-RVQ decoded-contact path;
   - v15 alignment-aware decoded loss terms for wrong-part margin and
     contact-segment consistency;
-  - full-RVQ sampling-time target guidance for offline eval.
+  - full-RVQ sampling-time target guidance for offline eval;
+  - v16 deterministic train-set mirror duplication.
 - Active bottleneck: v14 improves one-shot contact to `27.37 cm`, but K64
   alignment shows too few samples bind the correct body part to the correct
-  object-local patch/timing.
+  object-local patch/timing. v15 alignment losses/guidance did not fix this
+  (`27.62 cm` raw contact, `0.1684` moving correct GT-part recall).
 
 Stage C: Joint Finetune.
 
@@ -123,8 +125,9 @@ v14 sampled-ST best_contact on matched 80 clips:
 | swap | 74.79 cm |
 
 v14 K64 alignment oracle remeasures at `18.71 cm` contact but only `0.2496`
-correct GT-part recall and `40.30 cm` same-part local error. v15 is the
-implemented next branch to beat this baseline.
+correct GT-part recall and `40.30 cm` same-part local error. v15 raw
+best_contact is `27.62 cm` and `full_guided` is `31.57 cm`, so v15 is not the
+new best. v16 mirror-doubled alignment training is the active next branch.
 
 ## Code Layout
 

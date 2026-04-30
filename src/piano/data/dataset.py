@@ -90,6 +90,7 @@ class AugmentConfig:
 
     enabled: bool = False
     mirror_prob: float = 0.0
+    mirror_duplicate: bool = False
     rotate_around_y_prob: float = 0.0
     pc_jitter_std: float = 0.0
 
@@ -232,10 +233,18 @@ class HOIDataset(Dataset):
             self.pseudo_label_dir = self.root / "pseudo_labels"
 
     def __len__(self) -> int:
+        if self.augment.enabled and self.augment.mirror_duplicate:
+            return len(self.metadata) * 2
         return len(self.metadata)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        meta = self.metadata[idx]
+        force_mirror = False
+        if self.augment.enabled and self.augment.mirror_duplicate:
+            base_idx = idx // 2
+            force_mirror = bool(idx % 2)
+        else:
+            base_idx = idx
+        meta = self.metadata[base_idx]
         seq_id = meta["seq_id"]
 
         # --- Load motion ---
@@ -294,6 +303,7 @@ class HOIDataset(Dataset):
                     motion=motion,
                     object_positions=object_positions,
                     object_rotations=object_rotations,
+                    force_mirror=force_mirror,
                 )
             )
 
@@ -510,6 +520,7 @@ class HOIDataset(Dataset):
         motion: np.ndarray | None = None,            # (T, 263) HumanML3D rep (Stage B)
         object_positions: np.ndarray | None = None,  # (T, 3) world frame (Stage B)
         object_rotations: np.ndarray | None = None,  # (T, 3) axis-angle (Stage B)
+        force_mirror: bool = False,
     ) -> tuple[
         np.ndarray, np.ndarray, str, dict[str, np.ndarray],
         np.ndarray | None, np.ndarray | None, np.ndarray | None,
@@ -540,7 +551,11 @@ class HOIDataset(Dataset):
         #    point cloud is in object-local frame (no L/R structure
         #    the label space knows about), so we leave it alone.
         #    Phase / support are L/R-agnostic.
-        if self.augment.mirror_prob > 0 and random.random() < self.augment.mirror_prob:
+        do_mirror = force_mirror or (
+            self.augment.mirror_prob > 0
+            and random.random() < self.augment.mirror_prob
+        )
+        if do_mirror:
             joints = joints.copy()
             joints[:, :, 0] *= -1.0
             # Swap L/R joint pairs

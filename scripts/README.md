@@ -43,6 +43,10 @@ library code.
   consistency to the decoded contact auxiliary loss, selects `best_contact.pt`
   on strict alignment score, and enables full-RVQ target guidance during
   offline eval by default (`GUIDANCE_STEPS=30`, `GUIDANCE_LAYERS=full_rvq`).
+- `stage_b_generator/run_v16_alignment_mirror.sh`: v16 runner for the same
+  alignment-aware objective with deterministic train-set mirror doubling
+  (`augmentation.mirror_duplicate=true`). It keeps validation/eval unaugmented
+  and writes to `generator_v16_alignment_mirror` / `stageB_v0_16_alignment_mirror`.
 - `stage_b_generator/k_sample_oracle.py`: no-retrain diagnostic that samples K
   full-condition variants per fixed validation clip, scores each sample, and
   saves best-of-K outputs for visualization. Default selection is the existing

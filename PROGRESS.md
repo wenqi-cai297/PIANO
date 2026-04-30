@@ -7,7 +7,7 @@ Compact project memory as of 2026-04-30.
 Recent Stage B implementation:
 
 ```text
-v15 alignment-aware contact loss + full-RVQ guidance eval
+v16 alignment-aware contact loss + deterministic mirror-doubled training set
 ```
 
 Current Stage B best evaluated server checkpoint identifier. The local workspace may only
@@ -28,6 +28,8 @@ Matched 80-clip contact eval:
 | v14 sampled-ST best_contact full | 27.37 cm |
 | v14 sampled-ST best_val full | 30.77 cm |
 | v14 sampled-ST final full | 31.12 cm |
+| v15 alignment-guided best_contact full | 27.62 cm |
+| v15 alignment-guided best_contact full_guided | 31.57 cm |
 | v12 w02 K=16 distance oracle | 17.93 cm |
 | v12 w02 K=16 composite oracle | 18.08 cm |
 | v14 best_contact K=16 distance oracle | 16.80 cm |
@@ -46,8 +48,9 @@ part/patch/timing candidates are too rare.
 2026-04-30 follow-up analysis: v14 sampled-ST helps both one-shot spatial
 contact and K=16 candidate quality, but ordinary single-sample generation still
 rarely selects coupled candidates and K64 alignment selection shows the pool
-itself lacks enough aligned ones. The next main path should be a v15
-alignment/coupling branch or stronger full-RVQ decoded-motion guidance.
+itself lacks enough aligned ones. v15 tested the direct alignment/guidance
+branch and did not solve this, so v16 now tests deterministic mirrored-data
+doubling before abandoning this loss family.
 
 2026-04-30 visual/alignment update: v14 K=16 composite looks much better than
 earlier generations and slightly better than distance-only, but still visibly
@@ -75,14 +78,26 @@ reaching moving same-part recall >= `0.5`. Conclusion: v14 reranking is close
 to exhausted; the distribution itself needs stronger alignment/coupling
 training or guidance.
 
-2026-04-30 implementation update: v15 has been added but not yet server-run.
-It follows the literature/code conclusion from OMOMO/CHOIS/MaskControl-style
-methods: contact must be an explicit anchor/constraint, not only a distance
-readout. The new branch adds wrong-part margin and contact-segment consistency
-to `decoded_contact_aux.mode="target_trajectory"`, logs strict alignment
-metrics during contact eval, selects `best_contact.pt` on
-`alignment_contact_score`, and adds `full_rvq` decoded guidance in
-`piano.inference.contact_guidance`.
+2026-04-30 v15 result update: v15 alignment-guided training is a negative or
+at best neutral result. `best_contact` raw full is `27.62 cm`, essentially tied
+with v14 `27.37 cm`; the strict GT-alignment readouts are worse than the v14
+K-oracle baselines (`0.3804` moving IoU, `0.1684` moving correct GT-part recall,
+`55.09 cm` moving same-part local error). Full-RVQ target guidance improves
+some temporal-overlap readouts slightly but usually worsens contact/local error:
+for best_contact, `full_guided` is `31.57 cm` contact and `59.95 cm` local
+error. Local visualization in the `piano` conda env confirms the numbers:
+`runs/visualizations/stageB_v0_15_bc_review/{full,full_guided}` still shows
+visible human-object offset, and guidance can move the body farther from the
+object on trolley/suitcase cases.
+
+2026-04-30 implementation update: v16 has been added for the next server run.
+It keeps the v15 alignment objective but changes the data side to deterministic
+MoMask/HumanML3D-style mirror doubling: `HOIDataset.__len__` doubles when
+`augmentation.mirror_duplicate=true`, even indices are original clips, and odd
+indices are forced mirrored copies. Validation/eval remain unaugmented. New
+artifacts: `configs/training/generator_v16_alignment_mirror.yaml`,
+`scripts/stage_b_generator/run_v16_alignment_mirror.sh`, and
+`tests/test_dataset_mirror_duplicate.py`.
 
 ## Stage Status
 
@@ -116,11 +131,14 @@ Stage B Motion Generator:
   residual RVQ rollout for the decoded auxiliary path.
 - v15 adds alignment-aware negatives/segment binding to the same decoded path,
   and evaluates full-RVQ target guidance as a sampling-time correction.
+- v16 keeps v15's objective and turns on deterministic mirror duplication for
+  training only, matching MoMask/HumanML3D's mirrored-data assumption more
+  closely than the old stochastic v0.7 `mirror_prob=0.5` test.
 - Main training script: `src/piano/training/train_generator.py`.
 - Main model wrapper: `src/piano/models/motion_generator.py`.
 - Decoded contact loss: `src/piano/training/decoded_contact_loss.py`.
 - Current training runner:
-  `scripts/stage_b_generator/run_v15_alignment_guided.sh`.
+  `scripts/stage_b_generator/run_v16_alignment_mirror.sh`.
 - Current no-retrain diagnostic runner:
   `scripts/stage_b_generator/k_sample_oracle.py`.
 - Durable doc: `analyses/stageB_compact.md`.
@@ -162,7 +180,8 @@ Stage C Joint Finetune:
 | v14 RVQ diagnostics | mixed_pred_all 29.31 cm vs v13 33.50; pred base + GT residual 29.81 vs 35.92 | sampled/base path improved, residual bottleneck remains |
 | v14 contact alignment | composite moving IoU 0.447; correct GT-part recall 0.238; local part error 46 cm | spatial contact metrics are being gamed; use part/target-aware guidance |
 | v14 K64 alignment oracle | remeasured 18.71 cm; coupled 0.334; moving IoU 0.452; correct GT-part recall 0.250; local part error 40 cm | alignment selection gives only modest local-position gain; K64 pool lacks enough aligned samples |
-| v15 implementation | wrong-part margin + segment consistency + contact-eval alignment score + full-RVQ guidance eval | ready for server train/eval; not yet validated |
+| v15 alignment-guided | best_contact full 27.62 cm; guided 31.57 cm; moving IoU 0.380 and correct GT-part recall 0.168 | negative/neutral; alignment losses did not create GT-quality samples |
+| v16 mirror-doubled | deterministic original+mirror train-set duplication implemented and tested locally | next server run; tests MoMask/HumanML3D data assumption without conflating with old stochastic mirror p=0.5 |
 
 ## v0.12 Details
 
@@ -319,20 +338,20 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Design the next v15 alignment/coupling branch on top of v14
-   `best_contact.pt`; pure K/rerank tuning is no longer the main bet after the
-   K64 alignment oracle.
+1. Run v16 mirror-doubled alignment training on the server with
+   `scripts/stage_b_generator/run_v16_alignment_mirror.sh`.
 2. Evaluate with contact distance, temporal coupling, and
-   `measure_contact_alignment.py`; a real improvement must raise GT-aligned
-   moving contact and correct body-part recall.
-3. If doing sample-time guidance, optimize the predicted/conditioned contact
-   body part, object-local `contact_target_xyz`, and local-frame coupling
-   together rather than any-part min-distance alone.
+   `measure_contact_alignment.py`; a real improvement must beat v15 raw and
+   improve GT-aligned moving contact/correct body-part recall, not only
+   train-time decoded losses.
+3. If v16 still matches v15/v14, stop treating data symmetry as the main
+   blocker and move to a stronger sampling/training mechanism that directly
+   optimizes part, object-local target, and local-frame coupling.
 
 Secondary diagnostics:
 
 - Subset-specific codebook audit if IMHD remains poor after v14 K-sample search.
-- Full visual review of v14 best_contact hard cases before treating the contact
+- Full visual review of v16 best_contact hard cases before treating any contact
   gain as semantically meaningful.
 
 ## Environment

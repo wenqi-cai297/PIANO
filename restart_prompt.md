@@ -13,9 +13,9 @@ git status --short --branch
 git log -5 --oneline
 ```
 
-Latest pushed commit should be checked with `git log -5 --oneline`; before the
-v15 implementation work, the remembered pushed commit was `871d35d Add Stage B
-contact alignment diagnostics`.
+Latest pushed commit should be checked with `git log -5 --oneline`; after the
+v15/v16 local work, do not assume local `.md` files are fresher than git until
+`git status` is checked.
 
 ## Read Order
 
@@ -82,16 +82,22 @@ error and only `0.165` best moving same-part recall. The remaining problem is
 the generated distribution's lack of aligned manipulation samples, not just a
 reranker weakness.
 
-Latest implemented branch, pending server results:
+Latest evaluated branch:
 
 - config: `configs/training/generator_v15_alignment_guided.yaml`
 - runner: `scripts/stage_b_generator/run_v15_alignment_guided.sh`
-- loss change: wrong-part margin + contact-segment consistency on the decoded
-  target-trajectory objective.
-- monitoring change: contact eval logs strict alignment metrics and selects
-  `best_contact.pt` by `alignment_contact_score`.
-- guidance change: `qual_eval.py --guidance-layers full_rvq` optimizes the full
-  generated RVQ stack in decoded target space and writes `full_guided`.
+- result: negative/neutral. `best_contact` raw full is `27.62 cm`,
+  `full_guided` is `31.57 cm`, moving contact IoU is `0.3804`, moving correct
+  GT-part recall is `0.1684`, and moving same-part local error is `55.09 cm`.
+- local visualization: `runs/visualizations/stageB_v0_15_bc_review/{full,full_guided}`.
+
+Latest implemented branch, pending server results:
+
+- config: `configs/training/generator_v16_alignment_mirror.yaml`
+- runner: `scripts/stage_b_generator/run_v16_alignment_mirror.sh`
+- data change: deterministic MoMask/HumanML3D-style mirror doubling for train
+  only via `augmentation.mirror_duplicate=true`.
+- validation/eval remain unaugmented.
 
 ## Current Decision
 
@@ -101,10 +107,11 @@ near exhausted.
 
 Next work:
 
-1. Run v15 on the server, then sync the listed train/eval/wandb outputs back.
-2. Optimize predicted contact body part, object-local `contact_target_xyz`, and
+1. Run v16 on the server, then sync the listed train/eval/wandb outputs back.
+2. Evaluate predicted contact body part, object-local `contact_target_xyz`, and
    local-frame coupling together, not only any-part min-distance.
-3. Beat both v14 K=16 composite (`17.94 cm`, coupled `0.3715`, moving IoU
+3. Beat v15 raw (`27.62 cm`, moving IoU `0.3804`, correct-part recall
+   `0.1684`) and ideally both v14 K=16 composite (`17.94 cm`, coupled `0.3715`, moving IoU
    `0.4472`, correct-part recall `0.2378`) and v14 K=64 alignment
    (`18.71 cm`, coupled `0.3339`, moving IoU `0.4516`, correct-part recall
    `0.2496`, local error `40.30 cm`).
@@ -131,7 +138,9 @@ Meaningful gains:
 Negative or exhausted routes:
 
 - More CE training: lowered CE but worsened contact.
-- Mirror augmentation: mathematically correct but regressed contact.
+- Stochastic mirror augmentation v0.7 (`mirror_prob=0.5`): mathematically
+  correct but regressed contact. Deterministic mirror doubling is now separated
+  as v16 because MoMask/HumanML3D train data is mirrored.
 - Trainable-copy InterControl variant: fixed dead init, still regressed.
 - B3 inference-time base-logit guidance: produced mixed wins/losses; base
   logits are not a stable binding lever.
@@ -151,7 +160,7 @@ conda activate piano
 Current train/eval runner:
 
 ```bash
-bash scripts/stage_b_generator/run_v15_alignment_guided.sh
+bash scripts/stage_b_generator/run_v16_alignment_mirror.sh
 ```
 
 Local Windows workspace:

@@ -17,10 +17,11 @@ training improves spatial contact and candidate-pool quality, but K64
 alignment-aware selection shows the candidate pool usually still lacks truly
 GT-aligned interaction samples. v14 K=16 composite raises moving-coupled frame
 fraction to `0.3715`, above v12 composite `0.351`; K64 alignment then drops to
-`0.3339` while only modestly improving local-position error. The next main path
-is now implemented as v15: an alignment/coupling distribution change plus
-full-RVQ decoded-motion guidance eval, not another contact-loss weight,
-checkpoint-selection, or pure reranking sweep.
+`0.3339` while only modestly improving local-position error. v15's
+alignment/coupling loss plus full-RVQ final-stage guidance has now been run
+and is negative/neutral, so the active next path is v16 deterministic mirror
+doubling on top of v15, not another contact-loss weight, checkpoint-selection,
+or pure reranking sweep.
 
 2026-04-30 visual/alignment update: v14 K=16 composite looks much better than
 earlier generations, but the user's visual assessment is correct that it is
@@ -41,13 +42,29 @@ the best moving same-part recall is only `0.165` on average. The v14
 distribution usually does not contain a GT-aligned manipulation sample to pick,
 especially for NeuralDome and OMOMO.
 
-2026-04-30 implementation update: v15 adds a wrong-part margin term and a
-contact-segment consistency term to the decoded target-trajectory auxiliary
-loss. Train-time contact eval now reports strict GT-part/object-local alignment
-metrics and can select `best_contact.pt` by `alignment_contact_score`.
-Sampling-time guidance now has a `full_rvq` mode that optimizes the entire
-generated base+residual RVQ token stack in decoded target-contact space before
-argmax decode. This is pending server training/eval.
+2026-04-30 v15 result update: v15 adds wrong-part margin, contact-segment
+consistency, strict alignment checkpointing, and full-RVQ final-stage guidance,
+but the generated distribution did not improve. `best_contact` raw full is
+`27.62 cm`, moving contact IoU is `0.3804`, moving correct GT-part recall is
+`0.1684`, and moving same-part local error is `55.09 cm`. `full_guided` worsens
+contact to `31.57 cm`. Local `piano` visualization under
+`runs/visualizations/stageB_v0_15_bc_review` shows the same failure: trolley
+and suitcase clips still have clear human-object offsets, sometimes worse
+after guidance.
+
+2026-04-30 v16 implementation update: the data loader now supports
+`AugmentConfig.mirror_duplicate`. When enabled, train-set length doubles:
+even indices load the original clip and odd indices load a forced mirrored
+copy. The mirror path uses the existing Stage-B-correct augmentation logic for
+joints, HumanML3D `motion_263`, contact body-part labels/targets, text L/R
+swaps, and world-frame object pose. New config/runner:
+`configs/training/generator_v16_alignment_mirror.yaml` and
+`scripts/stage_b_generator/run_v16_alignment_mirror.sh`. Evidence: the
+[MoMask CVPR 2024 paper](https://openaccess.thecvf.com/content/CVPR2024/papers/Guo_MoMask_Generative_Masked_Modeling_of_3D_Human_Motions_CVPR_2024_paper.pdf)
+§4 states HumanML3D/KIT-ML are augmented by mirroring, and the official
+[HumanML3D README](https://github.com/EricGuo5513/HumanML3D) describes
+doubling the dataset with mirrored motions and text-side left/right keyword
+replacement.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
@@ -79,6 +96,8 @@ runs/training/generator_v14_sampled_st_contact/best_contact.pt
 | v14 best_contact full | 27.37 cm |
 | v14 best_contact text_only | 57.82 cm |
 | v14 best_contact swap | 74.79 cm |
+| v15 best_contact full | 27.62 cm |
+| v15 best_contact full_guided | 31.57 cm |
 | K=16 best-of-K oracle | 17.93 cm |
 | K=16 composite oracle | 18.08 cm |
 | v14 K=16 distance oracle | 16.80 cm |
@@ -117,9 +136,10 @@ Adapter/control literature shaped the gamma and trainable-copy experiments:
 The updated MaskControl lesson is narrower: base-only post-hoc guidance was too
 weak/unstable, but the stronger published recipe optimizes logits or embeddings
 through a decoded geometric loss at each unmasking stage and at the final stage.
-v15 implements the final-stage full-RVQ version for PIANO's RVQ stack; per-step
-MaskGIT guidance remains a possible follow-up if final-stage full-RVQ guidance
-helps but is not enough.
+v15 implemented the final-stage full-RVQ version for PIANO's RVQ stack, but
+the synced result did not validate it. Per-step MaskGIT guidance remains a
+possible follow-up only if a future branch shows stronger decoded constraints
+can improve alignment without worsening contact.
 
 Practical rule: use upstream MoMask/VQ/recovery functions. Avoid custom
 motion recovery or VQ decode logic unless no upstream function exists.
@@ -396,6 +416,7 @@ subset-specific representation issues must be checked.
 
 Configs:
 
+- `configs/training/generator_v16_alignment_mirror.yaml`
 - `configs/training/generator_v15_alignment_guided.yaml`
 - `configs/training/generator_v13_target_trajectory_contact.yaml`
 - `configs/training/generator_v14_sampled_st_contact.yaml`
@@ -407,6 +428,7 @@ Configs:
 
 Script:
 
+- `scripts/stage_b_generator/run_v16_alignment_mirror.sh`
 - `scripts/stage_b_generator/run_v15_alignment_guided.sh`
 - `scripts/stage_b_generator/run_v14_sampled_st_contact.sh`
 - `scripts/stage_b_generator/run_v13_rvq_diagnostics.sh`
@@ -421,6 +443,8 @@ Script:
 
 Logging/eval hygiene:
 
+- v16 inherits v15's decision metrics and enables deterministic train-set mirror
+  doubling; validation and offline eval are still unaugmented.
 - v15 training reports decision metrics by default: total/base/
   residual/decoded losses, aggregate base/residual accuracy, decoded target
   position/velocity, wrong-part margin, segment consistency, soft-distance,
@@ -469,6 +493,7 @@ v13 outcome after syncing results:
 | v12 w02 best_val | 31.82 cm | 0.296 | 0.264 | 0.140 |
 | v13 best_val | 31.57 cm | 0.334 | 0.265 | 0.171 |
 | v14 best_contact | 27.37 cm | 0.343 | 0.277 | 0.172 |
+| v15 best_contact | 27.62 cm | 0.338 | 0.284 | 0.174 |
 | v12 K=16 composite | 18.08 cm | 0.473 | 0.351 | 0.222 |
 | GT roundtrip | 18.47 cm | - | - | - |
 
@@ -608,11 +633,13 @@ them with the existing contact-distance and temporal-coupling scripts.
 
 Immediate next work:
 
-- Run v15 and compare raw `full` vs guided `full_guided`. Beat the v14 K=16
-  composite baseline (`17.94 cm`, coupled
-  `0.3715`, moving IoU `0.4472`, correct GT-part recall `0.2378`) and the v14
-  K=64 alignment baseline (`18.71 cm`, coupled `0.3339`, moving IoU `0.4516`,
-  correct GT-part recall `0.2496`, local error `40.30 cm`).
+- Run v16 mirror-doubled alignment training and compare raw `full` vs guided
+  `full_guided`. First beat v15 raw (`27.62 cm`, moving IoU `0.3804`, correct
+  GT-part recall `0.1684`, local error `55.09 cm`), then compare against the
+  stronger v14 K=16 composite baseline (`17.94 cm`, coupled `0.3715`, moving
+  IoU `0.4472`, correct GT-part recall `0.2378`) and v14 K=64 alignment
+  baseline (`18.71 cm`, coupled `0.3339`, moving IoU `0.4516`, correct GT-part
+  recall `0.2496`, local error `40.30 cm`).
 - The objective uses predicted/conditioned `contact_body_part`,
   object-local `contact_target_xyz` trajectory, and local-frame coupling
   together rather than the any-part min-distance objective that the current

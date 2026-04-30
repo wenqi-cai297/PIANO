@@ -179,6 +179,7 @@ def _build_dataset(cfg, split_override: str | None = None, enable_augment: bool 
         augment = AugmentConfig(
             enabled=True,
             mirror_prob=float(aug_cfg.get("mirror_prob", 0.0)),
+            mirror_duplicate=bool(aug_cfg.get("mirror_duplicate", False)),
             rotate_around_y_prob=float(aug_cfg.get("rotate_around_y_prob", 0.0)),
             pc_jitter_std=float(aug_cfg.get("pc_jitter_std", 0.0)),
         )
