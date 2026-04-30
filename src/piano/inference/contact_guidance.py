@@ -353,6 +353,105 @@ def _masked_contact_l2(
 
 
 # ============================================================================
+# v17-H: per-step target-mode loss with optional part_margin + segment_consistency
+# (training-time _target_trajectory_loss_canonical's wrong-part penalty and
+# segment-consistency terms ported into the inference per-step inner loop).
+# ============================================================================
+
+def _per_step_target_loss_with_aux(
+    body_world: Tensor,              # (B, T, P, 3)
+    target_world: Tensor,            # (B, T, P, 3) — object-local target lifted to world
+    contact_state: Tensor,           # (B, T, P)
+    *,
+    target_local: Tensor | None = None,        # (B, T, P, 3) — object-local frame
+    R_obj_world: Tensor | None = None,         # (B, T, 3, 3)
+    obj_pos_world: Tensor | None = None,       # (B, T, 3)
+    part_margin_weight: float = 0.0,
+    part_margin_m: float = 0.08,
+    segment_consistency_weight: float = 0.0,
+) -> Tensor:
+    """Primary masked L2 + optional wrong-part margin + segment-consistency.
+
+    Back-compat: when ``part_margin_weight == 0.0`` and
+    ``segment_consistency_weight == 0.0`` this returns exactly the same
+    scalar as :func:`_masked_contact_l2` and never touches the
+    object-frame inputs (so callers can pass ``None`` for them).
+
+    The auxiliary terms mirror
+    ``src/piano/training/decoded_contact_loss.py::_target_trajectory_loss_canonical``
+    (lines 204–248) but are computed at inference time. They are evaluated
+    in the **object-local frame** (matches the training site) so that
+    moving-object segments don't pollute the segment-delta signal with
+    object translation/rotation.
+
+    Aux terms:
+
+    - ``part_margin``: for every GT contact target ``p`` (where
+      ``contact_state[t, p] == 1``), require the GT body part ``p`` to be
+      closer to the target than any *other* tracked body part. Penalises
+      "wrong part touches the contact target" — the visual failure mode
+      that the K=64 alignment oracle and v17-E flagged. ``part_margin_m``
+      is the closeness margin in metres (training default 0.08).
+    - ``segment_consistency``: for adjacent contact-active pairs
+      ``(t, t+1)``, penalise the change in object-local body-target
+      offset. Encodes "during a contact segment, the body part stays
+      anchored to the GT contact patch in the object's frame", which is
+      OMOMO/CHOIS' contact-as-anchor pattern.
+
+    Both terms are weighted by ``contact_state`` so frames/parts not
+    asserted as in-contact contribute zero.
+    """
+    diff_sq = ((body_world - target_world) ** 2).sum(dim=-1)
+    mask = contact_state.float()
+    denom = mask.sum().clamp(min=1.0)
+    primary = (diff_sq * mask).sum() / denom
+
+    pmw = float(part_margin_weight)
+    scw = float(segment_consistency_weight)
+    if pmw == 0.0 and scw == 0.0:
+        return primary
+
+    if target_local is None or R_obj_world is None or obj_pos_world is None:
+        raise ValueError(
+            "part_margin_weight/segment_consistency_weight require target_local, "
+            "R_obj_world, obj_pos_world to compute object-local body coordinates",
+        )
+
+    # body_local = R_obj^T @ (body_world - obj_pos_world)
+    centered = body_world - obj_pos_world.unsqueeze(2)                        # (B, T, P, 3)
+    R_obj_T = R_obj_world.transpose(-1, -2)                                   # (B, T, 3, 3)
+    body_local = torch.einsum("btij,btpj->btpi", R_obj_T, centered)           # (B, T, P, 3)
+
+    aux = body_local.new_zeros(())
+    P = int(body_local.shape[2])
+
+    if pmw > 0.0 and P > 1:
+        pos_dist = torch.linalg.vector_norm(body_local - target_local, dim=-1)  # (B, T, P)
+        part_to_target = torch.linalg.vector_norm(
+            body_local[:, :, :, None, :] - target_local[:, :, None, :, :],
+            dim=-1,
+        )                                                                       # (B, T, P_pred, P_target)
+        eye = torch.eye(
+            P, device=body_local.device, dtype=torch.bool,
+        ).view(1, 1, P, P)
+        wrong_min = part_to_target.masked_fill(eye, float("inf")).min(dim=2).values   # (B, T, P_target)
+        margin_violation = F.relu(pos_dist + float(part_margin_m) - wrong_min)        # (B, T, P)
+        part_margin = (margin_violation * mask).sum() / denom
+        aux = aux + pmw * part_margin
+
+    if scw > 0.0 and body_local.shape[1] > 1:
+        local_offset = body_local - target_local                              # (B, T, P, 3)
+        offset_delta = local_offset[:, 1:] - local_offset[:, :-1]
+        segment_dist = torch.linalg.vector_norm(offset_delta, dim=-1)         # (B, T-1, P)
+        pair_contact = torch.minimum(mask[:, 1:], mask[:, :-1])               # (B, T-1, P)
+        seg_denom = pair_contact.sum().clamp(min=1.0)
+        segment_consistency = (segment_dist * pair_contact).sum() / seg_denom
+        aux = aux + scw * segment_consistency
+
+    return primary + aux
+
+
+# ============================================================================
 # Canonical → world lift (differentiable; mirrors contact_eval helper)
 # ============================================================================
 
@@ -554,6 +653,15 @@ def _generate_with_per_step_guidance(
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
     per_step_gumbel_scale: float = 0.0,  # PIANO default: 0.0 (v17-F result showed Gumbel hurts on multi-RVQ stack); set to 1.0 to match MaskControl exactly
+    # v17-H — part_margin + segment_consistency in target-mode inner loss.
+    # 0.0 = pre-v17-H back-compat (just _masked_contact_l2 primary). Object-
+    # frame tensors only required when at least one weight is > 0.
+    target_local_t: Tensor | None = None,     # (1, T, n_parts, 3) — object-local
+    R_obj_world_t: Tensor | None = None,      # (1, T, 3, 3)
+    obj_pos_world_t: Tensor | None = None,    # (1, T, 3)
+    part_margin_weight: float = 0.0,
+    part_margin_m: float = 0.08,
+    segment_consistency_weight: float = 0.0,
     device: torch.device,
     log_progress: bool = False,
 ) -> tuple[Tensor, dict[str, Any]]:
@@ -677,10 +785,25 @@ def _generate_with_per_step_guidance(
                 T_dec = body_world.shape[1]
                 if loss_mode == "target":
                     T_use = min(T_dec, target_world_t.shape[1])
-                    loss = _masked_contact_l2(
+                    loss = _per_step_target_loss_with_aux(
                         body_world=body_world[:, :T_use],
                         target_world=target_world_t[:, :T_use],
                         contact_state=contact_state_t[:, :T_use],
+                        target_local=(
+                            target_local_t[:, :T_use]
+                            if target_local_t is not None else None
+                        ),
+                        R_obj_world=(
+                            R_obj_world_t[:, :T_use]
+                            if R_obj_world_t is not None else None
+                        ),
+                        obj_pos_world=(
+                            obj_pos_world_t[:, :T_use]
+                            if obj_pos_world_t is not None else None
+                        ),
+                        part_margin_weight=part_margin_weight,
+                        part_margin_m=part_margin_m,
+                        segment_consistency_weight=segment_consistency_weight,
                     )
                 else:
                     T_use = min(T_dec, pc_world_t.shape[1])
@@ -728,6 +851,9 @@ def _generate_with_per_step_guidance(
         "per_step_temperature": float(per_step_temperature),
         "per_step_start_step": int(per_step_start_step),
         "per_step_gumbel_scale": float(per_step_gumbel_scale),
+        "per_step_part_margin_weight": float(part_margin_weight),
+        "per_step_part_margin_m": float(part_margin_m),
+        "per_step_segment_consistency_weight": float(segment_consistency_weight),
         "per_step_loss_initial": per_step_loss_initial,
         "per_step_loss_final": per_step_loss_final,
         "per_step_active": per_step_active,
@@ -774,6 +900,14 @@ def guide_with_contact(
     per_step_temperature: float = 1.0,
     per_step_start_step: int = 0,
     per_step_gumbel_scale: float = 0.0,  # PIANO default: 0.0 (v17-F: Gumbel hurts); set 1.0 for MaskControl-equivalent
+    # v17-H (B2): part_margin + segment_consistency in per-step inner loss.
+    # Defaults 0.0 = pre-v17-H back-compat (just primary masked L2). When
+    # > 0, body coordinates are transformed to object-local frame inside
+    # the inner loop using (object_positions, object_rotations) — no
+    # extra inputs required from callers.
+    per_step_part_margin_weight: float = 0.0,
+    per_step_part_margin_m: float = 0.08,
+    per_step_segment_consistency_weight: float = 0.0,
     # NOTE: gamma_int_boost (v17-G) is NOT a kwarg here. It is applied
     # once to model parameters in qual_eval after model load (mutation,
     # no restore) — see scripts/stage_b_generator/qual_eval.py
@@ -904,6 +1038,14 @@ def guide_with_contact(
     # compares two frames whose alignment depends on where the object
     # sits in the world — which produces wildly variable gradients
     # across clips and was the bug behind an earlier mixed-result run.
+    # Object-frame tensors used by the v17-H per-step part_margin /
+    # segment_consistency aux terms when their weights > 0. Always
+    # constructed when loss_mode == "target" so the inner-loop call site
+    # has them available; cost is one ``axis_angle_to_matrix_np`` per
+    # clip (negligible).
+    target_local_t_for_per_step: Tensor | None = None
+    R_obj_world_t_for_per_step: Tensor | None = None
+    obj_pos_world_t_for_per_step: Tensor | None = None
     if loss_mode == "target":
         # Lift target points from object-local to world. (T, 5, 3).
         target_world_np = _lift_target_to_world_np(
@@ -914,6 +1056,21 @@ def guide_with_contact(
         target_world_t = torch.from_numpy(target_world_np).to(device).float().unsqueeze(0)
         contact_state_t = torch.from_numpy(contact_state_np).to(device).float().unsqueeze(0)
         pc_world_t = None
+        # Object-local target + per-frame world-frame object pose, as
+        # tensors. Shapes (1, T, 5, 3), (1, T, 3, 3), (1, T, 3).
+        target_local_t_for_per_step = (
+            torch.from_numpy(np.asarray(contact_target_xyz_local, dtype=np.float32))
+            .to(device).float().unsqueeze(0)
+        )
+        R_obj_world_t_for_per_step = (
+            torch.from_numpy(
+                axis_angle_to_matrix_np(np.asarray(object_rotations, dtype=np.float32))
+            ).to(device).float().unsqueeze(0)
+        )
+        obj_pos_world_t_for_per_step = (
+            torch.from_numpy(np.asarray(object_positions, dtype=np.float32))
+            .to(device).float().unsqueeze(0)
+        )
     elif loss_mode == "metric":
         # Lift PC samples from object-local to world. (T, N_pc, 3).
         # This becomes the loss reference set: distances are min over
@@ -971,6 +1128,12 @@ def guide_with_contact(
             per_step_temperature=per_step_temperature,
             per_step_start_step=per_step_start_step,
             per_step_gumbel_scale=per_step_gumbel_scale,
+            target_local_t=target_local_t_for_per_step,
+            R_obj_world_t=R_obj_world_t_for_per_step,
+            obj_pos_world_t=obj_pos_world_t_for_per_step,
+            part_margin_weight=per_step_part_margin_weight,
+            part_margin_m=per_step_part_margin_m,
+            segment_consistency_weight=per_step_segment_consistency_weight,
             device=device,
             log_progress=log_progress,
         )
@@ -1162,6 +1325,76 @@ def guide_with_contact(
 
         motion = vq_model.forward_decoder(all_for_decode_after)
         motion = motion.squeeze(0) * motion_std + motion_mean
+
+    # --- B3 (residual drift diagnostic) ---
+    # Per-step inner loop optimised against frozen ``baseline_residual_emb_sum``;
+    # the saved motion uses post-guidance residuals (refreshed in Step 1.5).
+    # Re-evaluate the SAME loss on the final motion so we can quantify how
+    # much the residual rerun moved us off the optimiser's converged point.
+    # Cf. analyses/2026-05-01_v17_re_diagnosis.md F-6 / B3.
+    loss_final_post_residual: float = float("nan")
+    if per_step_info is not None:
+        with torch.no_grad():
+            # motion is denormalised (line just above: motion * std + mean).
+            # recover_from_ric expects denorm input, same as in the inner loop.
+            joints_canon_final = recover_from_ric(motion.unsqueeze(0), 22)         # (1, T, 22, 3)
+            joints_world_final = _lift_canonical_to_world_torch(
+                joints_canon_final, R_y_angle, T_xz,
+            )
+            body_idx_final = torch.tensor(
+                list(body_part_indices), device=device, dtype=torch.long,
+            )
+            body_world_final = joints_world_final.index_select(2, body_idx_final)   # (1, T, P, 3)
+            if loss_mode == "target":
+                T_use = min(body_world_final.shape[1], target_world_t.shape[1])
+                loss_t = _per_step_target_loss_with_aux(
+                    body_world=body_world_final[:, :T_use],
+                    target_world=target_world_t[:, :T_use],
+                    contact_state=contact_state_t[:, :T_use],
+                    target_local=(
+                        target_local_t_for_per_step[:, :T_use]
+                        if target_local_t_for_per_step is not None else None
+                    ),
+                    R_obj_world=(
+                        R_obj_world_t_for_per_step[:, :T_use]
+                        if R_obj_world_t_for_per_step is not None else None
+                    ),
+                    obj_pos_world=(
+                        obj_pos_world_t_for_per_step[:, :T_use]
+                        if obj_pos_world_t_for_per_step is not None else None
+                    ),
+                    part_margin_weight=per_step_part_margin_weight,
+                    part_margin_m=per_step_part_margin_m,
+                    segment_consistency_weight=per_step_segment_consistency_weight,
+                )
+            else:
+                T_use = min(body_world_final.shape[1], pc_world_t.shape[1])
+                loss_t = _eval_metric_as_loss(
+                    body_world=body_world_final[:, :T_use],
+                    pc_world=pc_world_t[:, :T_use],
+                )
+            loss_final_post_residual = float(loss_t.detach())
+
+        # Pull the per-step optimiser's last converged inner-loop loss
+        # (== loss_opt under the frozen-residual approximation). Difference
+        # against loss_final_post_residual measures the residual drift.
+        active_finals = [
+            v for v, a in zip(
+                per_step_info.get("per_step_loss_final", []),
+                per_step_info.get("per_step_active", []),
+            )
+            if a
+        ]
+        loss_opt_last = float(active_finals[-1]) if active_finals else float("nan")
+        per_step_info["loss_opt_last_inner"] = loss_opt_last
+        per_step_info["loss_final_post_residual"] = loss_final_post_residual
+        if not (
+            (loss_opt_last != loss_opt_last)  # NaN
+            or (loss_final_post_residual != loss_final_post_residual)
+        ):
+            per_step_info["residual_drift"] = (
+                loss_final_post_residual - loss_opt_last
+            )
 
     return (
         motion.detach().cpu().numpy().astype(np.float32),

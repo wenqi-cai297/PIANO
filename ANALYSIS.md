@@ -16,6 +16,7 @@ merged on 2026-04-29 to reduce context load.
 | `analyses/2026-05-01_v17_diagnostics_and_gumbel.md` | v17 follow-up — γ_int audit (final ≈ 0.02, IntXAttn heavily underused) + MaskControl source diff verification (VQ codebook is not the bottleneck) + Gumbel-Softmax relaxation added to per-step inner loop (matches MaskControl `each_iter`). |
 | `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md` | v17-F result (Gumbel **negative** on PIANO — regresses every metric at both budgets; multi-quantizer residual incompatibility) + P1 γ_int inference-boost plan (v17-G sweep at boost ∈ {1, 2, 5, 10, 20}). Inference path near-saturated; remaining lever is architectural γ_int gate. |
 | `analyses/2026-05-01_v17g_gamma_int_boost_result.md` | v17-G result (γ_int boost-at-inference **negative** — boost ≥ 5 catastrophic, boost = 2 mixed) + close-out summary of v17 inference-side series + P2 plan (re-init γ_int + finetune Stage B; first training-side experiment after 6 weeks of inference iteration). |
+| `analyses/2026-05-01_v17_re_diagnosis.md` | **Source-level re-diagnosis of the v17 series.** Refines (does not refute) the "γ_int undertrained" diagnosis. Surfaces 2 un-tested inference-side levers: (1) `final.pt` was never tested with v17-E (correct-part 0.199 vs best_contact 0.176); (2) per-step inner loss is a strict subset of training loss (no `part_margin` or `segment_consistency`). Revised decision tree B1–B5 with B1+B2 cheaper than P2. |
 
 Root memory docs:
 

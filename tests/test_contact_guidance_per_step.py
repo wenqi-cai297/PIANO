@@ -344,3 +344,246 @@ def test_scaled_gamma_int_restores_after_exception():
 
     for blk, original in zip(model.seqTransEncoder.layers, originals):
         assert torch.allclose(blk.gamma_int.data, original, atol=0.0, rtol=0.0)
+
+
+# ============================================================================
+# v17-H — _per_step_target_loss_with_aux: part_margin + segment_consistency
+# ============================================================================
+
+def test_per_step_target_loss_zero_weights_matches_masked_l2():
+    """When part_margin_weight == 0 and segment_consistency_weight == 0, the
+    helper must return the SAME scalar as the legacy `_masked_contact_l2`,
+    regardless of whether object-frame inputs are passed.
+    """
+    from piano.inference.contact_guidance import (
+        _masked_contact_l2,
+        _per_step_target_loss_with_aux,
+    )
+
+    B, T, P = 1, 8, 5
+    body_world = torch.randn(B, T, P, 3)
+    target_world = torch.randn(B, T, P, 3)
+    contact_state = (torch.rand(B, T, P) > 0.5).float()
+
+    legacy = _masked_contact_l2(body_world, target_world, contact_state)
+
+    # Without optional inputs.
+    new_no_aux = _per_step_target_loss_with_aux(
+        body_world=body_world,
+        target_world=target_world,
+        contact_state=contact_state,
+    )
+    torch.testing.assert_close(new_no_aux, legacy, atol=0.0, rtol=0.0)
+
+    # With optional inputs but both weights zero — must still match legacy.
+    target_local = torch.randn(B, T, P, 3)
+    R_obj = torch.eye(3).view(1, 1, 3, 3).expand(B, T, 3, 3).contiguous()
+    obj_pos = torch.randn(B, T, 3)
+    new_with_unused_inputs = _per_step_target_loss_with_aux(
+        body_world=body_world,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=0.0,
+        segment_consistency_weight=0.0,
+    )
+    torch.testing.assert_close(new_with_unused_inputs, legacy, atol=0.0, rtol=0.0)
+
+
+def test_per_step_target_loss_part_margin_penalises_wrong_part():
+    """When the GT contact part is FARTHER from the target than another
+    body part, part_margin must be > 0. When the GT part is closest, it
+    must be 0.
+    """
+    from piano.inference.contact_guidance import _per_step_target_loss_with_aux
+
+    B, T, P = 1, 1, 3
+    # Identity object frame so body_local == body_world - obj_pos.
+    R_obj = torch.eye(3).view(1, 1, 3, 3).expand(B, T, 3, 3).contiguous()
+    obj_pos = torch.zeros(B, T, 3)
+
+    # Target sits at the origin for part 0 only. contact_state asserts part 0.
+    target_local = torch.zeros(B, T, P, 3)
+    target_world = target_local.clone()  # identity transform
+    contact_state = torch.zeros(B, T, P)
+    contact_state[0, 0, 0] = 1.0
+
+    # CASE A: GT part 0 is FAR (1.0 m); part 1 is CLOSE (0.05 m).
+    body_world_a = torch.zeros(B, T, P, 3)
+    body_world_a[0, 0, 0, 0] = 1.0       # GT part 0 at (1, 0, 0)
+    body_world_a[0, 0, 1, 0] = 0.05      # wrong part 1 at (0.05, 0, 0)
+    loss_a = _per_step_target_loss_with_aux(
+        body_world=body_world_a,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        segment_consistency_weight=0.0,
+    )
+    # Without part_margin (only primary L2):
+    primary_only_a = _per_step_target_loss_with_aux(
+        body_world=body_world_a,
+        target_world=target_world,
+        contact_state=contact_state,
+    )
+    # part_margin must add positive penalty (wrong-part 0.05 < GT 1.0).
+    assert float(loss_a) > float(primary_only_a) + 1e-6
+
+    # CASE B: GT part 0 is CLOSE (0.05); other parts FAR (1.0). No violation.
+    body_world_b = torch.zeros(B, T, P, 3)
+    body_world_b[0, 0, 0, 0] = 0.05
+    body_world_b[0, 0, 1, 0] = 1.0
+    body_world_b[0, 0, 2, 0] = 1.0
+    loss_b = _per_step_target_loss_with_aux(
+        body_world=body_world_b,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        segment_consistency_weight=0.0,
+    )
+    primary_only_b = _per_step_target_loss_with_aux(
+        body_world=body_world_b,
+        target_world=target_world,
+        contact_state=contact_state,
+    )
+    # GT part 0 (0.05) + margin (0.08) = 0.13 < other parts (1.0) → no violation.
+    torch.testing.assert_close(loss_b, primary_only_b, atol=1e-6, rtol=0.0)
+
+
+def test_per_step_target_loss_segment_consistency_penalises_offset_drift():
+    """Object-local body-target offset that DRIFTS across contact frames
+    must produce > 0 segment_consistency loss; constant offset → 0.
+    """
+    from piano.inference.contact_guidance import _per_step_target_loss_with_aux
+
+    B, T, P = 1, 4, 1
+    R_obj = torch.eye(3).view(1, 1, 3, 3).expand(B, T, 3, 3).contiguous()
+    obj_pos = torch.zeros(B, T, 3)
+    target_local = torch.zeros(B, T, P, 3)
+    target_world = target_local.clone()
+    contact_state = torch.ones(B, T, P)  # always in contact
+
+    # CASE A: drifting offset — body moves linearly while target is stationary.
+    body_world_a = torch.zeros(B, T, P, 3)
+    body_world_a[:, :, 0, 0] = torch.tensor([0.10, 0.20, 0.30, 0.40])
+    loss_a = _per_step_target_loss_with_aux(
+        body_world=body_world_a,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=0.0,
+        segment_consistency_weight=1.0,
+    )
+    primary_a = _per_step_target_loss_with_aux(
+        body_world=body_world_a,
+        target_world=target_world,
+        contact_state=contact_state,
+    )
+    assert float(loss_a) > float(primary_a) + 1e-6
+
+    # CASE B: constant offset — body sits at (0.10, 0, 0) every frame.
+    body_world_b = torch.zeros(B, T, P, 3)
+    body_world_b[:, :, 0, 0] = 0.10
+    loss_b = _per_step_target_loss_with_aux(
+        body_world=body_world_b,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=0.0,
+        segment_consistency_weight=1.0,
+    )
+    primary_b = _per_step_target_loss_with_aux(
+        body_world=body_world_b,
+        target_world=target_world,
+        contact_state=contact_state,
+    )
+    # Constant offset → segment_dist = 0 across pairs → exactly equal to primary.
+    torch.testing.assert_close(loss_b, primary_b, atol=1e-6, rtol=0.0)
+
+
+def test_per_step_target_loss_object_local_invariant_under_object_translation():
+    """Adding a constant translation to BOTH body_world and obj_pos_world (and
+    target_world stays the lifted GT) must leave part_margin and
+    segment_consistency unchanged — they live in the object-local frame.
+    """
+    from piano.inference.contact_guidance import _per_step_target_loss_with_aux
+
+    B, T, P = 1, 3, 5
+    torch.manual_seed(0)
+    R_obj = torch.eye(3).view(1, 1, 3, 3).expand(B, T, 3, 3).contiguous()
+    obj_pos = torch.zeros(B, T, 3)
+    target_local = torch.randn(B, T, P, 3) * 0.1
+    target_world = target_local.clone()  # identity rotation + zero offset
+    body_world = torch.randn(B, T, P, 3) * 0.2
+    contact_state = (torch.rand(B, T, P) > 0.3).float()
+
+    loss_orig = _per_step_target_loss_with_aux(
+        body_world=body_world,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        segment_consistency_weight=1.0,
+    )
+
+    # Translate object + body + target_world by the same amount.
+    delta = torch.tensor([1.5, -2.0, 3.7]).view(1, 1, 1, 3)
+    delta_pos = torch.tensor([1.5, -2.0, 3.7]).view(1, 1, 3)
+    loss_translated = _per_step_target_loss_with_aux(
+        body_world=body_world + delta,
+        target_world=target_world + delta,
+        contact_state=contact_state,
+        target_local=target_local,                  # unchanged in object-local
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos + delta_pos,          # object also moves
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        segment_consistency_weight=1.0,
+    )
+    torch.testing.assert_close(loss_orig, loss_translated, atol=1e-5, rtol=1e-5)
+
+
+def test_per_step_target_loss_gradient_flows_into_body_world():
+    """When part_margin / segment_consistency are active, gradient must
+    still propagate through `body_world` (the term we optimise via base_logits)."""
+    from piano.inference.contact_guidance import _per_step_target_loss_with_aux
+
+    B, T, P = 1, 4, 5
+    R_obj = torch.eye(3).view(1, 1, 3, 3).expand(B, T, 3, 3).contiguous()
+    obj_pos = torch.zeros(B, T, 3)
+    target_local = torch.randn(B, T, P, 3) * 0.1
+    target_world = target_local.clone()
+    body_world = (torch.randn(B, T, P, 3) * 0.2).requires_grad_(True)
+    contact_state = torch.ones(B, T, P)
+
+    loss = _per_step_target_loss_with_aux(
+        body_world=body_world,
+        target_world=target_world,
+        contact_state=contact_state,
+        target_local=target_local,
+        R_obj_world=R_obj,
+        obj_pos_world=obj_pos,
+        part_margin_weight=1.0,
+        part_margin_m=0.08,
+        segment_consistency_weight=1.0,
+    )
+    loss.backward()
+    assert body_world.grad is not None
+    assert torch.isfinite(body_world.grad).all()
+    assert body_world.grad.abs().sum().item() > 0.0

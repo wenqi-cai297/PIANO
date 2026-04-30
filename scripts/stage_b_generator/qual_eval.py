@@ -615,6 +615,36 @@ def main() -> int:
              "analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md.",
     )
     parser.add_argument(
+        "--per-step-part-margin-weight", type=float, default=0.0,
+        help="v17-H — wrong-part margin weight in the per-step inner "
+             "loss. 0.0 (default) = back-compat (just primary masked L2). "
+             ">0 ports the training-time `part_margin_weight` term: for "
+             "every GT contact target p, penalise *other* body parts that "
+             "are closer to the target than the GT contact part (margin "
+             "set by --per-step-part-margin-m). Source: training-time "
+             "decoded_contact_loss.py::_target_trajectory_loss_canonical. "
+             "Targets the K=64-alignment / v17-E `correct GT-part recall` "
+             "gap. Recommended initial sweep: {0.5, 1.0, 2.0}. Detail: "
+             "analyses/2026-05-01_v17_re_diagnosis.md §B2.",
+    )
+    parser.add_argument(
+        "--per-step-part-margin-m", type=float, default=0.08,
+        help="Closeness margin (metres) for --per-step-part-margin-weight. "
+             "Default 0.08 matches the training-time default in "
+             "configs/training/generator_v15_alignment_guided.yaml.",
+    )
+    parser.add_argument(
+        "--per-step-segment-consistency-weight", type=float, default=0.0,
+        help="v17-H — segment-consistency weight in the per-step inner "
+             "loss. 0.0 (default) = back-compat. >0 ports the training-time "
+             "`segment_consistency_weight` term: for adjacent contact-active "
+             "frames, penalise the change in object-local body-target "
+             "offset (OMOMO/CHOIS contact-as-anchor pattern). Source: "
+             "decoded_contact_loss.py. Targets temporal contact "
+             "stability. Recommended initial sweep: {0.1, 0.5, 1.0}. Detail: "
+             "analyses/2026-05-01_v17_re_diagnosis.md §B2.",
+    )
+    parser.add_argument(
         "--gamma-int-boost", type=float, default=1.0,
         help="v17-G IntXAttn gate inference-time scale factor. Multiplies "
              "every gamma_int parameter (in both base and residual "
@@ -846,7 +876,10 @@ def main() -> int:
             f"per_step_lr={args.per_step_lr}, "
             f"per_step_temperature={args.per_step_temperature}, "
             f"per_step_start_step={args.per_step_start_step}, "
-            f"per_step_gumbel_scale={args.per_step_gumbel_scale}) ===",
+            f"per_step_gumbel_scale={args.per_step_gumbel_scale}, "
+            f"per_step_part_margin_weight={args.per_step_part_margin_weight}, "
+            f"per_step_part_margin_m={args.per_step_part_margin_m}, "
+            f"per_step_segment_consistency_weight={args.per_step_segment_consistency_weight}) ===",
         )
         per_clip_guided: list[dict[str, dict]] = []
         for i in range(len(samples)):
@@ -900,6 +933,9 @@ def main() -> int:
                 per_step_temperature=args.per_step_temperature,
                 per_step_start_step=args.per_step_start_step,
                 per_step_gumbel_scale=args.per_step_gumbel_scale,
+                per_step_part_margin_weight=args.per_step_part_margin_weight,
+                per_step_part_margin_m=args.per_step_part_margin_m,
+                per_step_segment_consistency_weight=args.per_step_segment_consistency_weight,
                 device=device,
             )
             print(
@@ -970,6 +1006,11 @@ def main() -> int:
             "per_step_temperature": float(args.per_step_temperature),
             "per_step_start_step": int(args.per_step_start_step),
             "per_step_gumbel_scale": float(args.per_step_gumbel_scale),
+            "per_step_part_margin_weight": float(args.per_step_part_margin_weight),
+            "per_step_part_margin_m": float(args.per_step_part_margin_m),
+            "per_step_segment_consistency_weight": float(
+                args.per_step_segment_consistency_weight,
+            ),
             "per_clip": [
                 {
                     "seq_id": seq_ids[i],

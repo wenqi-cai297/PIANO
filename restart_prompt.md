@@ -29,6 +29,11 @@ Must read:
 6. `analyses/2026-05-01_v17_per_step_result.md` - v17-C single-sample SOTA
    result (matches v14 K=16 oracle on local error; per-step inner loop flips
    60.67% of base tokens). Load alongside the design doc.
+7. `analyses/2026-05-01_v17_re_diagnosis.md` - source-level re-diagnosis
+   landed 2026-05-01 (after v17-G close-out). Surfaces 2 un-tested
+   inference-side levers (final.pt re-eval; part_margin + segment_consistency
+   in per-step loss); revises P2 to lower-risk γ_init candidates. Read this
+   BEFORE acting on the v17g_gamma_int_boost_result.md P2 plan.
 
 Read when touching that area:
 

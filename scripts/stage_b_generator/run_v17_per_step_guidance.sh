@@ -49,6 +49,13 @@ export PER_STEP_ITERS="${PER_STEP_ITERS:-10}"
 export PER_STEP_LR="${PER_STEP_LR:-6e-2}"
 export PER_STEP_TEMPERATURE="${PER_STEP_TEMPERATURE:-1.0}"
 export PER_STEP_START_STEP="${PER_STEP_START_STEP:-0}"
+# v17-H (B2): part_margin + segment_consistency in per-step inner loss.
+# Default 0.0 = back-compat. Sweep: PER_STEP_PART_MARGIN_WEIGHT ∈ {0.5, 1.0, 2.0},
+# PER_STEP_SEGMENT_CONSISTENCY_WEIGHT ∈ {0.1, 0.5, 1.0}. See
+# analyses/2026-05-01_v17_re_diagnosis.md §B2.
+export PER_STEP_PART_MARGIN_WEIGHT="${PER_STEP_PART_MARGIN_WEIGHT:-0.0}"
+export PER_STEP_PART_MARGIN_M="${PER_STEP_PART_MARGIN_M:-0.08}"
+export PER_STEP_SEGMENT_CONSISTENCY_WEIGHT="${PER_STEP_SEGMENT_CONSISTENCY_WEIGHT:-0.0}"
 
 # Post-hoc final-stage guidance disabled by default in v17-C. Set to 30
 # (and optionally GUIDANCE_LAYERS=full_rvq) to stack with per-step.
@@ -70,6 +77,7 @@ echo "v17 per-step guidance eval"
 echo "  source ckpt dir: ${RUN_DIR}"
 echo "  ckpts: ${CKPTS}"
 echo "  per_step_iters=${PER_STEP_ITERS} lr=${PER_STEP_LR} T=${PER_STEP_TEMPERATURE} start=${PER_STEP_START_STEP}"
+echo "  per_step_part_margin_weight=${PER_STEP_PART_MARGIN_WEIGHT} m=${PER_STEP_PART_MARGIN_M} segment_consistency=${PER_STEP_SEGMENT_CONSISTENCY_WEIGHT}"
 echo "  post_hoc guidance_steps=${GUIDANCE_STEPS} layers=${GUIDANCE_LAYERS} loss=${GUIDANCE_LOSS}"
 echo "  output prefix: ${EVAL_PREFIX}"
 echo "============================================================"

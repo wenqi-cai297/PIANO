@@ -243,6 +243,65 @@ work). Sweep candidates γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10
 epochs, ~3 h per candidate × 3 candidates ≈ 9 h server time. Detail:
 `analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
 
+2026-05-01 source-level re-diagnosis (post-v17-G close-out): a
+`/restart` Phase-2 trace through the actual repo code (not from prior
+synthesis docs) found the "v17 inference-side path SATURATED" claim
+was incomplete. Two un-tested inference-side levers exist:
+
+1. **`final.pt` was never evaluated with v17-E recipe.** All v17 work
+   used v16 `best_contact.pt`. Per PROGRESS row above, v16 `final.pt`
+   has `correct-part recall 0.199` (highest non-oracle in project) and
+   `same-part local 52.91 cm` — both strictly better than `best_contact.pt`'s
+   0.176 / 53.49 cm. Best_contact is selected on the legacy `mean_min_dist`
+   only (`train_generator.py:1257-1260`), which is exactly the
+   "checkpoint-selection metric ≠ ship metric" trap.
+2. **Inference per-step loss is a strict subset of training loss.**
+   Training-time `_target_trajectory_loss_canonical` includes
+   `part_margin_weight` (wrong-part margin) and `segment_consistency_weight`
+   (object-local offset stability) and `moving_frame_extra_weight=2.0`.
+   Inference per-step `_masked_contact_l2` has none — just per-part L2
+   to target_world. The visual "right area, wrong patch" failure is
+   directly explainable by missing `part_margin`.
+
+2026-05-01 B2 + B3 implementation landed (this commit):
+
+- `src/piano/inference/contact_guidance.py`: new
+  `_per_step_target_loss_with_aux` helper; inner-loop loss site +
+  `guide_with_contact` accept `per_step_part_margin_weight`,
+  `per_step_part_margin_m`, `per_step_segment_consistency_weight`
+  (default 0.0 = back-compat, equal to legacy `_masked_contact_l2`).
+  Aux terms run in **object-local frame** (matches training site at
+  `decoded_contact_loss.py::_target_trajectory_loss_canonical`).
+- B3 residual drift diagnostic: `guide_with_contact` now re-evaluates
+  the same loss on the FINAL post-residual-rerun motion and records
+  `loss_opt_last_inner`, `loss_final_post_residual`, `residual_drift`
+  inside `info["per_step"]`. Auto-writes to `guidance_trace.json` via
+  the existing `per_clip_guided[i]["full"]["guidance_info"]` dump, so
+  every B1/B2 run also produces B3 data.
+- `qual_eval.py`: new `--per-step-part-margin-weight` /
+  `--per-step-part-margin-m` /
+  `--per-step-segment-consistency-weight` CLI; written to
+  `guidance_trace.json` top-level for run-attribution.
+- `run_v13_target_trajectory.sh` / `run_v17_per_step_guidance.sh`:
+  pass-through env vars `PER_STEP_PART_MARGIN_WEIGHT`,
+  `PER_STEP_PART_MARGIN_M`, `PER_STEP_SEGMENT_CONSISTENCY_WEIGHT`.
+- `tests/test_contact_guidance_per_step.py`: 5 new tests covering
+  fast-path back-compat, wrong-part penalty correctness, segment-drift
+  correctness, object-frame translation invariance, gradient flow.
+  All 15 (15 new + 10 prior) per-step tests + 21 sibling
+  contact_guidance tests pass locally.
+
+Refines (does not refute) the P2 hypothesis: γ_int growth from v15
+(0.0161) → v16 (0.0204) was +27 % but contact only improved 3 %
+(27.62 → 26.79 cm). Diminishing returns at the trained plateau. v17-G
+boost = 2 was already mixed → network's tolerance window for γ_int
+change is < 2× at inference. P2 with γ_init=0.5 is asking for a 25×
+change post-training; lower-risk γ_init ∈ {0.05, 0.1, 0.2} is
+preferable. Revised decision tree B1–B5 with B1 (re-eval final.pt,
+zero code, ~3.5 h) and B2 (port part_margin to per-step, ~50 LOC,
+~4 h) ahead of any P2 commitment. Detail:
+`analyses/2026-05-01_v17_re_diagnosis.md`.
+
 ## Stage Status
 
 Stage 1 pseudo-labels:
@@ -483,35 +542,46 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 ## Next Work
 
-Immediate (v17 inference-side path closed; pivot to training-side P2):
+Immediate (revised after 2026-05-01 source-level re-diagnosis;
+supersedes the prior P2-first plan):
 
-1. **P2 — γ_int re-init + Stage B finetune from v16 ckpt**. First
-   training-side experiment after 6 weeks of inference-side iteration.
-   Hypothesis (per `analyses/2026-05-01_v17g_gamma_int_boost_result.md`):
-   v17-G boost-at-inference is OOD because trained network is
-   calibrated to γ_int ≈ 0.02, but if γ_int is re-initialized at a
-   positive constant and the network is allowed to adapt around it
-   for a few epochs, the larger gate may translate into actual contact
-   alignment improvement.
-   - Sweep γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10 epochs from
-     `runs/training/generator_v16_alignment_mirror/best_contact.pt`.
-   - Each candidate: ~1–2 h training + ~80 min eval = ~3 h.
-   - Total ~9 h server time for the 3-candidate sweep.
-   - Implementation cost: ~1 day (add `gamma_init_value` + ckpt-load
-     re-init helper + finetune config + sweep runner).
-2. Stop iterating on v17 inference-side. Ship configs frozen:
-   **v17-E.20** (recommended default; contact 18.62 / correct-part
-   0.264 / local 42.09 cm) or **v17-E.50** (best metrics with
-   metric-gaming caveat per visual review).
-3. Decision branches after P2 sweep:
-   - γ_init=0.5 finetune improves both contact and correct-part →
-     γ_int IS the bottleneck; scale up (γ_init=1.0, longer finetune,
-     eventually retrain from scratch).
-   - γ_init helps raw `full` but not per-step → ship "raw + finetuned
-     γ" without per-step.
-   - All inits worse than v16 baseline → γ_int not the lever; pivot to
-     OMOMO-style explicit contact_target as input (architecture change
-     using existing predictor output channel).
+1. **B1 — Re-eval v17-E.20 + v17-E.50 on v16 `final.pt`** (zero code,
+   ~3.5 h server). All v17 work was on `best_contact.pt`; `final.pt`
+   has +2.3 pp correct-part / −0.58 cm same-part local advantage that
+   has not yet been combined with per-step. Override
+   `SOURCE_RUN_DIR=runs/training/generator_v16_alignment_mirror CKPTS=final`
+   in `run_v17_per_step_guidance.sh`. If correct-part > 0.22 and local
+   < 42 cm without metric gaming → new ship config.
+2. **B2 — Port `part_margin_weight` and `segment_consistency_weight`
+   from training to per-step inner loss** (~50 LOC,
+   `contact_guidance.py::_generate_with_per_step_guidance`, no
+   retraining; ~4 h server per ablation). Visual "right area, wrong
+   patch" failure is directly explained by these terms being absent at
+   inference. Sweep `part_margin_weight ∈ {0.5, 1.0, 2.0}`. If
+   correct-part jumps ≥ 5 pp → ship `v17-H` as new default.
+3. **B3 — Diagnose residual-context drift** (~30 LOC,
+   `guide_with_contact`, ~4 h server). Per-step inner loop uses a
+   frozen `baseline_residual_emb_sum`; final motion uses
+   post-residual-rerun residuals. If |L_final − L_opt| > 5 cm,
+   per-step is being misled and a mid-loop residual-context refresh
+   becomes worth the compute.
+4. **B4 — P2 (γ_int re-init + Stage B finetune)** with revised γ_init
+   candidates. Existing P2 plan's γ_init=0.5/1.0 is too aggressive
+   given v17-G's "boost ≥ 5 catastrophic" measurement (network's
+   tolerance window < 2× at inference). Revised candidates:
+   `{0.05, 0.1, 0.2}`. Run only after B1+B2+B3 don't close the
+   correct-part gap. ~1 day code + ~12 h server.
+5. **B5 — Pivot to OMOMO-style explicit `contact_target` input**.
+   Final fallback if B1–B4 fail. Architecture change using existing
+   Stage A predictor output channel.
+
+Ship configs frozen until B1/B2 land: **v17-E.20** (recommended
+default; contact 18.62 / correct-part 0.264 / local 42.09 cm) or
+**v17-E.50** (best metrics with metric-gaming caveat per visual
+review).
+
+Decision tree detail:
+`analyses/2026-05-01_v17_re_diagnosis.md` §5.
 
 Secondary diagnostics:
 

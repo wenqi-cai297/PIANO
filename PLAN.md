@@ -248,35 +248,60 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
-**Next branch (P2 — γ_int re-init + Stage B finetune)**: NOT yet
-implemented. v17-G boost-at-inference closed out; result was that
-boost ≥ 5 catastrophic, boost = 2 mixed (raw IoU +4.3 pp but
-correct-part −2.5 pp; per-step every metric flat-or-worse). Diagnosis:
-γ_int is undertrained, not under-applied — the trained MaskTransformer
-is calibrated to γ_int ≈ 0.02, can't tolerate inference-time
-recalibration, but might absorb a larger gate if allowed to adapt
-during training.
+**Revised next branches (per 2026-05-01 source-level re-diagnosis)**:
+P2 is no longer the immediate next branch. Two cheaper inference-side
+levers were surfaced by re-reading the actual repo code (not from prior
+synthesis docs):
 
-Sweep plan (pending implementation greenlight):
+- **B1 — `final.pt` re-eval** (zero code, ~3.5 h server). v16 `final.pt`
+  has correct-part 0.199 / same-part local 52.91 cm vs `best_contact.pt`'s
+  0.176 / 53.49 cm. All v17 work used `best_contact.pt`; `final.pt`
+  + per-step v17-E.20 has never been measured. Single env override:
+  `SOURCE_RUN_DIR=runs/training/generator_v16_alignment_mirror CKPTS=final
+   bash scripts/stage_b_generator/run_v17_per_step_guidance.sh`.
+- **B2 — port `part_margin_weight` + `segment_consistency_weight` from
+  training to per-step inner loss** (~50 LOC, no retraining, ~4 h
+  server per ablation). Inference per-step `_masked_contact_l2` is a
+  strict subset of training-time `_target_trajectory_loss_canonical`;
+  visual "right area, wrong patch" failure directly explainable by
+  the missing wrong-part margin. Sweep `part_margin_weight ∈ {0.5, 1.0, 2.0}`.
+- **B3 — residual-context drift diagnostic** (~30 LOC, ~4 h). Per-step
+  uses frozen `baseline_residual_emb_sum`; |L_final − L_opt| measures
+  the approximation error. > 5 cm gap → mid-loop residual refresh
+  becomes worth implementing.
+
+P2 (γ_int re-init + Stage B finetune) is now **B4**, not B1, with
+**revised γ_init candidates `{0.05, 0.1, 0.2}`** instead of `{0.1, 0.5, 1.0}`.
+Rationale: v17-G's "boost = 2 mixed / boost ≥ 5 catastrophic" measures
+the network's inference-time γ_int tolerance window at < 2×. P2 with
+γ_init=0.5 is asking for a 25× post-training change; finetune 5–10
+epochs may not suffice to re-equilibrate. Lower γ_init candidates are
+incrementally safer; scale up only if 0.05/0.1/0.2 give signal.
 
 | variant | γ_init | role |
 |---|---:|---|
-| v18-γ.1 | 0.1 | small positive — does any growth above 0.02 help? |
-| v18-γ.5 | 0.5 | ControlNet-style typical |
-| v18-γ1.0 | 1.0 | aggressive — does network adapt? |
+| v18-γ.05 | 0.05 | 2.5× current — smallest positive that's outside RNG noise |
+| v18-γ.1 | 0.1 | 5× current — analogous to v17-G boost = 5 but with finetune adaptation |
+| v18-γ.2 | 0.2 | 10× current — analogous to v17-G boost = 10 with adaptation |
 
-Each finetune from `runs/training/generator_v16_alignment_mirror/best_contact.pt`,
-5–10 epochs, with v16 config otherwise unchanged. Eval with v17-E.20
-inference setup. Total ~9 h server time + ~1 day implementation.
+Each finetune from `runs/training/generator_v16_alignment_mirror/best_contact.pt`
+(or `final.pt`, depending on B1 outcome), 5–10 epochs, v16 config
+otherwise unchanged. Eval with v17-E.20 inference setup. Total ~9 h
+server + ~1 day implementation.
 
-Decision rule (analyses/2026-05-01_v17g_gamma_int_boost_result.md
-§"Decision tree"):
-- γ_init=0.5 improves both contact + correct-part → scale up.
-- helps raw but not per-step → ship "raw + finetuned γ" without per-step.
-- all worse than v16 → pivot to OMOMO-style explicit contact_target
-  input (architecture change using existing predictor output channel).
+Decision rule (revised):
+- B1 closes correct-part gap → ship `final.pt + v17-E.20`; close out.
+- B2 closes correct-part gap (≥ 5 pp jump) → ship `v17-H` as new default.
+- B3 reveals large drift → mid-loop residual refresh; redo B2 on top.
+- B1+B2+B3 don't close the gap → run B4 with revised γ_init sweep.
+- B4 doesn't close the gap → pivot to OMOMO-style explicit contact_target
+  as input (architecture change, ~1 week).
 
-Detail: `analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
+Original P2 hypothesis discussion still in:
+`analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
+
+**Re-diagnosis detail and ranked impact estimate**:
+`analyses/2026-05-01_v17_re_diagnosis.md` §5–§6.
 
 **Earlier runs (v17-G γ_int inference boost sweep, 2026-05-01)**:
 NEGATIVE result. boost ∈ {1, 2, 5, 10, 20} on top of v17-E.20 base
