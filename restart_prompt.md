@@ -166,19 +166,34 @@ both regress; budget sweep at diminishing returns. Ship configs:
 **v17-E.50** (contact 16.50, correct-part 0.275, local 39.02 cm; with
 metric-gaming caveat per visual review).
 
-Latest implemented branch, pending server results (v17-G γ_int boost):
+Latest evaluated sweep (v17-G γ_int inference boost, 2026-05-01) —
+NEGATIVE:
 
-- runner: `scripts/stage_b_generator/run_v17g_gamma_int_boost_sweep.sh`
-- hypothesis: γ_int ≈ 0.02 final value (per D-A audit) is ~1/25 of
-  typical ControlNet-style strength → IntXAttn cross-attention is
-  underused → boost it at inference time and see if contact-patch
-  misalignment improves.
-- new CLI: `--gamma-int-boost FLOAT` (default 1.0 = no change). Boost
-  is applied as in-place ×scale to all gamma_int / gamma_int_res
-  parameters during the inference call, restored after.
-- variants: v17-G.b{1,2,5,10,20} on top of v17-E.20 base config
-  (per_step=20 Gumbel OFF).
-- detail: `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
+- boost ∈ {1, 2, 5, 10, 20} on top of v17-E.20 base config.
+- boost = 1 sanity reproduces v17-E.20 within RNG noise.
+- boost = 2 mixed: raw IoU +4.3 pp BUT raw correct-part −2.5 pp; per-step
+  every metric flat-to-worse.
+- boost ≥ 5 catastrophic: contact > 100 cm, correct-part < 0.05.
+- Confirms γ_int boost mechanism works (swap column blows up
+  monotonically: 69.67 → 230.85), but trained MaskTransformer is
+  calibrated to γ_int ≈ 0.02 and goes OOD at inference-time boost.
+- **Do not ship γ_int boost on PIANO**.
+
+**v17 inference-side path SATURATED.** Five levers tested over
+2026-05-01: per-step (positive), post-hoc stacking (negative), Gumbel
+(negative), γ_int boost (negative), residual context (deferred).
+Ship configs frozen: **v17-E.20** (default; contact 18.62, correct-part
+0.264, local 42.09 cm) or **v17-E.50** (best metrics, with metric-
+gaming risk per visual review).
+
+Latest implementation status (P2 NOT yet implemented):
+
+- Hypothesis (analyses/2026-05-01_v17g_gamma_int_boost_result.md):
+  γ_int is undertrained, not under-applied — re-init γ_int at positive
+  constant + finetune Stage B from v16 ckpt may unlock the gate.
+- Sweep plan: γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10 epochs, ~9 h
+  server time. Implementation cost ~1 day.
+- Awaiting greenlight before coding.
 
 ## Current Decision
 

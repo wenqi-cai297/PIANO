@@ -248,26 +248,46 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
-**Next runs (v17-G γ_int boost sweep)**: launched via
-`scripts/stage_b_generator/run_v17g_gamma_int_boost_sweep.sh`. Tests
-whether the architecturally-underused IntXAttn gate (final γ_int ≈ 0.02
-in v14/v15/v16) is the residual contact-patch misalignment bottleneck.
-Per-step inference unchanged from v17-E.20 ship config:
+**Next branch (P2 — γ_int re-init + Stage B finetune)**: NOT yet
+implemented. v17-G boost-at-inference closed out; result was that
+boost ≥ 5 catastrophic, boost = 2 mixed (raw IoU +4.3 pp but
+correct-part −2.5 pp; per-step every metric flat-or-worse). Diagnosis:
+γ_int is undertrained, not under-applied — the trained MaskTransformer
+is calibrated to γ_int ≈ 0.02, can't tolerate inference-time
+recalibration, but might absorb a larger gate if allowed to adapt
+during training.
 
-| variant | gamma_int_boost | role |
+Sweep plan (pending implementation greenlight):
+
+| variant | γ_init | role |
 |---|---:|---|
-| v17-G.b1 | 1.0 | sanity reproducer of v17-E.20 |
-| v17-G.b2 | 2.0 | conservative — effective γ_int ≈ 0.04 |
-| v17-G.b5 | 5.0 | moderate — effective γ_int ≈ 0.10 |
-| v17-G.b10 | 10.0 | aggressive — effective γ_int ≈ 0.20 (still 1/2.5 of typical) |
-| v17-G.b20 | 20.0 | extreme — effective γ_int ≈ 0.40 (≈ ControlNet typical) |
+| v18-γ.1 | 0.1 | small positive — does any growth above 0.02 help? |
+| v18-γ.5 | 0.5 | ControlNet-style typical |
+| v18-γ1.0 | 1.0 | aggressive — does network adapt? |
 
-Decision rule: monotone improvement → γ_int IS the bottleneck → P2
-(re-init γ_int + finetune Stage B). Plateau → γ_int helps but isn't
-sole bottleneck. Catastrophe at high boost → IntXAttn output magnitude
-is OOD for trained base path → P3 architectural rework.
+Each finetune from `runs/training/generator_v16_alignment_mirror/best_contact.pt`,
+5–10 epochs, with v16 config otherwise unchanged. Eval with v17-E.20
+inference setup. Total ~9 h server time + ~1 day implementation.
 
-Detail: `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
+Decision rule (analyses/2026-05-01_v17g_gamma_int_boost_result.md
+§"Decision tree"):
+- γ_init=0.5 improves both contact + correct-part → scale up.
+- helps raw but not per-step → ship "raw + finetuned γ" without per-step.
+- all worse than v16 → pivot to OMOMO-style explicit contact_target
+  input (architecture change using existing predictor output channel).
+
+Detail: `analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
+
+**Earlier runs (v17-G γ_int inference boost sweep, 2026-05-01)**:
+NEGATIVE result. boost ∈ {1, 2, 5, 10, 20} on top of v17-E.20 base
+config. boost ≥ 5 catastrophic (contact > 100 cm); boost = 2 mixed.
+Confirms γ_int boost mechanism works (swap column blows up
+monotonically) but the trained network can't absorb inference-time
+recalibration. **Do not ship boost.** Detail:
+`analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
+
+**Earlier runs (v17-G γ_int boost sweep, planned then run)**: see
+above — completed and marked NEGATIVE.
 
 **Earlier runs (v17-F Gumbel sweep, 2026-05-01)**: NEGATIVE result.
 Gumbel-Softmax injection in per-step inner loop regressed every metric

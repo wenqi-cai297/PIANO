@@ -89,18 +89,36 @@ iteration moves to a different mechanism, not another data/loss-weight knob.
 - v17-F (Gumbel ON): NEGATIVE at both budgets. Multi-quantizer residual
   handling makes Gumbel noise ill-conditioned for PIANO. Default
   `--per-step-gumbel-scale=0.0`.
+- v17-G (γ_int inference boost ∈ {1, 2, 5, 10, 20}): NEGATIVE.
+  boost ≥ 5 catastrophic (contact > 100 cm, correct-part < 0.05);
+  boost = 2 mixed (raw IoU +4.3 pp but raw correct-part −2.5 pp; per-step
+  flat-to-worse). swap column monotonically blows up (69.67 → 230.85)
+  confirming boost mechanism IS plumbed correctly — the issue is the
+  trained MaskTransformer is calibrated to γ_int ≈ 0.02 and can't
+  absorb inference-time recalibration.
 - D-A audit: γ_int final ≈ 0.02 (zero-init grew to 0.02 over 80 epochs;
   ~1/25 of ControlNet typical) → IntXAttn underused architecturally.
-  v9–v16 training-time decoded contact loss helps via direct gradient on
-  decoded motion, not via the conditioning gate.
+  Refined diagnosis (post-v17-G): γ_int is *undertrained*, not
+  *under-applied*. v9–v16 loss didn't grow γ_int because zero-init +
+  8-layer-deep gradient dilution + CE/contact-aux objectives that
+  don't directly reward gate growth all point to a slow plateau at 0.02.
 - VQ codebook is NOT the bottleneck (MaskControl uses pretrained MoMask
   VQ, source-verified 2026-05-01 from `exitudio/ControlMM`).
 
-**Ship configs**: v17-E.20 (recommended default) or v17-E.50 (best
-metrics, paired with motion-quality QA).
+**Ship configs**: v17-E.20 (recommended default; contact 18.62 /
+correct-part 0.264 / local 42.09 cm) or v17-E.50 (best metrics
+16.50 / 0.275 / 39.02 cm, paired with motion-quality QA per visual
+review showing correct broad area but wrong patch).
 
-**Next branch**: v17-G inference-time γ_int boost ablation. Detail:
-`analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
+**v17 inference-side path SATURATED.** Five levers tested. Three
+negative (post-hoc stack, Gumbel, γ_int boost), one positive (per-step
+itself), one deferred (residual context). Diminishing returns clear.
+
+**Next branch (P2)**: re-init γ_int at positive constant + finetune
+Stage B from v16 ckpt. First training-side experiment after 6 weeks
+of inference work. Sweep γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10
+epochs, ~9 h server time + ~1 day implementation. Awaiting greenlight.
+Detail: `analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
 
 2026-05-01 v17 implementation update: per-step decoded-geometric guidance
 landed locally. Inference-time only — runs on the existing v16 (or v14/v15)

@@ -209,6 +209,40 @@ boost ablation (`gamma_int_boost ∈ {1, 2, 5, 10, 20}` on top of
 v17-E.20 base config). Detail:
 `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md`.
 
+2026-05-01 v17-G result (γ_int inference boost — **negative**):
+
+| boost | raw cont | per-step cont | raw IoU | per-step correct | per-step local |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 26.79 | 18.67 | 0.382 | 0.267 | 42.31 |
+| 2  | 25.99 | 19.93 | **0.425** | 0.275 | 46.99 |
+| 5  | **126.20** | **82.32** | 0.202 | 0.058 | 136.48 |
+| 10 | 167.83 | 110.58 | 0.115 | 0.034 | 169.92 |
+| 20 | 164.03 | 109.78 | 0.106 | 0.035 | 169.03 |
+
+Sanity (b1) reproduces v17-E.20 within RNG noise. boost=2 is
+mixed (raw IoU +4.3 pp, but raw correct-part −2.5 pp; per-step every
+metric flat-to-worse). **boost ≥ 5 catastrophic** — model goes OOD,
+contact > 100 cm, correct-part < 0.05. Confirms `swap` column
+monotonically blowing up (z_int amplification mechanism IS plumbed
+correctly): the issue is the rest of the trained MaskTransformer is
+calibrated to γ_int ≈ 0.02 and can't tolerate inference-time boost.
+
+**v17 inference-side TTT path SATURATED.** Five distinct levers
+tested: per-step (positive), post-hoc stacking (negative), Gumbel
+(negative), residual context (deferred), γ_int boost (negative).
+Ship configs unchanged: **v17-E.20** or **v17-E.50** (with
+metric-gaming caveat).
+
+Diagnosis refinement: γ_int is *undertrained*, not under-applied. The
+v9–v16 training loss didn't push γ_int above 0.02 because zero-init +
+8-layer-deep gradient dilution + CE/contact-aux objectives that don't
+directly reward gate growth all point to a slow plateau. **Next branch
+is P2 — re-init γ_int at positive constant + finetune Stage B from
+v16 ckpt** (first training-side experiment after 6 weeks of inference
+work). Sweep candidates γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10
+epochs, ~3 h per candidate × 3 candidates ≈ 9 h server time. Detail:
+`analyses/2026-05-01_v17g_gamma_int_boost_result.md`.
+
 ## Stage Status
 
 Stage 1 pseudo-labels:
@@ -449,34 +483,35 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 ## Next Work
 
-Immediate:
+Immediate (v17 inference-side path closed; pivot to training-side P2):
 
-1. Run v17-D + v17-E sweep on the server with the new wrapper:
-   `bash scripts/stage_b_generator/run_v17_sweep.sh`. Three back-to-back
-   eval conditions on the v16 best_contact ckpt:
-   - v17-D stacked: `PER_STEP_ITERS=10 GUIDANCE_STEPS=30` — canonical
-     MaskControl recipe (per-step + post-hoc).
-   - v17-E.20: `PER_STEP_ITERS=20 GUIDANCE_STEPS=0` — does doubling the
-     per-step inner budget close the remaining 1.8 pp correct-part gap?
-   - v17-E.50: `PER_STEP_ITERS=50 GUIDANCE_STEPS=0` — saturation check.
-2. Sync the three eval matrices back; compare contact / coupled / IoU /
-   correct-part / same-part local against v17-C (21.77 / 0.3428 / 0.4388
-   / 0.2020 / 46.13). Each condition lands under its own
-   `EVAL_PREFIX=stageB_v0_17_v16bc_*` directory tree.
-3. Decision branches:
-   - v17-D beats v17-C on correct-part recall → ship as the canonical
-     v17 config; record alongside v14/v15/v16 in the comparison table.
-   - v17-E.20 ≈ v17-E.10 → 10 inner iters is saturated, drop the 50 run.
-     If v17-E.50 > v17-E.20 by ≥ 1 cm contact and ≥ 1 pp correct-part →
-     consider MaskControl's full 100 with cost analysis.
-   - If correct-part recall stays below 0.22 across all v17-D/E variants
-     → pivot to OMOMO-style hand-position intermediate target as the
-     next training-time branch.
-4. Optional follow-up: `PER_STEP_START_STEP=2` ablation to test whether
-   skipping early MaskGIT iterations rescues the small subset of clips
-   (Sub1475, suitcase_lefthand_push) where per-step inner loss currently
-   *increases*. Run only if v17-D/E reveals correlated regression on
-   initially-low-loss clips.
+1. **P2 — γ_int re-init + Stage B finetune from v16 ckpt**. First
+   training-side experiment after 6 weeks of inference-side iteration.
+   Hypothesis (per `analyses/2026-05-01_v17g_gamma_int_boost_result.md`):
+   v17-G boost-at-inference is OOD because trained network is
+   calibrated to γ_int ≈ 0.02, but if γ_int is re-initialized at a
+   positive constant and the network is allowed to adapt around it
+   for a few epochs, the larger gate may translate into actual contact
+   alignment improvement.
+   - Sweep γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10 epochs from
+     `runs/training/generator_v16_alignment_mirror/best_contact.pt`.
+   - Each candidate: ~1–2 h training + ~80 min eval = ~3 h.
+   - Total ~9 h server time for the 3-candidate sweep.
+   - Implementation cost: ~1 day (add `gamma_init_value` + ckpt-load
+     re-init helper + finetune config + sweep runner).
+2. Stop iterating on v17 inference-side. Ship configs frozen:
+   **v17-E.20** (recommended default; contact 18.62 / correct-part
+   0.264 / local 42.09 cm) or **v17-E.50** (best metrics with
+   metric-gaming caveat per visual review).
+3. Decision branches after P2 sweep:
+   - γ_init=0.5 finetune improves both contact and correct-part →
+     γ_int IS the bottleneck; scale up (γ_init=1.0, longer finetune,
+     eventually retrain from scratch).
+   - γ_init helps raw `full` but not per-step → ship "raw + finetuned
+     γ" without per-step.
+   - All inits worse than v16 baseline → γ_int not the lever; pivot to
+     OMOMO-style explicit contact_target as input (architecture change
+     using existing predictor output channel).
 
 Secondary diagnostics:
 
