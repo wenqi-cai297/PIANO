@@ -475,7 +475,9 @@ def test_build_decode_ids_all_pad():
 
 
 def test_guide_with_contact_signature_accepts_new_kwargs():
-    """v5 added residual_seed + no_residual_rerun kwargs; signature smoke test.
+    """v5 added residual_seed + no_residual_rerun kwargs; v17 added per-step
+    kwargs. Signature smoke test confirming both generations of kwargs
+    survive.
 
     Doesn't run the function (requires MoMask) — just confirms the kwargs
     exist with the documented defaults via inspect.signature.
@@ -490,3 +492,13 @@ def test_guide_with_contact_signature_accepts_new_kwargs():
     assert sig.parameters["no_residual_rerun"].default is False
     assert "guidance_layers" in sig.parameters
     assert sig.parameters["guidance_layers"].default == "base"
+
+    # v17 per-step decoded-geometric guidance.
+    assert "per_step_iters" in sig.parameters
+    assert sig.parameters["per_step_iters"].default == 0
+    assert "per_step_lr" in sig.parameters
+    assert sig.parameters["per_step_lr"].default == 6e-2
+    assert "per_step_temperature" in sig.parameters
+    assert sig.parameters["per_step_temperature"].default == 1.0
+    assert "per_step_start_step" in sig.parameters
+    assert sig.parameters["per_step_start_step"].default == 0

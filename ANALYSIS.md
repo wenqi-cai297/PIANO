@@ -11,6 +11,7 @@ merged on 2026-04-29 to reduce context load.
 | `analyses/stageA_design.md` | Stage A Interaction Predictor v6 shipped state and revisit triggers. |
 | `analyses/pseudo_label_pipeline.md` | Current pseudo-label fields, thresholds, abandoned label paths, and known label risks. |
 | `analyses/early_setup.md` | Server/data/backbone setup facts that are easy to forget. |
+| `analyses/2026-05-01_per_step_guidance_design.md` | v17 per-step decoded-geometric guidance design — MaskControl source-code refs, PIANO-specific multi-quantizer adaptation, hyperparameter starting points, ablation matrix v17-A..E with decision rule, risk register. Pending server run. |
 
 Root memory docs:
 

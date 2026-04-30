@@ -66,6 +66,29 @@ swaps, and world-frame object pose. New config/runner:
 doubling the dataset with mirrored motions and text-side left/right keyword
 replacement.
 
+2026-05-01 v16 server result update: partial positive but does not close the
+K-oracle gap. Raw `best_contact full` 26.79 cm vs v15 27.62 cm, `full_guided`
+28.91 cm vs v15 31.57 cm (the v15 guidance-induced contact regression is
+largely fixed). On `final` ckpt, moving correct GT-part recall is `0.1990` —
+the highest non-oracle value in the project. Same-part local error 53.49
+(bc) / 53.23 (bv) / 52.91 (final) cm vs v15's 55.09 / 59.92 / 54.24.
+However v16 is still ~8-13 cm short of the v14 K=16 distance oracle
+(17.60 cm) and v14 K=64 alignment oracle (40.30 cm local error). Per restart
+prompt rule, mirror-doubling is worth keeping but not the breakthrough; next
+iteration moves to a different mechanism, not another data/loss-weight knob.
+
+2026-05-01 v17 implementation update: per-step decoded-geometric guidance
+landed locally. Inference-time only — runs on the existing v16 (or v14/v15)
+`best_contact.pt` unchanged. Closes MaskControl ICCV 2025's `each_iter` half
+of the recipe that PIANO had been running only the post-hoc half of since
+v15. Design + ablation plan:
+[analyses/2026-05-01_per_step_guidance_design.md]. Entry points:
+`src/piano/inference/contact_guidance.py::_generate_with_per_step_guidance`,
+new CLI `--per-step-iters` etc. in
+`scripts/stage_b_generator/qual_eval.py`, runner
+`scripts/stage_b_generator/run_v17_per_step_guidance.sh`. Default v17-C:
+`per_step_iters=10`, `guidance_steps=0`. Server run pending.
+
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable
 decoded contact path, but generation uses discrete MaskGIT/Gumbel base tokens,

@@ -362,6 +362,64 @@ def _build_decode_ids_with_baseline_residuals(
     )
 
 
+def _precompute_residual_emb_sum(
+    all_ids: Tensor,                    # (B, S, Q) — full RVQ ids from a baseline pass
+    vq_model: torch.nn.Module,
+) -> Tensor:                             # (B, S, d) — frozen residual context
+    """Precompute the sum of residual codebook embeddings for layers 1..Q-1.
+
+    Used by per-step guidance as the frozen residual context approximation
+    while the MaskGIT loop is still committing base-layer tokens (the
+    real residual tokens for the in-progress base distribution don't
+    exist yet). Computed once from a baseline residual pass and reused
+    across all MaskGIT iterations + inner guidance steps. Bias source:
+    the baseline residuals were generated on a different base
+    distribution. After per-step guidance finishes, we re-run the
+    residual transformer on the post-guidance base to absorb the drift.
+    """
+    quantizer = vq_model.quantizer
+    Q = int(quantizer.num_quantizers)
+    if int(all_ids.shape[-1]) != Q:
+        raise ValueError(
+            f"all_ids should have Q={Q} layers (got {all_ids.shape[-1]})",
+        )
+    all_codes = quantizer.get_codes_from_indices(all_ids)                     # (Q, B, S, d)
+    return all_codes[1:].sum(dim=0)                                            # (B, S, d)
+
+
+def _decode_with_relaxed_masked_base(
+    base_logits: Tensor,                 # (B, S, V) — optimised inside per-step inner loop
+    committed_ids: Tensor,               # (B, S) — hard tokens at non-masked positions, anything at masked
+    differentiable_mask: Tensor,         # (B, S) bool — True at positions where logits matter
+    baseline_residual_emb_sum: Tensor,   # (B, S, d) frozen
+    vq_model: torch.nn.Module,
+    *,
+    temperature: float = 1.0,
+) -> Tensor:                              # (B, T, 263) normalised motion
+    """Differentiable decode for per-step MaskGIT guidance.
+
+    At ``differentiable_mask=True`` positions the base layer uses the
+    relaxed expectation ``softmax(logits/T) @ codebook[0]`` (gradient
+    flows here). At ``False`` positions it uses the hard codebook entry
+    ``codebook[0][committed_ids]`` (gradient blocked because committed
+    tokens won't change). Residual context is the frozen
+    ``baseline_residual_emb_sum`` precomputed once from the baseline
+    residual pass.
+    """
+    quantizer = vq_model.quantizer
+    base_codebook = quantizer.codebooks[0]                                    # (V, d)
+    V = int(base_codebook.shape[0])
+
+    soft_emb = F.softmax(base_logits / max(temperature, 1e-6), dim=-1) @ base_codebook
+    safe_ids = committed_ids.clamp(min=0, max=V - 1)
+    hard_emb = base_codebook[safe_ids]                                        # (B, S, d)
+    relaxed_base = torch.where(
+        differentiable_mask.unsqueeze(-1), soft_emb, hard_emb,
+    )                                                                          # (B, S, d)
+    x_emb = relaxed_base + baseline_residual_emb_sum                          # (B, S, d)
+    return vq_model.decoder(x_emb.permute(0, 2, 1))                           # (B, T, 263)
+
+
 def _generate_residual_tokens(
     res_transformer: torch.nn.Module,
     *,
@@ -392,6 +450,216 @@ def _generate_residual_tokens(
         m_lens=m_lens_tok,
         cond_scale=res_cond_scale,
     )
+
+
+# ============================================================================
+# Per-step decoded-geometric guidance (re-rolled MaskGIT loop)
+# ============================================================================
+
+def _generate_with_per_step_guidance(
+    transformer: torch.nn.Module,             # InteractionMaskTransformer
+    vq_model: torch.nn.Module,
+    *,
+    cond_vector: Tensor,                      # (1, clip_dim) — pre-encoded text
+    m_lens_tok: Tensor,                       # (1,) token-space length
+    int_tokens_bf: Tensor | None,             # (1, S_int, d) or None
+    int_padding_mask_bf: Tensor | None,       # (1, S_int) or None
+    baseline_residual_emb_sum: Tensor,        # (1, S, d) frozen residual context
+    target_world_t: Tensor | None,            # (1, T, n_parts, 3) for loss_mode="target"
+    contact_state_t: Tensor | None,           # (1, T, n_parts) for loss_mode="target"
+    pc_world_t: Tensor | None,                # (1, T, N_pc, 3) for loss_mode="metric"
+    R_y_angle: float,
+    T_xz: np.ndarray,
+    motion_mean: Tensor,
+    motion_std: Tensor,
+    body_part_indices: tuple[int, ...],
+    loss_mode: str,                           # "target" or "metric"
+    timesteps: int = 10,
+    w_text: float = 4.0,
+    w_int: float = 2.0,
+    base_temperature: float = 1.0,
+    topk_filter_thres: float = 0.9,
+    per_step_iters: int = 10,
+    per_step_lr: float = 6e-2,
+    per_step_temperature: float = 1.0,
+    per_step_start_step: int = 0,
+    device: torch.device,
+    log_progress: bool = False,
+) -> tuple[Tensor, dict[str, Any]]:
+    """Re-rolled InteractionMaskTransformer.generate with per-step decoded-geometric guidance.
+
+    Replaces ``transformer.generate(...)`` for the v17 ablation. At each
+    MaskGIT iteration, after the model produces logits but before the
+    commit decision, runs ``per_step_iters`` AdamW inner steps on the
+    logits using a relaxed-decode geometric loss (MaskControl-style
+    ``each_iter`` test-time training). The optimised logits then drive
+    the standard MaskGIT top-k + gumbel commit. Padded positions stay
+    pad_id; their logits are not optimised. Residual context for the
+    relaxed decode comes from ``baseline_residual_emb_sum``, frozen.
+
+    Mirrors the unrolled MaskGIT loop in
+    ``InteractionMaskTransformer.generate`` (see
+    ``src/piano/models/motion_generator.py:866-948``); the only change
+    is the per-step inner optimisation between logit computation and
+    sampling. Returns the same ids tensor convention as the wrapper:
+    pad positions = -1, real positions = code id.
+
+    See ``analyses/2026-05-01_per_step_guidance_design.md`` for design
+    rationale, MaskControl source-code references, ablation plan, and
+    failure modes.
+    """
+    # Lazy MoMask imports (consistent with the post-hoc path).
+    from models.mask_transformer.tools import (
+        cosine_schedule, gumbel_sample, lengths_to_mask, top_k,
+    )
+    from utils.motion_process import recover_from_ric
+
+    if loss_mode not in {"target", "metric"}:
+        raise ValueError(f"loss_mode must be 'target' or 'metric', got {loss_mode!r}")
+
+    mt = transformer.mask_transformer
+    B = int(cond_vector.shape[0])
+    if B != 1:
+        raise NotImplementedError(
+            "per-step guidance currently supports single-clip B=1 only; "
+            "batched per-clip eval pipeline already iterates one clip at a time."
+        )
+    S = int(m_lens_tok.max().item())
+
+    non_pad_mask = lengths_to_mask(m_lens_tok, S)                              # (B, S)
+    padding_mask = ~non_pad_mask
+    ids = torch.where(padding_mask, mt.pad_id, mt.mask_id)
+    scores = torch.where(
+        padding_mask,
+        torch.full_like(ids, 1e5, dtype=torch.float),
+        torch.zeros_like(ids, dtype=torch.float),
+    )
+
+    body_idx_t = torch.tensor(list(body_part_indices), device=device, dtype=torch.long)
+
+    per_step_loss_initial: list[float] = []
+    per_step_loss_final: list[float] = []
+    per_step_active: list[int] = []  # int (0/1) for JSON friendliness
+
+    timestep_grid = torch.linspace(0, 1, timesteps, device=device)
+    for step_idx, timestep in enumerate(timestep_grid):
+        rand_mask_prob = cosine_schedule(timestep)
+        num_token_masked = torch.round(
+            rand_mask_prob * m_lens_tok.float(),
+        ).clamp(min=1)
+        sorted_indices = scores.argsort(dim=1)
+        ranks = sorted_indices.argsort(dim=1)
+        is_mask = ranks < num_token_masked.unsqueeze(-1)
+        ids = torch.where(is_mask, mt.mask_id, ids)
+
+        # Forward through 3-pass compositional CFG (no grad — we'll detach
+        # and re-instantiate logits as the optimisation parameter).
+        with torch.no_grad():
+            logits_raw = transformer.forward_with_cond_scale(
+                motion_ids=ids,
+                cond_vector=cond_vector,
+                token_padding_mask=padding_mask,
+                int_tokens_bf=int_tokens_bf,
+                int_padding_mask_bf=int_padding_mask_bf,
+                w_text=w_text,
+                w_int=w_int,
+            ).permute(0, 2, 1)                                                # (B, S, V)
+
+        active = (per_step_iters > 0) and (step_idx >= per_step_start_step)
+        loss_init_step = float("nan")
+        loss_final_step = float("nan")
+
+        if active:
+            # Differentiable mask: only the still-masked + non-pad positions
+            # contribute gradient. Committed tokens (and pad) use their hard
+            # codebook embedding.
+            differentiable_mask = is_mask & non_pad_mask                       # (B, S)
+            # Committed-id tensor: anything safe at masked positions (gets
+            # overwritten by the soft branch in _decode_with_relaxed_masked_base
+            # via the where-mask).
+            committed_ids = torch.where(
+                differentiable_mask,
+                torch.zeros_like(ids),
+                ids,
+            )
+            logits_param = logits_raw.detach().clone().requires_grad_(True)
+            optimizer = torch.optim.AdamW(
+                [logits_param], lr=per_step_lr, betas=(0.5, 0.9),
+                weight_decay=1e-6,
+            )
+            for inner_idx in range(per_step_iters):
+                motion_norm = _decode_with_relaxed_masked_base(
+                    base_logits=logits_param,
+                    committed_ids=committed_ids,
+                    differentiable_mask=differentiable_mask,
+                    baseline_residual_emb_sum=baseline_residual_emb_sum,
+                    vq_model=vq_model,
+                    temperature=per_step_temperature,
+                )                                                              # (B, T, 263)
+                motion = motion_norm * motion_std + motion_mean
+                joints_canon = recover_from_ric(motion, 22)                    # (B, T, 22, 3)
+                joints_world = _lift_canonical_to_world_torch(
+                    joints_canon, R_y_angle, T_xz,
+                )
+                body_world = joints_world.index_select(2, body_idx_t)          # (B, T, 5, 3)
+                T_dec = body_world.shape[1]
+                if loss_mode == "target":
+                    T_use = min(T_dec, target_world_t.shape[1])
+                    loss = _masked_contact_l2(
+                        body_world=body_world[:, :T_use],
+                        target_world=target_world_t[:, :T_use],
+                        contact_state=contact_state_t[:, :T_use],
+                    )
+                else:
+                    T_use = min(T_dec, pc_world_t.shape[1])
+                    loss = _eval_metric_as_loss(
+                        body_world=body_world[:, :T_use],
+                        pc_world=pc_world_t[:, :T_use],
+                    )
+                if inner_idx == 0:
+                    loss_init_step = float(loss.detach())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_final_step = float(loss.detach())
+            logits_for_commit = logits_param.detach()
+        else:
+            logits_for_commit = logits_raw
+
+        per_step_loss_initial.append(loss_init_step)
+        per_step_loss_final.append(loss_final_step)
+        per_step_active.append(int(active))
+
+        # Standard MaskGIT commit on the (possibly optimised) logits.
+        filtered_logits = top_k(logits_for_commit, topk_filter_thres, dim=-1)
+        pred_ids = gumbel_sample(
+            filtered_logits, temperature=base_temperature, dim=-1,
+        )
+        ids = torch.where(is_mask, pred_ids, ids)
+
+        probs = logits_for_commit.softmax(dim=-1)
+        tok_scores = probs.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)
+        scores = torch.where(is_mask, tok_scores, scores)
+        scores = scores.masked_fill(~is_mask, 1e5)
+
+        if log_progress:
+            tag = "ON " if active else "off"
+            print(
+                f"      [per-step {step_idx:2d}/{int(timesteps) - 1}] {tag} "
+                f"loss {loss_init_step:.4f} -> {loss_final_step:.4f}",
+            )
+
+    ids = torch.where(padding_mask, torch.full_like(ids, -1), ids)
+    info = {
+        "per_step_iters": int(per_step_iters),
+        "per_step_lr": float(per_step_lr),
+        "per_step_temperature": float(per_step_temperature),
+        "per_step_start_step": int(per_step_start_step),
+        "per_step_loss_initial": per_step_loss_initial,
+        "per_step_loss_final": per_step_loss_final,
+        "per_step_active": per_step_active,
+    }
+    return ids, info
 
 
 # ============================================================================
@@ -428,6 +696,10 @@ def guide_with_contact(
     residual_seed: int | None = None,
     no_residual_rerun: bool = False,
     guidance_layers: str = "base",   # "base" or "full_rvq"
+    per_step_iters: int = 0,         # 0 = no per-step guidance (back-compat)
+    per_step_lr: float = 6e-2,
+    per_step_temperature: float = 1.0,
+    per_step_start_step: int = 0,
     body_part_indices: tuple[int, ...] = tuple(BODY_PART_INDICES),
     device: torch.device,
     log_progress: bool = False,
@@ -538,7 +810,8 @@ def guide_with_contact(
              "rvq_token_change_count": 0,
              "residual_seed": residual_seed,
              "no_residual_rerun": bool(no_residual_rerun),
-             "guidance_layers": guidance_layers},
+             "guidance_layers": guidance_layers,
+             "per_step": None},
         )
 
     # Pre-compute the world-frame loss reference ONCE (constant across
@@ -574,6 +847,83 @@ def guide_with_contact(
         contact_state_t = None
     else:
         raise ValueError(f"loss_mode must be 'target' or 'metric', got {loss_mode!r}")
+
+    # --- Step 1.5: optional per-step decoded-geometric guidance ---
+    # When ``per_step_iters > 0`` we discard the naive baseline base_ids
+    # and re-run MaskGIT with per-step inner optimisation. The naive
+    # baseline residual pass is reused only as the frozen residual
+    # context approximation during the inner loops; after per-step
+    # generation completes we re-run the residual transformer on the
+    # post-guidance base_ids so the saved motion uses fresh residuals.
+    # See analyses/2026-05-01_per_step_guidance_design.md.
+    per_step_info: dict[str, Any] | None = None
+    if per_step_iters > 0:
+        with torch.no_grad():
+            baseline_residual_emb_sum = _precompute_residual_emb_sum(
+                all_for_decode, vq_model,
+            )                                                                  # (1, S, d), frozen
+        naive_base_ids = base_ids_baseline.detach().clone()
+        base_ids_baseline, per_step_info = _generate_with_per_step_guidance(
+            transformer=transformer,
+            vq_model=vq_model,
+            cond_vector=cond_vector,
+            m_lens_tok=m_lens_tok,
+            int_tokens_bf=int_kv,
+            int_padding_mask_bf=int_pad,
+            baseline_residual_emb_sum=baseline_residual_emb_sum,
+            target_world_t=target_world_t,
+            contact_state_t=contact_state_t,
+            pc_world_t=pc_world_t,
+            R_y_angle=R_y_angle,
+            T_xz=T_xz,
+            motion_mean=motion_mean,
+            motion_std=motion_std,
+            body_part_indices=body_part_indices,
+            loss_mode=loss_mode,
+            timesteps=timesteps,
+            w_text=w_text,
+            w_int=w_int,
+            base_temperature=1.0,
+            per_step_iters=per_step_iters,
+            per_step_lr=per_step_lr,
+            per_step_temperature=per_step_temperature,
+            per_step_start_step=per_step_start_step,
+            device=device,
+            log_progress=log_progress,
+        )
+        base_for_res = torch.where(
+            base_ids_baseline < 0,
+            torch.zeros_like(base_ids_baseline),
+            base_ids_baseline,
+        )
+        with torch.no_grad():
+            if residual_seed is not None:
+                torch.manual_seed(int(residual_seed))
+            all_ids = _generate_residual_tokens(
+                res_transformer,
+                motion_ids=base_for_res,
+                text=text,
+                m_lens_tok=m_lens_tok,
+                int_kv=int_kv,
+                int_pad=int_pad,
+                res_cond_scale=res_cond_scale,
+            )
+            all_for_decode = torch.where(
+                all_ids < 0, torch.zeros_like(all_ids), all_ids,
+            )
+        # Record how many base tokens the per-step guidance changed
+        # vs the naive baseline (excludes pad). Post-hoc Step 3 then
+        # operates on top of this and reports its own change count
+        # in the standard info["base_token_change_count"] field.
+        with torch.no_grad():
+            naive_token_mask = (
+                torch.arange(int(naive_base_ids.shape[-1]), device=device).unsqueeze(0)
+                < m_lens_tok.to(device=device).long().clamp(min=1).unsqueeze(1)
+            )
+            per_step_info["per_step_base_token_change_count"] = int(
+                ((base_ids_baseline != naive_base_ids) & naive_token_mask).sum().item(),
+            )
+            per_step_info["per_step_base_token_total"] = int(naive_token_mask.sum().item())
 
     # --- Step 2: initialize logits to optimize ---
     # One-hot(base_ids) * init_scale. Stronger init = optimization
@@ -745,5 +1095,6 @@ def guide_with_contact(
             "guidance_layers": guidance_layers,
             "residual_seed": residual_seed,
             "no_residual_rerun": bool(no_residual_rerun),
+            "per_step": per_step_info,
         },
     )

@@ -570,6 +570,38 @@ def main() -> int:
              "the full generated base+residual RVQ stack in decoded space "
              "and decodes that stack directly.",
     )
+    parser.add_argument(
+        "--per-step-iters", type=int, default=0,
+        help="Per-step decoded-geometric guidance inner-loop budget (v17, "
+             "MaskControl 'each_iter' analog, arXiv:2410.10780). When > 0, "
+             "the baseline MaskGIT loop is replaced by a re-rolled version "
+             "that runs N AdamW inner steps on the logits at each MaskGIT "
+             "iteration before commit, using a relaxed-decode geometric "
+             "loss with frozen baseline residuals. Default 0 = legacy "
+             "post-hoc-only path (back-compat). Recommended first cut: 10. "
+             "Stacks with --guidance-steps (post-hoc) when both > 0. See "
+             "analyses/2026-05-01_per_step_guidance_design.md.",
+    )
+    parser.add_argument(
+        "--per-step-lr", type=float, default=6e-2,
+        help="Learning rate for the per-step inner AdamW loop. Default "
+             "6e-2 matches MaskControl + the post-hoc --guidance-lr.",
+    )
+    parser.add_argument(
+        "--per-step-temperature", type=float, default=1.0,
+        help="Softmax temperature in the per-step relaxed decode. 1.0 = "
+             "unbiased expectation, matching MaskControl. Lower (e.g. 0.5) "
+             "would peak the relaxed embedding closer to the argmax token "
+             "but provides weaker gradient signal.",
+    )
+    parser.add_argument(
+        "--per-step-start-step", type=int, default=0,
+        help="MaskGIT iteration index at which per-step guidance begins. "
+             "0 = active from step 0 (matches MaskControl). Raise to 5 "
+             "if early-step optimisation is unstable (most positions are "
+             "still masked at low step indices, so the relaxed-decode "
+             "signal is uniform-like).",
+    )
     parser.add_argument("--w-int-sweep", action="store_true",
                         help="also generate a w_int sweep over {0, 1, 2, 4, 8}")
     parser.add_argument(
@@ -752,16 +784,20 @@ def main() -> int:
     # Optional: contact-aware inference-time logit guidance (B3).
     # Source-verified MaskControl arXiv:2410.10780 recipe. See
     # piano.inference.contact_guidance for the algorithm.
-    if args.guidance_steps > 0:
+    if args.guidance_steps > 0 or args.per_step_iters > 0:
         from piano.inference.contact_guidance import guide_with_contact
 
         print(
             f"\n=== Generating 'full_guided' condition with contact guidance "
-            f"({args.guidance_steps} steps, lr={args.guidance_lr}, "
+            f"(post_hoc_steps={args.guidance_steps}, lr={args.guidance_lr}, "
             f"init_scale={args.guidance_init_scale}, loss={args.guidance_loss}, "
             f"layers={args.guidance_layers}, "
             f"residual_seed={args.guidance_residual_seed}, "
-            f"no_residual_rerun={args.guidance_no_residual_rerun}) ===",
+            f"no_residual_rerun={args.guidance_no_residual_rerun}, "
+            f"per_step_iters={args.per_step_iters}, "
+            f"per_step_lr={args.per_step_lr}, "
+            f"per_step_temperature={args.per_step_temperature}, "
+            f"per_step_start_step={args.per_step_start_step}) ===",
         )
         per_clip_guided: list[dict[str, dict]] = []
         for i in range(len(samples)):
@@ -810,16 +846,36 @@ def main() -> int:
                 residual_seed=args.guidance_residual_seed,
                 no_residual_rerun=args.guidance_no_residual_rerun,
                 guidance_layers=args.guidance_layers,
+                per_step_iters=args.per_step_iters,
+                per_step_lr=args.per_step_lr,
+                per_step_temperature=args.per_step_temperature,
+                per_step_start_step=args.per_step_start_step,
                 device=device,
             )
             print(
-                f"    guidance: loss {info['loss_initial']:.4f} → "
+                f"    guidance: post_hoc_loss {info['loss_initial']:.4f} → "
                 f"{info['loss_final']:.4f} | "
-                f"tokens changed: {info['base_token_change_count']}/"
+                f"post_hoc tokens changed: {info['base_token_change_count']}/"
                 f"{info['base_token_total']} base, "
                 f"{info.get('rvq_token_change_count', 0)}/"
                 f"{info.get('rvq_token_total', info['base_token_total'])} rvq",
             )
+            per_step = info.get("per_step")
+            if per_step is not None:
+                ps_init = per_step.get("per_step_loss_initial", []) or []
+                ps_final = per_step.get("per_step_loss_final", []) or []
+                ps_active = per_step.get("per_step_active", []) or []
+                active_init = [v for v, a in zip(ps_init, ps_active) if a]
+                active_final = [v for v, a in zip(ps_final, ps_active) if a]
+                if active_init and active_final:
+                    print(
+                        f"    per-step: active_steps={int(sum(ps_active))}/"
+                        f"{len(ps_active)} | "
+                        f"first→last loss {active_init[0]:.4f} → {active_final[-1]:.4f} | "
+                        f"per-step base tokens changed vs naive: "
+                        f"{per_step.get('per_step_base_token_change_count', 0)}/"
+                        f"{per_step.get('per_step_base_token_total', info['base_token_total'])}",
+                    )
             per_clip_guided.append({
                 "full": {
                     "motion": motion_g,
@@ -859,6 +915,10 @@ def main() -> int:
                 else int(args.guidance_residual_seed)
             ),
             "no_residual_rerun": bool(args.guidance_no_residual_rerun),
+            "per_step_iters": int(args.per_step_iters),
+            "per_step_lr": float(args.per_step_lr),
+            "per_step_temperature": float(args.per_step_temperature),
+            "per_step_start_step": int(args.per_step_start_step),
             "per_clip": [
                 {
                     "seq_id": seq_ids[i],

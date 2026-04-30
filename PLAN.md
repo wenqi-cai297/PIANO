@@ -1,14 +1,22 @@
 # PIANO Plan
 
-Compact action plan as of 2026-04-30.
+Compact action plan as of 2026-05-01.
 
 ## Immediate Priority
 
-Stage B single-sample generation is no longer completely stuck at the old
-`31-32 cm` contact band: v14 sampled-ST `best_contact` reaches `27.37 cm` full
-contact on the matched 80-clip eval. This is a real spatial-contact gain, but
-GT VQ roundtrip is still `18.47 cm`, and temporal coupling barely moves
-(`0.2765` moving-coupled frame fraction vs v13 `0.2653` and v12 `0.2639`).
+v17 per-step decoded-geometric guidance has been implemented locally and is
+the next server run. It is inference-time only and runs on the existing v16
+(or v14/v15) `best_contact.pt` unchanged. v17 closes MaskControl ICCV 2025's
+`each_iter` half of the recipe that PIANO had been running only the post-hoc
+half of since v15. Decision rule and ablation plan are pinned in
+`analyses/2026-05-01_per_step_guidance_design.md`.
+
+Background: Stage B single-sample generation is no longer completely stuck at
+the old `31-32 cm` contact band: v14 sampled-ST `best_contact` reaches
+`27.37 cm` full contact on the matched 80-clip eval. This is a real
+spatial-contact gain, but GT VQ roundtrip is still `18.47 cm`, and temporal
+coupling barely moves (`0.2765` moving-coupled frame fraction vs v13 `0.2653`
+and v12 `0.2639`).
 
 Current diagnosis: `z_int` is active, and v14 proves that making the decoded
 auxiliary path harder and closer to sampling improves both one-shot spatial
@@ -214,6 +222,60 @@ metric-gaming-prone. Composite modestly improves correct body-part recall, but
 neither selection aligns the generated body to the GT object-local contact
 trajectory. Guidance/reranking must become body-part and contact-target aware,
 not only "any tracked part near any object point."
+
+### 4a. v17 per-step decoded-geometric guidance (next server run)
+
+Implemented locally 2026-05-01 as an inference-time addition. No retraining.
+Replaces the baseline MaskGIT loop with a re-rolled version that runs N AdamW
+inner steps on the predicted logits at each MaskGIT iteration before commit,
+using a relaxed-decode geometric loss with frozen baseline residuals.
+
+Entry points:
+
+- `src/piano/inference/contact_guidance.py::_generate_with_per_step_guidance`
+  re-rolled MaskGIT loop with the per-step inner optimisation hook.
+- `src/piano/inference/contact_guidance.py::_decode_with_relaxed_masked_base`
+  differentiable decode with hard committed + soft masked + frozen residual.
+- `src/piano/inference/contact_guidance.py::_precompute_residual_emb_sum`
+  one-time residual codebook lookup used as the inner loop's frozen context.
+- `scripts/stage_b_generator/qual_eval.py` new CLI:
+  `--per-step-iters / --per-step-lr / --per-step-temperature /
+  --per-step-start-step`. Stacks with the existing post-hoc
+  `--guidance-steps`.
+- `scripts/stage_b_generator/run_v17_per_step_guidance.sh` runner. Default
+  v17-C: per-step only, `PER_STEP_ITERS=10`, `GUIDANCE_STEPS=0`. Runs against
+  `runs/training/generator_v16_alignment_mirror/best_contact.pt` by default;
+  override `SOURCE_RUN_DIR=` to swap ckpts.
+- `tests/test_contact_guidance_per_step.py` 3 CPU tests; signature smoke
+  in `tests/test_contact_guidance.py::test_guide_with_contact_signature_accepts_new_kwargs`.
+
+Ablation matrix:
+
+| run | per-step | post-hoc | what it tests |
+|---|---:|---:|---|
+| v17-A baseline | 0 | 0 | sanity / re-baseline raw generation |
+| v17-B post-hoc only | 0 | 30 | reproduce v16 `full_guided` |
+| v17-C per-step only | 10 | 0 | does per-step alone move contact? |
+| v17-D stacked | 10 | 30 | full MaskControl recipe; ceiling check |
+| v17-E budget sweep | {20, 50, 100} | 0 | does more per-step iters help further? |
+
+Decision rule:
+
+- v17-C beats v17-B on contact distance + correct-part recall + same-part
+  local error → go to v17-D + v17-E.
+- v17-C ≈ v17-B → pivot to OMOMO-style hand-position intermediate target
+  as the next training-time branch.
+- v17-C worse than v17-B → diagnose with `guidance_trace.json::per_clip[*]
+  .info.per_step` before declaring per-step dead.
+
+Success threshold (rough): match v14 K=16 distance oracle (17.60 cm) within
+≤ 5 cm raw, with correct-part recall ≥ 0.22 and same-part local error
+≤ 48 cm.
+
+Risks: residual approximation drift (frozen baseline residuals stale wrt
+post-guidance base), early-step soft-decode meaningless (most positions
+masked at low step indices), AdamW init-scale calibration. See §5 of the
+design doc.
 
 ### 4. v15 result and v16 mirror-doubled branch
 

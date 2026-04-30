@@ -29,6 +29,10 @@ GUIDANCE_LR="${GUIDANCE_LR:-6e-2}"
 GUIDANCE_INIT_SCALE="${GUIDANCE_INIT_SCALE:-3.0}"
 GUIDANCE_RESIDUAL_SEED="${GUIDANCE_RESIDUAL_SEED:-}"
 GUIDANCE_NO_RESIDUAL_RERUN="${GUIDANCE_NO_RESIDUAL_RERUN:-0}"
+PER_STEP_ITERS="${PER_STEP_ITERS:-0}"
+PER_STEP_LR="${PER_STEP_LR:-6e-2}"
+PER_STEP_TEMPERATURE="${PER_STEP_TEMPERATURE:-1.0}"
+PER_STEP_START_STEP="${PER_STEP_START_STEP:-0}"
 WANDB_COLUMNS="${WANDB_COLUMNS:-epoch,loss,loss_base,loss_residual,loss_decoded_contact,loss_weighted_decoded_contact,acc,acc_residual,decoded_contact_aux_target_position,decoded_contact_aux_target_velocity,decoded_contact_aux_part_margin,decoded_contact_aux_part_margin_active_frac,decoded_contact_aux_segment_consistency,decoded_contact_aux_mean_min_dist,gamma_int_abs_mean,gamma_int_res_abs_mean,val_loss,val_loss_base,val_loss_residual,val_loss_decoded_contact,val_loss_weighted_decoded_contact,val_acc,val_acc_residual,val_decoded_contact_aux_target_position,val_decoded_contact_aux_target_velocity,val_decoded_contact_aux_part_margin,val_decoded_contact_aux_part_margin_active_frac,val_decoded_contact_aux_segment_consistency,val_decoded_contact_aux_mean_min_dist,contact_alignment_contact_score,contact_alignment_primary_error,contact_alignment_moving_target_error,contact_alignment_moving_same_part_recall,contact_composite_contact_score,contact_mean_min_dist,contact_moving_close_frame_frac,contact_moving_coupled_frame_frac,contact_moving_close_but_uncoupled_frac,contact_n_clips,lr,epoch_time_sec}"
 
 if [[ ! -f "$CFG" ]]; then
@@ -102,7 +106,7 @@ if [[ "$EVAL" == "1" ]]; then
       --seed "$SEED" \
       --summary-detail "$SUMMARY_DETAIL"
     )
-    if [[ "$GUIDANCE_STEPS" != "0" ]]; then
+    if [[ "$GUIDANCE_STEPS" != "0" || "$PER_STEP_ITERS" != "0" ]]; then
       qual_cmd+=(
         --guidance-steps "$GUIDANCE_STEPS"
         --guidance-layers "$GUIDANCE_LAYERS"
@@ -115,6 +119,14 @@ if [[ "$EVAL" == "1" ]]; then
       fi
       if [[ "$GUIDANCE_NO_RESIDUAL_RERUN" == "1" ]]; then
         qual_cmd+=(--guidance-no-residual-rerun)
+      fi
+      if [[ "$PER_STEP_ITERS" != "0" ]]; then
+        qual_cmd+=(
+          --per-step-iters "$PER_STEP_ITERS"
+          --per-step-lr "$PER_STEP_LR"
+          --per-step-temperature "$PER_STEP_TEMPERATURE"
+          --per-step-start-step "$PER_STEP_START_STEP"
+        )
       fi
     fi
     "${qual_cmd[@]}"
@@ -222,7 +234,7 @@ for ckpt_name in $CKPTS; do
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_contact_dist/summary.json"
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_temporal_coupling/summary.json"
   echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_alignment_to_gt_roundtrip/summary.json"
-  if [[ "$GUIDANCE_STEPS" != "0" ]]; then
+  if [[ "$GUIDANCE_STEPS" != "0" || "$PER_STEP_ITERS" != "0" ]]; then
     echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_qual/full_guided/{summary.json,guidance_trace.json,generated.npz}"
     echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_temporal_coupling/summary.json"
     echo "  runs/eval/${EVAL_PREFIX}_${ckpt_tag}_guided_alignment_to_gt_roundtrip/summary.json"

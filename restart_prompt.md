@@ -25,6 +25,8 @@ Must read:
 2. `PLAN.md` - next actions and routes that are no longer worth running.
 3. `ANALYSIS.md` - compact index for durable analysis docs.
 4. `analyses/stageB_compact.md` - consolidated Stage B evidence and decisions.
+5. `analyses/2026-05-01_per_step_guidance_design.md` - v17 design + ablation
+   (next server run; load this before working on Stage B inference code).
 
 Read when touching that area:
 
@@ -37,7 +39,7 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-04-30
+## Current State, 2026-05-01
 
 Project goal: PIANO generates object-adaptive human motion by inserting a
 structured interaction latent `z_int` between text/object inputs and the
@@ -91,13 +93,33 @@ Latest evaluated branch:
   GT-part recall is `0.1684`, and moving same-part local error is `55.09 cm`.
 - local visualization: `runs/visualizations/stageB_v0_15_bc_review/{full,full_guided}`.
 
-Latest implemented branch, pending server results:
+Latest evaluated branch (v16):
 
 - config: `configs/training/generator_v16_alignment_mirror.yaml`
 - runner: `scripts/stage_b_generator/run_v16_alignment_mirror.sh`
 - data change: deterministic MoMask/HumanML3D-style mirror doubling for train
   only via `augmentation.mirror_duplicate=true`.
 - validation/eval remain unaugmented.
+- result: partial positive. `best_contact full` 26.79 cm (vs v15 27.62);
+  `full_guided` 28.91 cm (vs v15 31.57). Best non-oracle correct GT-part
+  recall to date: `0.1990` on `final` ckpt. Same-part local 52.91-53.49 cm
+  (vs v15 54.24-59.92). Still 8-13 cm short of v14 K=16/K=64 oracle. Decision-
+  gate verdict: keep mirror-doubling, but the next iteration must change
+  the mechanism, not the data/loss knob.
+
+Latest implemented branch, pending server results (v17):
+
+- runner: `scripts/stage_b_generator/run_v17_per_step_guidance.sh`
+- design: `analyses/2026-05-01_per_step_guidance_design.md`
+- mechanism: per-step decoded-geometric guidance — replaces the baseline
+  MaskGIT loop with a re-rolled version that runs N AdamW inner steps on the
+  predicted logits at each MaskGIT iteration before commit, using a
+  relaxed-decode geometric loss with frozen baseline residuals
+  (MaskControl ICCV 2025 `each_iter` half of the recipe; PIANO previously
+  ran only the `iter_last` post-hoc half).
+- inference-time only — runs on existing v14/v15/v16 `best_contact.pt`
+  unchanged, no retraining.
+- defaults v17-C: `PER_STEP_ITERS=10`, `GUIDANCE_STEPS=0` (per-step only).
 
 ## Current Decision
 
@@ -107,16 +129,20 @@ near exhausted.
 
 Next work:
 
-1. Run v16 on the server, then sync the listed train/eval/wandb outputs back.
-2. Evaluate predicted contact body part, object-local `contact_target_xyz`, and
-   local-frame coupling together, not only any-part min-distance.
-3. Beat v15 raw (`27.62 cm`, moving IoU `0.3804`, correct-part recall
-   `0.1684`) and ideally both v14 K=16 composite (`17.94 cm`, coupled `0.3715`, moving IoU
-   `0.4472`, correct-part recall `0.2378`) and v14 K=64 alignment
-   (`18.71 cm`, coupled `0.3339`, moving IoU `0.4516`, correct-part recall
-   `0.2496`, local error `40.30 cm`).
+1. Run v17-C on the server (`bash scripts/stage_b_generator/run_v17_per_step_guidance.sh`,
+   default points at v16 best_contact); sync back the
+   `runs/eval/stageB_v0_17_per_step_v16bc_*` outputs.
+2. Compare v17-C against v17-B (post-hoc only = current v16 `full_guided`)
+   first, then against v14 K=16 composite oracle (`17.94 cm`, coupled `0.3715`,
+   IoU `0.4472`, correct-part `0.2378`) and v14 K=64 alignment oracle
+   (`18.71 cm`, `0.3339`, `0.4516`, `0.2496`, local `40.30 cm`).
+3. If v17-C clearly beats v17-B → run v17-D stacked + v17-E iter sweep.
+   If v17-C ≈ v17-B → pivot to OMOMO-style hand-position intermediate
+   target. If v17-C worse → diagnose with `guidance_trace.json::per_clip[*].
+   info.per_step` before declaring per-step dead.
 
-Do not spend another main iteration on larger K or rerank-weight tuning alone.
+Do not spend another main iteration on larger K, rerank-weight tuning, or
+data-symmetry knobs.
 
 ## Stage B Routes Already Tested
 

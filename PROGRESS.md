@@ -1,6 +1,6 @@
 # PIANO Progress
 
-Compact project memory as of 2026-04-30.
+Compact project memory as of 2026-05-01.
 
 ## Current Snapshot
 
@@ -99,6 +99,40 @@ artifacts: `configs/training/generator_v16_alignment_mirror.yaml`,
 `scripts/stage_b_generator/run_v16_alignment_mirror.sh`, and
 `tests/test_dataset_mirror_duplicate.py`.
 
+2026-05-01 v16 server result: partial positive, doesn't close the K-oracle gap.
+Raw `best_contact full` 26.79 cm vs v15 27.62 cm (+0.83 cm); `full_guided`
+28.91 cm vs v15 31.57 cm (+2.66 cm, the v15 guidance-induced contact regression
+is largely fixed). Moving correct GT-part recall on `final` ckpt is `0.1990`
+(highest non-oracle in the project). Same-part local error 53.49 / 53.23 /
+52.91 cm across bc/bv/final vs v15's 55.09 / 59.92 / 54.24. Still ~8-13 cm
+short of the v14 K=16 distance oracle (17.60 cm) and v14 K=64 alignment oracle
+(40.30 cm local error). Decision-gate verdict: mirror-doubling is worth keeping
+but is not a breakthrough; per restart prompt rule we now move to a different
+mechanism, not another data/loss-weight knob. See
+`analyses/2026-05-01_per_step_guidance_design.md`.
+
+⚠️ v16 wandb diagnostic: train-time `contact_alignment_contact_score`,
+`contact_composite_contact_score`, and `contact_alignment_moving_same_part_recall`
+are degenerate-early-maximum selectors (peak at epochs 5/5/35 respectively
+with very small values). The ckpt-of-record uses `contact_mean_min_dist`
+which is fine; do not promote any of the three to ship-metric without
+adding a sanity floor (e.g. require `contact_mean_min_dist < X` first).
+
+2026-05-01 implementation update: v17 per-step decoded-geometric guidance
+landed locally, server run pending. Inference-time only — runs on the v16
+(or any v14/v15) `best_contact.pt` unchanged. New entry points:
+`_generate_with_per_step_guidance` in `src/piano/inference/contact_guidance.py`,
+new CLI flags `--per-step-iters / --per-step-lr / --per-step-temperature /
+--per-step-start-step` in `scripts/stage_b_generator/qual_eval.py`, runner
+`scripts/stage_b_generator/run_v17_per_step_guidance.sh`. Default config is
+v17-C: `per_step_iters=10`, `guidance_steps=0` (per-step only, no post-hoc).
+Closes MaskControl ICCV 2025 `each_iter` half of the recipe that PIANO had
+been running only the post-hoc half of since v15. See design doc
+`analyses/2026-05-01_per_step_guidance_design.md` for ablation plan + decision
+rule. Tests `tests/test_contact_guidance_per_step.py` (3 CPU-friendly:
+residual emb sum lookup, masked-grad routing, all-masked agreement) all pass
+locally.
+
 ## Stage Status
 
 Stage 1 pseudo-labels:
@@ -182,6 +216,8 @@ Stage C Joint Finetune:
 | v14 K64 alignment oracle | remeasured 18.71 cm; coupled 0.334; moving IoU 0.452; correct GT-part recall 0.250; local part error 40 cm | alignment selection gives only modest local-position gain; K64 pool lacks enough aligned samples |
 | v15 alignment-guided | best_contact full 27.62 cm; guided 31.57 cm; moving IoU 0.380 and correct GT-part recall 0.168 | negative/neutral; alignment losses did not create GT-quality samples |
 | v16 mirror-doubled | deterministic original+mirror train-set duplication implemented and tested locally | next server run; tests MoMask/HumanML3D data assumption without conflating with old stochastic mirror p=0.5 |
+| v16 server result | bc full 26.79 cm; bv full 28.13; final full 28.05; final correct GT-part recall 0.1990; same-part local 52.91-53.49 cm | partial positive vs v15; still 8-13 cm short of v14 K-oracle baselines; decision-gate triggers next-mechanism branch (v17 per-step) |
+| v17 per-step guidance | inference-time MaskControl-style each_iter logit optimisation, runs on existing v14/v15/v16 ckpts unchanged; v17-C runner + tests landed | next server run; ablation plan in analyses/2026-05-01_per_step_guidance_design.md (v17-A baseline, v17-B post-hoc only, v17-C per-step only, v17-D stacked, v17-E iter sweep) |
 
 ## v0.12 Details
 
@@ -338,15 +374,21 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Run v16 mirror-doubled alignment training on the server with
-   `scripts/stage_b_generator/run_v16_alignment_mirror.sh`.
-2. Evaluate with contact distance, temporal coupling, and
-   `measure_contact_alignment.py`; a real improvement must beat v15 raw and
-   improve GT-aligned moving contact/correct body-part recall, not only
-   train-time decoded losses.
-3. If v16 still matches v15/v14, stop treating data symmetry as the main
-   blocker and move to a stronger sampling/training mechanism that directly
-   optimizes part, object-local target, and local-frame coupling.
+1. Run v17-C per-step guidance on the server using the v16 best_contact ckpt:
+   `bash scripts/stage_b_generator/run_v17_per_step_guidance.sh`. v17 is
+   inference-time only — no retraining. Matched 80-clip eval expected to
+   complete in ~1-2 hours on a single A6000 (per-step adds ~0.5 s/clip per
+   guided MaskGIT pass on top of baseline).
+2. Sync results back; compare against v17-B (post-hoc only = current v16
+   `full_guided` 28.91 cm) and the strong oracles (v14 K=16 composite
+   17.94 cm, v14 K=64 alignment 18.71 cm with local error 40.30 cm).
+3. Decision rule (per `analyses/2026-05-01_per_step_guidance_design.md`):
+   - v17-C beats v17-B clearly → go to v17-D stacked + v17-E iter sweep.
+   - v17-C ≈ v17-B → pivot to OMOMO-style hand-position intermediate
+     target as the next training-time branch.
+   - v17-C worse than v17-B → diagnose with the per-step loss trace
+     (`guidance_trace.json::per_clip[*].info.per_step`) before declaring
+     per-step dead.
 
 Secondary diagnostics:
 
