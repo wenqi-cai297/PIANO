@@ -118,20 +118,25 @@ with very small values). The ckpt-of-record uses `contact_mean_min_dist`
 which is fine; do not promote any of the three to ship-metric without
 adding a sanity floor (e.g. require `contact_mean_min_dist < X` first).
 
-2026-05-01 implementation update: v17 per-step decoded-geometric guidance
-landed locally, server run pending. Inference-time only — runs on the v16
-(or any v14/v15) `best_contact.pt` unchanged. New entry points:
-`_generate_with_per_step_guidance` in `src/piano/inference/contact_guidance.py`,
-new CLI flags `--per-step-iters / --per-step-lr / --per-step-temperature /
---per-step-start-step` in `scripts/stage_b_generator/qual_eval.py`, runner
-`scripts/stage_b_generator/run_v17_per_step_guidance.sh`. Default config is
-v17-C: `per_step_iters=10`, `guidance_steps=0` (per-step only, no post-hoc).
-Closes MaskControl ICCV 2025 `each_iter` half of the recipe that PIANO had
-been running only the post-hoc half of since v15. See design doc
-`analyses/2026-05-01_per_step_guidance_design.md` for ablation plan + decision
-rule. Tests `tests/test_contact_guidance_per_step.py` (3 CPU-friendly:
-residual emb sum lookup, masked-grad routing, all-masked agreement) all pass
-locally.
+2026-05-01 v17-C result: largest single-sample contact gain in project
+history, on the v16 `best_contact.pt` ckpt without retraining. Per-step
+decoded-geometric guidance only (no post-hoc):
+`full_guided` contact `21.77 cm` (v16 raw 26.79; v16 `full_guided` 28.91;
+v14 K=16 composite oracle `17.94 cm`). Moving coupled `0.3428` (v16 raw
+0.2734; v14 K=64 alignment oracle 0.3339 — **v17-C single-sample beats the
+K=64 oracle on coupling**). Moving IoU `0.4388` (v14 K=16 0.4472).
+Moving correct GT-part recall `0.2020` (v14 K=16 0.2378). Same-part
+object-local position error `46.13 cm` (v14 K=16 oracle 46.32 cm —
+**v17-C single-sample matches the K=16 composite oracle on local error**).
+Design success threshold: 2 of 3 pass (contact ≤ 22.60 cm: pass at 21.77;
+local error ≤ 48 cm: pass at 46.13; correct-part ≥ 0.22: miss at 0.2020,
+−1.8 pp). Per-step inner loop flips 60.67% of base tokens vs naive
+baseline on average, much deeper than the 0–30% flip rate of post-hoc-only
+guidance. Detail: `analyses/2026-05-01_v17_per_step_result.md`.
+
+Decision-rule outcome (per design doc §4): "v17-C clearly beats v17-B" →
+proceed to v17-D (stacked per-step + post-hoc) and v17-E (per-step budget
+sweep at iters ∈ {20, 50}).
 
 ## Stage Status
 
@@ -218,6 +223,7 @@ Stage C Joint Finetune:
 | v16 mirror-doubled | deterministic original+mirror train-set duplication implemented and tested locally | next server run; tests MoMask/HumanML3D data assumption without conflating with old stochastic mirror p=0.5 |
 | v16 server result | bc full 26.79 cm; bv full 28.13; final full 28.05; final correct GT-part recall 0.1990; same-part local 52.91-53.49 cm | partial positive vs v15; still 8-13 cm short of v14 K-oracle baselines; decision-gate triggers next-mechanism branch (v17 per-step) |
 | v17 per-step guidance | inference-time MaskControl-style each_iter logit optimisation, runs on existing v14/v15/v16 ckpts unchanged; v17-C runner + tests landed | next server run; ablation plan in analyses/2026-05-01_per_step_guidance_design.md (v17-A baseline, v17-B post-hoc only, v17-C per-step only, v17-D stacked, v17-E iter sweep) |
+| v17-C result | full_guided 21.77 cm contact / 0.3428 coupled / 0.4388 IoU / 0.2020 correct-part / 46.13 cm same-part local | matches v14 K=16 composite oracle on local error; beats K=64 alignment oracle on coupling; advance to v17-D + v17-E |
 
 ## v0.12 Details
 
@@ -374,21 +380,32 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 Immediate:
 
-1. Run v17-C per-step guidance on the server using the v16 best_contact ckpt:
-   `bash scripts/stage_b_generator/run_v17_per_step_guidance.sh`. v17 is
-   inference-time only — no retraining. Matched 80-clip eval expected to
-   complete in ~1-2 hours on a single A6000 (per-step adds ~0.5 s/clip per
-   guided MaskGIT pass on top of baseline).
-2. Sync results back; compare against v17-B (post-hoc only = current v16
-   `full_guided` 28.91 cm) and the strong oracles (v14 K=16 composite
-   17.94 cm, v14 K=64 alignment 18.71 cm with local error 40.30 cm).
-3. Decision rule (per `analyses/2026-05-01_per_step_guidance_design.md`):
-   - v17-C beats v17-B clearly → go to v17-D stacked + v17-E iter sweep.
-   - v17-C ≈ v17-B → pivot to OMOMO-style hand-position intermediate
-     target as the next training-time branch.
-   - v17-C worse than v17-B → diagnose with the per-step loss trace
-     (`guidance_trace.json::per_clip[*].info.per_step`) before declaring
-     per-step dead.
+1. Run v17-D + v17-E sweep on the server with the new wrapper:
+   `bash scripts/stage_b_generator/run_v17_sweep.sh`. Three back-to-back
+   eval conditions on the v16 best_contact ckpt:
+   - v17-D stacked: `PER_STEP_ITERS=10 GUIDANCE_STEPS=30` — canonical
+     MaskControl recipe (per-step + post-hoc).
+   - v17-E.20: `PER_STEP_ITERS=20 GUIDANCE_STEPS=0` — does doubling the
+     per-step inner budget close the remaining 1.8 pp correct-part gap?
+   - v17-E.50: `PER_STEP_ITERS=50 GUIDANCE_STEPS=0` — saturation check.
+2. Sync the three eval matrices back; compare contact / coupled / IoU /
+   correct-part / same-part local against v17-C (21.77 / 0.3428 / 0.4388
+   / 0.2020 / 46.13). Each condition lands under its own
+   `EVAL_PREFIX=stageB_v0_17_v16bc_*` directory tree.
+3. Decision branches:
+   - v17-D beats v17-C on correct-part recall → ship as the canonical
+     v17 config; record alongside v14/v15/v16 in the comparison table.
+   - v17-E.20 ≈ v17-E.10 → 10 inner iters is saturated, drop the 50 run.
+     If v17-E.50 > v17-E.20 by ≥ 1 cm contact and ≥ 1 pp correct-part →
+     consider MaskControl's full 100 with cost analysis.
+   - If correct-part recall stays below 0.22 across all v17-D/E variants
+     → pivot to OMOMO-style hand-position intermediate target as the
+     next training-time branch.
+4. Optional follow-up: `PER_STEP_START_STEP=2` ablation to test whether
+   skipping early MaskGIT iterations rescues the small subset of clips
+   (Sub1475, suitcase_lefthand_push) where per-step inner loss currently
+   *increases*. Run only if v17-D/E reveals correlated regression on
+   initially-low-loss clips.
 
 Secondary diagnostics:
 

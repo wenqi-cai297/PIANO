@@ -87,7 +87,25 @@ v15. Design + ablation plan:
 new CLI `--per-step-iters` etc. in
 `scripts/stage_b_generator/qual_eval.py`, runner
 `scripts/stage_b_generator/run_v17_per_step_guidance.sh`. Default v17-C:
-`per_step_iters=10`, `guidance_steps=0`. Server run pending.
+`per_step_iters=10`, `guidance_steps=0`.
+
+2026-05-01 v17-C result: largest single-sample contact gain in project
+history. On v16 `best_contact.pt`, no retraining: contact `21.77 cm`
+(v16 raw 26.79, v16 `full_guided` 28.91, K=16 distance oracle 17.60),
+moving_coupled `0.3428` (v14 K=64 alignment oracle 0.3339 — **v17-C
+single-sample beats the K=64 oracle on coupling**), moving IoU `0.4388`
+(v14 K=16 0.4472), correct-part recall `0.2020` (v14 K=16 0.2378),
+same-part object-local position error `46.13 cm` (v14 K=16 composite
+oracle 46.32 cm — **v17-C single-sample matches the K=16 oracle on local
+error**). Design success threshold 2 of 3 pass; correct-part recall ≥ 0.22
+is the only miss (1.8 pp short). Per-step inner loop flips 60.67% of base
+tokens vs naive baseline (vs 0–30% for post-hoc-only). Detail and
+per-step trace analysis in `analyses/2026-05-01_v17_per_step_result.md`.
+
+2026-05-01 v17-D / v17-E next: `scripts/stage_b_generator/run_v17_sweep.sh`
+runs v17-D stacked (per_step=10, post_hoc=30; canonical MaskControl
+recipe), v17-E.20 (per_step=20), v17-E.50 (per_step=50) back-to-back.
+Targets the remaining 1.8 pp correct-part recall gap.
 
 2026-04-29 literature/code review update: the current bottleneck is best framed
 as a sample-time geometric feedback problem. C2b optimizes a soft, differentiable

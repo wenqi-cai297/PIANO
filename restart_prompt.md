@@ -25,8 +25,10 @@ Must read:
 2. `PLAN.md` - next actions and routes that are no longer worth running.
 3. `ANALYSIS.md` - compact index for durable analysis docs.
 4. `analyses/stageB_compact.md` - consolidated Stage B evidence and decisions.
-5. `analyses/2026-05-01_per_step_guidance_design.md` - v17 design + ablation
-   (next server run; load this before working on Stage B inference code).
+5. `analyses/2026-05-01_per_step_guidance_design.md` - v17 design + ablation.
+6. `analyses/2026-05-01_v17_per_step_result.md` - v17-C single-sample SOTA
+   result (matches v14 K=16 oracle on local error; per-step inner loop flips
+   60.67% of base tokens). Load alongside the design doc.
 
 Read when touching that area:
 
@@ -107,10 +109,11 @@ Latest evaluated branch (v16):
   gate verdict: keep mirror-doubling, but the next iteration must change
   the mechanism, not the data/loss knob.
 
-Latest implemented branch, pending server results (v17):
+Latest evaluated branch (v17-C):
 
 - runner: `scripts/stage_b_generator/run_v17_per_step_guidance.sh`
 - design: `analyses/2026-05-01_per_step_guidance_design.md`
+- result: `analyses/2026-05-01_v17_per_step_result.md`
 - mechanism: per-step decoded-geometric guidance — replaces the baseline
   MaskGIT loop with a re-rolled version that runs N AdamW inner steps on the
   predicted logits at each MaskGIT iteration before commit, using a
@@ -119,7 +122,18 @@ Latest implemented branch, pending server results (v17):
   ran only the `iter_last` post-hoc half).
 - inference-time only — runs on existing v14/v15/v16 `best_contact.pt`
   unchanged, no retraining.
-- defaults v17-C: `PER_STEP_ITERS=10`, `GUIDANCE_STEPS=0` (per-step only).
+- v17-C config: `PER_STEP_ITERS=10`, `GUIDANCE_STEPS=0` (per-step only).
+- single-sample 80-clip result: contact `21.77 cm` / coupled `0.3428` /
+  IoU `0.4388` / correct-part recall `0.2020` / same-part local `46.13 cm`.
+  Same-part local matches v14 K=16 composite oracle (46.32 cm); coupling
+  beats v14 K=64 alignment oracle (0.3339). Per-step inner loop flips
+  60.67% of base tokens vs naive baseline.
+
+Latest implemented branch, pending server results (v17-D + v17-E sweep):
+
+- runner: `scripts/stage_b_generator/run_v17_sweep.sh`
+- variants: v17-D stacked (per_step=10, post_hoc=30); v17-E.20 (per_step=20);
+  v17-E.50 (per_step=50). Detailed in PLAN.md §4a.
 
 ## Current Decision
 
@@ -129,17 +143,17 @@ near exhausted.
 
 Next work:
 
-1. Run v17-C on the server (`bash scripts/stage_b_generator/run_v17_per_step_guidance.sh`,
-   default points at v16 best_contact); sync back the
-   `runs/eval/stageB_v0_17_per_step_v16bc_*` outputs.
-2. Compare v17-C against v17-B (post-hoc only = current v16 `full_guided`)
-   first, then against v14 K=16 composite oracle (`17.94 cm`, coupled `0.3715`,
-   IoU `0.4472`, correct-part `0.2378`) and v14 K=64 alignment oracle
-   (`18.71 cm`, `0.3339`, `0.4516`, `0.2496`, local `40.30 cm`).
-3. If v17-C clearly beats v17-B → run v17-D stacked + v17-E iter sweep.
-   If v17-C ≈ v17-B → pivot to OMOMO-style hand-position intermediate
-   target. If v17-C worse → diagnose with `guidance_trace.json::per_clip[*].
-   info.per_step` before declaring per-step dead.
+1. Run v17-D + v17-E sweep on the server with the new wrapper:
+   `bash scripts/stage_b_generator/run_v17_sweep.sh`. Three back-to-back
+   conditions (v17-D stacked, v17-E.20, v17-E.50). Sync back
+   `runs/eval/stageB_v0_17_v16bc_{stacked,per_step_iters20,per_step_iters50}_*`.
+2. Compare each variant against v17-C baseline (contact `21.77`, coupled
+   `0.3428`, IoU `0.4388`, correct-part `0.2020`, same-part local `46.13`).
+   The remaining design threshold to clear is correct-part recall ≥ 0.22.
+3. v17-D > v17-C on correct-part → ship v17-D. v17-E.20 ≈ v17-C → 10 iters
+   saturated; drop v17-E.50. v17-E.50 > v17-E.20 by ≥ 1 cm contact and 1 pp
+   correct-part → consider full 100. correct-part stays < 0.22 across all
+   variants → pivot to OMOMO-style hand-position intermediate target.
 
 Do not spend another main iteration on larger K, rerank-weight tuning, or
 data-symmetry knobs.

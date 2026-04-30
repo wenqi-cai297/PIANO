@@ -4,12 +4,22 @@ Compact action plan as of 2026-05-01.
 
 ## Immediate Priority
 
-v17 per-step decoded-geometric guidance has been implemented locally and is
-the next server run. It is inference-time only and runs on the existing v16
-(or v14/v15) `best_contact.pt` unchanged. v17 closes MaskControl ICCV 2025's
-`each_iter` half of the recipe that PIANO had been running only the post-hoc
-half of since v15. Decision rule and ablation plan are pinned in
-`analyses/2026-05-01_per_step_guidance_design.md`.
+v17-C per-step decoded-geometric guidance is the new Stage B state-of-the-art
+single-sample result, achieved without retraining (runs on the v16
+`best_contact.pt` ckpt unchanged). On the matched 80-clip eval:
+
+- contact `21.77 cm` (single-sample), `−5.02 cm` vs v16 raw, `−7.14 cm` vs
+  v16 `full_guided`, `+3.83 cm` to v14 K=16 distance oracle (best-of-16).
+- moving same-part object-local position error `46.13 cm`, **matching the
+  v14 K=16 composite oracle (46.32 cm)** in single-sample.
+- moving_coupled `0.3428`, **beating the v14 K=64 alignment oracle (0.3339)**
+  in single-sample.
+
+Result detail: `analyses/2026-05-01_v17_per_step_result.md`. The remaining
+single design-threshold gap is correct-part recall `0.2020` vs target
+`≥ 0.22` (1.8 pp short). Decision-rule outcome: proceed to v17-D (stacked
+per-step + post-hoc) and v17-E (per-step iter sweep), targeting the
+remaining correct-part gap.
 
 Background: Stage B single-sample generation is no longer completely stuck at
 the old `31-32 cm` contact band: v14 sampled-ST `best_contact` reaches
@@ -223,12 +233,43 @@ neither selection aligns the generated body to the GT object-local contact
 trajectory. Guidance/reranking must become body-part and contact-target aware,
 not only "any tracked part near any object point."
 
-### 4a. v17 per-step decoded-geometric guidance (next server run)
+### 4a. v17 per-step decoded-geometric guidance (v17-C shipped, v17-D/E next)
 
-Implemented locally 2026-05-01 as an inference-time addition. No retraining.
+Implemented 2026-05-01 as an inference-time addition. No retraining.
 Replaces the baseline MaskGIT loop with a re-rolled version that runs N AdamW
 inner steps on the predicted logits at each MaskGIT iteration before commit,
 using a relaxed-decode geometric loss with frozen baseline residuals.
+
+**v17-C result (per-step only, `per_step_iters=10`, `guidance_steps=0`):**
+contact `21.77 cm` / coupled `0.3428` / IoU `0.4388` / correct-part `0.2020`
+/ same-part local `46.13 cm`. Beats every v15/v16 baseline by clear margins.
+Same-part local error matches the v14 K=16 composite oracle in single-sample;
+coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
+loop flips 60.67% of base tokens vs naive baseline. See
+`analyses/2026-05-01_v17_per_step_result.md`.
+
+**Next runs (v17-D + v17-E sweep)**: launched together via
+`scripts/stage_b_generator/run_v17_sweep.sh`. Three eval conditions:
+
+| variant | per_step_iters | guidance_steps | EVAL_PREFIX | hypothesis |
+|---|---:|---:|---|---|
+| v17-D stacked | 10 | 30 | `stageB_v0_17_v16bc_stacked` | post-hoc on top of per-step adds another 1–3 cm contact + 0.5–2 pp correct-part; canonical MaskControl recipe |
+| v17-E.20 | 20 | 0 | `stageB_v0_17_v16bc_per_step_iters20` | does doubling the per-step inner budget close the 1.8 pp correct-part gap? |
+| v17-E.50 | 50 | 0 | `stageB_v0_17_v16bc_per_step_iters50` | saturation check; skip if v17-E.20 ≈ v17-C |
+
+Decision rules after sync:
+
+- v17-D > v17-C on correct-part → v17-D becomes ship config.
+- v17-E.20 ≈ v17-C → 10 iters is saturated; drop v17-E.50 from comparison.
+- v17-E.50 > v17-E.20 → consider MaskControl's full 100 (cost: ~7 min added
+  per condition; manageable).
+- correct-part stays below 0.22 across all v17-D/E variants → pivot to
+  OMOMO-style hand-position intermediate target as the next training-time
+  branch.
+
+**Optional**: `PER_STEP_START_STEP=2` ablation if a subset of clips with
+initially-low loss (Sub1475, suitcase_lefthand_push) regresses under
+per-step. Defer until v17-D/E reveals whether this is correlated.
 
 Entry points:
 
