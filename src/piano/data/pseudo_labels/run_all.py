@@ -21,6 +21,10 @@ from tqdm import tqdm
 import hashlib
 
 from piano.data.pseudo_labels.extract_contact import ContactConfig, extract_contact_state
+from piano.data.pseudo_labels.extract_strict_contact import (
+    StrictContactConfig,
+    extract_strict_contact_state,
+)
 from piano.data.pseudo_labels.extract_phase import PhaseConfig, extract_interaction_phase
 from piano.data.pseudo_labels.extract_support import SupportConfig, extract_support_state
 from piano.data.pseudo_labels.extract_target import TargetConfig, extract_contact_target
@@ -103,6 +107,8 @@ def process_sequence(
     support_config: SupportConfig | None = None,
     hmm_config: HMMConfig | None = None,
     use_hmm_refinement: bool = True,
+    contact_version: str = "v11",
+    strict_contact_config: StrictContactConfig | None = None,
 ) -> dict[str, np.ndarray]:
     """Run the full pseudo-label extraction for one sequence.
 
@@ -133,13 +139,29 @@ def process_sequence(
     else:
         mesh = object_mesh
 
-    # Step 1: Contact state — inverse-transforms joints to object-local
-    contact_state = extract_contact_state(
-        joints, mesh,
-        object_positions=object_positions,
-        object_rotations=object_rotations,
-        config=contact_config,
-    )
+    # Step 1: Contact state — inverse-transforms joints to object-local.
+    # contact_version selects v11 (legacy "approach within ~12 cm") vs
+    # v12_strict (real-contact: tight distance OR engagement, with drift
+    # filter). See analyses/2026-05-03_pseudo_label_v12_strict_design.md.
+    if contact_version == "v11":
+        contact_state = extract_contact_state(
+            joints, mesh,
+            object_positions=object_positions,
+            object_rotations=object_rotations,
+            config=contact_config,
+        )
+    elif contact_version == "v12_strict":
+        contact_state = extract_strict_contact_state(
+            joints, mesh,
+            object_positions=object_positions,
+            object_rotations=object_rotations,
+            strict_config=strict_contact_config,
+            base_kin_config=contact_config,
+        )
+    else:
+        raise ValueError(
+            f"contact_version must be 'v11' or 'v12_strict', got {contact_version!r}"
+        )
 
     # Step 2: Contact target. Now returns three arrays:
     # - contact_target_xyz_gt (T, 5, 3): closest-surface-point per body
@@ -211,6 +233,7 @@ def run_pipeline(
     use_hmm: bool = True,
     mesh_suffixes: tuple[str, ...] = ("_cleaned_simplified", ""),
     fps: float | None = None,
+    contact_version: str = "v11",
 ) -> None:
     """Batch pseudo-label extraction for all sequences.
 
@@ -248,12 +271,28 @@ def run_pipeline(
     phase_cfg = PhaseConfig(fps=resolved_fps)
     target_cfg = TargetConfig()
     support_cfg = SupportConfig(fps=resolved_fps)
+    # v12: use the strict definition (analyses/2026-05-03_pseudo_label_v12_strict_design.md)
+    strict_cfg: StrictContactConfig | None = None
+    if contact_version == "v12_strict":
+        strict_cfg = StrictContactConfig(fps=resolved_fps)
+        # v12 uses a wider kin_local_sigma than v11 default — pass via
+        # contact_config so _kinematic_contact_score sees the loosened σ.
+        contact_cfg = ContactConfig(
+            kin_local_sigma=0.06,
+            kin_local_transition=0.025,
+            kin_world_eps=0.15,
+            kin_world_sigma=0.04,
+            kin_radius_proxy=0.3,
+            kin_window_sec=0.5,
+            fps=resolved_fps,
+        )
 
     print(f"Extracting pseudo-labels for {len(metadata)} sequences")
     print(f"  Data:   {data_dir}")
     print(f"  Meshes: {mesh_dir}")
     print(f"  Output: {output_dir}")
     print(f"  FPS:    {resolved_fps}  (used for velocity thresholds)")
+    print(f"  Contact version: {contact_version}")
 
     # Cache LOADED meshes (not just paths) so each object is loaded once
     # and its trimesh spatial index is reused across all sequences using
@@ -345,6 +384,8 @@ def run_pipeline(
                 phase_config=phase_cfg,
                 support_config=support_cfg,
                 use_hmm_refinement=use_hmm,
+                contact_version=contact_version,
+                strict_contact_config=strict_cfg,
             )
         except Exception as e:
             print(f"  [warn] {seq_id}: {e}")
@@ -389,6 +430,7 @@ def run_pipeline(
         "subset": subset_hint,
         "fps": resolved_fps,
         "use_hmm": use_hmm,
+        "contact_version": contact_version,
         "mesh_suffixes": list(mesh_suffixes),
         "num_objects_with_atlas": len([k for k, v in atlas_cache.items() if v is not None]),
         "counts": {
@@ -475,6 +517,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override fps used for velocity thresholds. Default: read "
              "target_fps from <data-dir>/summary.json, else 20.",
     )
+    parser.add_argument(
+        "--contact-version",
+        choices=["v11", "v12_strict"],
+        default="v11",
+        help="Contact-state extraction definition. v11 (default) is the "
+             "legacy 'distance-OR-kinematic' formulation with anatomy-"
+             "calibrated thresholds (hand 12 cm, foot 6 cm, pelvis 20 cm). "
+             "v12_strict is the 2026-05-03 'real-contact' definition: "
+             "loose-distance × engagement (kinematic OR static), with "
+             "drift filter. See "
+             "analyses/2026-05-03_pseudo_label_v12_strict_design.md for "
+             "the design and rationale.",
+    )
     return parser
 
 
@@ -489,6 +544,7 @@ def main() -> None:
         use_hmm=not args.no_hmm,
         mesh_suffixes=tuple(args.mesh_suffixes),
         fps=args.fps,
+        contact_version=args.contact_version,
     )
 
 
