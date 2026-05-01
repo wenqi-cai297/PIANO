@@ -431,6 +431,11 @@ def run(config_path: str) -> None:
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
         focal_gamma=cfg.loss.get("focal_gamma", 0.0),
         use_kendall_weights=cfg.loss.get("use_kendall_weights", False),
+        # v7-fix (2026-05-04): "all" instead of "contact" recovers target
+        # supervision on every valid (frame, part) cell, since
+        # closest-surface-point xyz is well-defined irrespective of
+        # contact state. Default "contact" preserves v6 behaviour.
+        target_gate_kind=cfg.loss.get("target_gate_kind", "contact"),
         logit_adjust_phase=logit_adjust_phase,
         logit_adjust_support=logit_adjust_support,
         logit_adjust_tau=float(cfg.loss.get("logit_adjust_tau", 1.0)),

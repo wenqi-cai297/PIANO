@@ -1,0 +1,138 @@
+# Stage A v7-fix: re-train predictor with v12 strict labels but with
+# target-head fixes to address v7's 21 cm L2 disaster.
+#
+# Diagnosis of v7 (predictor_v7_v12strict, ep54 best_val + ep99 final):
+#   - target xyz L2 = 21-26 cm overall (vs v6 baseline 5-10 cm)
+#   - Root causes:
+#     1. v12 strict labels reduce contact frame frac 70% → 50%, which
+#        cuts target supervision frames ~30% (legacy v6 PredictorLoss
+#        only supervises target on cells where gt_contact > 0.5).
+#     2. Kendall multi-task weights auto-pushed target_weight to 23×
+#        because loss_target value is small (smooth-L1 in metres) but
+#        21 cm corresponds to 0.5×0.21² = 0.022 — Kendall mistook the
+#        small numerical loss for "task is well-balanced", but actual
+#        prediction quality is bad. With sparse supervision the boost
+#        couldn't drive L2 down further.
+#     3. smooth-L1 saturates the gradient at large errors (>1 m), so
+#        outliers from the sparse supervision don't get strong signal.
+#
+# v7-fix changes vs v7 (only Stage A loss config; everything else same):
+#   - use_kendall_weights: false (was true) — pin task weights manually
+#   - target_weight: 5.0 (was 1.0 nominal under Kendall) — recover
+#     target gradient share now that we don't auto-balance
+#   - contact_weight: 2.0 (unchanged)
+#   - target_gate_kind: "all" (was "contact") — supervise target on
+#     every valid (frame, part) cell. closest-surface-point xyz is
+#     well-defined regardless of contact state (extract_target.py
+#     emits 100% non-zero xyz). v12 strict's 50% contact frac wastes
+#     50% of supervision under "contact" gating; "all" recovers it.
+#
+# Predicted v7-fix outcome:
+#   target_xyz L2 overall: 21 cm → 6-10 cm (v6 baseline range)
+#   contact head metrics: roughly unchanged (contact_weight unchanged)
+#   phase/support: roughly unchanged
+#
+# Hardware: 2 × A6000 48 GB, bf16, Accelerate DDP. ~6 h.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_predictor \
+#     --config configs/training/predictor_v7fix_v12strict.yaml
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2   # unused when use_kendall_weights=false
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  # v7-fix: PIN weights manually (Kendall under sparse contact frac
+  # over-amplified target_weight to 23× yet still didn't drive L2 down).
+  use_kendall_weights: false
+
+  # Bumped target_weight from v6's nominal 1.0 to 5.0 to keep target
+  # gradient share comparable to Kendall's auto-balanced regime once
+  # we lose the auto-balancer. Other heads keep their v6 ratios.
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+
+  # v7-fix: target supervised on EVERY valid (frame, part) cell, not
+  # only contact-positive ones. closest-surface-point xyz is well-
+  # defined regardless of contact state.
+  target_gate_kind: "all"
+
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+  use_logit_adjustment: false
+  logit_adjust_tau: 1.0
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v7fix_v12strict"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v7fix_v12strict"

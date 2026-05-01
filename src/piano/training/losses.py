@@ -108,6 +108,7 @@ class PredictorLoss(nn.Module):
         label_smoothing: float = 0.0,
         focal_gamma: float = 0.0,
         use_kendall_weights: bool = False,
+        target_gate_kind: str = "contact",
         logit_adjust_phase: Tensor | None = None,
         logit_adjust_support: Tensor | None = None,
         logit_adjust_tau: float = 1.0,
@@ -133,6 +134,25 @@ class PredictorLoss(nn.Module):
         # contact loss ≈ 0.43; Kendall weights remove that hand-tuning
         # by construction.
         self.use_kendall_weights = use_kendall_weights
+        # target_gate_kind selects WHICH frame/part cells contribute to
+        # target xyz regression loss:
+        #   "contact" — only cells where gt_contact > contact_threshold
+        #               (legacy v6 behaviour; appropriate when contact is
+        #               dense, e.g. v11 labels with ~70% contact frac)
+        #   "all"     — every (frame, part) cell with valid frame mask
+        #               regardless of contact state. Justified because
+        #               extract_target.py emits closest-surface-point xyz
+        #               for every cell (100% non-zero), and that quantity
+        #               is well-defined whether or not the body actually
+        #               makes contact at this frame. v12 strict labels
+        #               drop contact frame frac to ~50%, leaving 50% of
+        #               target supervision unused under "contact" gating
+        #               — switch to "all" to recover supervision.
+        if target_gate_kind not in ("contact", "all"):
+            raise ValueError(
+                f"target_gate_kind must be 'contact' or 'all', got {target_gate_kind!r}"
+            )
+        self.target_gate_kind = target_gate_kind
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -271,7 +291,16 @@ class PredictorLoss(nn.Module):
             (loss_contact * frame_mask.unsqueeze(-1)).sum()
             / (n_frames * num_parts)
         )
-        loss_target = (loss_target * contact_gate).sum() / n_contact
+        if self.target_gate_kind == "all":
+            # Supervise every valid (frame, part) cell — closest-surface-
+            # point is well-defined regardless of contact (extract_target
+            # emits 100% non-zero xyz). Recovers supervision when contact
+            # frac drops, e.g. v12 strict labels.
+            target_full_gate = frame_mask.unsqueeze(-1).expand_as(loss_target)  # (B, T, 5)
+            n_target = target_full_gate.sum() + 1e-8
+            loss_target = (loss_target * target_full_gate).sum() / n_target
+        else:
+            loss_target = (loss_target * contact_gate).sum() / n_contact
         loss_phase = (loss_phase * frame_mask).sum() / n_frames
         loss_support = (loss_support * frame_mask).sum() / n_frames
 
