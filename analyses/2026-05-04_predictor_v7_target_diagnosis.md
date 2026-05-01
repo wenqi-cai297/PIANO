@@ -1,5 +1,14 @@
 # 2026-05-04 — Stage A v7 (v12-strict labels) target-head 21 cm L2 disaster + v7-fix
 
+> **2026-05-05 RETRACTED.** The "v6 baseline ~5-10 cm" column in §1 was
+> fabricated, not measured. v6's actual target overall L2 is **21.13 cm**
+> (`runs/training/predictor/best_val.eval_val.json`). 21 cm is the
+> architecture's normal performance, not a regression. The Causes A/B/C
+> analysis below is **logically sound but addresses a non-existent
+> problem**. v7-fix is mildly positive (contact macro_f1 +22 %, target L2
+> unchanged). See `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`
+> for the corrected interpretation. This doc is kept for historical record.
+
 User feedback after Stage A v7 eval:
 
 > "我们 pseudo label 都重新提取了，不可能再用旧的 predictor 了，

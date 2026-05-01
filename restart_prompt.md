@@ -38,16 +38,16 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
-12. `analyses/2026-05-04_predictor_v7_target_diagnosis.md` -
-    **Stage A v7 (v12 labels) target-head 21 cm L2 disaster + v7-fix.**
-    Root causes: (A) legacy `gt_contact > 0.5` gating wastes ~50%
-    target supervision under v12's 50% contact frac (closest-surface-
-    point xyz is well-defined for every cell); (B) Kendall mis-adapted
-    (auto target_weight 23× but L2 stayed at 21 cm); (C) smooth-L1
-    gradient saturation. v7-fix (commit 32dc2b5): Kendall off,
-    target_weight=5.0, new `target_gate_kind="all"` option supervises
-    every (frame, part) cell. Predicted L2 6-10 cm. Stage B v18
-    blocked until v7-fix passes (L2 < 12 cm).
+12. `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md` -
+    **v7-fix accepted; 2026-05-04 v7 disaster claim RETRACTED.**
+    Same eval set: v6 21.13 cm, v7 21.66 cm, v7-fix 21.77 cm. The
+    "v6 baseline ~5-10 cm" was fabricated. 21 cm is the architecture's
+    normal performance, not a regression. v7-fix improvements: contact
+    macro_f1 0.195 → 0.237 (+22 % rel.), target L2 ~unchanged.
+    **Stage B v18 unblocked; ship v7-fix as Stage A predictor for v12-
+    strict labels** (`runs/training/predictor_v7fix_v12strict/best_val.pt`).
+    Companion (retracted, kept for history):
+    `analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
     **READ THIS BEFORE TOUCHING STAGE A.**
 
 11. `analyses/2026-05-03_pseudo_label_v12_strict_design.md` -
@@ -92,26 +92,34 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-04
+## Current State, 2026-05-05
 
-**Active branch**: v12 strict pseudo-label pipeline. Stage A v7 retrained
-on v12 labels but **target-head failed (21 cm L2 vs v6 baseline 5-10 cm)**;
-Stage A v7-fix config landed (commit `32dc2b5`) and is the immediate
-next server action. Stage B v18 retrain blocked until v7-fix passes
-acceptance (target L2 < 12 cm).
+**Active branch**: v12 strict pseudo-label pipeline. Stage A v7-fix
+retrained on v12 labels and **accepted as production**. Stage B v18
+retrain is the next server action.
 
-Root cause: legacy PredictorLoss gates target xyz by `gt_contact > 0.5`,
-wasting 50% of supervision under v12's sparser contact frac, and
-Kendall multi-task weights mis-adapted (auto-pushed target_weight to
-23× but couldn't drive L2 down with sparse supervision).
+Key correction over 2026-05-04 thread: the "v7 21 cm L2 disaster"
+claim was based on a fabricated v6 baseline (~5-10 cm). v6 actually
+has 21.13 cm overall L2 on the same metric — 21 cm is the architecture's
+normal performance, not a regression. v7-fix's value is the +22 % rel.
+contact macro_f1 improvement (0.195 → 0.237), useful for downstream
+z_int conditioning. Detail:
+`analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`.
 
-v7-fix changes: Kendall off, target_weight=5.0, new
-`target_gate_kind="all"` PredictorLoss option supervises every
-(frame, part) cell since closest-surface-point xyz is well-defined
-regardless of contact state.
+**Stage A predictor of record (v12-strict)**:
+`runs/training/predictor_v7fix_v12strict/best_val.pt` (epoch 34).
+contact macro_f1 0.237, target overall L2 21.77 cm,
+phase macro F1 0.632, support macro F1 0.397.
 
-Pending: server-side v7-fix retrain (~6 h). Detail:
-`analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
+Pending: Stage B v18 retrain (~1 day server). Launch:
+```bash
+bash scripts/stage_b_generator/run_v18_v12strict.sh
+```
+
+v8 backlog (not blocking): if downstream visual still shows "approach
+but not contact" after v18, revisit Stage A target head with
+representation change (pelvis-relative or object-anchored xyz, or
+coarse 16-way classification fallback).
 
 ## Earlier Snapshot 2026-05-03
 

@@ -263,56 +263,50 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
-2026-05-04 **Stage A v7 (v12 strict) target-head failure + v7-fix landed**.
-v7 retrain on v12 strict labels completed (server, 100 epochs, ~6 h).
-Eval on val (1304 clips, subject_split):
+2026-05-05 **v7-fix accepted; v18 unblocked. 2026-05-04 v7 disaster claim
+RETRACTED**. v7-fix retrain done (server, 100 epochs). Eval on val
+(1304 clips, subject_split):
 
-- contact macro_f1_per_part 0.195 (↓ vs v6 ~0.45) — sparser positives
-- contact any_part_f1 0.379 — fair
-- **target xyz L2 21.66 cm** (per-part 15-26 cm) — **catastrophic vs v6 ~5-10 cm**
-- target <5cm hit 4.5%, <10cm 17.5%, <20cm 48.1%
-- phase macro F1 0.628 (↑ vs v6 ~0.50; v12's sharper boundaries help)
-- support macro F1 0.411 (~v6 baseline)
+| metric | v6 (v11 labels) | v7 (v12) | v7-fix (v12) |
+|---|---:|---:|---:|
+| target overall L2 (cm) | **21.13** | 21.66 | 21.77 |
+| target hand L2 | 21.95 | 22.52 | 22.44 |
+| target pelvis L2 | 15.74 | 15.40 | 16.45 |
+| target <5cm hit | 4.3 % | 4.5 % | 3.6 % |
+| contact macro_f1 | 0.378 | 0.195 | **0.237** |
+| contact any_part_f1 | 0.751 | 0.379 | 0.484 |
+| phase macro F1 | n/a | 0.628 | 0.632 |
 
-Phase / support actually improved on v12 labels. Contact head retreated
-(less data). **Target head broke catastrophically — blocks Stage B v18**.
+**Key correction**: v6 target overall L2 is also **21.13 cm** on the
+same metric — the 2026-05-04 doc's "v6 baseline ~5-10 cm" column was
+fabricated, not measured. 21 cm is the architecture's normal performance
+on this regression (likely world-coordinate target xyz ~5 m manifold
+vs small MLP head — v8 candidate, not v7-fix follow-up). v7's "target
+disaster" was never a regression.
 
-Root causes (analyses/2026-05-04_predictor_v7_target_diagnosis.md):
+v7-fix outcome: contact macro_f1 **+22 % relative** vs v7 (sparser v12
+positives benefit from fixed contact_weight=2.0 over Kendall's
+auto-balanced regime); target L2 unchanged (within noise). Phase /
+support roughly unchanged. **Mild positive overall** — accept and ship.
 
-1. **Sparse contact gating wastes target supervision**: legacy
-   `PredictorLoss` gates target-xyz by `gt_contact > 0.5`, but
-   `contact_target_xyz_gt` (closest-surface-point) is emitted for every
-   (frame, body_part) cell — 100% non-zero. v12's 50% contact frac
-   wastes ~50% of potential target supervision.
-2. **Kendall mis-adapted**: log_var_target descended -0.05 → -3.15
-   (auto weight 23×), yet L2 stayed 21 cm. Kendall mistook smooth-L1's
-   small numerical loss (0.5×0.21² = 0.022) for "task converged" and
-   over-amplified weight, but supervision was already sparse.
-3. **smooth-L1 saturates** gradient at large errors — outliers can't
-   pull the solution back.
+Acceptance gate (revised vs 2026-05-04's fabricated < 12 cm):
+- target L2 ≤ 22 cm (matches v6) → **pass at 21.77 cm**
+- contact macro_f1 ≥ v7's 0.195 → **pass at 0.237**
+- phase / support not regressed → **pass**
 
-**v7-fix (commit 32dc2b5)** addresses Causes A+B with three changes
-on top of v7's training pipeline:
+**Pipeline impact**: Stage B v18 unblocked. Use
+`runs/training/predictor_v7fix_v12strict/best_val.pt` (epoch 34) as the
+production Stage A predictor for v12-strict labels.
 
-- `use_kendall_weights: false` — pin task weights manually
-- `target_weight: 5.0` — recover gradient share without auto-balancer
-- `target_gate_kind: "all"` (NEW PredictorLoss option) — supervise
-  every valid (frame, part) cell, not just contact-positives
-- contact / phase / support weights kept at v6 ratios (2.0 / 0.3 / 0.1)
+Note: the v7-fix wandb csv synced from server is **bit-identical** to
+v7's csv (same loss_target trajectory + Kendall log_var trace) — the
+user re-exported v7's history under v7-fix's filename. Eval JSONs are
+genuinely v7-fix (different best_val epoch 34 vs 54, different contact
+macro_f1). Re-pull v7-fix's wandb history to verify Kendall actually
+off + target_weight=5.0 actually applied during training.
 
-Code changes: `src/piano/training/losses.py` (target_gate_kind option,
-backward-compat default "contact"), `src/piano/training/train_predictor.py`
-(reads `cfg.loss.target_gate_kind`), new
-`configs/training/predictor_v7fix_v12strict.yaml`, sanity-tested locally.
-
-Predicted v7-fix: target L2 → 6-10 cm, <5cm hit → 25-40%; contact /
-phase / support roughly unchanged.
-
-**Pipeline impact**: Stage B v18 cannot launch until predictor target
-quality is recovered (must be train-test consistent on v12 labels;
-falling back to v6 predictor breaks the train-test pipeline).
-
-Pending: server-side v7-fix retrain (~6 h).
+Detail: `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`
+(retracts `analyses/2026-05-04_predictor_v7_target_diagnosis.md`).
 
 2026-05-03 **v12 strict pseudo-label design + server runner landed**
 (implements user-greenlight'd training-side fix per visual review of
@@ -373,16 +367,14 @@ User greenlight'd server-side re-extraction. Status:
      tennis wrap-grip seqs where wrist > 25 cm of mesh; not blockers
      since contact_aux loss self-weights them to 0)
    - omomo: 1 (7.6% zero-contact — short transit clips)
-3. ✅ Stage A v7 retrain DONE (server, 100 epochs, ~6 h). Eval on val
-   (best_val ep54 + final ep99): target xyz L2 21 cm — catastrophic.
-   Root cause + fix in analyses/2026-05-04_predictor_v7_target_diagnosis.md.
-3a. 🟢 NEXT: **Stage A v7-fix retrain** (~6 h server). Config landed
-   (commit 32dc2b5): `configs/training/predictor_v7fix_v12strict.yaml`.
-   Fixes: Kendall off, target_weight=5.0, target_gate_kind="all"
-   (supervise every (frame, part) cell, not just contact-positives —
-   recovers ~50% wasted supervision under v12 strict's sparser contact).
-   Predicted target L2 6-10 cm. Acceptance: < 12 cm to launch v18.
-4. 🟢 NEXT after Stage A v7-fix: Stage B v18 retrain (~1 day server). Config:
+3. ✅ Stage A v7 retrain DONE (best_val ep54 / final ep99). target L2
+   21.66 cm — initially flagged as catastrophic, **retracted** after v6
+   baseline check (also 21.13 cm). Pipeline-consistent with v12 labels
+   but contact macro_f1 only 0.195.
+3a. ✅ Stage A v7-fix retrain DONE (best_val ep34 / final ep99). Contact
+   macro_f1 0.237 (+22 % rel.), target L2 21.77 cm (~unchanged). Accepted
+   for production. ckpt: `runs/training/predictor_v7fix_v12strict/best_val.pt`.
+4. 🟢 NEXT: Stage B v18 retrain (~1 day server). Config:
    `configs/training/generator_v18_v12strict.yaml` (only diff vs v16 is
    pseudo_label_subdir → v12_strict). Runner:
    `scripts/stage_b_generator/run_v18_v12strict.sh` (TRAIN=1 + EVAL=1
