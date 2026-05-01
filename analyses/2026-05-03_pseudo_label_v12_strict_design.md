@@ -1,0 +1,236 @@
+# 2026-05-03 — v12 strict pseudo-label design
+
+User triggered this after visual review of v17-E.50 + final.pt:
+
+> "视觉还是不过关，很多时候人根本就没有真正的接触到物体上，只是有点靠近而已。"
+
+The 2026-05-03 unified metric results showed this is a **training-side
+distribution problem** — `correct_part_recall` of v16 raw output is
+0.176 (only 18 % of GT contact frames have the right part actually
+labeled as in-contact in the model's output). Inference per-step pushes
+it to 0.292 but pays a plausibility tax (jerk × 8, penetration +0.4 cm)
+and STILL doesn't produce visually correct contact.
+
+Root cause: **v11 pseudo-label defines "contact" as "within 12 cm" for
+the hand**. The hand wrist sits 5–8 cm inside the forearm; palm surface
+is another 5 cm out. So `wrist within 12 cm of mesh` corresponds to
+`palm within ~−1 to 7 cm of mesh` — most of which is "approaching",
+not "touching". The model trains on this label and reproduces this
+behaviour: it learns to approach the surface neighbourhood, not to
+touch the surface.
+
+This document specifies a STRICT pseudo-label v12 that re-defines
+"contact" as actual physical engagement, and presents the local
+PC-based comparison evidence to justify the proposed thresholds.
+
+## 1. Definition (v12 strict)
+
+A frame `t` × body part `p` is in contact iff ALL of the following hold:
+
+```python
+# (1) Tight distance — palm/sole/ischium near surface
+distance_score = sigmoid(
+    (threshold_strict[part] - distance_to_mesh) / 0.015
+)
+# threshold_strict: hand=0.05, foot=0.03, pelvis=0.12 (m)
+# Was v11: hand=0.12, foot=0.06, pelvis=0.20
+
+# (2) Engagement — body is physically interacting, not just close
+kinematic_engagement = (
+    body_stable_in_object_local_frame  # std < 3 cm over 0.5 s
+    AND object_translating_or_rotating  # speed > 0.15 m/s proxy
+)
+static_engagement = (
+    object_stationary  # speed < 0.05 m/s
+    AND body_stable_at_contact_point   # local std < 2 cm
+)
+engagement_score = max(kinematic_engagement, static_engagement)
+
+# (3) AND-combined (was v11 OR-combined)
+contact_score = distance_score * engagement_score
+
+# (4) Temporal smoothing + min duration
+contact = median_filter(contact_score, size=7) > 0.5
+contact = filter_out_segments_shorter_than(5_frames)   # 0.25 s @ 20 fps
+
+# (5) Within-segment drift filter (NEW for v12)
+contact = filter_out_segments_where(
+    body_part_in_object_local_drifts_more_than(0.05_m)
+)
+```
+
+Key differences vs v11:
+- **Tighter distance** (2–2.5 × tighter on each part, sigma 2 × tighter)
+- **AND with engagement** (was OR with kinematic)
+- **Longer min duration** (5 frames vs 3)
+- **NEW: within-segment object-local drift filter** (5 cm)
+- **NEW: static engagement signal** for press/sit/lean (not just kinematic
+  coupling on moving objects)
+
+## 2. Per-part threshold rationale
+
+| part | v11 (m) | v12 strict (m) | rationale |
+|------|--------:|---------------:|-----------|
+| left/right_hand | 0.12 | **0.05** | wrist joint to palm surface ≈ 5–8 cm; v12 threshold means palm is within 0–2 cm of mesh ("touching") |
+| left/right_foot | 0.06 | **0.03** | foot mid-joint to sole ≈ 4–5 cm; v12 means sole is within 0–1 cm ("on the surface") |
+| pelvis | 0.20 | **0.12** | SMPL root to ischium ≈ 15–20 cm; v12 means ischium is within ~0–5 cm ("seated") |
+
+Community alignment: OMOMO (Li et al., SIGGRAPH Asia 2023, arXiv:2309.16237)
+§"Contact metric" uses 0.05 m hand-to-object distance + duration filter
+as the canonical contact definition. CHOIS (Li et al., CVPR 2024,
+arXiv:2312.17134) uses similar 0.05 m. v12's 0.05 m hand threshold
+matches this directly.
+
+## 3. Local PC-based evaluation on 80 GT clips
+
+Evaluated via `evaluate_contact_definitions_pc.py` (uses nearest-PC
+distance as `points_to_mesh_distance` approximation; mesh-based on the
+server will be ~1–2 cm more permissive on average).
+
+### Aggregate
+
+| metric | v11 | v12 strict | reduction |
+|--------|----:|-----------:|----------:|
+| mean contact frame frac (any part) | 77.6 % | **12.5 %** | −83.9 % |
+| total contact frames (across 79 clips) | 8787 | 1474 | −83.2 % |
+| total contact segments | 485 | 109 | −77.5 % |
+| mean segment duration (frames) | 43.2 | 14.4 | −67 % |
+
+### Per body part
+
+| part | v11 frame frac | v12 frame frac | reduction |
+|------|---------------:|---------------:|----------:|
+| left_hand   | 49.6 % | 4.7 %  | −90.5 % |
+| right_hand  | 52.0 % | 5.7 %  | −89.1 % |
+| left_foot   | 2.8 %  | 0.0 %  | −100 % |
+| right_foot  | 2.7 %  | 0.0 %  | −100 % |
+| pelvis      | 39.5 % | 5.3 %  | −86.5 % |
+
+### By subset
+
+| subset (N=20) | v11 frac | v12 frac | v11 #seg | v12 #seg |
+|---------------|---------:|---------:|---------:|---------:|
+| chairs        | 83.4 %   | **25.6 %** | 82  | 44  |
+| imhd          | 94.5 %   | 8.0 %    | 119 | 23  |
+| neuraldome    | 73.7 %   | 12.0 %   | 155 | 32  |
+| omomo (correct_v2) | 59.8 % | 4.3 % | 129 | 10  |
+
+### Interpretation
+
+**v11 is too permissive everywhere**. Even imhd (mostly wave/point
+gestures with minimal real grip) shows 94 % contact-frame fraction —
+which directly explains the model learning to "be generally near the
+object" instead of "touching it".
+
+**v12 strict is mostly correct but possibly too aggressive in two areas**:
+
+1. **omomo at 4.3 %** is suspiciously low. OMOMO is a grasp-rich dataset
+   (plasticbox, largebox, etc. — should have substantial sustained
+   grip). The PC-based approximation introduces some negative bias:
+   sparse PC (256 points on a 30 × 50 cm box → ~ 5 cm spacing) means
+   tight thresholds (5 cm) measure "close to nearest sample" which is
+   stricter than "close to mesh surface". Mesh-based on the server
+   should give 8–15 % for omomo.
+
+2. **foot at 0 %** is from the combination of (a) 3 cm threshold,
+   (b) most PIANO motion is upright walking/standing where feet rarely
+   contact the *object* (vs floor), (c) PC sparsity. In v11 it's
+   already only 2.7 %, so this isn't a regression — feet just rarely
+   contact the manipulated object in this dataset.
+
+**Chairs at 25 %** is the most encouraging signal: 25 % means "person
+sitting on chair for 1/4 of the clip" — visually correct ground truth.
+v11's 83 % is "person within 20 cm of chair for most of the clip"
+which is way over-counted.
+
+## 4. Two candidate configurations (server-side choice)
+
+### Option A: STRICT (recommended for first try)
+
+The exact definition above. Pros: maximally aligned with "real contact"
+visual semantic. Cons: training data sparser, potentially harder to
+optimise.
+
+```python
+StrictContactConfig(
+    distance_thresholds={"left_hand": 0.05, "right_hand": 0.05,
+                          "left_foot": 0.03, "right_foot": 0.03,
+                          "pelvis": 0.12},
+    distance_sigma=0.015,
+    require_engagement=True,
+    min_contact_duration=5,
+    max_segment_drift_m=0.05,
+)
+```
+
+Predicted training data shape after re-extraction (mesh-based on server):
+- ~15–20 % of frames in contact (vs v11's 60 %+)
+- contact segments mostly grasp / sit / press
+
+### Option B: MODERATE (safer fallback)
+
+Halfway between v11 and v12:
+
+```python
+StrictContactConfig(
+    distance_thresholds={"left_hand": 0.07, "right_hand": 0.07,    # was 0.05
+                          "left_foot": 0.05, "right_foot": 0.05,   # was 0.03
+                          "pelvis": 0.15},                          # was 0.12
+    distance_sigma=0.02,
+    require_engagement=True,
+    min_contact_duration=4,                                          # was 5
+    max_segment_drift_m=0.08,                                        # was 0.05
+)
+```
+
+Predicted: ~30–40 % contact frame frac (vs v11 78 %, strict 12 %).
+Less aggressive but still meaningfully strict.
+
+## 5. Implementation plan
+
+Files added (commit pending):
+- `src/piano/data/pseudo_labels/extract_strict_contact.py` — v12 module
+- `scripts/stage_b_generator/evaluate_contact_definitions_pc.py` — local
+  PC-based comparison script (used to produce §3 numbers)
+- `analyses/2026-05-03_pseudo_label_v12_strict_design.md` — this doc
+
+Server-side workflow when user greenlights:
+1. Run mesh-based v12 extraction on all 4 datasets (chairs / imhd /
+   neuraldome / omomo). Stores to `pseudo_labels/v12_strict/`.
+2. Train Stage A predictor on v12 labels (~6 h server time).
+3. Train Stage B v18 with v12 pseudo-labels (`pseudo_label_dir` config
+   override → `pseudo_labels/v12_strict/`).
+4. Evaluate v18 on the unified metric set, expecting:
+   - raw `correct_part_recall` to rise from 0.176 (v16) → 0.30+
+   - guided to rise from 0.292 → 0.40+
+   - Visual: real contact, not just approach
+5. If v18 improves on alignment AND visual: ship. Else: try moderate
+   config (Option B), or back to inference-side / γ_int branches.
+
+## 6. Risk register
+
+| risk | mitigation |
+|------|------------|
+| Training data too sparse → model can't learn contact at all | Try moderate config (Option B). If still too sparse, fall back to v11 with downweighted contact aux loss. |
+| omomo / imhd subsets become unusably low contact frac | Per-subset threshold relaxation (allow looser thresholds for known-difficult subsets). |
+| Stage A predictor fails to predict strict labels | Stage A predicts soft scores; even sparse strict labels train the predictor with contrastive signal vs non-contact frames. |
+| Mesh-based extraction differs significantly from PC-based eval | PC-based eval is upper bound on distance (so under-estimates contact); mesh-based should be 5–15 pp higher contact frac. Acceptable. |
+
+## 7. Sources
+
+- Implementation: `src/piano/data/pseudo_labels/extract_strict_contact.py`
+- PC-based eval: `runs/eval/_contact_def_compare_GT/summary.json`
+- Reproducer: `python scripts/stage_b_generator/evaluate_contact_definitions_pc.py
+  --input-dir runs/eval/<...>_gt_roundtrip_80/gt_original
+  --output-dir runs/eval/_contact_def_compare_GT`
+- v11 source: `src/piano/data/pseudo_labels/extract_contact.py`
+- Visual evidence (failure motivating this work):
+  `runs/visualizations/stageB_v17E50_final_review/` (10 mp4 clips)
+- External community references:
+  - Li et al. *OMOMO.* SIGGRAPH Asia 2023. arXiv:2309.16237.
+  - Li et al. *CHOIS.* CVPR 2024. arXiv:2312.17134.
+  - Xu et al. *InterDiff.* ICCV 2023. arXiv:2308.16905.
+- Prior PIANO docs (this design responds to):
+  - `analyses/pseudo_label_pipeline.md` (v11 design rationale)
+  - `analyses/2026-05-03_unified_metric_results.md` (training-bottleneck diagnosis)
+  - `analyses/2026-05-03_gamma_int_re_evaluation.md` (γ_int is not the lever; pseudo-label is)
