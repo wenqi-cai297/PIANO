@@ -83,26 +83,71 @@ from piano.utils.smpl_utils import (
 # ============================================================================
 
 STRICT_DISTANCE_THRESHOLDS: dict[str, float] = {
-    "left_hand":  0.05,    # was 0.12 — wrist within 5 cm = palm touching surface
+    # Tight thresholds for the case_static branch (object stationary +
+    # body in physical contact; e.g. sit, press, grip-static). At these
+    # distances the body skin/sole is essentially touching the surface.
+    "left_hand":  0.05,    # was 0.12 — wrist within 5 cm ≈ palm touching surface
     "right_hand": 0.05,
-    "left_foot":  0.03,    # was 0.06 — foot joint within 3 cm = sole touching
+    "left_foot":  0.03,    # was 0.06 — foot joint within 3 cm ≈ sole touching
     "right_foot": 0.03,
-    "pelvis":     0.12,    # was 0.20 — root within 12 cm = ischium touching seat
+    "pelvis":     0.12,    # was 0.20 — root within 12 cm ≈ ischium touching seat
+}
+
+LOOSE_DISTANCE_THRESHOLDS: dict[str, float] = {
+    # Loose thresholds for the case_kinematic branch (wrap-grip / gloved
+    # / handle-grip / carry-the-bag cases). The wrist can be 18–25 cm
+    # from the mesh and the hand still be physically attached if the
+    # body part moves in lockstep with the object in world frame
+    # (kinematic engagement). v11 docstring: "wrist joint is 18-22 cm
+    # from mesh surface in wrap-grip cases" — these thresholds give
+    # ~25 cm coverage for hand-grip and proportional limits elsewhere.
+    "left_hand":  0.25,
+    "right_hand": 0.25,
+    "left_foot":  0.15,
+    "right_foot": 0.15,
+    "pelvis":     0.30,
 }
 
 
 @dataclass(slots=True)
 class StrictContactConfig:
-    """Configuration for v12 strict 'real contact' extraction."""
+    """Configuration for v12 strict 'real contact' extraction.
 
-    # Per-part distance thresholds (m). Tighter than v11 by 2-2.5x.
+    The contact decision is the OR of two cases:
+
+      case_kinematic:  body moves in lockstep with object in world frame
+                       (kinematic_score >= threshold) AND body is within
+                       a *loose* distance threshold (handles wrap-grip
+                       / gloved / handle-grip cases where wrist can be
+                       18–25 cm from mesh but is physically attached).
+
+      case_static:     object is stationary AND body is stable at the
+                       contact point (static_engagement_score >=
+                       threshold) AND body is within a *tight* distance
+                       threshold (handles press / sit / grip-static —
+                       must be physically touching, not just close).
+
+    Within-segment drift (object-local frame) is filtered post-hoc
+    regardless of which case fired the segment, ensuring the contact
+    is a stable engagement rather than a glancing brush.
+    """
+
+    # Per-part TIGHT distance thresholds (m), used in case_static.
     distance_thresholds: dict[str, float] = field(
         default_factory=lambda: dict(STRICT_DISTANCE_THRESHOLDS)
     )
-    # Sigmoid transition width — also tightened (v11 used 0.03).
-    distance_sigma: float = 0.015
+    # Per-part LOOSE distance thresholds (m), used in case_kinematic.
+    # Allows wrap-grip / glove / handle cases where wrist is 18–25 cm
+    # from the mesh but truly attached.
+    loose_distance_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(LOOSE_DISTANCE_THRESHOLDS)
+    )
+    # Sigmoid transition widths.
+    distance_sigma: float = 0.015          # tight, for case_static
+    loose_distance_sigma: float = 0.04     # loose, for case_kinematic
 
-    # AND with engagement: kinematic coupling OR static contact.
+    # Engagement thresholds — currently used as soft scores, but kept
+    # as named knobs for consistency with the design doc.
     require_engagement: bool = True
     engagement_threshold: float = 0.5
 
@@ -114,7 +159,7 @@ class StrictContactConfig:
     max_segment_drift_m: float = 0.05
 
     # Static-engagement detection: when object is stationary, body stable
-    # at contact point also counts as engagement. Object stationary =
+    # at contact point counts as engagement. Object stationary =
     # speed < eps; body stable = local std < threshold over kin_window.
     static_engagement_eps_mps: float = 0.05    # m/s
     static_engagement_local_std_m: float = 0.02
@@ -263,14 +308,24 @@ def extract_strict_contact_state(
         bp_local = world_to_object_local(bp_world, object_positions, object_rotations)
         body_locals[:, bp_idx, :] = bp_local
 
-        # Distance score — TIGHT threshold + tighter sigmoid
+        # Distance scores — both tight (case_static) and loose (case_kinematic)
         distances, _ = points_to_mesh_distance(bp_local, object_mesh)
-        thr = strict_config.distance_thresholds.get(
+        tight_thr = strict_config.distance_thresholds.get(
             bp_name, STRICT_DISTANCE_THRESHOLDS[bp_name]
         )
-        dist_score = _soft_sigmoid(distances, thr, strict_config.distance_sigma)
+        loose_thr = strict_config.loose_distance_thresholds.get(
+            bp_name, LOOSE_DISTANCE_THRESHOLDS[bp_name]
+        )
+        tight_dist_score = _soft_sigmoid(distances, tight_thr, strict_config.distance_sigma)
+        loose_dist_score = _soft_sigmoid(distances, loose_thr, strict_config.loose_distance_sigma)
 
-        # Engagement score: kinematic coupling OR static engagement
+        # Two-case OR formulation:
+        #   case_kinematic = kinematic_engagement × loose_distance
+        #     captures wrap-grip / glove / handle-grip / carry-bag cases
+        #     where wrist is 18–25 cm from mesh but physically attached.
+        #   case_static = static_engagement × tight_distance
+        #     captures press / sit / grip-static where body is actually
+        #     touching the surface and not moving relative to it.
         if strict_config.require_engagement:
             kin_score = _kinematic_contact_score(
                 bp_world, object_positions, object_rotations, base_kin_config,
@@ -281,11 +336,12 @@ def extract_strict_contact_state(
                 eps_mps=strict_config.static_engagement_eps_mps,
                 local_std_thresh=strict_config.static_engagement_local_std_m,
             )
-            engagement = np.maximum(kin_score, static_score)
-            # AND-combine: contact = dist × engagement
-            score = dist_score * engagement
+            case_kinematic = kin_score * loose_dist_score
+            case_static = static_score * tight_dist_score
+            score = np.maximum(case_kinematic, case_static)
         else:
-            score = dist_score
+            # Distance-only fallback (for ablation / sanity)
+            score = tight_dist_score
 
         contact[:, bp_idx] = score
 

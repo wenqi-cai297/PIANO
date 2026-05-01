@@ -38,6 +38,7 @@ from piano.data.pseudo_labels.extract_contact import (
     _soft_sigmoid,
 )
 from piano.data.pseudo_labels.extract_strict_contact import (
+    LOOSE_DISTANCE_THRESHOLDS,
     STRICT_DISTANCE_THRESHOLDS,
     StrictContactConfig,
     _filter_drifting_contacts,
@@ -125,8 +126,10 @@ def _v12_strict_contact(joints, object_pc, object_positions, object_rotations, *
         body_locals[:, bp_idx, :] = bp_local
 
         distances = _nearest_pc_distance(bp_local, object_pc)
-        thr = STRICT_DISTANCE_THRESHOLDS[bp_name]
-        dist_score = _soft_sigmoid(distances, thr, sc.distance_sigma)
+        tight_thr = STRICT_DISTANCE_THRESHOLDS[bp_name]
+        loose_thr = LOOSE_DISTANCE_THRESHOLDS[bp_name]
+        tight_dist = _soft_sigmoid(distances, tight_thr, sc.distance_sigma)
+        loose_dist = _soft_sigmoid(distances, loose_thr, sc.loose_distance_sigma)
 
         kin_score = _kinematic_contact_score(
             bp_world, object_positions, object_rotations, base,
@@ -137,8 +140,10 @@ def _v12_strict_contact(joints, object_pc, object_positions, object_rotations, *
             eps_mps=sc.static_engagement_eps_mps,
             local_std_thresh=sc.static_engagement_local_std_m,
         )
-        engagement = np.maximum(kin_score, static_score)
-        contact[:, bp_idx] = dist_score * engagement
+        # Two-case OR: kinematic+loose OR static+tight
+        case_kinematic = kin_score * loose_dist
+        case_static = static_score * tight_dist
+        contact[:, bp_idx] = np.maximum(case_kinematic, case_static)
 
     for bp_idx in range(NUM_BODY_PARTS):
         contact[:, bp_idx] = median_filter(contact[:, bp_idx], size=sc.median_filter_size)

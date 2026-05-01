@@ -1,4 +1,47 @@
-# 2026-05-03 — v12 strict pseudo-label design
+# 2026-05-03 — v12 strict pseudo-label design (rev 2: two-case OR)
+
+**Update 2026-05-03 r2**: User pushed back on the v1 AND-formulation
+("contact = distance × engagement") with a wrap-grip case:
+
+> "手拿着球拍晃动，人的手由于戴了手套，双手的关节节点和球拍之间距离大于5cm，
+> 但是由于在世界里的坐标是同步运动的，其实是真实接触的，
+> 这种情况你现在的限制条件下会判定为接触吗？"
+
+Answer under v1: **NO** — distance > 5 cm makes `dist_score ≈ 0`, AND
+multiplied with any engagement gives 0. This is a serious false negative,
+losing v11's documented "wrist 18–22 cm from mesh in wrap-grip cases"
+coverage for bat / racket / handle / carry-bag / glove scenarios.
+
+This revision (r2) rebuilds contact as the **OR of two cases**, each
+internally AND'd:
+
+```
+contact = case_kinematic   OR   case_static
+
+case_kinematic = kinematic_engagement × loose_distance      # wrap-grip / glove
+                  hand loose threshold = 0.25 m  (vs 0.05 tight)
+                  foot loose threshold = 0.15 m  (vs 0.03)
+                  pelvis loose threshold = 0.30 m (vs 0.12)
+
+case_static    = static_engagement × tight_distance         # press / sit / grip-static
+                  uses original v12 r1 tight thresholds (5 / 3 / 12 cm)
+```
+
+Verification of the user's example: wrist–racket distance 7–10 cm
+(through gloves) < loose threshold 25 cm; racket + wrist move in
+lockstep → kinematic_engagement HIGH → **case_kinematic fires →
+contact ✓**.
+
+Verification "walking past a table" (false positive case to avoid):
+wrist 7 cm from table edge, table is stationary, body is moving
+quickly → kinematic_engagement = 0 (object speed 0), static_engagement
+= 0 (body not stable) → both cases fire = 0 → not contact ✓.
+
+Verification "sit on chair": pelvis 12 cm from seat, chair stationary,
+body stable → static_engagement HIGH, distance < tight threshold →
+case_static fires → contact ✓.
+
+
 
 User triggered this after visual review of v17-E.50 + final.pt:
 
@@ -81,39 +124,47 @@ as the canonical contact definition. CHOIS (Li et al., CVPR 2024,
 arXiv:2312.17134) uses similar 0.05 m. v12's 0.05 m hand threshold
 matches this directly.
 
-## 3. Local PC-based evaluation on 80 GT clips
+## 3. Local PC-based evaluation on 80 GT clips (revised r2)
 
 Evaluated via `evaluate_contact_definitions_pc.py` (uses nearest-PC
 distance as `points_to_mesh_distance` approximation; mesh-based on the
 server will be ~1–2 cm more permissive on average).
 
-### Aggregate
+### Aggregate (r2 two-case OR)
 
-| metric | v11 | v12 strict | reduction |
-|--------|----:|-----------:|----------:|
-| mean contact frame frac (any part) | 77.6 % | **12.5 %** | −83.9 % |
-| total contact frames (across 79 clips) | 8787 | 1474 | −83.2 % |
-| total contact segments | 485 | 109 | −77.5 % |
-| mean segment duration (frames) | 43.2 | 14.4 | −67 % |
+| metric | v11 | v12 r1 (AND) | **v12 r2 (OR)** | r2 reduction vs v11 |
+|--------|----:|----:|----:|----:|
+| mean contact frame frac (any part) | 77.6 % | 12.5 % | **19.4 %** | −75.0 % |
+| total contact frames | 8787 | 1474 | **2214** | −74.8 % |
+| total contact segments | 485 | 109 | **185** | −61.9 % |
+| mean segment duration (frames) | 43.2 | 14.4 | 14.9 | −66 % |
 
-### Per body part
+r2 captures meaningful wrap-grip cases that r1 dropped, while keeping
+the over-counting reduction substantial.
 
-| part | v11 frame frac | v12 frame frac | reduction |
+### Per body part (r2)
+
+| part | v11 frame frac | v12 r2 frame frac | reduction |
 |------|---------------:|---------------:|----------:|
-| left_hand   | 49.6 % | 4.7 %  | −90.5 % |
-| right_hand  | 52.0 % | 5.7 %  | −89.1 % |
-| left_foot   | 2.8 %  | 0.0 %  | −100 % |
-| right_foot  | 2.7 %  | 0.0 %  | −100 % |
-| pelvis      | 39.5 % | 5.3 %  | −86.5 % |
+| left_hand   | 49.6 % | 9.0 %  | −81.9 % |
+| right_hand  | 52.0 % | 10.9 % | −79.1 % |
+| left_foot   | 2.8 %  | 0.2 %  | −93.5 % |
+| right_foot  | 2.7 %  | 0.1 %  | −97.4 % |
+| pelvis      | 39.5 % | 6.1 %  | −84.6 % |
 
-### By subset
+### By subset (r2)
 
-| subset (N=20) | v11 frac | v12 frac | v11 #seg | v12 #seg |
+| subset (N=20) | v11 frac | v12 r2 frac | v11 #seg | v12 r2 #seg |
 |---------------|---------:|---------:|---------:|---------:|
-| chairs        | 83.4 %   | **25.6 %** | 82  | 44  |
-| imhd          | 94.5 %   | 8.0 %    | 119 | 23  |
-| neuraldome    | 73.7 %   | 12.0 %   | 155 | 32  |
-| omomo (correct_v2) | 59.8 % | 4.3 % | 129 | 10  |
+| chairs        | 83.4 %   | **25.9 %** | 82  | 51  |
+| imhd          | 94.5 %   | **19.2 %** | 119 | 40  |
+| neuraldome    | 73.7 %   | **25.4 %** | 155 | 72  |
+| omomo (correct_v2) | 59.8 % | 7.2 % | 129 | 22  |
+
+**Key change r1 → r2**: neuraldome rises from 12.0 % to 25.4 % — this
+is the dataset dominated by wrap-grip cases (bat, racket, monitor,
+handle, bag) that the user's racket example highlighted. The OR
+formulation correctly captures these.
 
 ### Interpretation
 
