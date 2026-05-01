@@ -23,15 +23,22 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
    for verification. Quality flags reviewed; neuraldome 31% zero-
    contact is short-transit / approach-only sequences that the
    contact_aux loss self-weights to 0 — not blockers.
-2. 🟢 NEXT: Retrain Stage A predictor on v12 labels (~6 h server).
-   Config: `configs/training/predictor_v7_v12strict.yaml`.
+2a. ✅ Stage A v7 retrain DONE; FAILED on target head (21 cm L2 vs
+   v6 baseline ~5-10 cm). Diagnosis + fix:
+   `analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
+2b. 🟢 NEXT: **Stage A v7-fix retrain** (~6 h server). Config:
+   `configs/training/predictor_v7fix_v12strict.yaml` (commit `32dc2b5`).
+   Fixes: Kendall off, target_weight=5.0, target_gate_kind="all"
+   (supervise every (frame, part) cell). Predicted target L2 6-10 cm.
+   Acceptance: < 12 cm to launch v18.
    Launch:
    ```bash
    accelerate launch --config_file configs/accelerate_config.yaml \
      -m piano.training.train_predictor \
-     --config configs/training/predictor_v7_v12strict.yaml
+     --config configs/training/predictor_v7fix_v12strict.yaml
    ```
-3. 🟢 NEXT (after Stage A done): Retrain Stage B as v18 (~1 day
+3. 🟢 NEXT (after Stage A v7-fix passes acceptance): Retrain Stage B
+   as v18 (~1 day
    server). Config: `configs/training/generator_v18_v12strict.yaml`
    (only diff vs v16 is `pseudo_label_subdir: pseudo_labels/v12_strict`).
    Runner:

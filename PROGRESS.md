@@ -263,6 +263,57 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-04 **Stage A v7 (v12 strict) target-head failure + v7-fix landed**.
+v7 retrain on v12 strict labels completed (server, 100 epochs, ~6 h).
+Eval on val (1304 clips, subject_split):
+
+- contact macro_f1_per_part 0.195 (↓ vs v6 ~0.45) — sparser positives
+- contact any_part_f1 0.379 — fair
+- **target xyz L2 21.66 cm** (per-part 15-26 cm) — **catastrophic vs v6 ~5-10 cm**
+- target <5cm hit 4.5%, <10cm 17.5%, <20cm 48.1%
+- phase macro F1 0.628 (↑ vs v6 ~0.50; v12's sharper boundaries help)
+- support macro F1 0.411 (~v6 baseline)
+
+Phase / support actually improved on v12 labels. Contact head retreated
+(less data). **Target head broke catastrophically — blocks Stage B v18**.
+
+Root causes (analyses/2026-05-04_predictor_v7_target_diagnosis.md):
+
+1. **Sparse contact gating wastes target supervision**: legacy
+   `PredictorLoss` gates target-xyz by `gt_contact > 0.5`, but
+   `contact_target_xyz_gt` (closest-surface-point) is emitted for every
+   (frame, body_part) cell — 100% non-zero. v12's 50% contact frac
+   wastes ~50% of potential target supervision.
+2. **Kendall mis-adapted**: log_var_target descended -0.05 → -3.15
+   (auto weight 23×), yet L2 stayed 21 cm. Kendall mistook smooth-L1's
+   small numerical loss (0.5×0.21² = 0.022) for "task converged" and
+   over-amplified weight, but supervision was already sparse.
+3. **smooth-L1 saturates** gradient at large errors — outliers can't
+   pull the solution back.
+
+**v7-fix (commit 32dc2b5)** addresses Causes A+B with three changes
+on top of v7's training pipeline:
+
+- `use_kendall_weights: false` — pin task weights manually
+- `target_weight: 5.0` — recover gradient share without auto-balancer
+- `target_gate_kind: "all"` (NEW PredictorLoss option) — supervise
+  every valid (frame, part) cell, not just contact-positives
+- contact / phase / support weights kept at v6 ratios (2.0 / 0.3 / 0.1)
+
+Code changes: `src/piano/training/losses.py` (target_gate_kind option,
+backward-compat default "contact"), `src/piano/training/train_predictor.py`
+(reads `cfg.loss.target_gate_kind`), new
+`configs/training/predictor_v7fix_v12strict.yaml`, sanity-tested locally.
+
+Predicted v7-fix: target L2 → 6-10 cm, <5cm hit → 25-40%; contact /
+phase / support roughly unchanged.
+
+**Pipeline impact**: Stage B v18 cannot launch until predictor target
+quality is recovered (must be train-test consistent on v12 labels;
+falling back to v6 predictor breaks the train-test pipeline).
+
+Pending: server-side v7-fix retrain (~6 h).
+
 2026-05-03 **v12 strict pseudo-label design + server runner landed**
 (implements user-greenlight'd training-side fix per visual review of
 v17-E.50 + final.pt: "人没真正接触到物体，只是有点靠近而已"). Replaces
@@ -322,10 +373,16 @@ User greenlight'd server-side re-extraction. Status:
      tennis wrap-grip seqs where wrist > 25 cm of mesh; not blockers
      since contact_aux loss self-weights them to 0)
    - omomo: 1 (7.6% zero-contact — short transit clips)
-3. 🟢 NEXT: Stage A predictor v7 retrain (~6 h server). Config landed:
-   `configs/training/predictor_v7_v12strict.yaml` (uses
-   `pseudo_label_subdir: pseudo_labels/v12_strict`).
-4. 🟢 NEXT after Stage A: Stage B v18 retrain (~1 day server). Config:
+3. ✅ Stage A v7 retrain DONE (server, 100 epochs, ~6 h). Eval on val
+   (best_val ep54 + final ep99): target xyz L2 21 cm — catastrophic.
+   Root cause + fix in analyses/2026-05-04_predictor_v7_target_diagnosis.md.
+3a. 🟢 NEXT: **Stage A v7-fix retrain** (~6 h server). Config landed
+   (commit 32dc2b5): `configs/training/predictor_v7fix_v12strict.yaml`.
+   Fixes: Kendall off, target_weight=5.0, target_gate_kind="all"
+   (supervise every (frame, part) cell, not just contact-positives —
+   recovers ~50% wasted supervision under v12 strict's sparser contact).
+   Predicted target L2 6-10 cm. Acceptance: < 12 cm to launch v18.
+4. 🟢 NEXT after Stage A v7-fix: Stage B v18 retrain (~1 day server). Config:
    `configs/training/generator_v18_v12strict.yaml` (only diff vs v16 is
    pseudo_label_subdir → v12_strict). Runner:
    `scripts/stage_b_generator/run_v18_v12strict.sh` (TRAIN=1 + EVAL=1

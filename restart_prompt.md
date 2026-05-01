@@ -38,6 +38,18 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
+12. `analyses/2026-05-04_predictor_v7_target_diagnosis.md` -
+    **Stage A v7 (v12 labels) target-head 21 cm L2 disaster + v7-fix.**
+    Root causes: (A) legacy `gt_contact > 0.5` gating wastes ~50%
+    target supervision under v12's 50% contact frac (closest-surface-
+    point xyz is well-defined for every cell); (B) Kendall mis-adapted
+    (auto target_weight 23× but L2 stayed at 21 cm); (C) smooth-L1
+    gradient saturation. v7-fix (commit 32dc2b5): Kendall off,
+    target_weight=5.0, new `target_gate_kind="all"` option supervises
+    every (frame, part) cell. Predicted L2 6-10 cm. Stage B v18
+    blocked until v7-fix passes (L2 < 12 cm).
+    **READ THIS BEFORE TOUCHING STAGE A.**
+
 11. `analyses/2026-05-03_pseudo_label_v12_strict_design.md` -
     **v12 strict pseudo-label design (r3) — current active work.**
     Replaces v11 "approach within 12 cm" with "real contact" (5 cm
@@ -80,7 +92,28 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-03
+## Current State, 2026-05-04
+
+**Active branch**: v12 strict pseudo-label pipeline. Stage A v7 retrained
+on v12 labels but **target-head failed (21 cm L2 vs v6 baseline 5-10 cm)**;
+Stage A v7-fix config landed (commit `32dc2b5`) and is the immediate
+next server action. Stage B v18 retrain blocked until v7-fix passes
+acceptance (target L2 < 12 cm).
+
+Root cause: legacy PredictorLoss gates target xyz by `gt_contact > 0.5`,
+wasting 50% of supervision under v12's sparser contact frac, and
+Kendall multi-task weights mis-adapted (auto-pushed target_weight to
+23× but couldn't drive L2 down with sparse supervision).
+
+v7-fix changes: Kendall off, target_weight=5.0, new
+`target_gate_kind="all"` PredictorLoss option supervises every
+(frame, part) cell since closest-surface-point xyz is well-defined
+regardless of contact state.
+
+Pending: server-side v7-fix retrain (~6 h). Detail:
+`analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
+
+## Earlier Snapshot 2026-05-03
 
 **Active branch**: v12 strict pseudo-label re-extraction + Stage B v18
 retrain. Triggered by visual review of v17-E.50 + final.pt failing
