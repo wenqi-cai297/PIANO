@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -201,15 +202,27 @@ def _build_dataset(
             pc_jitter_std=float(aug_cfg.get("pc_jitter_std", 0.0)),
         )
 
-    # Per-subset HOIDataset instances, concatenated. pseudo_label_dir
-    # defaults to <root>/pseudo_labels inside HOIDataset when the top-
-    # level config leaves it null — matching the v9 per-subset layout.
-    pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    # Per-subset HOIDataset instances, concatenated.
+    #
+    # Path resolution priorities (highest first):
+    #   1. ``data.pseudo_label_dir`` (absolute, single dir, all subsets share it)
+    #   2. ``data.pseudo_label_subdir`` (relative to each subset root —
+    #      lets v12_strict / future label versions live as a sibling
+    #      directory under each subset's own pseudo_labels tree)
+    #   3. None — HOIDataset falls back to ``<root>/pseudo_labels``
+    pseudo_label_dir_global = cfg.data.get("pseudo_label_dir", None)
+    pseudo_label_subdir = cfg.data.get("pseudo_label_subdir", None)
     datasets = []
     for entry in cfg.data.datasets:
+        if pseudo_label_dir_global is not None:
+            this_pseudo_label_dir = pseudo_label_dir_global
+        elif pseudo_label_subdir is not None:
+            this_pseudo_label_dir = str(Path(entry.root) / pseudo_label_subdir)
+        else:
+            this_pseudo_label_dir = None
         ds = HOIDataset(
             root=entry.root,
-            pseudo_label_dir=pseudo_label_dir,
+            pseudo_label_dir=this_pseudo_label_dir,
             max_seq_length=cfg.data.max_seq_length,
             object_id_filter=split_info["object_id_filter"],
             subject_id_filter=split_info["subject_id_filter"],

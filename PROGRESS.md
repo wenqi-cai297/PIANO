@@ -303,14 +303,41 @@ Server-side runner landed (commit `e16a59d`):
 - `scripts/stage1_pseudo_labels/compare_v11_v12_strict.py` — post-extraction
   sanity check (per-subset and per-body-part contact frame fraction)
 
-User greenlight'd server-side re-extraction. Pending steps:
-1. Run `extract_v12_strict_interact.sh` on server (~1-2 h, mesh-based)
-2. Run `compare_v11_v12_strict.py` to verify frame fractions match predicted
-3. Retrain Stage A predictor on v12_strict labels (~6 h server)
-4. Retrain Stage B as v18 with `pseudo_label_dir = pseudo_labels/v12_strict`
-   (~1 day server)
+User greenlight'd server-side re-extraction. Status:
+
+1. ✅ Server v12_strict extraction DONE (1-2 h, mesh-based). Synced
+   compare + per-subset summary.json to `runs/InterAct/piano/`. All 4
+   subsets: 0 skipped, 0 errors. Frame frac (mesh-based) matched
+   prediction range 40-55%:
+     chairs:     74% → 68% (sit captured at realistic per-clip rate)
+     imhd:       66% → 30% (over-counted approach removed)
+     neuraldome: 62% → 28% (over-counted approach removed)
+     omomo:      72% → 53% (grasp-rich; mesh recovers PC sparsity)
+   Aggregate (n=8475): ~71% → 50%.
+2. ✅ Quality flags reviewed:
+   - chairs: 0 flags ✓
+   - imhd: 2 (88% both_feet support; 14% zero-contact — short wave/swing OK)
+   - neuraldome: 5 (75% both_feet; 33% no phase trans; 99% no foot;
+     **31% zero-contact** — 82% are box / trolleycase / flower / case /
+     tennis wrap-grip seqs where wrist > 25 cm of mesh; not blockers
+     since contact_aux loss self-weights them to 0)
+   - omomo: 1 (7.6% zero-contact — short transit clips)
+3. 🟢 NEXT: Stage A predictor v7 retrain (~6 h server). Config landed:
+   `configs/training/predictor_v7_v12strict.yaml` (uses
+   `pseudo_label_subdir: pseudo_labels/v12_strict`).
+4. 🟢 NEXT after Stage A: Stage B v18 retrain (~1 day server). Config:
+   `configs/training/generator_v18_v12strict.yaml` (only diff vs v16 is
+   pseudo_label_subdir → v12_strict). Runner:
+   `scripts/stage_b_generator/run_v18_v12strict.sh` (TRAIN=1 + EVAL=1
+   default; uses v17-E.20 inference recipe for eval).
 5. Evaluate v18 with unified metric set; predicted raw correct_part_recall
    0.176 → 0.30+, guided 0.292 → 0.40+, visual: real contact
+
+Train-script changes (commit pending):
+- `train_predictor.py` + `train_generator.py`: add `pseudo_label_subdir`
+  config option (relative to each subset root). Resolved per-subset:
+  `<root>/<subdir>`. Backward compat: existing v11 configs unaffected
+  (their `pseudo_label_dir: null` falls through to the legacy default).
 
 Detail: [analyses/2026-05-03_pseudo_label_v12_strict_design.md](analyses/2026-05-03_pseudo_label_v12_strict_design.md).
 

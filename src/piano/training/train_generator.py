@@ -184,16 +184,29 @@ def _build_dataset(cfg, split_override: str | None = None, enable_augment: bool 
             pc_jitter_std=float(aug_cfg.get("pc_jitter_std", 0.0)),
         )
 
-    pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    # Path resolution (highest priority first):
+    #   1. data.pseudo_label_dir       (absolute, single dir, all subsets)
+    #   2. data.pseudo_label_subdir    (relative to each subset root —
+    #      e.g. "pseudo_labels/v12_strict" places v12 labels next to v11)
+    #   3. None ⇒ HOIDataset falls back to <root>/pseudo_labels (v11 layout)
+    pseudo_label_dir_global = cfg.data.get("pseudo_label_dir", None)
+    pseudo_label_subdir = cfg.data.get("pseudo_label_subdir", None)
     # v0.3-α: when cfg.data.force_world_frame=true, the obj-pose channels
     # are returned in world frame rather than body-canonical. Defaults
     # to false (v0.2 behaviour) when the key is absent.
     force_world_frame = bool(cfg.data.get("force_world_frame", False))
     datasets = []
     for entry in cfg.data.datasets:
+        if pseudo_label_dir_global is not None:
+            this_pseudo_label_dir = pseudo_label_dir_global
+        elif pseudo_label_subdir is not None:
+            from pathlib import Path as _P
+            this_pseudo_label_dir = str(_P(entry.root) / pseudo_label_subdir)
+        else:
+            this_pseudo_label_dir = None
         ds = HOIDataset(
             root=entry.root,
-            pseudo_label_dir=pseudo_label_dir,
+            pseudo_label_dir=this_pseudo_label_dir,
             max_seq_length=cfg.data.max_seq_length,
             object_id_filter=split_info["object_id_filter"],
             subject_id_filter=split_info["subject_id_filter"],

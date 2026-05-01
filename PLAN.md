@@ -15,24 +15,34 @@ contact as "wrist within 12 cm of mesh", which is "approach", not
 "touch". v12 strict redefines using OMOMO/CHOIS convention (5 cm hand +
 duration + engagement) with PIANO-specific wrap-grip tolerance.
 
-**Server-side execution sequence (user-greenlight'd)**:
+**Server-side execution sequence**:
 
-1. `bash scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`
-   — re-extracts v12 strict labels for 4 InterAct subsets, ~1-2 h.
-   Output: `<subset>/pseudo_labels/v12_strict/<seq>.npz`. Existing
-   v11 `pseudo_labels/<seq>.npz` untouched.
-2. `python scripts/stage1_pseudo_labels/compare_v11_v12_strict.py
-   --piano-root /media/.../InterAct/piano` — sanity check predicted
-   frame-frac drops match expectations:
-     chairs ~80% → 60-75%; imhd 94% → 35-45%;
-     neuraldome 74% → 35-50%; omomo 60% → 45-55%
-3. Retrain Stage A predictor on v12 labels (~6 h server).
-4. Retrain Stage B as v18 with `pseudo_label_dir = pseudo_labels/v12_strict`
-   (~1 day server). New config
-   `configs/training/generator_v18_v12strict.yaml`.
-5. Evaluate v18 with unified metric set (penetration / weighted_local /
+1. ✅ `bash scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`
+   — DONE (1-2 h, mesh-based). All 4 subsets, 0 skipped. Aggregate
+   frame frac 71% (v11) → 50% (v12). Synced `runs/InterAct/piano/`
+   for verification. Quality flags reviewed; neuraldome 31% zero-
+   contact is short-transit / approach-only sequences that the
+   contact_aux loss self-weights to 0 — not blockers.
+2. 🟢 NEXT: Retrain Stage A predictor on v12 labels (~6 h server).
+   Config: `configs/training/predictor_v7_v12strict.yaml`.
+   Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v7_v12strict.yaml
+   ```
+3. 🟢 NEXT (after Stage A done): Retrain Stage B as v18 (~1 day
+   server). Config: `configs/training/generator_v18_v12strict.yaml`
+   (only diff vs v16 is `pseudo_label_subdir: pseudo_labels/v12_strict`).
+   Runner:
+   ```bash
+   bash scripts/stage_b_generator/run_v18_v12strict.sh
+   # TRAIN=1 + EVAL=1 default. Uses v17-E.20 inference recipe for eval
+   # (per_step_iters=20, gumbel off, no post-hoc).
+   ```
+4. Evaluate v18 with unified metric set (penetration / weighted_local /
    correct_part / soft_IoU / jerk + KS distance to GT_orig).
-6. Decision tree: see PROGRESS.md `## Next Work` §5.
+5. Decision tree: see PROGRESS.md `## Next Work` §5.
 
 **Predicted v18 outcome**:
 - raw correct_part_recall: 0.176 (v16) → **0.30+** (closing v11→codec floor gap)
