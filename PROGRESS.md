@@ -263,6 +263,42 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-02 B1 + B2 + B3 server results synced (3 branches from
+`analyses/2026-05-01_v17_re_diagnosis.md` decision tree):
+
+- **B1 (final.pt re-eval) — partial WIN at high budget**:
+  v17-E.50 + final.pt → contact 16.86 cm / IoU 0.507 / **correct-part
+  0.292 (project SOTA on raw single-sample)** / **same-part local
+  36.11 cm (project SOTA)**. Beats prior v17-E.50 + best_contact on
+  every alignment metric. v17-E.20 + final.pt regresses (correct-part
+  0.241 vs prior 0.264) — final.pt's wider raw distribution requires
+  per_step ≥ 50 to translate into a guided-side win.
+- **B2 (part_margin + segment_consistency) — NEGATIVE**: every variant
+  with weight > 0 regresses correct-part recall vs sanity (pm=0)
+  rerun. pm=1.0 alone: 0.198 (−6.7 pp). pm=1.0 + sc∈{0.1,0.5,1.0} only
+  partially recovers. Sanity rerun matches prior v17-E.20 within RNG
+  (0.265 vs 0.264) → new code path is correctly wired; the aux terms
+  themselves do not transfer to inference.
+- **B3 (residual drift) — confirms ceiling**: even sanity (pm=0) has
+  mean |drift| 5.93 cm; max 49.86 cm per clip. drift scales with
+  part_margin weight (pm=2.0 → 11.86 cm) — explains B2 failure: aux
+  terms make base-token flipping more aggressive, which amplifies
+  divergence between the per-step optimiser's frozen-baseline residual
+  context and the actual post-residual-rerun residuals.
+
+**New ship config**: `v17-E.50 + final.pt` (subject to visual review).
+Metric-gaming caveat (contact 16.86 < GT VQ roundtrip 18.47) carries
+over from prior E.50, but correct-part 0.292 is project-best.
+
+**Next branch**: implement B3' — mid-loop residual refresh
+(`per_step_residual_refresh_every=N`) before any P2 commitment. Drift
+> 5 cm is the actual inference ceiling; B2 is expected to flip from
+negative to positive once drift < 2 cm. P2 (γ_int re-init) continues
+to wait.
+
+Detail: [analyses/2026-05-02_v17h_results.md](analyses/2026-05-02_v17h_results.md).
+Reproducer: `python scripts/stage_b_generator/summarize_v17h_results.py`.
+
 2026-05-01 B2 + B3 implementation landed (this commit):
 
 - `src/piano/inference/contact_guidance.py`: new

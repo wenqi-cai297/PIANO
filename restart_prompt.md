@@ -34,6 +34,10 @@ Must read:
    inference-side levers (final.pt re-eval; part_margin + segment_consistency
    in per-step loss); revises P2 to lower-risk γ_init candidates. Read this
    BEFORE acting on the v17g_gamma_int_boost_result.md P2 plan.
+8. `analyses/2026-05-02_v17h_results.md` - B1+B2+B3 server results.
+   v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
+   local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
+   branch is mid-loop residual refresh, NOT P2.
 
 Read when touching that area:
 

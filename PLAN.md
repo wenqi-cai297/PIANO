@@ -248,6 +248,31 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
+**2026-05-02 results landed for B1 + B2 + B3** — see
+`analyses/2026-05-02_v17h_results.md` for the summary tables.
+Headline:
+
+- B1 v17-E.50 + final.pt → correct-part **0.292** / local **36.11 cm**
+  (project SOTA on raw single-sample alignment). Pending visual review
+  for ship.
+- B2 part_margin / segment_consistency NEGATIVE — every weight > 0
+  regresses correct-part. Sanity rerun matches prior, code path
+  verified.
+- B3 residual drift ≈ 5.93–11.86 cm mean; max 50–104 cm per clip.
+  Confirmed > 5 cm threshold. **drift scales with part_margin** —
+  explains B2 failure mechanically.
+
+Revised next branch order:
+
+- **N1 — visual review of v17-E.50 + final.pt** (~30 min). If passes,
+  becomes new default ship config.
+- **N2 — implement B3' = mid-loop residual refresh**
+  (`--per-step-residual-refresh-every N`, ~1 day code + 4 h server).
+  Hypothesis: drift > 5 cm caps per-step ceiling; B2 may flip
+  positive after drift control. Re-run B2 sweep on top.
+- **N3 — P2 (γ_int re-init) continues to wait** until N1 + N2 are
+  exhausted.
+
 **Revised next branches (per 2026-05-01 source-level re-diagnosis)**:
 P2 is no longer the immediate next branch. Two cheaper inference-side
 levers were surfaced by re-reading the actual repo code (not from prior
