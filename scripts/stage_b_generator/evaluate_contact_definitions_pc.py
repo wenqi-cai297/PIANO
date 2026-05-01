@@ -102,9 +102,18 @@ def _v11_contact(joints, object_pc, object_positions, object_rotations, *, fps=2
 
 
 def _v12_strict_contact(joints, object_pc, object_positions, object_rotations, *, fps=20.0):
-    """V12 strict contact extraction with PC-distance approximation."""
+    """V12 strict contact extraction with PC-distance approximation (r3)."""
     sc = StrictContactConfig(fps=float(fps))
-    base = ContactConfig(fps=float(fps))
+    # r3: loosened kin_local_sigma 0.03 -> 0.06 m for wrap-grip articulation
+    base = ContactConfig(
+        kin_local_sigma=0.06,
+        kin_local_transition=0.025,
+        kin_world_eps=0.15,
+        kin_world_sigma=0.04,
+        kin_radius_proxy=0.3,
+        kin_window_sec=0.5,
+        fps=float(fps),
+    )
     T = len(joints)
     contact = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
     body_locals = np.zeros((T, NUM_BODY_PARTS, 3), dtype=np.float32)
@@ -140,9 +149,9 @@ def _v12_strict_contact(joints, object_pc, object_positions, object_rotations, *
             eps_mps=sc.static_engagement_eps_mps,
             local_std_thresh=sc.static_engagement_local_std_m,
         )
-        # Two-case OR: kinematic+loose OR static+tight
+        # r3: both cases use loose distance; engagement type is the discriminator.
         case_kinematic = kin_score * loose_dist
-        case_static = static_score * tight_dist
+        case_static = static_score * loose_dist
         contact[:, bp_idx] = np.maximum(case_kinematic, case_static)
 
     for bp_idx in range(NUM_BODY_PARTS):

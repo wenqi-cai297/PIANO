@@ -1,4 +1,54 @@
-# 2026-05-03 — v12 strict pseudo-label design (rev 2: two-case OR)
+# 2026-05-03 — v12 strict pseudo-label design (rev 3: loose-distance + relaxed kinematic σ)
+
+**Update 2026-05-03 r3**: User asked to inspect dropped clips:
+
+> "你直接去检查数据集里的接触帧比例异常低的部分，分析这部分数据，看看我们遗漏了哪些。"
+
+Debug of 27 clips where v11 marked > 40 % contact but v12 r2 dropped to
+< 5 % surfaced 4 root causes:
+
+1. **Sit case (e.g. Sub1034 sit, T=196, v11=100% → r2=0%)**: pelvis dist
+   16 cm > tight threshold 12 cm. static_engagement was high (0.57) but
+   case_static was tied to tight_distance, which gave 7 % — not enough.
+   **Pelvis-to-seat is structurally 15–22 cm for SMPL 22-joint root**;
+   tight 12 cm is anatomically wrong.
+2. **Bat / racket swing (v11=100% → r2=0%)**: kin_engagement only 0.17
+   even though bat moves at 4 m/s. Reason: SMPL wrist joint articulates
+   ±4–5 cm in the bat's local frame during a swing (wrist flexion);
+   `kin_local_sigma=0.03 m` makes the sigmoid output ~0.17 instead of
+   ~1.0. The local-stability test was too strict for a 22-joint model
+   that can't represent finger grip rigidly.
+3. **Carry case (subject03_case_1350, v11=100% → r2=0%)**: case_kin mean
+   72 % (high!) but binary frame frac 0 %. drift filter at 5 cm killed
+   all segments — wrist articulation makes wrist drift 5–10 cm in
+   object-local even when grip is rigid.
+4. **Walking carry (Sub1716 sit, plasticbox, etc.)**: scores hover near
+   0.5; median_filter + min_duration filter chains broke segments.
+
+Fixes (r3):
+
+- **Both cases use loose distance** (kinematic AND static). The
+  tight_distance branch was anatomically wrong for sit/press; the
+  engagement signal is what excludes false positives.
+- **`kin_local_sigma`: 0.03 → 0.06 m** (allows wrap-grip wrist
+  articulation; PIANO 22-joint can't go below this without artifacts).
+- **`static_engagement_local_std_m`: 0.02 → 0.05 m** (sit/press has
+  micro-motion).
+- **`max_segment_drift_m`: 0.05 → 0.10 m** (wrist articulation in
+  object-local frame).
+
+Verification of user's racket case under r3: dist 8 cm < loose 25 cm
+→ loose_score ~1.0; kin_local_sigma 0.06 with 4 cm articulation gives
+kin_engage ~0.4–0.7 (boundary but firing); contact ✓.
+
+Re-evaluation on the 27 r2-dropped clips:
+- **24 / 27 clips fully or substantially recovered** (r3 ≥ 30 %)
+- **3 / 27 still 0 %**: tripod_068 (right_hand mean 36 %, boundary
+  binarisation), suitcase_lefthand_push (wrist 42 cm from PC due to
+  PC sparsity, mesh-based should be ~8 cm), pink_1327_1 (mean 32 %,
+  boundary).
+
+
 
 **Update 2026-05-03 r2**: User pushed back on the v1 AND-formulation
 ("contact = distance × engagement") with a wrap-grip case:
@@ -130,17 +180,19 @@ Evaluated via `evaluate_contact_definitions_pc.py` (uses nearest-PC
 distance as `points_to_mesh_distance` approximation; mesh-based on the
 server will be ~1–2 cm more permissive on average).
 
-### Aggregate (r2 two-case OR)
+### Aggregate (all revisions compared)
 
-| metric | v11 | v12 r1 (AND) | **v12 r2 (OR)** | r2 reduction vs v11 |
+| metric | v11 | r1 (AND tight) | r2 (OR tight/loose) | **r3 (OR loose/loose)** |
 |--------|----:|----:|----:|----:|
-| mean contact frame frac (any part) | 77.6 % | 12.5 % | **19.4 %** | −75.0 % |
-| total contact frames | 8787 | 1474 | **2214** | −74.8 % |
-| total contact segments | 485 | 109 | **185** | −61.9 % |
-| mean segment duration (frames) | 43.2 | 14.4 | 14.9 | −66 % |
+| mean contact frame frac (any part) | 77.6 % | 12.5 % | 19.4 % | **45.1 %** |
+| total contact frames | 8787 | 1474 | 2214 | **4960** |
+| total contact segments | 485 | 109 | 185 | **301** |
+| mean segment duration (frames) | 43.2 | 14.4 | 14.9 | **28.0** |
 
-r2 captures meaningful wrap-grip cases that r1 dropped, while keeping
-the over-counting reduction substantial.
+r3 substantially recovers wrap-grip + sit + carry cases that r2 dropped.
+The 45 % vs v11's 78 % gap reflects v11 over-counting "approaches" (hand
+within 12 cm) as contact; r3 requires either kinematic engagement OR
+static engagement *plus* loose-distance gate.
 
 ### Per body part (r2)
 
@@ -152,19 +204,47 @@ the over-counting reduction substantial.
 | right_foot  | 2.7 %  | 0.1 %  | −97.4 % |
 | pelvis      | 39.5 % | 6.1 %  | −84.6 % |
 
-### By subset (r2)
+### By subset (r2 → r3)
 
-| subset (N=20) | v11 frac | v12 r2 frac | v11 #seg | v12 r2 #seg |
-|---------------|---------:|---------:|---------:|---------:|
-| chairs        | 83.4 %   | **25.9 %** | 82  | 51  |
-| imhd          | 94.5 %   | **19.2 %** | 119 | 40  |
-| neuraldome    | 73.7 %   | **25.4 %** | 155 | 72  |
-| omomo (correct_v2) | 59.8 % | 7.2 % | 129 | 22  |
+| subset (N=20) | v11 frac | r2 frac | **r3 frac** | r3 #seg | comment |
+|---------------|---------:|--------:|------------:|--------:|---------|
+| chairs        | 83.4 %   | 25.9 %  | **73.0 %** | 129 | sit dominant; r3 captures full sit duration (was missing pelvis-on-seat at 12-22 cm) |
+| imhd          | 94.5 %   | 19.2 %  | **33.3 %** | 52  | bat/racket/suitcase wrap-grip; r3 captures swing actions |
+| neuraldome    | 73.7 %   | 25.4 %  | **35.6 %** | 74  | large wrap-grip objects; r3 captures carry/wave actions |
+| omomo (correct_v2) | 59.8 % | 7.2 % | **37.9 %** | 46  | grasp-rich; r3 captures most grips. PC sparsity still causes some bias on long boxes |
 
-**Key change r1 → r2**: neuraldome rises from 12.0 % to 25.4 % — this
-is the dataset dominated by wrap-grip cases (bat, racket, monitor,
-handle, bag) that the user's racket example highlighted. The OR
-formulation correctly captures these.
+**Key change r2 → r3**: chairs jumps from 25.9 % → 73.0 % (sit is now
+captured at the realistic 70-90 % per-clip rate); neuraldome 25.4 % →
+35.6 %; omomo 7.2 % → 37.9 %. Aggregate 19.4 % → 45.1 %.
+
+### Sanity check: r3 doesn't over-count "approach"
+
+Clips where v11 already marked < 30 % contact (i.e., short/sparse
+contact, mostly approach with brief touch):
+
+| seq_id | v11 | r3 | verdict |
+|--------|----:|---:|---------|
+| sub7_smallbox_035 | 22 % | 30 % | small over-count (8 pp) |
+| sub7_whitechair_030 | 12 % | 14 % | aligned |
+| subject03_trolleycase_1083_3 | 21 % | 13 % | r3 stricter |
+| sub5_suitcase_030 | 17 % | 0 % | r3 stricter (PC sparsity) |
+| sub7_trashcan_001 | 28 % | 0 % | r3 stricter |
+
+r3 is in the same ballpark as v11 for low-contact clips (no false-positive
+explosion), and is strictly tighter for some (which is the intended
+behaviour — v11 over-counts brief approaches).
+
+### Remaining edge cases (3/27 still 0 % at r3)
+
+- **tripod_068**: right_hand case_kin score mean 36 %, boundary binarise
+- **suitcase_lefthand_push**: wrist mean 42 cm from PC due to PC
+  sparsity (mesh-based on the server should bring this to ~8 cm)
+- **subject03_pink_1327_1**: similar mean-32 % boundary case
+
+These are the natural failure modes of PC-based approximation +
+0.5 binarise threshold. Server-side mesh evaluation will recover the
+two PC-sparsity cases. The boundary-binarise cases are inherent to
+the strict definition and acceptable as long as they're a small minority.
 
 ### Interpretation
 

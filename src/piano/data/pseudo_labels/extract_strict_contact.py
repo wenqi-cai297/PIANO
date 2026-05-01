@@ -110,6 +110,26 @@ LOOSE_DISTANCE_THRESHOLDS: dict[str, float] = {
 
 
 @dataclass(slots=True)
+class StrictKinConfig:
+    """Loosened ContactConfig knobs for r3.
+
+    Allows the kinematic-coupling and static-engagement signals to fire
+    on wrap-grip articulation (wrist local std up to ~5–6 cm) and
+    sitting/pressing micro-motion (pelvis local std up to ~5 cm).
+    """
+    # Looser kin_local_sigma (was 0.03) — captures wrap-grip cases where
+    # SMPL 22-joint wrist drifts 4–5 cm in object-local frame due to
+    # hand/wrist articulation that the 22-joint model can't represent.
+    kin_local_sigma: float = 0.06
+    kin_local_transition: float = 0.025
+    kin_world_eps: float = 0.15
+    kin_world_sigma: float = 0.04
+    kin_radius_proxy: float = 0.3
+    kin_window_sec: float = 0.5
+    fps: float = 30.0
+
+
+@dataclass(slots=True)
 class StrictContactConfig:
     """Configuration for v12 strict 'real contact' extraction.
 
@@ -155,14 +175,19 @@ class StrictContactConfig:
     min_contact_duration: int = 5
 
     # Within-segment drift in object-local frame (m).
-    # Contact segments with body drift > this are invalidated.
-    max_segment_drift_m: float = 0.05
+    # r3: loosened 0.05 -> 0.10 to allow wrist articulation during
+    # wrap-grip carry (hand rotation makes wrist joint drift 5-10 cm
+    # in object-local even though grip is rigid; not a 22-joint
+    # representation problem we can solve here).
+    max_segment_drift_m: float = 0.10
 
     # Static-engagement detection: when object is stationary, body stable
     # at contact point counts as engagement. Object stationary =
     # speed < eps; body stable = local std < threshold over kin_window.
+    # r3: loosened static body std 0.02 -> 0.05 m to allow sit/press
+    # micro-motion (pelvis-on-seat oscillation, hand-on-table tremor).
     static_engagement_eps_mps: float = 0.05    # m/s
-    static_engagement_local_std_m: float = 0.02
+    static_engagement_local_std_m: float = 0.05
 
     # Median filter window (frames).
     median_filter_size: int = 7
@@ -278,15 +303,19 @@ def extract_strict_contact_state(
 
     if strict_config is None:
         strict_config = StrictContactConfig()
-    if base_kin_config is None:
-        base_kin_config = ContactConfig(fps=strict_config.fps)
-    else:
-        # Match fps and kinematic params from caller's base config
-        base_kin_config = ContactConfig(
-            **{k: getattr(base_kin_config, k) for k in base_kin_config.__slots__}
-        )
-    # Ensure fps consistency
-    base_kin_config.fps = strict_config.fps
+    # r3: build a ContactConfig with loosened kin_local_sigma so the
+    # kinematic_contact_score can fire for wrap-grip cases where the
+    # SMPL 22-joint wrist drifts 4–6 cm in object-local frame due to
+    # articulation that the 22-joint model cannot represent rigidly.
+    base_kin_config = ContactConfig(
+        kin_local_sigma=0.06,           # was 0.03
+        kin_local_transition=0.025,     # was 0.015
+        kin_world_eps=0.15,
+        kin_world_sigma=0.04,
+        kin_radius_proxy=0.3,
+        kin_window_sec=0.5,
+        fps=strict_config.fps,
+    )
 
     T = len(joints)
     contact = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
@@ -337,7 +366,15 @@ def extract_strict_contact_state(
                 local_std_thresh=strict_config.static_engagement_local_std_m,
             )
             case_kinematic = kin_score * loose_dist_score
-            case_static = static_score * tight_dist_score
+            # r3: case_static now uses loose_distance too. Reasoning: when
+            # body is static-engaged (object stationary, body stable on
+            # it), the relevant cap is "body within physical reach of
+            # the object surface", not "body touching with palm/sole
+            # within 5 cm". Sit case had pelvis 16-22 cm from seat
+            # (within loose 30 cm but outside tight 12 cm) — it was
+            # the dominant r2 false negative. Tight was always too
+            # tight given joint-to-skin offsets in 22-joint SMPL.
+            case_static = static_score * loose_dist_score
             score = np.maximum(case_kinematic, case_static)
         else:
             # Distance-only fallback (for ablation / sanity)
