@@ -263,6 +263,41 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-03 **γ_int re-evaluation** (per user pushback on prior "1/25 of
+ControlNet" framing). Source-level + quantitative re-analysis:
+
+- **Full v4–v16 γ_int trajectory**: all 12 runs converge to 0.017–0.036
+  range. v05 (160 epochs, 2 × longer) reaches 0.036 — γ_int slowly grows
+  past 80 epochs but linear extrapolation suggests γ ≈ 0.05 needs ~480
+  total epochs, γ ≈ 0.10 needs ~1100 epochs. NOT a hard plateau.
+- **z_int alignment contribution measured directly** by running
+  `measure_contact_alignment.py` on full / text_only / swap conditions
+  of v16bc raw output (γ_int = 0.02 frozen):
+  - text_only (no z_int): correct-part 0.110
+  - swap (wrong z_int): correct-part 0.091
+  - full (correct z_int): correct-part 0.176
+  - codec floor (perfect z_int): correct-part 0.393
+  - **z_int at γ=0.02 captures only 23 % of z_int-attributable headroom
+    (0.066 / 0.283)**. Substantial but sub-optimal.
+- **Architecture comparison**: ControlNet doesn't have a directly-
+  comparable scalar γ; the right anchor is LLaMA-Adapter (per-layer
+  scalar gating cross-attention output). PIANO at 0.02 vs LLaMA-Adapter
+  0.5–1.0 ratio holds (~1/25), but for **architectural reasons**
+  (gradient path 8 layers deep, training data 100 × smaller, lower-rank
+  conditioning signal) — NOT because PIANO is broken.
+- **Revised P2 verdict**: γ_int = 0.02 is below the asymptote but the
+  asymptote likely sits at ~0.05–0.10 under PIANO's setup, not
+  ControlNet/LLaMA's 0.5–1.0. **Realistic P2 upside: +3–6 pp correct-
+  part on guided** (from 0.292 toward 0.32–0.35), NOT closing the entire
+  codec floor gap. P2 stays in queue, but candidates revised to
+  **{0.05, 0.10, 0.20}** (incremental ramp) and **0.5/1.0 EXCLUDED**.
+
+N1 visual review rendered: `runs/visualizations/stageB_v17E50_final_review/`,
+`stageB_v17E20_final_review/`, `stageB_v17E50_bc_review/` — same 10 clips
+per run for side-by-side comparison.
+
+Detail: [analyses/2026-05-03_gamma_int_re_evaluation.md](analyses/2026-05-03_gamma_int_re_evaluation.md).
+
 2026-05-03 **Unified metric overhaul + training-vs-inference bottleneck
 diagnosis**. Per user's metric review (2026-05-02), implemented N1/N2
 penetration (22-joint sphere vs object PC convex hull, body-level only;
