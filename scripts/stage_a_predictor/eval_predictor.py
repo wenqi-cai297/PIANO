@@ -112,6 +112,9 @@ def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict, dict]:
     by design — paper-final metrics live downstream in Stage C eval.
     """
     pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    # Mirror train_predictor's resolution: support per-subset relative subdir
+    # (e.g. v12_strict labels live at <root>/pseudo_labels/v12_strict/).
+    pseudo_label_subdir = cfg.data.get("pseudo_label_subdir", None)
 
     subj_cfg = cfg.data.get("subject_split")
     obj_cfg = cfg.data.get("object_split")
@@ -175,10 +178,17 @@ def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict, dict]:
     else:
         info = {"split_kind": "none"}
 
+    def _resolve_pseudo_dir(entry):
+        if pseudo_label_dir is not None:
+            return pseudo_label_dir
+        if pseudo_label_subdir is not None:
+            return str(Path(entry.root) / pseudo_label_subdir)
+        return None
+
     datasets = [
         HOIDataset(
             root=entry.root,
-            pseudo_label_dir=pseudo_label_dir,
+            pseudo_label_dir=_resolve_pseudo_dir(entry),
             max_seq_length=cfg.data.max_seq_length,
             object_id_filter=object_id_filter,
             subject_id_filter=subject_id_filter,
