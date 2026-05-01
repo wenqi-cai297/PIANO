@@ -245,6 +245,8 @@ def build_predictor_step_fn(
     priors: PhysicalPriors,
     device: torch.device,
     prior_warmup_steps: int = 0,
+    teacher_forcing_schedule: dict | None = None,
+    epochs_per_step: float | None = None,
 ):
     """Build the step function for predictor training.
 
@@ -253,6 +255,20 @@ def build_predictor_step_fn(
     fed in by ``run_training_loop`` — we use it to linearly ramp the
     physical prior contribution from 0 to full weight over the first
     ``prior_warmup_steps`` calls (PhysDiff / CG-HOI convention).
+
+    Parameters
+    ----------
+    teacher_forcing_schedule : optional dict with keys
+        ``high_until_epoch``, ``low_after_epoch``, ``high_prob``,
+        ``low_prob``. When set + structured_head is enabled, the
+        StructuredHead receives GT contact + GT phase as the
+        conditioning input to downstream heads. Probability is
+        annealed linearly from ``high_prob`` (epochs ≤ high_until)
+        to ``low_prob`` (epochs ≥ low_after). Bengio et al. NeurIPS
+        2015 scheduled-sampling convention.
+    epochs_per_step : 1 / num_steps_per_epoch — how many epochs each
+        global_step represents. Required iff teacher_forcing_schedule
+        is set.
     """
     def step_fn(
         _model: nn.Module,
@@ -266,8 +282,17 @@ def build_predictor_step_fn(
             clip_model, batch["text"], device,
         )
 
-        # Object tokens
-        obj_tokens = object_encoder(batch["object_pc"])         # (B, M, d)
+        # Object tokens. v8 needs token positions too for affordance
+        # heatmap GT construction; encoder returns (xyz, features) when
+        # ``return_xyz=True``. Predictor's structured_head flag decides
+        # whether this is consumed.
+        use_structured = getattr(predictor, "structured_head", False) or \
+            (hasattr(predictor, "module") and getattr(predictor.module, "structured_head", False))
+        if use_structured:
+            obj_xyz, obj_tokens = object_encoder(batch["object_pc"], return_xyz=True)
+        else:
+            obj_tokens = object_encoder(batch["object_pc"])
+            obj_xyz = None
 
         # Initial pose: first-frame SMPL-22 joint positions (66-d).
         # HumanML3D 263-d frame 0 has undefined velocities (process_file
@@ -279,12 +304,45 @@ def build_predictor_step_fn(
         seq_len = batch["seq_len"]
         max_T = batch["motion"].shape[1]
 
+        # Teacher forcing decision (per batch). Only meaningful when
+        # structured_head is on; ignored otherwise. Per-batch (not
+        # per-frame) coin flip so the head sees a coherent upstream
+        # signal across the 196 frames.
+        teacher_forcing = False
+        if use_structured and teacher_forcing_schedule is not None and predictor.training:
+            assert epochs_per_step is not None
+            current_epoch = float(global_step) * float(epochs_per_step)
+            high_until = float(teacher_forcing_schedule.get("high_until_epoch", 50))
+            low_after = float(teacher_forcing_schedule.get("low_after_epoch", 80))
+            high_prob = float(teacher_forcing_schedule.get("high_prob", 1.0))
+            low_prob = float(teacher_forcing_schedule.get("low_prob", 0.5))
+            if current_epoch <= high_until:
+                tf_prob = high_prob
+            elif current_epoch >= low_after:
+                tf_prob = low_prob
+            else:
+                # linear anneal between the two anchors
+                alpha = (current_epoch - high_until) / max(low_after - high_until, 1e-6)
+                tf_prob = high_prob + alpha * (low_prob - high_prob)
+            teacher_forcing = bool(torch.rand(1).item() < tf_prob)
+
         # Predict interaction latent
-        pred = predictor(
-            text_features, obj_tokens, init_pose,
-            seq_length=max_T,
-            text_key_padding_mask=text_mask,
-        )
+        if use_structured:
+            pred = predictor(
+                text_features, obj_tokens, init_pose,
+                seq_length=max_T,
+                text_key_padding_mask=text_mask,
+                object_xyz=obj_xyz,
+                gt_contact=batch["contact_state"] if teacher_forcing else None,
+                gt_phase=batch["phase"].long() if teacher_forcing else None,
+                teacher_forcing=teacher_forcing,
+            )
+        else:
+            pred = predictor(
+                text_features, obj_tokens, init_pose,
+                seq_length=max_T,
+                text_key_padding_mask=text_mask,
+            )
 
         # Frame mask (True for valid, non-padded frames)
         frame_mask = (
@@ -292,9 +350,8 @@ def build_predictor_step_fn(
             < seq_len.unsqueeze(1)
         )
 
-        # Supervision loss. Target is now xyz regression in object-
-        # local frame (not patch-softmax), fed from HOIDataset's
-        # contact_target_xyz = softmax-weighted patch-centroid.
+        # Supervision loss. v7-fix path uses smooth-L1 on xyz; v8 path
+        # uses KL-div on attention over object tokens (requires obj_xyz).
         loss_dict = criterion(
             pred,
             gt_contact=batch["contact_state"],
@@ -302,6 +359,7 @@ def build_predictor_step_fn(
             gt_phase=batch["phase"].long(),
             gt_support=batch["support"].long(),
             mask=frame_mask,
+            object_xyz=obj_xyz,
         )
 
         # Physical prior regularization, linearly warmed up from 0. On
@@ -348,6 +406,7 @@ def run(config_path: str) -> None:
 
     # Models
     tr_cfg = model_cfg.get("temporal_refine", {})
+    sh_cfg = model_cfg.get("structured_head", {})
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -364,6 +423,11 @@ def run(config_path: str) -> None:
         temporal_refine_enabled=bool(tr_cfg.get("enabled", True)),
         temporal_refine_kernel_size=int(tr_cfg.get("kernel_size", 5)),
         temporal_refine_dropout=float(tr_cfg.get("dropout", 0.1)),
+        # v8 (2026-05-05): structured head. Default off (legacy heads).
+        structured_head=bool(sh_cfg.get("enabled", False)),
+        structured_head_d_emb=int(sh_cfg.get("d_emb", 64)),
+        structured_head_hidden=int(sh_cfg.get("hidden", 256)),
+        structured_head_attn_heads=int(sh_cfg.get("attn_heads", 6)),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,
@@ -439,6 +503,10 @@ def run(config_path: str) -> None:
         logit_adjust_phase=logit_adjust_phase,
         logit_adjust_support=logit_adjust_support,
         logit_adjust_tau=float(cfg.loss.get("logit_adjust_tau", 1.0)),
+        # v8 (2026-05-05) flags. Defaults preserve v7-fix behaviour.
+        target_loss_kind=cfg.loss.get("target_loss_kind", "smooth_l1"),
+        target_kernel_sigma=float(cfg.loss.get("target_kernel_sigma", 0.08)),
+        consistency_weight=float(cfg.loss.get("consistency_weight", 0.0)),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(
@@ -531,9 +599,23 @@ def run(config_path: str) -> None:
     if val_dataloader is not None:
         val_dataloader = accelerator.prepare(val_dataloader)
 
+    # v8 teacher-forcing schedule for the StructuredHead. Pass through
+    # only when structured_head is on AND a schedule block is provided.
+    tf_schedule = None
+    epochs_per_step = None
+    if bool(model_cfg.get("structured_head", {}).get("enabled", False)):
+        tf_block = cfg.training.get("teacher_forcing", None)
+        if tf_block is not None:
+            tf_schedule = dict(tf_block) if not isinstance(tf_block, dict) else tf_block
+            steps_per_epoch = max(1, len(dataloader) //
+                                  max(1, int(cfg.training.get("gradient_accumulation_steps", 1))))
+            epochs_per_step = 1.0 / float(steps_per_epoch)
+
     step_fn = build_predictor_step_fn(
         predictor, object_encoder, clip_model, criterion, priors, device,
         prior_warmup_steps=cfg.priors.get("prior_warmup_steps", 0),
+        teacher_forcing_schedule=tf_schedule,
+        epochs_per_step=epochs_per_step,
     )
 
     # Wandb (optional)

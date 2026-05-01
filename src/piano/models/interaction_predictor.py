@@ -215,6 +215,236 @@ class TemporalRefineBlock(nn.Module):
 
 
 # ============================================================================
+# v8 StructuredHead — affordance-style target attention + DAG conditioning
+# ============================================================================
+#
+# Replaces the four parallel ``nn.Linear`` heads in v7-fix with sequential
+# conditioning that mirrors the pseudo-label extraction DAG:
+#
+#     contact ──┬──▶ target  (soft attention over 128 object tokens)
+#               ├──▶ phase
+#               └──▶ support  (also conditioned on phase)
+#
+# The target head is now an attention readout over object tokens
+# (Move-as-You-Say CVPR'24 style affordance heatmap) instead of direct
+# xyz regression, fixing W1 (head too thin) + W2 (head loses object
+# identity) in one stroke. See
+# ``analyses/2026-05-05_predictor_v8_design.md`` Section 3.
+#
+# Backward-compatible xyz output is retained as
+# ``contact_target_xyz = einsum('btpk,bkc->btpc', attn, object_xyz)``
+# (attention-weighted token positions). This keeps the existing Stage B
+# inference path working without modification; v8.5 will migrate that
+# path to consume ``contact_target_attn`` directly.
+
+class StructuredHead(nn.Module):
+    """v8 head: DAG-ordered conditioning + affordance-style target attention.
+
+    Parameters
+    ----------
+    d_model : trunk hidden dim (matches encoder feature_dim)
+    num_body_parts : 5 — left/right hand/foot + pelvis
+    num_phases : 3 — non_contact / stable_contact / manipulation
+    num_support_states : 4 — both_feet / single_foot / sitting / hand_support
+    d_emb : dimension of the contact/phase one-hot-style embedding fed
+        into downstream heads. 64 is a sensible default — small enough
+        to act as a "context channel" without competing with x's
+        bandwidth.
+    head_hidden : MLP hidden dim for contact/phase/support 2-layer heads.
+    num_attn_heads : multi-head attention heads for target xattn.
+    dropout : dropout in MLP heads.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 384,
+        num_body_parts: int = 5,
+        num_phases: int = 3,
+        num_support_states: int = 4,
+        d_emb: int = 64,
+        head_hidden: int = 256,
+        num_attn_heads: int = 6,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_body_parts = num_body_parts
+        self.num_phases = num_phases
+        self.num_support_states = num_support_states
+        self.d_emb = d_emb
+
+        # ── Level 0: contact (base) ──────────────────────────────
+        self.contact_head = nn.Sequential(
+            nn.Linear(d_model, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, num_body_parts),
+        )
+        # Project the per-frame contact prob (B, T, num_body_parts) into
+        # a context embedding consumed by all downstream heads. Scaled
+        # init so contact_emb starts ~ 0 and downstream heads behave
+        # like the legacy independent-head setup at epoch 0.
+        self.contact_to_emb = nn.Linear(num_body_parts, d_emb)
+        nn.init.normal_(self.contact_to_emb.weight, std=0.02)
+        nn.init.zeros_(self.contact_to_emb.bias)
+
+        # ── Level 1a: target (attention over object tokens) ──────
+        # Per-body-part learnable query token (separate computational
+        # path per part — fixes the v7-fix W1 "single Linear cant
+        # span 5-part output" issue). Distinct queries per part so
+        # each part attends differently to object tokens.
+        self.part_queries = nn.Parameter(
+            torch.randn(num_body_parts, d_model) * 0.02
+        )
+        # Frame feature + contact context → query base. The attention
+        # sums frame_q + part_query[p] for each (frame, part) cell.
+        self.target_query_proj = nn.Linear(d_model + d_emb, d_model)
+        # Cross-attention over object tokens. need_weights=True at
+        # forward time to expose the attention map as the affordance
+        # output — the soft distribution over 128 tokens *is* the
+        # primary v8 target prediction.
+        #
+        # dropout=0 here is critical: torch's MultiheadAttention applies
+        # dropout to the post-softmax attention weights, then returns
+        # those (rescaled) weights via need_weights. With dropout > 0
+        # the returned weights no longer sum to 1, which breaks the
+        # KL-divergence loss formulation. The MLP heads carry the
+        # regularisation budget for v8 instead.
+        self.target_attn = nn.MultiheadAttention(
+            d_model, num_attn_heads, dropout=0.0, batch_first=True,
+        )
+
+        # ── Level 1b: phase (cond on contact) ────────────────────
+        self.phase_head = nn.Sequential(
+            nn.Linear(d_model + d_emb, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, num_phases),
+        )
+        self.phase_to_emb = nn.Linear(num_phases, d_emb)
+        nn.init.normal_(self.phase_to_emb.weight, std=0.02)
+        nn.init.zeros_(self.phase_to_emb.bias)
+
+        # ── Level 2: support (cond on contact + phase) ───────────
+        self.support_head = nn.Sequential(
+            nn.Linear(d_model + 2 * d_emb, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, num_support_states),
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        object_tokens: Tensor,
+        object_xyz: Tensor,
+        gt_contact: Tensor | None = None,
+        gt_phase: Tensor | None = None,
+        teacher_forcing: bool = False,
+    ) -> dict[str, Tensor]:
+        """Run the structured head.
+
+        Parameters
+        ----------
+        x : (B, T, d_model) — per-frame trunk features (POSE token already stripped)
+        object_tokens : (B, M=128, d_model) — object encoder features
+        object_xyz : (B, M=128, 3) — object encoder centroid positions,
+            in object-local frame (consistent with the GT extraction's
+            object-local frame).
+        gt_contact : (B, T, num_body_parts) — GT contact prob in
+            {0., 1.} from the pseudo-labels. Required when
+            ``teacher_forcing=True``.
+        gt_phase : (B, T) long — GT phase ids in [0, num_phases).
+            Required when ``teacher_forcing=True``.
+        teacher_forcing : if True (training only), feed GT contact +
+            GT phase as the conditioning input to downstream heads.
+            If False, feed model predictions (sigmoid / softmax). The
+            decision is made per-batch by the caller (scheduled
+            sampling), not per-frame.
+
+        Returns
+        -------
+        Dict with keys:
+            contact_logits      : (B, T, num_body_parts)
+            contact_state       : sigmoid of the above
+            contact_target_attn : (B, T, num_body_parts, M) softmax
+                                  over object tokens — the primary v8
+                                  affordance output
+            contact_target_xyz  : (B, T, num_body_parts, 3) — back-compat
+                                  attention-weighted token xyz
+            phase_logits        : (B, T, num_phases)
+            phase               : softmax
+            support_logits      : (B, T, num_support_states)
+            support             : softmax
+        """
+        B, T, _ = x.shape
+        M = object_tokens.shape[1]
+        P = self.num_body_parts
+
+        # ── Level 0: contact ─────────────────────────────────────
+        contact_logits = self.contact_head(x)                      # (B, T, P)
+        contact_prob = torch.sigmoid(contact_logits)               # (B, T, P)
+        if teacher_forcing:
+            assert gt_contact is not None, "teacher_forcing requires gt_contact"
+            contact_for_downstream = gt_contact.to(contact_prob.dtype)
+        else:
+            contact_for_downstream = contact_prob
+        contact_emb = self.contact_to_emb(contact_for_downstream)  # (B, T, d_emb)
+
+        # ── Level 1a: target attention ───────────────────────────
+        # frame_q encodes frame feature + contact context per (B, T)
+        x_with_c = torch.cat([x, contact_emb], dim=-1)             # (B, T, d + d_emb)
+        frame_q = self.target_query_proj(x_with_c)                 # (B, T, d)
+        # Broadcast: per-part query = frame_q + part_query[p]
+        # frame_q.unsqueeze(2): (B, T, 1, d); part_queries: (P, d)
+        q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
+        q_flat = q.reshape(B, T * P, -1)                            # (B, T*P, d)
+        # Cross-attention. average_attn_weights=False to expose per-head
+        # weights, then mean across heads to get a single affordance map.
+        _, attn_weights = self.target_attn(
+            q_flat, object_tokens, object_tokens,
+            need_weights=True, average_attn_weights=False,
+        )
+        # attn_weights: (B, num_attn_heads, T*P, M) → mean across heads → (B, T*P, M)
+        target_attn = attn_weights.mean(dim=1).reshape(B, T, P, M)  # (B, T, P, M)
+
+        # Back-compat xyz output: attention-weighted centroid positions.
+        # (B, T, P, M) @ (B, M, 3) → (B, T, P, 3)
+        contact_target_xyz = torch.einsum(
+            "btpk,bkc->btpc", target_attn, object_xyz,
+        )                                                           # (B, T, P, 3)
+
+        # ── Level 1b: phase ──────────────────────────────────────
+        phase_logits = self.phase_head(x_with_c)                    # (B, T, num_phases)
+        phase_prob = torch.softmax(phase_logits, dim=-1)            # (B, T, num_phases)
+        if teacher_forcing:
+            assert gt_phase is not None, "teacher_forcing requires gt_phase"
+            phase_one_hot = torch.zeros_like(phase_prob)
+            phase_one_hot.scatter_(
+                -1, gt_phase.long().unsqueeze(-1).clamp_(0, self.num_phases - 1), 1.0,
+            )
+            phase_for_downstream = phase_one_hot
+        else:
+            phase_for_downstream = phase_prob
+        phase_emb = self.phase_to_emb(phase_for_downstream)         # (B, T, d_emb)
+
+        # ── Level 2: support ─────────────────────────────────────
+        x_full = torch.cat([x, contact_emb, phase_emb], dim=-1)    # (B, T, d + 2*d_emb)
+        support_logits = self.support_head(x_full)                  # (B, T, num_support)
+
+        return {
+            "contact_logits": contact_logits,
+            "contact_state": contact_prob,
+            "contact_target_attn": target_attn,
+            "contact_target_xyz": contact_target_xyz,
+            "phase_logits": phase_logits,
+            "phase": phase_prob,
+            "support_logits": support_logits,
+            "support": torch.softmax(support_logits, dim=-1),
+        }
+
+
+# ============================================================================
 # Full Interaction Predictor
 # ============================================================================
 
@@ -258,6 +488,15 @@ class InteractionPredictor(nn.Module):
         temporal_refine_enabled: bool = True,
         temporal_refine_kernel_size: int = 5,
         temporal_refine_dropout: float = 0.1,
+        # v8 (2026-05-05): structured head with DAG conditioning + affordance-
+        # style target attention. Default off for backward compat with
+        # v6 / v7 / v7-fix configs. When enabled, the four parallel
+        # nn.Linear heads are replaced with the StructuredHead module
+        # above. See analyses/2026-05-05_predictor_v8_design.md.
+        structured_head: bool = False,
+        structured_head_d_emb: int = 64,
+        structured_head_hidden: int = 256,
+        structured_head_attn_heads: int = 6,
         # Legacy alias: older configs pass ``num_object_patches=16``;
         # ignored since the target head is now an xyz regressor.
         num_object_patches: int | None = None,
@@ -309,15 +548,35 @@ class InteractionPredictor(nn.Module):
                 dropout=temporal_refine_dropout,
             )
 
-        # Output heads — per-frame linear projections. The target head
-        # regresses xyz in the object's local frame (see module docstring
-        # on why this replaced the earlier K-way patch softmax). Loss is
-        # smooth-L1 gated by contact_state, so the xyz is only supervised
-        # where the body part is actually touching.
-        self.contact_head = nn.Linear(d_model, num_body_parts)
-        self.target_head = nn.Linear(d_model, num_body_parts * target_coord_dim)
-        self.phase_head = nn.Linear(d_model, num_phases)
-        self.support_head = nn.Linear(d_model, num_support_states)
+        # Output heads. Two modes:
+        #
+        # (a) Legacy independent heads (v6 / v7 / v7-fix): four parallel
+        #     ``nn.Linear`` projections of the same trunk feature. No
+        #     cross-head information flow. ``contact_target_xyz`` is
+        #     regressed directly in the object-local frame.
+        #
+        # (b) StructuredHead (v8+): DAG-ordered conditioning that mirrors
+        #     the pseudo-label extraction order (contact → {target,
+        #     phase} → support), with affordance-style target attention
+        #     over the 128 object tokens. Requires the ObjectEncoder to
+        #     also pass token xyz into ``forward``.
+        self.structured_head = structured_head
+        if structured_head:
+            self.head = StructuredHead(
+                d_model=d_model,
+                num_body_parts=num_body_parts,
+                num_phases=num_phases,
+                num_support_states=num_support_states,
+                d_emb=structured_head_d_emb,
+                head_hidden=structured_head_hidden,
+                num_attn_heads=structured_head_attn_heads,
+                dropout=dropout,
+            )
+        else:
+            self.contact_head = nn.Linear(d_model, num_body_parts)
+            self.target_head = nn.Linear(d_model, num_body_parts * target_coord_dim)
+            self.phase_head = nn.Linear(d_model, num_phases)
+            self.support_head = nn.Linear(d_model, num_support_states)
 
     def forward(
         self,
@@ -326,6 +585,10 @@ class InteractionPredictor(nn.Module):
         init_pose: Tensor,
         seq_length: int | None = None,
         text_key_padding_mask: Tensor | None = None,
+        object_xyz: Tensor | None = None,
+        gt_contact: Tensor | None = None,
+        gt_phase: Tensor | None = None,
+        teacher_forcing: bool = False,
     ) -> dict[str, Tensor]:
         """Predict interaction latents.
 
@@ -384,6 +647,22 @@ class InteractionPredictor(nn.Module):
         if self.temporal_refine_enabled:
             x = self.temporal_refine(x)
 
+        if self.structured_head:
+            if object_xyz is None:
+                raise ValueError(
+                    "structured_head=True requires object_xyz "
+                    "(pass ObjectEncoder(pc, return_xyz=True))."
+                )
+            return self.head(
+                x=x,
+                object_tokens=object_tokens,
+                object_xyz=object_xyz,
+                gt_contact=gt_contact,
+                gt_phase=gt_phase,
+                teacher_forcing=teacher_forcing,
+            )
+
+        # Legacy independent-heads path (v6 / v7 / v7-fix)
         contact_logits = self.contact_head(x)               # (B, T, num_body_parts)
         target_xyz = self.target_head(x)                    # (B, T, num_body_parts * 3)
         phase_logits = self.phase_head(x)                   # (B, T, P)

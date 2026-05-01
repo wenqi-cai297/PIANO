@@ -228,16 +228,28 @@ class ObjectEncoder(nn.Module):
         # the 128 tokens after max-pool already summarised each group.
         self.refine = InvResMLPBlock(feature_dim, expansion=4, dropout=0.0)
 
-    def forward(self, point_cloud: Tensor) -> Tensor:
+    def forward(
+        self,
+        point_cloud: Tensor,
+        return_xyz: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Encode object point cloud into feature tokens.
 
         Parameters
         ----------
         point_cloud : (B, N, 3)
+        return_xyz : if True, also return centroid positions of the
+            output tokens. Required by the v8 affordance-style target
+            head, which needs token positions to compute Gaussian-
+            kernelled GT distributions and the back-compat xyz output.
 
         Returns
         -------
         tokens : (B, M, feature_dim) where M = num_output_tokens
+        OR
+        (xyz, tokens) : if ``return_xyz=True``
+            xyz    : (B, M, 3) — centroid xyz from the final SA stage
+            tokens : (B, M, feature_dim)
         """
         xyz = point_cloud
         feat: Tensor | None = None
@@ -245,4 +257,6 @@ class ObjectEncoder(nn.Module):
         xyz, feat = self.sa1(xyz, feat)
         xyz, feat = self.sa2(xyz, feat)
         feat = self.refine(feat)
+        if return_xyz:
+            return xyz, feat
         return feat

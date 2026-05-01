@@ -51,3 +51,18 @@ temporal_refine:
   enabled: true
   kernel_size: 5          # ±2 frames = ±0.1 s @ 20 fps
   dropout: 0.1
+
+# StructuredHead (v8 2026-05-05): DAG-ordered conditioning + affordance-
+# style target attention. When enabled=true, replaces the four parallel
+# nn.Linear heads with sequential conditioning that mirrors the
+# extract_*.py DAG (contact → {target, phase} → support). The target
+# head emits a soft attention over the 128 object tokens (Move-as-You-Say
+# CVPR'24 affordance-heatmap style) instead of regressing world xyz —
+# see analyses/2026-05-05_predictor_v8_design.md.
+#
+# Default off so v6/v7/v7-fix configs reproduce bit-for-bit.
+structured_head:
+  enabled: false
+  d_emb: 64               # contact/phase embedding dim fed downstream
+  hidden: 256             # MLP hidden dim for contact/phase/support heads
+  attn_heads: 6           # multi-head attention heads for target xattn

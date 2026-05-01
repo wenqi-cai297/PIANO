@@ -1,0 +1,157 @@
+# Stage A v8: structured DAG heads + affordance-style target attention.
+#
+# Two paired changes vs v7-fix:
+#
+# 1. Output representation — replace per-part xyz regression with soft
+#    attention over the 128 object tokens. The affordance map is
+#    computed inside StructuredHead.target_attn (cross-attention over
+#    object_tokens with per-body-part learnable queries) and supervised
+#    via KL divergence against a Gaussian-kernelled GT distribution
+#    (σ = 0.08 m on object scale; Move-as-You-Say CVPR'24 uses 0.8 m
+#    on scene scale). Back-compat ``contact_target_xyz`` is emitted as
+#    the attention-weighted token centroid for existing Stage B
+#    inference paths.
+#
+# 2. Head architecture — replace the four parallel nn.Linear heads with
+#    sequential conditioning that mirrors the extract_*.py DAG:
+#        contact ─→ target  (cond on contact_emb)
+#                ├─→ phase   (cond on contact_emb)
+#                └─→ support (cond on contact_emb + phase_emb)
+#    Plus auxiliary consistency loss enforcing four physical priors
+#    (hand_support ⊂ hand contact, sitting ⊂ pelvis contact, phase !=
+#    non_contact ⊂ any contact, target attention high-entropy on
+#    no-contact frames).
+#
+# Teacher forcing: epochs 0–50 at prob 1.0 (heads see GT contact + GT
+# phase as conditioning input), epochs 50–80 anneal to 0.5, hold at
+# 0.5 thereafter. Bengio et al. NeurIPS'15 scheduled sampling.
+#
+# Acceptance gate (analyses/2026-05-05_predictor_v8_design.md §3.6):
+#   target_top1_token_recall ≥ 0.30
+#   target_xyz_l2_legacy ≤ 18 cm  (vs v7-fix 21.77)
+#   contact macro_f1 ≥ 0.24       (vs v7-fix 0.237)
+#   phase macro F1 ≥ 0.62         (vs v7-fix 0.632)
+#   support macro F1 ≥ 0.40       (vs v7-fix 0.397)
+#
+# Hardware: 2 × A6000 48 GB, bf16, Accelerate DDP. ~6 h.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_predictor \
+#     --config configs/training/predictor_v8_structured.yaml
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  # v8: enable structured head. Other model fields inherit from
+  # configs/model/interaction_predictor.yaml.
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2   # unused when use_kendall_weights=false
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+  # v8: scheduled-sampling teacher forcing for the StructuredHead.
+  # Per-batch coin flip on tf_prob (not per-frame) so the head sees a
+  # coherent upstream signal across the full clip.
+  teacher_forcing:
+    high_until_epoch: 50      # epochs ≤ 50: tf_prob = 1.0
+    low_after_epoch: 80       # epochs ≥ 80: tf_prob = 0.5
+    high_prob: 1.0
+    low_prob: 0.5
+
+loss:
+  # Inherit v7-fix's pinned weights (Kendall stays off).
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  # target_gate_kind is ignored under target_loss_kind=kl_div (KL
+  # forces contact gate by definition — closest-mesh-point only meaningful
+  # on contact frames). Kept as "all" for back-compat in case the loss
+  # kind is later switched.
+  target_gate_kind: "all"
+
+  # v8 affordance-style target loss.
+  target_loss_kind: "kl_div"
+  target_kernel_sigma: 0.08    # m, Gaussian kernel width on object scale
+
+  # v8 DAG consistency loss. 0.1 is the default starting weight; sweep
+  # 0.05 / 0.2 if heads regress.
+  consistency_weight: 0.1
+
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+  use_logit_adjustment: false
+  logit_adjust_tau: 1.0
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v8_structured"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v8_structured"

@@ -38,17 +38,25 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
-12. `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md` -
-    **v7-fix accepted; 2026-05-04 v7 disaster claim RETRACTED.**
-    Same eval set: v6 21.13 cm, v7 21.66 cm, v7-fix 21.77 cm. The
-    "v6 baseline ~5-10 cm" was fabricated. 21 cm is the architecture's
-    normal performance, not a regression. v7-fix improvements: contact
-    macro_f1 0.195 → 0.237 (+22 % rel.), target L2 ~unchanged.
-    **Stage B v18 unblocked; ship v7-fix as Stage A predictor for v12-
-    strict labels** (`runs/training/predictor_v7fix_v12strict/best_val.pt`).
-    Companion (retracted, kept for history):
+12. `analyses/2026-05-05_predictor_v8_design.md` -
+    **v8 head re-architecture (current Stage A action).**
+    Replaces world-coord xyz regression with Move-as-You-Say-style
+    cross-attention over 128 object tokens (KL loss against Gaussian-
+    kernelled GT distribution, σ=0.08 m); replaces 4 independent
+    Linear heads with DAG conditioning (contact → {target, phase} →
+    support) + 4 hinge consistency losses + scheduled-sampling
+    teacher forcing. Code prototype + 9/9 sanity tests passed locally.
+    Pending server retrain. v18 BLOCKED on this — γ_int = 0.02 shows
+    Stage B already ignores z_int. **READ THIS BEFORE TOUCHING
+    STAGE A.**
+
+13. `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md` -
+    **v7-fix accepted as v12-strict baseline; 2026-05-04 v7 disaster
+    claim RETRACTED.** Same eval set: v6 21.13 cm, v7 21.66 cm,
+    v7-fix 21.77 cm. The "v6 baseline ~5-10 cm" was fabricated.
+    21 cm is the architecture's normal performance — exactly why v8
+    re-architects the head. Companion (retracted, kept for history):
     `analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
-    **READ THIS BEFORE TOUCHING STAGE A.**
 
 11. `analyses/2026-05-03_pseudo_label_v12_strict_design.md` -
     **v12 strict pseudo-label design (r3) — current active work.**
@@ -92,11 +100,35 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-05
+## Current State, 2026-05-05 (latest update)
+
+**Active branch**: Stage A v8 — affordance-attention target head +
+DAG-structured heads. Code prototype landed locally with 9/9 sanity
+tests passing. Server retrain (~6 h) is the next action; v18 is
+**blocked on v8**. Reason: predictor quality is the ship-blocker, not
+Stage B inference (γ_int = 0.02 evidence). v7-fix (21 cm L2, contact
+F1 0.237) cannot drive Stage B above the current floor — re-architect
+the head per `analyses/2026-05-05_predictor_v8_design.md`.
+
+Launch:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+  -m piano.training.train_predictor \
+  --config configs/training/predictor_v8_structured.yaml
+```
+
+Acceptance for v8 (vs v7-fix):
+- target top-1 token recall ≥ 0.30
+- target xyz L2 (back-compat) ≤ 18 cm
+- contact macro_f1 ≥ 0.24, phase / support not regressed
+
+After v8 passes, launch Stage B v18.
+
+## Earlier State, 2026-05-05
 
 **Active branch**: v12 strict pseudo-label pipeline. Stage A v7-fix
-retrained on v12 labels and **accepted as production**. Stage B v18
-retrain is the next server action.
+retrained on v12 labels and accepted as v12-strict baseline. Replaced
+by v8 design above.
 
 Key correction over 2026-05-04 thread: the "v7 21 cm L2 disaster"
 claim was based on a fabricated v6 baseline (~5-10 cm). v6 actually

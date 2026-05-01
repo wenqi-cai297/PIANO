@@ -207,6 +207,23 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
     model_cfg = OmegaConf.load(cfg.model.config)
     obj_cfg = OmegaConf.load(cfg.model.object_encoder_config)
 
+    # Train-time structured_head config can be overridden in the
+    # training yaml's ``model.structured_head`` block; eval honours
+    # that override so checkpoints trained with structured heads load
+    # correctly.
+    sh_train = cfg.model.get("structured_head", None)
+    sh_model = model_cfg.get("structured_head", {})
+    if sh_train is not None:
+        sh_enabled = bool(sh_train.get("enabled", sh_model.get("enabled", False)))
+        sh_demb = int(sh_train.get("d_emb", sh_model.get("d_emb", 64)))
+        sh_hidden = int(sh_train.get("hidden", sh_model.get("hidden", 256)))
+        sh_attn = int(sh_train.get("attn_heads", sh_model.get("attn_heads", 6)))
+    else:
+        sh_enabled = bool(sh_model.get("enabled", False))
+        sh_demb = int(sh_model.get("d_emb", 64))
+        sh_hidden = int(sh_model.get("hidden", 256))
+        sh_attn = int(sh_model.get("attn_heads", 6))
+
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -220,6 +237,10 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         num_object_patches=model_cfg.output.num_object_patches,
         num_phases=model_cfg.output.num_phases,
         num_support_states=model_cfg.output.num_support_states,
+        structured_head=sh_enabled,
+        structured_head_d_emb=sh_demb,
+        structured_head_hidden=sh_hidden,
+        structured_head_attn_heads=sh_attn,
     ).to(device).eval()
 
     object_encoder = ObjectEncoder(
@@ -309,6 +330,42 @@ def _multiclass_metrics(
     }
 
 
+def _token_recall_metrics(
+    all_pred_top_tokens: list[np.ndarray],
+    all_gt_top1_token: list[np.ndarray],
+) -> dict[str, float | None]:
+    """Compute v8 affordance-attention token recall metrics.
+
+    Returns ``{}`` when no token data was collected (legacy v6/v7 eval).
+    """
+    if not all_pred_top_tokens or not all_gt_top1_token:
+        return {
+            "token_top1_recall": None,
+            "token_top3_recall": None,
+            "token_top5_recall": None,
+            "token_recall_n_cells": 0,
+        }
+    pred_top = np.concatenate(all_pred_top_tokens, axis=0)   # (N, 5)
+    gt_top1 = np.concatenate(all_gt_top1_token, axis=0)      # (N,)
+    n = int(gt_top1.shape[0])
+    if n == 0:
+        return {
+            "token_top1_recall": None,
+            "token_top3_recall": None,
+            "token_top5_recall": None,
+            "token_recall_n_cells": 0,
+        }
+    top1 = float((pred_top[:, 0] == gt_top1).mean())
+    top3 = float((pred_top[:, :3] == gt_top1[:, None]).any(axis=-1).mean())
+    top5 = float((pred_top[:, :5] == gt_top1[:, None]).any(axis=-1).mean())
+    return {
+        "token_top1_recall": top1,
+        "token_top3_recall": top3,
+        "token_top5_recall": top5,
+        "token_recall_n_cells": n,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Eval loop
 # ---------------------------------------------------------------------------
@@ -367,6 +424,9 @@ def run_eval(
         support_weight=cfg.loss.support_weight,
         label_smoothing=cfg.loss.get("label_smoothing", 0.0),
         focal_gamma=cfg.loss.get("focal_gamma", 0.0),
+        target_loss_kind=cfg.loss.get("target_loss_kind", "smooth_l1"),
+        target_kernel_sigma=float(cfg.loss.get("target_kernel_sigma", 0.08)),
+        consistency_weight=float(cfg.loss.get("consistency_weight", 0.0)),
     )
 
     # Accumulators
@@ -379,6 +439,9 @@ def run_eval(
     all_gt_phase: list[np.ndarray] = []
     all_pred_support: list[np.ndarray] = []
     all_gt_support: list[np.ndarray] = []
+    # v8 token-recall accumulators (only populated when use_structured)
+    all_pred_top_tokens: list[np.ndarray] = []   # (N_gated, 5) top-5 predicted tokens per cell
+    all_gt_top1_token: list[np.ndarray] = []     # (N_gated,) GT argmax token id
     # Per-clip records for per-object aggregation. Each entry is
     # {subset, object_id, seq_id, n_frames_valid, n_gated_target,
     #  target_mean_l2_m_per_clip, contact_any_n_pos, contact_any_n_pred_pos,
@@ -401,18 +464,35 @@ def run_eval(
             for k, v in batch.items()
         }
 
+        # v8: structured_head needs object_xyz both for predictor input
+        # and (when target_loss_kind="kl_div") for the KL loss GT
+        # construction. Detect via the predictor flag.
+        use_structured = bool(getattr(predictor, "structured_head", False))
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             text_features, text_mask = encode_text_per_token(
                 clip_model, batch["text"], device,
             )
-            obj_tokens = object_encoder(batch["object_pc"])
+            if use_structured:
+                obj_xyz, obj_tokens = object_encoder(batch["object_pc"], return_xyz=True)
+            else:
+                obj_tokens = object_encoder(batch["object_pc"])
+                obj_xyz = None
             B = batch["joints"].shape[0]
             init_pose = batch["joints"][:, 0, :, :].reshape(B, -1)
             max_T = batch["motion"].shape[1]
-            pred = predictor(
-                text_features, obj_tokens, init_pose,
-                seq_length=max_T, text_key_padding_mask=text_mask,
-            )
+            if use_structured:
+                pred = predictor(
+                    text_features, obj_tokens, init_pose,
+                    seq_length=max_T, text_key_padding_mask=text_mask,
+                    object_xyz=obj_xyz,
+                    teacher_forcing=False,  # eval = no TF
+                )
+            else:
+                pred = predictor(
+                    text_features, obj_tokens, init_pose,
+                    seq_length=max_T, text_key_padding_mask=text_mask,
+                )
 
         seq_len = batch["seq_len"]
         frame_mask = (
@@ -422,14 +502,16 @@ def run_eval(
 
         # --- losses (use same criterion; cast logits to fp32 for loss math)
         pred_fp32 = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in pred.items()}
-        loss_dict = criterion(
-            pred_fp32,
+        loss_kwargs = dict(
             gt_contact=batch["contact_state"],
             gt_target=batch["contact_target_xyz"],
             gt_phase=batch["phase"].long(),
             gt_support=batch["support"].long(),
             mask=frame_mask,
         )
+        if use_structured and obj_xyz is not None:
+            loss_kwargs["object_xyz"] = obj_xyz.float()
+        loss_dict = criterion(pred_fp32, **loss_kwargs)
         for k in loss_sums:
             loss_sums[k] += float(loss_dict[k].item())
         n_loss_batches += 1
@@ -454,6 +536,26 @@ def run_eval(
         all_pred_target_xyz.append(pred_txyz.reshape(-1, 5, 3)[valid])
         all_gt_target_xyz.append(gt_txyz.reshape(-1, 5, 3)[valid])
         all_contact_gate.append(gt_contact_v > 0.5)
+
+        # v8 token-recall: requires (a) attention output and (b) GT
+        # token id, which we get by argmax of the Gaussian-kernelled
+        # GT distribution against this batch's actual object_xyz.
+        if use_structured and "contact_target_attn" in pred_fp32 and obj_xyz is not None:
+            attn = pred_fp32["contact_target_attn"].cpu().numpy()    # (B, T, 5, M)
+            obj_xyz_np = obj_xyz.float().cpu().numpy()                # (B, M, 3)
+            # GT argmax token: distance from gt xyz to each token, take argmin.
+            # gt_txyz: (B, T, 5, 3), obj_xyz: (B, M, 3)
+            diff = gt_txyz[:, :, :, None, :] - obj_xyz_np[:, None, None, :, :]
+            d_sq = (diff ** 2).sum(axis=-1)                           # (B, T, 5, M)
+            gt_token = np.argmin(d_sq, axis=-1)                       # (B, T, 5)
+            top5 = np.argsort(-attn, axis=-1)[..., :5]                # (B, T, 5, 5)
+            # Flatten over (B, T) and gate by frame_mask + contact
+            valid_t = mask_np[..., None]                              # (B, T, 1)
+            gate_mat = (gt_contact_np > 0.5) & valid_t.astype(bool)   # (B, T, 5)
+            gt_token_flat = gt_token[gate_mat]                        # (N_gated,)
+            top5_flat = top5[gate_mat]                                # (N_gated, 5)
+            all_pred_top_tokens.append(top5_flat)
+            all_gt_top1_token.append(gt_token_flat)
 
         # Phase
         pred_phase = pred_fp32["phase_logits"].argmax(dim=-1).cpu().numpy()            # (B, T)
@@ -725,6 +827,7 @@ def run_eval(
             "pct_within_20cm_overall_gated": target_pct_20cm,
             "total_gated_frames_x_parts": total_gated,
             "per_body_part": target_per_part_xyz,
+            **_token_recall_metrics(all_pred_top_tokens, all_gt_top1_token),
         },
         "phase": phase_metrics,
         "support": support_metrics,

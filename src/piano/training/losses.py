@@ -112,6 +112,11 @@ class PredictorLoss(nn.Module):
         logit_adjust_phase: Tensor | None = None,
         logit_adjust_support: Tensor | None = None,
         logit_adjust_tau: float = 1.0,
+        # v8 (2026-05-05): affordance-style target loss + DAG consistency.
+        # See analyses/2026-05-05_predictor_v8_design.md Section 3.3.
+        target_loss_kind: str = "smooth_l1",
+        target_kernel_sigma: float = 0.08,
+        consistency_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -153,6 +158,28 @@ class PredictorLoss(nn.Module):
                 f"target_gate_kind must be 'contact' or 'all', got {target_gate_kind!r}"
             )
         self.target_gate_kind = target_gate_kind
+        # v8 target loss kind:
+        #   "smooth_l1" — legacy Huber on xyz regression (v6 / v7 / v7-fix)
+        #   "kl_div"    — KL(GT_attn || pred_attn) where GT_attn is a
+        #                 Gaussian-kernelled distribution over object tokens
+        #                 derived from contact_target_xyz_gt + object_xyz.
+        #                 Requires pred to contain ``contact_target_attn``
+        #                 and forward() to receive ``object_xyz``. See
+        #                 Move-as-You-Say CVPR'24 (arXiv 2403.18036) for the
+        #                 affordance-heatmap precedent.
+        if target_loss_kind not in ("smooth_l1", "kl_div"):
+            raise ValueError(
+                f"target_loss_kind must be 'smooth_l1' or 'kl_div', "
+                f"got {target_loss_kind!r}"
+            )
+        self.target_loss_kind = target_loss_kind
+        self.target_kernel_sigma = target_kernel_sigma
+        # Consistency loss is the auxiliary term that mirrors the
+        # extract_*.py DAG: hand_support ⊂ hand_contact, sitting ⊂
+        # pelvis_contact, phase != non_contact ⊂ any_contact, target
+        # attention is high-entropy on no-contact frames. Weight 0
+        # disables. Default 0 so legacy training reproduces v7-fix.
+        self.consistency_weight = consistency_weight
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -196,6 +223,7 @@ class PredictorLoss(nn.Module):
         gt_phase: Tensor,
         gt_support: Tensor,
         mask: Tensor | None = None,
+        object_xyz: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Compute all predictor losses.
 
@@ -203,13 +231,17 @@ class PredictorLoss(nn.Module):
         ----------
         pred : output dict from InteractionPredictor. Must contain
             ``contact_logits``, ``contact_target_xyz``, ``phase_logits``,
-            ``support_logits``.
+            ``support_logits``. v8 ``target_loss_kind="kl_div"`` also
+            requires ``contact_target_attn`` ∈ (B, T, 5, M).
         gt_contact : (B, T, 5) — soft contact pseudo-labels in [0, 1]
         gt_target : (B, T, 5, 3) — xyz target in object-local frame
             (zero / arbitrary where gt_contact < threshold — gated out)
         gt_phase : (B, T) — integer phase labels
         gt_support : (B, T) — integer support labels
         mask : (B, T) — True for valid (non-padded) frames
+        object_xyz : (B, M, 3) — object encoder centroid positions in
+            object-local frame. Required when ``target_loss_kind="kl_div"``
+            (v8 affordance-heatmap target).
 
         Returns
         -------
@@ -220,12 +252,34 @@ class PredictorLoss(nn.Module):
             pred["contact_logits"], gt_contact, reduction="none",
         )  # (B, T, 5)
 
-        # Target: smooth-L1 (Huber) on xyz in object-local frame. Summed
-        # over the coord dim so loss scales like a single L1 distance,
-        # which is more interpretable than an L2 squared-distance.
-        loss_target = F.smooth_l1_loss(
-            pred["contact_target_xyz"], gt_target, reduction="none",
-        ).sum(dim=-1)  # (B, T, 5)
+        # Target loss: dispatch on target_loss_kind.
+        # smooth_l1 path is the legacy v6/v7/v7-fix Huber regression.
+        # kl_div path is v8: KL(GT_attn || pred_attn) where GT_attn is
+        # a Gaussian kernel over the distance from gt_target_xyz to each
+        # of the M object-token centroid positions.
+        if self.target_loss_kind == "smooth_l1":
+            loss_target = F.smooth_l1_loss(
+                pred["contact_target_xyz"], gt_target, reduction="none",
+            ).sum(dim=-1)  # (B, T, 5)
+        elif self.target_loss_kind == "kl_div":
+            if "contact_target_attn" not in pred:
+                raise ValueError(
+                    "target_loss_kind='kl_div' requires the predictor to "
+                    "emit 'contact_target_attn' (use structured_head=True)."
+                )
+            if object_xyz is None:
+                raise ValueError(
+                    "target_loss_kind='kl_div' requires object_xyz to be "
+                    "passed into PredictorLoss.forward()."
+                )
+            loss_target = self._kl_div_target_loss(
+                pred_attn=pred["contact_target_attn"],   # (B, T, P, M)
+                gt_xyz=gt_target,                        # (B, T, P, 3)
+                object_xyz=object_xyz,                   # (B, M, 3)
+                sigma=self.target_kernel_sigma,
+            )  # (B, T, P)
+        else:
+            raise ValueError(self.target_loss_kind)  # unreachable
 
         # Phase: CE on integer labels + label smoothing + optional
         # logit-adjustment (Menon ICLR'21) + optional focal.
@@ -291,7 +345,13 @@ class PredictorLoss(nn.Module):
             (loss_contact * frame_mask.unsqueeze(-1)).sum()
             / (n_frames * num_parts)
         )
-        if self.target_gate_kind == "all":
+        # KL-div target loss is only meaningful where the body part is
+        # actually contacting (closest-mesh-point is the contact site).
+        # Force "contact" gate regardless of target_gate_kind for kl_div.
+        # smooth_l1 retains the v7-fix "all" path for backward compat.
+        if self.target_loss_kind == "kl_div":
+            loss_target = (loss_target * contact_gate).sum() / n_contact
+        elif self.target_gate_kind == "all":
             # Supervise every valid (frame, part) cell — closest-surface-
             # point is well-defined regardless of contact (extract_target
             # emits 100% non-zero xyz). Recovers supervision when contact
@@ -303,6 +363,14 @@ class PredictorLoss(nn.Module):
             loss_target = (loss_target * contact_gate).sum() / n_contact
         loss_phase = (loss_phase * frame_mask).sum() / n_frames
         loss_support = (loss_support * frame_mask).sum() / n_frames
+
+        # v8 consistency loss — auxiliary term enforcing the extraction
+        # DAG's physical priors. Disabled when consistency_weight == 0,
+        # which preserves the v6 / v7 / v7-fix legacy training contract.
+        if self.consistency_weight > 0:
+            loss_consistency = self._consistency_loss(pred, frame_mask)
+        else:
+            loss_consistency = torch.zeros((), device=loss_contact.device)
 
         if self.kendall is not None:
             # Kendall et al. CVPR'18 multi-task uncertainty weighting.
@@ -324,6 +392,9 @@ class PredictorLoss(nn.Module):
             )
             kendall_log = {}
 
+        if self.consistency_weight > 0:
+            total = total + self.consistency_weight * loss_consistency
+
         # Unweighted sum of raw per-task losses — the supervision
         # signal that actually tracks model quality, with no Kendall
         # combinator and no `+0.5·s_i` term. v4 found that selecting
@@ -342,9 +413,109 @@ class PredictorLoss(nn.Module):
             "loss_target": loss_target,
             "loss_phase": loss_phase,
             "loss_support": loss_support,
+            "loss_consistency": loss_consistency,
             "n_contact_frames": n_contact.detach(),
             **kendall_log,
         }
+
+    @staticmethod
+    def _kl_div_target_loss(
+        pred_attn: Tensor,
+        gt_xyz: Tensor,
+        object_xyz: Tensor,
+        sigma: float,
+    ) -> Tensor:
+        """KL-divergence target loss for v8 affordance-style heads.
+
+        Constructs a Gaussian-kernelled GT distribution over the M object
+        tokens for each (frame, body_part) cell, then computes
+        KL(GT || pred). Returned shape (B, T, P) — caller applies the
+        contact gate.
+
+        Parameters
+        ----------
+        pred_attn : (B, T, P, M) — softmax-normalised predicted attention
+            over object tokens. Must already be a valid distribution
+            (StructuredHead's MultiheadAttention emits softmax weights).
+        gt_xyz : (B, T, P, 3) — closest-mesh-point xyz per body part,
+            in object-local frame.
+        object_xyz : (B, M, 3) — object encoder centroid positions in
+            object-local frame.
+        sigma : Gaussian kernel width (m). Move-as-You-Say uses 0.8 m at
+            scene scale; 0.08 m at object scale is the v8 default
+            (~ 1/10 of their σ since our objects are 10-100× smaller).
+
+        Returns
+        -------
+        loss_target : (B, T, P) — per-cell KL divergence (≥ 0).
+        """
+        B, T, P, _ = gt_xyz.shape
+        M = object_xyz.shape[1]
+        # Pairwise squared distance between gt_xyz and each object token.
+        # gt_xyz: (B, T, P, 3) → (B, T, P, 1, 3); object_xyz: (B, 1, 1, M, 3)
+        diff = gt_xyz.unsqueeze(-2) - object_xyz.view(B, 1, 1, M, 3)
+        d_sq = diff.pow(2).sum(dim=-1)                              # (B, T, P, M)
+        # Gaussian-kernel softmax → GT distribution
+        gt_attn = F.softmax(-d_sq / (2.0 * sigma * sigma), dim=-1)  # (B, T, P, M)
+        # KL(gt || pred) = sum gt * (log gt - log pred)
+        # F.kl_div expects log-prob input + prob target.
+        log_pred = (pred_attn.clamp_min(1e-12)).log()
+        # reduction='none' → (B, T, P, M); sum over M for per-cell loss
+        loss = F.kl_div(log_pred, gt_attn, reduction="none").sum(dim=-1)
+        return loss                                                 # (B, T, P)
+
+    @staticmethod
+    def _consistency_loss(
+        pred: dict[str, Tensor],
+        frame_mask: Tensor,
+    ) -> Tensor:
+        """Auxiliary consistency loss enforcing the extraction-DAG priors.
+
+        Four relu-hinge constraints, all = 0 when satisfied:
+        1. P(target attention spread > 0) when contact = 0
+           (target attention should be near-uniform on no-contact frames)
+        2. P(hand_support) ≤ max(P(left_hand), P(right_hand))
+           ([extract_support.py:184-202](src/piano/data/pseudo_labels/extract_support.py#L184))
+        3. P(sitting) ≤ P(pelvis_contact)
+        4. P(phase != non_contact) ≤ P(any_part_contact)
+           ([extract_phase.py:122](src/piano/data/pseudo_labels/extract_phase.py#L122))
+
+        The hinge form `relu(p_dependent - p_prerequisite)` lets the
+        model leverage cases where it is more confident than the
+        extractor without forcing exact label match.
+        """
+        contact_prob = torch.sigmoid(pred["contact_logits"])           # (B, T, P)
+
+        # 1. Target attention entropy on no-contact frames
+        if "contact_target_attn" in pred:
+            attn = pred["contact_target_attn"].clamp_min(1e-12)        # (B, T, P, M)
+            entropy = -(attn * attn.log()).sum(dim=-1)                 # (B, T, P)
+            max_entropy = math.log(attn.shape[-1])
+            no_contact = 1.0 - contact_prob                            # (B, T, P)
+            l_attn = (no_contact * (max_entropy - entropy)).mean()
+        else:
+            l_attn = torch.zeros((), device=contact_prob.device)
+
+        # 2. hand_support ⊂ hand contact
+        # support classes: {0=both_feet, 1=single_foot, 2=sitting, 3=hand_support}
+        support_prob = F.softmax(pred["support_logits"], dim=-1)       # (B, T, 4)
+        hand_contact = torch.maximum(contact_prob[..., 0], contact_prob[..., 1])
+        l_hand = F.relu(support_prob[..., 3] - hand_contact)
+        l_hand = (l_hand * frame_mask).sum() / (frame_mask.sum() + 1e-8)
+
+        # 3. sitting ⊂ pelvis contact (pelvis is body-part index 4)
+        pelvis_contact = contact_prob[..., 4]
+        l_sit = F.relu(support_prob[..., 2] - pelvis_contact)
+        l_sit = (l_sit * frame_mask).sum() / (frame_mask.sum() + 1e-8)
+
+        # 4. phase != non_contact ⊂ any part contact
+        phase_prob = F.softmax(pred["phase_logits"], dim=-1)
+        any_contact = contact_prob.max(dim=-1).values
+        p_in_contact = 1.0 - phase_prob[..., 0]
+        l_phase = F.relu(p_in_contact - any_contact)
+        l_phase = (l_phase * frame_mask).sum() / (frame_mask.sum() + 1e-8)
+
+        return l_attn + l_hand + l_sit + l_phase
 
 
 # ============================================================================

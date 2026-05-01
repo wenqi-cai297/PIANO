@@ -32,12 +32,35 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
    `runs/training/predictor_v7fix_v12strict/best_val.pt` (epoch 34).
    Contact macro_f1 0.237 (+22 % rel.), target L2 21.77 cm
    (~unchanged), phase / support unchanged. Mild positive overall.
-   **Accepted as production Stage A predictor for v12-strict labels**.
-   Detail: `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`.
-3. 🟢 NEXT: Retrain Stage B as v18 (~1 day server). Config:
+   Accepted as v12-strict baseline. Detail:
+   `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`.
+2c. ✅ **v8 design + code prototype LANDED locally** (commit pending).
+   Combines two paired changes that the v7-fix eval analysis surfaced:
+   (i) replace world-coord xyz regression with affordance-style
+   attention over 128 object tokens (Move-as-You-Say CVPR'24 style),
+   fixing the 21 cm L2 architectural floor; (ii) replace 4 independent
+   Linear heads with DAG conditioning (contact → {target, phase} →
+   support) + auxiliary consistency loss + teacher forcing. 9/9 local
+   sanity tests pass. Code lives in `src/piano/models/`,
+   `src/piano/training/`, `scripts/stage_a_predictor/eval_predictor.py`,
+   `configs/model/interaction_predictor.yaml`, and
+   `configs/training/predictor_v8_structured.yaml`. Param Δ: +1.1 M
+   (4 % over v7-fix). Detail:
+   `analyses/2026-05-05_predictor_v8_design.md`.
+2d. 🟢 NEXT: **Stage A v8 retrain** (~6 h server). v18 is BLOCKED
+   on this — γ_int evidence (converges to 0.02 across v4-v16) shows
+   Stage B already ignoring z_int at 1/25 of typical conditioning;
+   predictor quality must rise before v18 has a chance. Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v8_structured.yaml
+   ```
+   Acceptance: top-1 token recall ≥ 0.30, target_xyz_l2_legacy ≤ 18 cm,
+   contact macro_f1 ≥ 0.24, phase / support not regressed.
+3. 🟢 AFTER v8 ACCEPTED: Retrain Stage B as v18 (~1 day server). Config:
    `configs/training/generator_v18_v12strict.yaml` (diffs vs v16:
-   `pseudo_label_subdir: pseudo_labels/v12_strict` and predictor ckpt →
-   `runs/training/predictor_v7fix_v12strict/best_val.pt`).
+   `pseudo_label_subdir: pseudo_labels/v12_strict`).
    Runner:
    ```bash
    bash scripts/stage_b_generator/run_v18_v12strict.sh

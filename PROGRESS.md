@@ -263,8 +263,67 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
-2026-05-05 **v7-fix accepted; v18 unblocked. 2026-05-04 v7 disaster claim
-RETRACTED**. v7-fix retrain done (server, 100 epochs). Eval on val
+2026-05-05 **v8 predictor design + prototype landed; predictor is the
+ship-blocking bottleneck**. After reading the architecture against the
+pseudo-label extraction DAG and against Move-as-You-Say (CVPR 2024),
+two coupled defects identified in v7-fix:
+
+- **Wrong target representation**: world-coord xyz regression ⇒ 21 cm
+  L2 floor regardless of supervision (W1 head too thin + W2 head loses
+  object identity). v6 baseline is also 21.13 cm — architectural, not
+  data.
+- **Independent heads ignore extraction DAG**: contact → {target,
+  phase} → support is the actual dependency graph in extract_*.py,
+  but model uses 4 parallel ``nn.Linear`` heads with no cross-head
+  flow.
+
+Independent evidence the predictor is the bottleneck: γ_int converges
+to **0.02** across v4-v16 (vs typical 0.5-1.0 for ControlNet-style
+gates). Stage B is voting with its weights that z_int is unreliable.
+
+**v8 = one merged change** that fixes both:
+
+- **StructuredHead** (`src/piano/models/interaction_predictor.py`):
+  4 parallel Linear heads → DAG-ordered conditioning. Target head is
+  cross-attention over the 128 object tokens with per-body-part
+  learnable queries; output is `(B, T, 5, 128)` softmax over object
+  tokens (Move-as-You-Say affordance heatmap style). Back-compat
+  ``contact_target_xyz`` is the attention-weighted token centroid.
+- **KL target loss** + **DAG consistency loss**
+  (`src/piano/training/losses.py`): KL(GT_attn || pred_attn) where
+  GT_attn = softmax(-d²/2σ²) on token distance to GT closest-mesh-
+  point, σ=0.08 m. 4 hinge consistency terms enforce the extraction
+  DAG (hand_support ⊂ hand contact, sitting ⊂ pelvis contact, etc.).
+- **Teacher forcing** scheduled-sampling
+  (`src/piano/training/train_predictor.py`): epochs 0-50 prob=1.0,
+  anneal to 0.5 by epoch 80, hold. Bengio NeurIPS'15.
+
+Code state (commit pending):
+- `src/piano/models/object_encoder.py` — `forward(return_xyz=True)` returns `(xyz, features)`
+- `src/piano/models/interaction_predictor.py` — `StructuredHead` class + `structured_head` flag
+- `src/piano/training/losses.py` — `target_loss_kind="kl_div"`, `consistency_weight`, `_kl_div_target_loss`, `_consistency_loss`
+- `src/piano/training/train_predictor.py` — `teacher_forcing_schedule`, structured-head dispatch
+- `scripts/stage_a_predictor/eval_predictor.py` — token top-1/3/5 recall metrics
+- `configs/model/interaction_predictor.yaml` — `structured_head` block (default off)
+- `configs/training/predictor_v8_structured.yaml` — full v8 config (KL loss + consistency + TF on)
+- `tests/test_structured_head.py` — **9/9 sanity tests pass**
+
+Param count: 27.5M (v7-fix) → 28.6M (v8), +4 %.
+
+Backward compat: defaults preserve v7-fix bit-for-bit. v6/v7/v7-fix
+configs reproduce identically.
+
+Acceptance gate (analyses/2026-05-05_predictor_v8_design.md §3.6):
+- target_top1_token_recall ≥ 0.30
+- target_xyz_l2_legacy ≤ 18 cm (vs v7-fix 21.77)
+- contact macro_f1 ≥ 0.24 (vs v7-fix 0.237)
+- phase macro F1 ≥ 0.62 (vs v7-fix 0.632)
+- support macro F1 ≥ 0.40 (vs v7-fix 0.397)
+
+Pending: server-side v8 retrain (~6 h), then v18 generator on top.
+
+2026-05-05 **v7-fix accepted as v12-strict baseline; 2026-05-04 v7 disaster
+claim RETRACTED** (kept as v8 starting point). v7-fix retrain done (server, 100 epochs). Eval on val
 (1304 clips, subject_split):
 
 | metric | v6 (v11 labels) | v7 (v12) | v7-fix (v12) |
@@ -372,9 +431,18 @@ User greenlight'd server-side re-extraction. Status:
    baseline check (also 21.13 cm). Pipeline-consistent with v12 labels
    but contact macro_f1 only 0.195.
 3a. ✅ Stage A v7-fix retrain DONE (best_val ep34 / final ep99). Contact
-   macro_f1 0.237 (+22 % rel.), target L2 21.77 cm (~unchanged). Accepted
-   for production. ckpt: `runs/training/predictor_v7fix_v12strict/best_val.pt`.
-4. 🟢 NEXT: Stage B v18 retrain (~1 day server). Config:
+   macro_f1 0.237 (+22 % rel.), target L2 21.77 cm (~unchanged).
+   Accepted as v12-strict baseline; ckpt:
+   `runs/training/predictor_v7fix_v12strict/best_val.pt`.
+3b. 🟢 NEXT: **Stage A v8 retrain** — re-architected predictor head
+   (StructuredHead with DAG conditioning + Move-as-You-Say-style
+   affordance attention + KL target loss + DAG consistency + teacher
+   forcing). Code prototype landed + 9/9 sanity tests pass. v18 is
+   blocked on this; predictor is the ship-blocking bottleneck (γ_int
+   evidence: Stage B ignores z_int at 1/25 of typical conditioning
+   weight). Config: `configs/training/predictor_v8_structured.yaml`.
+   Detail: `analyses/2026-05-05_predictor_v8_design.md`.
+4. 🟢 AFTER v8 acceptance: Stage B v18 retrain (~1 day server). Config:
    `configs/training/generator_v18_v12strict.yaml` (only diff vs v16 is
    pseudo_label_subdir → v12_strict). Runner:
    `scripts/stage_b_generator/run_v18_v12strict.sh` (TRAIN=1 + EVAL=1
