@@ -1,8 +1,51 @@
 # PIANO Plan
 
-Compact action plan as of 2026-05-01.
+Compact action plan as of 2026-05-03.
 
-## Immediate Priority
+## Immediate Priority (2026-05-03 — supersedes prior v17-* plans)
+
+**Active work**: v12 strict pseudo-label re-extraction + Stage B v18
+retrain. Triggered by visual review of v17-E.50 + final.pt (4 metric-
+gaming flags + visually still "靠近但不接触"), confirmed by training-vs-
+inference diagnosis (52% of correct-part headroom uncaptured by best
+inference; per-step pays jerk × 8 plausibility tax) and γ_int re-
+evaluation (γ-side ceiling estimated +3-6 pp correct-part — not enough
+to close the gap alone). Root cause: v11 pseudo-label defines hand
+contact as "wrist within 12 cm of mesh", which is "approach", not
+"touch". v12 strict redefines using OMOMO/CHOIS convention (5 cm hand +
+duration + engagement) with PIANO-specific wrap-grip tolerance.
+
+**Server-side execution sequence (user-greenlight'd)**:
+
+1. `bash scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`
+   — re-extracts v12 strict labels for 4 InterAct subsets, ~1-2 h.
+   Output: `<subset>/pseudo_labels/v12_strict/<seq>.npz`. Existing
+   v11 `pseudo_labels/<seq>.npz` untouched.
+2. `python scripts/stage1_pseudo_labels/compare_v11_v12_strict.py
+   --piano-root /media/.../InterAct/piano` — sanity check predicted
+   frame-frac drops match expectations:
+     chairs ~80% → 60-75%; imhd 94% → 35-45%;
+     neuraldome 74% → 35-50%; omomo 60% → 45-55%
+3. Retrain Stage A predictor on v12 labels (~6 h server).
+4. Retrain Stage B as v18 with `pseudo_label_dir = pseudo_labels/v12_strict`
+   (~1 day server). New config
+   `configs/training/generator_v18_v12strict.yaml`.
+5. Evaluate v18 with unified metric set (penetration / weighted_local /
+   correct_part / soft_IoU / jerk + KS distance to GT_orig).
+6. Decision tree: see PROGRESS.md `## Next Work` §5.
+
+**Predicted v18 outcome**:
+- raw correct_part_recall: 0.176 (v16) → **0.30+** (closing v11→codec floor gap)
+- guided correct_part_recall: 0.292 → **0.40+** (approaching codec floor 0.393)
+- visual: real contact, not approach (matches GT_orig physical semantic)
+
+If v18 visual passes: ship v18 + per-step inference as default. If
+training data turns out too sparse: fall back to Option B moderate
+thresholds (hand 7 / foot 5 / pelvis 15 cm).
+
+Detail: [analyses/2026-05-03_pseudo_label_v12_strict_design.md](analyses/2026-05-03_pseudo_label_v12_strict_design.md).
+
+## Earlier Priority (deprioritised by v12 work)
 
 v17-C per-step decoded-geometric guidance is the new Stage B state-of-the-art
 single-sample result, achieved without retraining (runs on the v16

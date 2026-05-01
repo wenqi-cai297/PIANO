@@ -38,6 +38,17 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
+11. `analyses/2026-05-03_pseudo_label_v12_strict_design.md` -
+    **v12 strict pseudo-label design (r3) — current active work.**
+    Replaces v11 "approach within 12 cm" with "real contact" (5 cm
+    palm-touch + engagement + drift filter). Two-case OR (kinematic
+    OR static), loose-distance gate, kin_local_sigma 0.06 m. PC-eval
+    frame frac 45% (v11 78%). Server runner ready
+    (`scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`);
+    pending server-side re-extraction → Stage A retrain → Stage B
+    v18 retrain. v18 predicted raw correct_part 0.176 → 0.30+,
+    guided 0.292 → 0.40+. **READ THIS FOR THE CURRENT MAIN BRANCH.**
+
 10. `analyses/2026-05-03_unified_metric_results.md` - Unified metric
     overhaul + **training-vs-inference bottleneck diagnosis**.
     Training is dominant bottleneck (52% of correct-part headroom
@@ -69,7 +80,22 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-01
+## Current State, 2026-05-03
+
+**Active branch**: v12 strict pseudo-label re-extraction + Stage B v18
+retrain. Triggered by visual review of v17-E.50 + final.pt failing
+("人没真正接触到物体，只是有点靠近而已") + training-vs-inference
+diagnosis showing 52% of correct-part headroom uncaptured by best
+inference, with per-step paying jerk × 8 plausibility tax. Root cause:
+v11 pseudo-label defines hand contact as "wrist within 12 cm of mesh"
+which is "approach", not "touch". v12 strict redefines using
+OMOMO/CHOIS convention (5 cm palm + engagement + drift filter).
+
+Current state: server runner ready (`scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`),
+greenlight'd. Pending server execution: re-extract → Stage A retrain →
+Stage B v18 retrain → unified metric eval.
+
+## Earlier Snapshot 2026-05-01
 
 Project goal: PIANO generates object-adaptive human motion by inserting a
 structured interaction latent `z_int` between text/object inputs and the

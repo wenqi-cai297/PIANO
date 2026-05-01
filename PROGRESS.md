@@ -1,6 +1,6 @@
 # PIANO Progress
 
-Compact project memory as of 2026-05-01.
+Compact project memory as of 2026-05-03.
 
 ## Current Snapshot
 
@@ -262,6 +262,57 @@ was incomplete. Two un-tested inference-side levers exist:
    Inference per-step `_masked_contact_l2` has none — just per-part L2
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
+
+2026-05-03 **v12 strict pseudo-label design + server runner landed**
+(implements user-greenlight'd training-side fix per visual review of
+v17-E.50 + final.pt: "人没真正接触到物体，只是有点靠近而已"). Replaces
+v11's "approach-within-12-cm" definition with "real contact" criteria
+matching OMOMO/CHOIS/InterDiff convention.
+
+Definition (r3, two-case OR loose-distance):
+```
+contact = case_kinematic OR case_static
+case_kinematic = kinematic_engagement × loose_distance     # wrap-grip
+case_static    = static_engagement × loose_distance        # sit/press
+loose: hand 25 cm / foot 15 / pelvis 30 (gates "physically reachable")
+engagement: kin_local_sigma 0.06 m (allows wrap-grip wrist articulation)
+duration ≥ 5 frames + max segment drift ≤ 10 cm in object-local frame.
+```
+
+Three rounds of refinement on 80 GT clips:
+- r1 (AND tight): 12.5% frame frac — over-strict, dropped wrap-grip
+- r2 (OR tight/loose): 19.4% — fixed wrap-grip but lost sit (pelvis
+  tight 12 cm anatomically wrong)
+- r3 (OR loose/loose, relaxed σ): **45.1% — balanced**
+
+User's racket-with-glove false negative (r1) verified fixed under r3.
+27 r2-dropped clips: 24/27 recovered, 3/27 boundary 0% (PC sparsity
+expected to recover under mesh-based server extraction).
+
+Per-subset r3 (PC eval):
+- chairs:     73.0%   (sit captured at realistic per-clip rate; v11 83%)
+- imhd:       33.3%   (bat/racket swing recovered; v11 94%)
+- neuraldome: 35.6%   (carry/handle wrap-grip; v11 74%)
+- omomo:      37.9%   (PC sparsity, mesh-based predicted 45-55%; v11 60%)
+
+Server-side runner landed (commit `e16a59d`):
+- `src/piano/data/pseudo_labels/run_all.py` — `--contact-version v11|v12_strict`
+  CLI flag (v11 default = backward-compat; v12_strict triggers new pipeline)
+- `scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh` — batch
+  runner for 4 InterAct subsets, outputs to `<subset>/pseudo_labels/v12_strict/`
+- `scripts/stage1_pseudo_labels/compare_v11_v12_strict.py` — post-extraction
+  sanity check (per-subset and per-body-part contact frame fraction)
+
+User greenlight'd server-side re-extraction. Pending steps:
+1. Run `extract_v12_strict_interact.sh` on server (~1-2 h, mesh-based)
+2. Run `compare_v11_v12_strict.py` to verify frame fractions match predicted
+3. Retrain Stage A predictor on v12_strict labels (~6 h server)
+4. Retrain Stage B as v18 with `pseudo_label_dir = pseudo_labels/v12_strict`
+   (~1 day server)
+5. Evaluate v18 with unified metric set; predicted raw correct_part_recall
+   0.176 → 0.30+, guided 0.292 → 0.40+, visual: real contact
+
+Detail: [analyses/2026-05-03_pseudo_label_v12_strict_design.md](analyses/2026-05-03_pseudo_label_v12_strict_design.md).
 
 2026-05-03 **γ_int re-evaluation** (per user pushback on prior "1/25 of
 ControlNet" framing). Source-level + quantitative re-analysis:
@@ -696,8 +747,38 @@ On 80 clips, IMHD has a large roundtrip/codebook issue.
 
 ## Next Work
 
-Immediate (revised after 2026-05-01 source-level re-diagnosis;
-supersedes the prior P2-first plan):
+Immediate (revised 2026-05-03 after visual review + γ_int re-evaluation
++ v12 strict design — supersedes earlier B1–B5 / N1–N3 plans):
+
+1. **v12 strict pseudo-label re-extraction (server, ~1-2 h)**:
+   `bash scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`.
+   Outputs to `<subset>/pseudo_labels/v12_strict/`. Then sanity check:
+   `python scripts/stage1_pseudo_labels/compare_v11_v12_strict.py
+   --piano-root /media/.../InterAct/piano`.
+2. **Stage A predictor retrain on v12 labels** (~6 h server). Pending
+   train config update to point at `pseudo_label_dir = pseudo_labels/v12_strict`.
+3. **Stage B v18 retrain** (~1 day server). New config
+   `configs/training/generator_v18_v12strict.yaml` — copies v16's
+   loss/architecture, only changes `pseudo_label_dir`.
+4. **v18 evaluate on unified metric set** (penetration / weighted_local /
+   correct_part / soft_IoU / jerk + KS). Predicted raw correct-part
+   0.176 → 0.30+, guided 0.292 → 0.40+, visual: real contact.
+5. **Decision branches after v18**:
+   - v18 visual + correct-part both pass → ship v18 + per-step inference
+     as new default.
+   - v18 alignment ↑ but visual still has wrong-patch issues → consider
+     B6 (alignment-aware VQ retrain) or B7 (OMOMO explicit contact_target).
+   - v18 worse than v16 (training-data sparsity hurts learning) → fall
+     back to Option B moderate strict thresholds (hand 7 cm / foot 5 cm /
+     pelvis 15 cm) and retrain.
+
+Branches now deprioritised (still in queue but not blocking):
+- N1 v17-E.50 visual review: DONE (failed — drove this v12 work).
+- N2 mid-loop residual refresh: low ROI now (v12 retrain has bigger lever).
+- B4 P2 (γ_init {0.05, 0.10, 0.20} finetune): still candidate after v18.
+- B6 alignment-aware VQ retrain: still candidate, biggest investment.
+
+Original P2-first plan (revised after 2026-05-01 source-level re-diagnosis):
 
 1. **B1 — Re-eval v17-E.20 + v17-E.50 on v16 `final.pt`** (zero code,
    ~3.5 h server). All v17 work was on `best_contact.pt`; `final.pt`
