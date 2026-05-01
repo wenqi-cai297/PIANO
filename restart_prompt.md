@@ -38,6 +38,25 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
+10. `analyses/2026-05-03_unified_metric_results.md` - Unified metric
+    overhaul + **training-vs-inference bottleneck diagnosis**.
+    Training is dominant bottleneck (52% of correct-part headroom
+    uncaptured even by best inference config; per-step pays jerk×8
+    plausibility tax). New ship gates: penetration (N1/N2),
+    weighted_local (N3), soft IoU (N6), jerk + KS (N7). v17-E.50 +
+    final.pt has 4 metric-gaming flags — **DO NOT SHIP**. New ship
+    default: v17-E.20 + final.pt. Next training-side branches:
+    B4 (γ_init ∈ {0.05, 0.1, 0.2}) → B6 (alignment-aware VQ retrain).
+
+9. `analyses/2026-05-02_codec_floor_baselines.md` - VQ codec floor
+   on alignment metrics measured for the first time (paradigm
+   shift). Codec floor: moving correct-part 0.393, moving same-part
+   local 28.61 cm, moving IoU 0.640. v17-E.50+final.pt has absorbed
+   ~74% of correct-part headroom. v17-E.50 mean_min_dist 16.86 <
+   codec floor 18.47 = **metric gaming**. **READ THIS BEFORE
+   reading any v17 result number** — model gaps need to be
+   reinterpreted relative to codec floor, not relative to perfect
+   1.0/0.0.
 
 Read when touching that area:
 

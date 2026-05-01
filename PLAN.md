@@ -248,6 +248,35 @@ coupling beats the v14 K=64 alignment oracle in single-sample. Per-step inner
 loop flips 60.67% of base tokens vs naive baseline. See
 `analyses/2026-05-01_v17_per_step_result.md`.
 
+**2026-05-03 unified metric results + training-vs-inference diagnosis** —
+see `analyses/2026-05-03_unified_metric_results.md`. Ship-gate metrics
+finalized: mean_min_dist + N1/N2 penetration + N3 weighted_local +
+correct-part recall + N7 jerk + KS distance. **Training is the dominant
+bottleneck** (52 % of correct-part headroom uncaptured even by best
+inference config; per-step pays jerk × 8, pen +0.4 cm, pen-2cm +13 pp
+in plausibility tax that scales with budget). Revised next-branch order:
+
+- **N1 visual review** (block all E.50 ship)
+- **Ship default → v17-E.20 + final.pt** (no gaming flags)
+- N2 mid-loop residual refresh (1–3 pp expected, not transformative)
+- **B4 = P2 with γ_init ∈ {0.05, 0.1, 0.2}** (first training-side
+  experiment; revised lower-risk candidates)
+- **B6 alignment-aware VQ retrain** (highest expected upside on
+  alignment metrics; biggest investment)
+
+**2026-05-02 codec floor measurement** — see
+`analyses/2026-05-02_codec_floor_baselines.md`. Paradigm shift:
+previously-unmeasured codec floor on alignment metrics reveals
+v17-E.50+final.pt has absorbed ~74% of inference-side correct-part
+headroom (model 0.292 vs codec floor 0.393). E.50's mean_min_dist
+16.86 < codec floor 18.47 = **direct evidence of metric gaming**;
+ship default switched to v17-E.20+final.pt pending penetration metric
+(T1.1). N2 (B3' residual refresh) realistic upside drops from
+"many pp" to "1–3 pp" — still worth doing but ROI smaller.
+**New possible branch B6**: alignment-aware VQ retrain (codec is now
+the dominant bottleneck on alignment metrics, contradicting prior
+claim that was based on `mean_min_dist` only).
+
 **2026-05-02 results landed for B1 + B2 + B3** — see
 `analyses/2026-05-02_v17h_results.md` for the summary tables.
 Headline:

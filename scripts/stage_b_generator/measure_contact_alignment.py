@@ -467,6 +467,43 @@ def _clip_metrics(
         "part_confusion_on_both_contact": part_confusion.tolist(),
         "moving_part_confusion_on_both_contact": moving_part_confusion.tolist(),
     }
+    # ---- v17-H metric review (2026-05-03): weighted local errors with miss
+    # penalty + soft (±2 frame) temporal IoU. See
+    # `analyses/2026-05-02_codec_floor_baselines.md` and the metric review.
+    miss_penalty_m = 0.30  # 30 cm — slightly above codec floor 28.6 cm so missing
+                           # a contact frame is roughly equivalent to "wrong patch
+                           # by 30 cm"; choice avoids both under- and over-weighting.
+    moving_right_recall = row.get("moving_right_part_contact_recall_on_gt") or 0.0
+    moving_same_local = row.get("moving_same_gt_part_local_position_error_m_on_gt_contact") or miss_penalty_m
+    moving_target_local = row.get("moving_target_part_local_error_m_on_gt_contact") or miss_penalty_m
+    row["moving_weighted_local_error_m"] = _round(
+        moving_right_recall * float(moving_same_local)
+        + (1.0 - moving_right_recall) * miss_penalty_m
+    )
+    row["moving_weighted_target_error_m"] = _round(
+        moving_right_recall * float(moving_target_local)
+        + (1.0 - moving_right_recall) * miss_penalty_m
+    )
+
+    # Soft temporal IoU with ±2 frame tolerance (timing-robust).
+    # Uses scipy.ndimage.binary_dilation; falls back to NumPy if scipy not in env.
+    try:
+        from scipy.ndimage import binary_dilation
+        window_frames = 2
+        gt_dil = binary_dilation(gt_mask, iterations=window_frames)
+        gen_dil = binary_dilation(gen_mask, iterations=window_frames)
+        soft_inter = int((gt_dil & gen_dil).sum())
+        soft_union = int((gt_dil | gen_dil).sum())
+        moving_gt_dil = moving & gt_dil
+        moving_gen_dil = moving & gen_dil
+        moving_soft_inter = int((moving_gt_dil & moving_gen_dil).sum())
+        moving_soft_union = int((moving_gt_dil | moving_gen_dil).sum())
+    except ImportError:
+        soft_inter = soft_union = moving_soft_inter = moving_soft_union = 0
+    row["soft_contact_temporal_iou_pm2"] = _round(_safe_div(soft_inter, soft_union))
+    row["moving_soft_contact_temporal_iou_pm2"] = _round(
+        _safe_div(moving_soft_inter, moving_soft_union)
+    )
     return row
 
 
@@ -636,6 +673,19 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "moving_part_confusion_on_both_contact": _sum_confusion(
             rows,
             "moving_part_confusion_on_both_contact",
+        ),
+        # ---- v17-H metric review (2026-05-03) ----
+        "moving_weighted_local_error_m": _round(
+            _mean_or_none([r.get("moving_weighted_local_error_m") for r in rows])
+        ),
+        "moving_weighted_target_error_m": _round(
+            _mean_or_none([r.get("moving_weighted_target_error_m") for r in rows])
+        ),
+        "soft_contact_temporal_iou_pm2": _round(
+            _mean_or_none([r.get("soft_contact_temporal_iou_pm2") for r in rows])
+        ),
+        "moving_soft_contact_temporal_iou_pm2": _round(
+            _mean_or_none([r.get("moving_soft_contact_temporal_iou_pm2") for r in rows])
         ),
     }
     return aggregate

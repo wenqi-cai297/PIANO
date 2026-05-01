@@ -263,6 +263,89 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-03 **Unified metric overhaul + training-vs-inference bottleneck
+diagnosis**. Per user's metric review (2026-05-02), implemented N1/N2
+penetration (22-joint sphere vs object PC convex hull, body-level only;
+finger-level explicitly out of scope per InterDiff/CHOIS/HOI-Diff
+convention), N3/N8 weighted_local_error with miss penalty, N6 soft IoU
+±2 frame, N7 mean_jerk + KS distance to GT, N4 codec-floor-normalized
+% absorbed. Ran full set on GT_orig + GT_roundtrip + 22 v17 conditions.
+
+Diagnosis (per user's request, training-vs-inference attribution):
+
+**Training is the dominant bottleneck.** Decomposition of correct-part
+recall headroom (model raw 0.199 → guided 0.292 → codec floor 0.393):
+
+- training-side delta (best_contact → final.pt raw): +2.3 pp (10.6 % of headroom)
+- inference-side per-step contribution: +9.3 pp (47.9 % of headroom)
+- **52 % of correct-part headroom remains uncaptured**
+
+Training improvements translate ~1:1 into guided gains AND don't pay
+plausibility tax. Inference per-step pays:
+- mean_jerk **8 × GT_orig** (291 vs 36 m/s³) — independent of budget/Gumbel/boost
+- mean_pen **+0.4 cm vs GT_orig** (1.66 vs 1.25)
+- frac_pen_gt_2cm **+13 pp vs GT_orig** (54 vs 41 %)
+
+v17-E.50 + final.pt has 4 independent metric-gaming flags
+(mean_min_dist 16.86 < codec floor 18.47; pen +0.4 cm; pen-2cm frac
++13 pp; jerk 8×). Should NOT ship as default. Conservative ship config:
+**v17-E.20 + final.pt** (cont 19.69 > codec floor, pen 1.53 acceptable,
+corPt 0.241, wLoc 28.93).
+
+Decision tree update:
+
+- **N1 visual review** (block before any E.50 ship)
+- **Ship default → v17-E.20 + final.pt** (defensible, code-free)
+- **N2 mid-loop residual refresh** (B3') — narrowed expected upside 1–3 pp
+- **B4 = P2 with revised γ_init {0.05, 0.1, 0.2}** — first training-side
+  experiment; cheapest path to lift raw distribution
+- **B6 alignment-aware VQ retrain** — biggest expected upside (codec
+  floor is dominant alignment ceiling at 60 pp), but biggest investment
+- **B7 OMOMO-style explicit contact_target input** — long-term backup
+
+Detail: [analyses/2026-05-03_unified_metric_results.md](analyses/2026-05-03_unified_metric_results.md).
+Reproducer: `python scripts/stage_b_generator/summarize_unified_metrics.py`.
+
+2026-05-02 **VQ codec floor on alignment metrics measured for the first
+time** — paradigm shift: previously-unmeasured codec floor reveals all
+v17 inference results are MUCH closer to the achievable ceiling than
+the raw numbers suggested. Trigger: user asked "are GT/GT_roundtrip
+references still trustworthy?". Answer: numbers correct, but reference
+set was incomplete — `GT_roundtrip vs GT_orig` on alignment metrics had
+never been measured (only `GT_orig vs GT_orig` self-check, which is
+trivial 1.0/0.0).
+
+| metric | prior reference | **codec floor** | v17-E.50+final.pt | gap to floor |
+|---|---|---:|---:|---:|
+| moving correct-part recall | (1.0 implied) | **0.393** | 0.292 | 0.101 (74% absorbed) |
+| moving same-part local error | (0.0 implied) | **28.61 cm** | 36.11 cm | 7.5 cm (much smaller) |
+| moving contact IoU | (1.0 implied) | **0.640** | 0.507 | 0.133 |
+| mean_min_dist | 18.47 cm (codec) | 18.47 cm | **16.86 cm** | **−1.61 cm = GAMED** |
+
+**Major implications**:
+
+1. v17-E.50 + final.pt mean_min_dist 16.86 cm < codec floor 18.47 cm is
+   **direct evidence of metric gaming** (no model can physically beat
+   the codec floor on its own GT input). Penetration metric needed
+   before E.50 can ship.
+2. Inference-side ceiling much closer than thought: v17-E.50 + final.pt
+   has absorbed ~74% of available correct-part headroom. B3' residual
+   refresh realistic upside drops from "many pp" to "1–3 pp".
+3. **Prior "VQ codec not the bottleneck" claim narrowed**: it's true on
+   `mean_min_dist`, but VQ codec is now the **dominant** bottleneck on
+   alignment metrics (60 pp of correct-part recall lost to codec alone).
+   B6 (alignment-aware VQ retrain) becomes a real candidate after
+   inference-side exhausted.
+4. **Recommended ship change**: default to v17-E.20 + final.pt
+   (mean_min_dist 19.69 cm > codec floor — physically defensible),
+   not v17-E.50. E.50 stays as opt-in with metric-gaming caveat
+   pending penetration metric (T1.1) and visual review (N1).
+
+Detail: [analyses/2026-05-02_codec_floor_baselines.md](analyses/2026-05-02_codec_floor_baselines.md).
+Reproducer: same `measure_contact_alignment.py` with
+`generated_dir=gt_roundtrip`, `gt_dir=gt_original`. Stored at
+`runs/eval/stageB_codec_floor_alignment/summary.json`.
+
 2026-05-02 B1 + B2 + B3 server results synced (3 branches from
 `analyses/2026-05-01_v17_re_diagnosis.md` decision tree):
 
