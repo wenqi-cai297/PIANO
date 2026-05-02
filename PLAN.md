@@ -34,6 +34,34 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
    (~unchanged), phase / support unchanged. Mild positive overall.
    Accepted as v12-strict baseline. Detail:
    `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`.
+2c-1. ✅ v8 server retrain DONE; mixed result. pelvis target +18pp
+   on <10cm hit (architecture sound); phase / support regressed
+   (TF train-test gap); target_top1 0.093 (KL+softmax over-constrains).
+2c-2. ✅ **v8.1 design + code prototype LANDED locally** (3 frontier-
+   paper surveys + design doc + 15/15 tests pass). 3 changes vs v8:
+   - MoMask CVPR 2024 random mask replaces Bengio 2015 TF
+   - EgoChoir/Text2HOI focal+dice on multi-hot binary replaces KL+softmax
+   - Drop consistency loss (was ignored by optimizer)
+   - Path B: drop xyz back-compat (Stage B v8.1b will consume mask)
+   Detail: `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md`.
+2c-3. 🟢 NEXT: **Stage A v8.1a server retrain** (~6 h). Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v8_1_masked.yaml
+   ```
+   Acceptance: multihot_mean_iou ≥ 0.30, contact / phase / support
+   not regressed, pelvis L2 ≤ 14.5 cm.
+2c-4. 🟢 AFTER v8.1a passes: **Stage B v8.1b refactor** (~2-3 days).
+   - `src/piano/models/interaction_tokenizer.py` — replace
+     `contact_target_xyz (B,T,15)` flatten with `contact_target_attn
+     (B,T,5,128)` cross-attention path. Choose between:
+     (a) flat concat (640 dim into z_int) — simple
+     (b) parallel obj-affordance cross-attn alongside IntXAttn — like
+         EgoChoir motion-stream KV
+   - Update `src/piano/inference/contact_guidance.py` per-step paths
+   - Update `src/piano/inference/generate.py` Stage B inference
+   - Train v18 generator on v8.1a predictor outputs
 2c. ✅ **v8 design + code prototype LANDED locally** (commit pending).
    Combines two paired changes that the v7-fix eval analysis surfaced:
    (i) replace world-coord xyz regression with affordance-style

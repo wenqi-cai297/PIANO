@@ -398,6 +398,189 @@ def test_v8_config_yaml_end_to_end_compat():
     print("[PASS] test_v8_config_yaml_end_to_end_compat")
 
 
+# --------------------------------------------------------------------------
+# v8.1 tests: Bernoulli mask + focal/dice on multi-hot + Path B
+# --------------------------------------------------------------------------
+
+def test_v81_structured_head_logits_output():
+    """target_attn_output='logits' emits pre-sigmoid logits, no softmax xyz."""
+    B, T, M, d = 2, 8, 128, 384
+    head = StructuredHead(
+        d_model=d, num_body_parts=5, num_phases=3, num_support_states=4,
+        downstream_mode="mask", target_attn_output="logits",
+    )
+    head.eval()
+    x = torch.randn(B, T, d)
+    obj_tok = torch.randn(B, M, d)
+    obj_xyz = torch.randn(B, M, 3)
+    out = head(x, obj_tok, obj_xyz)
+    assert "contact_target_attn_logits" in out, "v8.1 must emit raw logits"
+    assert out["contact_target_attn_logits"].shape == (B, T, 5, M)
+    # Path B: no back-compat xyz output
+    assert "contact_target_xyz" not in out, \
+        "v8.1 Path B drops contact_target_xyz; got it in output"
+    # Sigmoid attn for inference / metrics
+    assert "contact_target_attn" in out
+    sig = out["contact_target_attn"]
+    assert (sig >= 0).all() and (sig <= 1).all(), \
+        "sigmoid output must be in [0, 1]"
+    # No constraint that sigmoid sums to 1 (multi-hot, each token independent)
+    print("[PASS] test_v81_structured_head_logits_output")
+
+
+def test_v81_bernoulli_mask_mode_train_vs_eval():
+    """In mask mode + training, downstream sees a mix of GT and pred.
+    In eval, downstream sees only pred (regardless of GT being passed)."""
+    torch.manual_seed(7)
+    B, T, M, d = 2, 8, 128, 384
+    head = StructuredHead(
+        d_model=d, num_body_parts=5, num_phases=3, num_support_states=4,
+        downstream_mode="mask", target_attn_output="logits",
+    )
+    x = torch.randn(B, T, d)
+    obj_tok = torch.randn(B, M, d)
+    obj_xyz = torch.randn(B, M, 3)
+    gt_contact = torch.ones(B, T, 5)              # extreme GT to make differ visible
+    gt_phase = torch.zeros(B, T, dtype=torch.long)
+
+    head.eval()
+    out_eval = head(x, obj_tok, obj_xyz,
+                    gt_contact=gt_contact, gt_phase=gt_phase)
+    head.train()
+    out_train = head(x, obj_tok, obj_xyz,
+                     gt_contact=gt_contact, gt_phase=gt_phase)
+    # In eval, head.training=False so _mix_with_gt always returns pred.
+    # In train mode, GT mixed in → phase output should differ from eval.
+    diff = (out_eval["phase_logits"] - out_train["phase_logits"]).abs().max()
+    assert diff > 1e-4, f"eval vs train should differ in mask mode, got {diff}"
+    print(f"[PASS] test_v81_bernoulli_mask_mode_train_vs_eval (diff={diff:.4f})")
+
+
+def test_v81_focal_dice_target_loss():
+    """Focal+dice loss is non-negative and goes to ~0 when prediction is
+    perfectly aligned with GT mask AND the mask has at least one
+    positive token (the realistic case during training; gate filters
+    contact-negative cells where mask might be empty).
+    """
+    B, T, P, M = 2, 4, 5, 128
+    # Construct GT s.t. each cell has SOME tokens within τ. Place
+    # gt_xyz at the position of a sampled object token + small noise,
+    # so the closest 3-5 tokens fall within τ.
+    object_xyz = torch.randn(B, M, 3) * 0.5
+    # Pick token 0 as the "true contact target" for every cell
+    gt_xyz = object_xyz[:, 0:1, :].unsqueeze(2).expand(B, T, P, 3).clone()
+    gt_xyz = gt_xyz + torch.randn_like(gt_xyz) * 0.005  # small jitter
+    tau = torch.tensor([0.10, 0.10, 0.10, 0.10, 0.20])  # generous τ
+
+    # Build the GT mask
+    diff = gt_xyz.unsqueeze(-2) - object_xyz.view(B, 1, 1, M, 3)
+    d = diff.norm(dim=-1)
+    gt_mask = (d < tau.view(1, 1, P, 1)).float()
+    assert gt_mask.sum(dim=-1).min() >= 1, "test setup: every cell must have ≥ 1 positive"
+
+    # "Perfect" logits: large positive on GT-positive tokens, large
+    # negative on GT-negative.
+    perfect_logits = (gt_mask * 10.0) + ((1 - gt_mask) * -10.0)
+    loss_perfect = PredictorLoss._focal_dice_target_loss(
+        perfect_logits, gt_xyz, object_xyz, tau,
+        focal_alpha=0.25, focal_gamma=2.0,
+    )
+    assert loss_perfect.shape == (B, T, P)
+    # Perfect should be near 0 (focal goes to 0 because (1-p_t)^γ → 0,
+    # dice goes to 0 because intersection / union → 1).
+    assert loss_perfect.max() < 0.05, \
+        f"perfect prediction should give near-0 loss, got max {loss_perfect.max():.4f}"
+
+    # Random logits should give clearly positive loss
+    random_logits = torch.randn(B, T, P, M)
+    loss_random = PredictorLoss._focal_dice_target_loss(
+        random_logits, gt_xyz, object_xyz, tau,
+    )
+    assert loss_random.mean() > 0.1, \
+        f"random logits should give significant loss, got {loss_random.mean():.4f}"
+    print(f"[PASS] test_v81_focal_dice_target_loss "
+          f"(perfect_max={loss_perfect.max():.2e}, random_mean={loss_random.mean():.4f})")
+
+
+def test_v81_full_loss_backward_no_unused_params():
+    """Full v8.1 loss + backward; every StructuredHead param gets grad
+    (DDP regression)."""
+    inp = _make_inputs(T=8)
+    pred_model = InteractionPredictor(
+        d_model=384, num_layers=2, num_heads=6, dim_feedforward=512,
+        max_seq_length=196,
+        structured_head=True,
+        structured_head_downstream_mode="mask",
+        structured_head_target_attn_output="logits",
+    )
+    pred_model.train()
+    out = pred_model(
+        inp["text_tokens"], inp["object_tokens"], inp["init_pose"],
+        seq_length=8, object_xyz=inp["object_xyz"],
+        gt_contact=inp["gt_contact"], gt_phase=inp["gt_phase"],
+        teacher_forcing=False,  # ignored in mask mode
+    )
+    assert "contact_target_attn_logits" in out
+    assert "contact_target_xyz" not in out  # Path B
+
+    loss_fn = PredictorLoss(
+        contact_weight=2.0, target_weight=5.0,
+        phase_weight=0.3, support_weight=0.1,
+        target_loss_kind="focal_dice",
+        target_focal_alpha=0.25, target_focal_gamma=2.0,
+        target_tau_per_part=(0.05, 0.05, 0.03, 0.03, 0.12),
+        consistency_weight=0.0,  # v8.1 drops consistency
+    )
+    loss_dict = loss_fn(
+        out,
+        gt_contact=inp["gt_contact"],
+        gt_target=inp["gt_target"],
+        gt_phase=inp["gt_phase"].long(),
+        gt_support=inp["gt_support"].long(),
+        mask=torch.ones(2, 8, dtype=torch.bool),
+        object_xyz=inp["object_xyz"],
+    )
+    total = loss_dict["loss"]
+    assert torch.isfinite(total), f"loss must be finite, got {total}"
+    total.backward()
+
+    # Every StructuredHead param must have grad (DDP-safe)
+    head_no_grad = [
+        n for n, p in pred_model.head.named_parameters()
+        if p.requires_grad and p.grad is None
+    ]
+    assert not head_no_grad, \
+        f"v8.1 head params without grad (DDP-fatal): {head_no_grad}"
+    print(f"[PASS] test_v81_full_loss_backward_no_unused_params "
+          f"(loss={total.item():.4f}, "
+          f"loss_target={loss_dict['loss_target'].item():.4f})")
+
+
+def test_v81_config_yaml_end_to_end():
+    """predictor_v8_1_masked.yaml builds a predictor + loss that runs
+    end-to-end without errors."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v8_1_masked.yaml"
+    )
+    model_cfg = OmegaConf.load(repo_root / cfg.model.config)
+    sh_cfg = OmegaConf.merge(
+        model_cfg.get("structured_head", {}),
+        cfg.model.get("structured_head", {}),
+    )
+    assert bool(sh_cfg.get("enabled", False))
+    assert str(sh_cfg.get("downstream_mode", "tf")) == "mask", \
+        "v8.1 yaml must request mask mode"
+    assert str(sh_cfg.get("target_attn_output", "softmax")) == "logits", \
+        "v8.1 yaml must request logits output"
+    assert cfg.loss.target_loss_kind == "focal_dice"
+    assert float(cfg.loss.consistency_weight) == 0.0
+    print("[PASS] test_v81_config_yaml_end_to_end")
+
+
 if __name__ == "__main__":
     test_structured_head_forward_shape()
     test_predictor_legacy_forward_unchanged()
@@ -409,4 +592,9 @@ if __name__ == "__main__":
     test_v7fix_legacy_loss_unchanged()
     test_object_encoder_return_xyz()
     test_v8_config_yaml_end_to_end_compat()
-    print("\nAll v8 sanity tests passed.")
+    test_v81_structured_head_logits_output()
+    test_v81_bernoulli_mask_mode_train_vs_eval()
+    test_v81_focal_dice_target_loss()
+    test_v81_full_loss_backward_no_unused_params()
+    test_v81_config_yaml_end_to_end()
+    print("\nAll v8 + v8.1 sanity tests passed.")

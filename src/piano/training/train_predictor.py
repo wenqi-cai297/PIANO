@@ -304,12 +304,21 @@ def build_predictor_step_fn(
         seq_len = batch["seq_len"]
         max_T = batch["motion"].shape[1]
 
-        # Teacher forcing decision (per batch). Only meaningful when
-        # structured_head is on; ignored otherwise. Per-batch (not
-        # per-frame) coin flip so the head sees a coherent upstream
-        # signal across the 196 frames.
+        # Downstream conditioning input: depends on structured-head mode.
+        #
+        # downstream_mode="tf" (v8 default): per-batch coin flip on
+        # tf_prob (Bengio NeurIPS 2015 scheduled sampling). When True,
+        # downstream heads see GT; when False, see pred.
+        #
+        # downstream_mode="mask" (v8.1, MoMask CVPR 2024): the head
+        # itself draws a per-batch mask_ratio ~ Uniform[0, 1] and mixes
+        # GT with pred via Bernoulli mask, training on every mix
+        # simultaneously. The step_fn just always passes GT; the head
+        # ignores the teacher_forcing argument.
         teacher_forcing = False
-        if use_structured and teacher_forcing_schedule is not None and predictor.training:
+        sh_module = predictor.module.head if hasattr(predictor, "module") else predictor.head if use_structured else None
+        downstream_mode = getattr(sh_module, "downstream_mode", "tf") if sh_module is not None else "tf"
+        if use_structured and downstream_mode == "tf" and teacher_forcing_schedule is not None and predictor.training:
             assert epochs_per_step is not None
             current_epoch = float(global_step) * float(epochs_per_step)
             high_until = float(teacher_forcing_schedule.get("high_until_epoch", 50))
@@ -326,15 +335,18 @@ def build_predictor_step_fn(
                 tf_prob = high_prob + alpha * (low_prob - high_prob)
             teacher_forcing = bool(torch.rand(1).item() < tf_prob)
 
-        # Predict interaction latent
+        # In mask mode, always pass GT — the head's _mix_with_gt does the
+        # Bernoulli mix internally. In TF mode, only pass GT when the
+        # coin flip says so (matches v8 behaviour).
         if use_structured:
+            pass_gt = (downstream_mode == "mask") or teacher_forcing
             pred = predictor(
                 text_features, obj_tokens, init_pose,
                 seq_length=max_T,
                 text_key_padding_mask=text_mask,
                 object_xyz=obj_xyz,
-                gt_contact=batch["contact_state"] if teacher_forcing else None,
-                gt_phase=batch["phase"].long() if teacher_forcing else None,
+                gt_contact=batch["contact_state"] if pass_gt else None,
+                gt_phase=batch["phase"].long() if pass_gt else None,
                 teacher_forcing=teacher_forcing,
             )
         else:
@@ -438,6 +450,12 @@ def run(config_path: str) -> None:
         structured_head_d_emb=int(sh_cfg.get("d_emb", 64)),
         structured_head_hidden=int(sh_cfg.get("hidden", 256)),
         structured_head_attn_heads=int(sh_cfg.get("attn_heads", 6)),
+        # v8.1: downstream conditioning mode + target attention output
+        # form. Defaults preserve v8 behaviour.
+        structured_head_downstream_mode=str(sh_cfg.get("downstream_mode", "tf")),
+        structured_head_target_attn_output=str(
+            sh_cfg.get("target_attn_output", "softmax")
+        ),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,
@@ -517,6 +535,16 @@ def run(config_path: str) -> None:
         target_loss_kind=cfg.loss.get("target_loss_kind", "smooth_l1"),
         target_kernel_sigma=float(cfg.loss.get("target_kernel_sigma", 0.08)),
         consistency_weight=float(cfg.loss.get("consistency_weight", 0.0)),
+        # v8.1 focal+dice hyperparameters (only used when
+        # target_loss_kind="focal_dice"). target_tau_per_part order
+        # matches PIANO body-part indexing: left/right hand, left/right
+        # foot, pelvis. Default (5cm, 5cm, 3cm, 3cm, 12cm) matches
+        # v12_strict tight contact thresholds.
+        target_focal_alpha=float(cfg.loss.get("target_focal_alpha", 0.25)),
+        target_focal_gamma=float(cfg.loss.get("target_focal_gamma", 2.0)),
+        target_tau_per_part=tuple(cfg.loss.get(
+            "target_tau_per_part", (0.05, 0.05, 0.03, 0.03, 0.12),
+        )),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(

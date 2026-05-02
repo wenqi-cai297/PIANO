@@ -236,19 +236,37 @@ class CrossAttentionWeightsOnly(nn.Module):
     Output shape (B, Lq, Lk). No value projection, no output projection
     — the affordance head consumes the soft distribution over keys
     directly as its prediction.
+
+    Parameters
+    ----------
+    output : "softmax" (default — v8 behaviour, returns probability
+        distribution that sums to 1 across keys) or "logits" (v8.1
+        behaviour — returns raw QK^T/sqrt(d_h) scores averaged across
+        heads, suitable for per-key sigmoid + multi-hot binary GT
+        following EgoChoir / Text2HOI HOI affordance literature).
     """
 
-    def __init__(self, d_model: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        output: str = "softmax",
+    ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            )
+        if output not in ("softmax", "logits"):
+            raise ValueError(
+                f"output must be 'softmax' or 'logits', got {output!r}"
             )
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self._scale = 1.0 / math.sqrt(self.head_dim)
+        self.output = output
 
     def forward(self, q: Tensor, k: Tensor) -> Tensor:
         """Compute (B, Lq, Lk) attention weights, averaged across heads."""
@@ -258,8 +276,10 @@ class CrossAttentionWeightsOnly(nn.Module):
         k = self.k_proj(k).reshape(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
         # (B, h, Lq, Lk)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self._scale
-        attn = torch.softmax(scores, dim=-1)
-        return attn.mean(dim=1)
+        if self.output == "softmax":
+            return torch.softmax(scores, dim=-1).mean(dim=1)
+        # logits: average across heads, return raw scores for sigmoid
+        return scores.mean(dim=1)
 
 
 # ============================================================================
@@ -313,6 +333,19 @@ class StructuredHead(nn.Module):
         head_hidden: int = 256,
         num_attn_heads: int = 6,
         dropout: float = 0.1,
+        # v8.1 (2026-05-05): random masking replaces scheduled-sampling
+        # teacher forcing (Bengio NeurIPS 2015), which was proven non-
+        # consistent (Huszár arXiv:1511.05101). Following MoMask
+        # (Guo et al. CVPR 2024, arXiv:2312.00063): per-batch sample
+        # mask_ratio ~ Uniform[0, 1], Bernoulli-mask GT-vs-pred for the
+        # downstream conditioning input, train head on every mix
+        # simultaneously.
+        downstream_mode: str = "tf",  # "tf" (v8) | "mask" (v8.1)
+        # v8.1: target attention emits per-token sigmoid logits (multi-
+        # hot binary GT) instead of softmax. Following EgoChoir
+        # (NeurIPS 2024, arXiv:2405.13659) and Text2HOI (CVPR 2024,
+        # arXiv:2404.00562) — HOI affordance literature consensus.
+        target_attn_output: str = "softmax",  # "softmax" (v8) | "logits" (v8.1)
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -320,6 +353,17 @@ class StructuredHead(nn.Module):
         self.num_phases = num_phases
         self.num_support_states = num_support_states
         self.d_emb = d_emb
+        if downstream_mode not in ("tf", "mask"):
+            raise ValueError(
+                f"downstream_mode must be 'tf' or 'mask', got {downstream_mode!r}"
+            )
+        self.downstream_mode = downstream_mode
+        if target_attn_output not in ("softmax", "logits"):
+            raise ValueError(
+                f"target_attn_output must be 'softmax' or 'logits', "
+                f"got {target_attn_output!r}"
+            )
+        self.target_attn_output = target_attn_output
 
         # ── Level 0: contact (base) ──────────────────────────────
         self.contact_head = nn.Sequential(
@@ -351,11 +395,14 @@ class StructuredHead(nn.Module):
         # ``CrossAttentionWeightsOnly`` skips the V/out_proj path that
         # ``nn.MultiheadAttention`` would otherwise leave unused (which
         # crashes DDP at backward — see the helper module's docstring).
-        # Also: nothing to dropout here. The attention map IS the
-        # output; dropping it post-softmax would denormalise the
-        # probability distribution and break the KL loss.
+        # output="softmax" (v8): each query has a probability dist over
+        # keys, supervised by KL against soft Gaussian GT.
+        # output="logits" (v8.1): raw QK^T scores averaged across heads,
+        # converted to per-token sigmoid + supervised by focal+dice
+        # against multi-hot binary GT.
         self.target_attn = CrossAttentionWeightsOnly(
             d_model=d_model, num_heads=num_attn_heads,
+            output=target_attn_output,
         )
 
         # ── Level 1b: phase (cond on contact) ────────────────────
@@ -428,11 +475,11 @@ class StructuredHead(nn.Module):
         # ── Level 0: contact ─────────────────────────────────────
         contact_logits = self.contact_head(x)                      # (B, T, P)
         contact_prob = torch.sigmoid(contact_logits)               # (B, T, P)
-        if teacher_forcing:
-            assert gt_contact is not None, "teacher_forcing requires gt_contact"
-            contact_for_downstream = gt_contact.to(contact_prob.dtype)
-        else:
-            contact_for_downstream = contact_prob
+        contact_for_downstream = self._mix_with_gt(
+            pred=contact_prob, gt=gt_contact,
+            teacher_forcing=teacher_forcing,
+            training=self.training,
+        )
         contact_emb = self.contact_to_emb(contact_for_downstream)  # (B, T, d_emb)
 
         # ── Level 1a: target attention ───────────────────────────
@@ -443,46 +490,100 @@ class StructuredHead(nn.Module):
         # frame_q.unsqueeze(2): (B, T, 1, d); part_queries: (P, d)
         q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
         q_flat = q.reshape(B, T * P, -1)                            # (B, T*P, d)
-        # Q/K-only cross-attention; emits the head-averaged softmax map
-        # directly as the affordance heatmap. No V projection means no
-        # unused parameters under DDP.
-        target_attn = self.target_attn(q_flat, object_tokens)       # (B, T*P, M)
-        target_attn = target_attn.reshape(B, T, P, M)               # (B, T, P, M)
+        # Q/K-only cross-attention. With target_attn_output="softmax"
+        # (v8 default) emits a probability distribution over keys; with
+        # "logits" (v8.1) emits raw scores for per-key sigmoid +
+        # multi-hot binary supervision.
+        target_attn_raw = self.target_attn(q_flat, object_tokens)   # (B, T*P, M)
+        target_attn_raw = target_attn_raw.reshape(B, T, P, M)       # (B, T, P, M)
 
-        # Back-compat xyz output: attention-weighted centroid positions.
-        # (B, T, P, M) @ (B, M, 3) → (B, T, P, 3)
-        contact_target_xyz = torch.einsum(
-            "btpk,bkc->btpc", target_attn, object_xyz,
-        )                                                           # (B, T, P, 3)
+        out: dict[str, Tensor] = {
+            "contact_logits": contact_logits,
+            "contact_state": contact_prob,
+        }
+        if self.target_attn_output == "softmax":
+            # v8 path: target_attn_raw is a probability distribution.
+            # Emit it directly + an attention-weighted xyz back-compat
+            # output for Stage B's existing xyz consumption.
+            out["contact_target_attn"] = target_attn_raw
+            out["contact_target_xyz"] = torch.einsum(
+                "btpk,bkc->btpc", target_attn_raw, object_xyz,
+            )
+        else:
+            # v8.1 path: target_attn_raw is logits. Stage B v8.1b will
+            # consume the per-token sigmoid mask directly. No
+            # back-compat xyz emitted (Path B).
+            out["contact_target_attn_logits"] = target_attn_raw
+            out["contact_target_attn"] = torch.sigmoid(target_attn_raw)
 
         # ── Level 1b: phase ──────────────────────────────────────
         phase_logits = self.phase_head(x_with_c)                    # (B, T, num_phases)
         phase_prob = torch.softmax(phase_logits, dim=-1)            # (B, T, num_phases)
-        if teacher_forcing:
-            assert gt_phase is not None, "teacher_forcing requires gt_phase"
-            phase_one_hot = torch.zeros_like(phase_prob)
-            phase_one_hot.scatter_(
+        # Build one-hot from gt_phase if available (used only when feeding
+        # GT downstream — either TF=True or in mask mode where some
+        # cells are GT-fed).
+        if gt_phase is not None:
+            gt_phase_one_hot = torch.zeros_like(phase_prob)
+            gt_phase_one_hot.scatter_(
                 -1, gt_phase.long().unsqueeze(-1).clamp_(0, self.num_phases - 1), 1.0,
             )
-            phase_for_downstream = phase_one_hot
         else:
-            phase_for_downstream = phase_prob
+            gt_phase_one_hot = None
+        phase_for_downstream = self._mix_with_gt(
+            pred=phase_prob, gt=gt_phase_one_hot,
+            teacher_forcing=teacher_forcing,
+            training=self.training,
+        )
         phase_emb = self.phase_to_emb(phase_for_downstream)         # (B, T, d_emb)
 
         # ── Level 2: support ─────────────────────────────────────
         x_full = torch.cat([x, contact_emb, phase_emb], dim=-1)    # (B, T, d + 2*d_emb)
         support_logits = self.support_head(x_full)                  # (B, T, num_support)
 
-        return {
-            "contact_logits": contact_logits,
-            "contact_state": contact_prob,
-            "contact_target_attn": target_attn,
-            "contact_target_xyz": contact_target_xyz,
-            "phase_logits": phase_logits,
-            "phase": phase_prob,
-            "support_logits": support_logits,
-            "support": torch.softmax(support_logits, dim=-1),
-        }
+        out["phase_logits"] = phase_logits
+        out["phase"] = phase_prob
+        out["support_logits"] = support_logits
+        out["support"] = torch.softmax(support_logits, dim=-1)
+        return out
+
+    def _mix_with_gt(
+        self,
+        pred: Tensor,
+        gt: Tensor | None,
+        teacher_forcing: bool,
+        training: bool,
+    ) -> Tensor:
+        """Mix model predictions with GT for downstream conditioning.
+
+        Three modes:
+        - eval / inference: always return ``pred`` (model never sees GT
+          at test time)
+        - training, ``downstream_mode == "tf"``: return ``gt`` if
+          ``teacher_forcing`` else ``pred`` (Bengio NeurIPS 2015
+          scheduled sampling — v8 behaviour)
+        - training, ``downstream_mode == "mask"``: per-batch sample
+          ``r ~ Uniform[0, 1]``, draw a Bernoulli mask of that ratio,
+          mix ``r * gt + (1-r) * pred`` element-wise (MoMask CVPR 2024
+          random masking — v8.1 behaviour). The model sees every
+          information mix, never an extreme it wasn't trained for.
+        """
+        if not training or gt is None:
+            return pred
+        gt = gt.to(pred.dtype)
+        if self.downstream_mode == "tf":
+            return gt if teacher_forcing else pred
+        # mask mode: per-batch ratio, Bernoulli mask per (B, T, *) cell
+        # Shape match: gt.shape == pred.shape (we built phase one-hot above).
+        mask_ratio = torch.rand((), device=pred.device).item()
+        # Mask drawn over leading dims (B, T) but broadcast across the
+        # last (num_classes / num_parts) so the entire prediction for a
+        # cell is either GT or pred — keeps the per-cell distribution
+        # internally consistent.
+        leading = pred.shape[:-1]
+        mask = torch.bernoulli(
+            torch.full(leading, mask_ratio, device=pred.device, dtype=pred.dtype)
+        ).unsqueeze(-1)
+        return mask * gt + (1.0 - mask) * pred
 
 
 # ============================================================================
@@ -538,6 +639,14 @@ class InteractionPredictor(nn.Module):
         structured_head_d_emb: int = 64,
         structured_head_hidden: int = 256,
         structured_head_attn_heads: int = 6,
+        # v8.1 (2026-05-05): "tf" preserves v8 behaviour (caller decides
+        # teacher_forcing per batch). "mask" replaces TF with per-batch
+        # random Bernoulli mask between GT and pred (MoMask CVPR 2024).
+        structured_head_downstream_mode: str = "tf",
+        # v8.1: "softmax" preserves v8 KL-on-softmax target output;
+        # "logits" emits raw scores for sigmoid + multi-hot binary GT
+        # supervision (EgoChoir / Text2HOI HOI affordance literature).
+        structured_head_target_attn_output: str = "softmax",
         # Legacy alias: older configs pass ``num_object_patches=16``;
         # ignored since the target head is now an xyz regressor.
         num_object_patches: int | None = None,
@@ -612,6 +721,8 @@ class InteractionPredictor(nn.Module):
                 head_hidden=structured_head_hidden,
                 num_attn_heads=structured_head_attn_heads,
                 dropout=dropout,
+                downstream_mode=structured_head_downstream_mode,
+                target_attn_output=structured_head_target_attn_output,
             )
         else:
             self.contact_head = nn.Linear(d_model, num_body_parts)

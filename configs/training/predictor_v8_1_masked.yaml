@@ -1,0 +1,163 @@
+# Stage A v8.1: 3 paired changes against v8's mixed-result diagnosis.
+#
+# v8 was a partial success (pelvis target +18pp on <10cm hit) but failed
+# 5/6 acceptance gates. Diagnosis traced 3 specific failure modes to
+# 10-year-old methodology; v8.1 swaps each for a 2024-2025 SOTA.
+#
+# Diagnosis + literature evidence in:
+#   analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md
+#
+# Three changes ON TOP OF v8 (everything else inherited):
+#
+# A. Random Bernoulli mask replaces scheduled-sampling teacher forcing.
+#    Bengio NeurIPS 2015 was proven non-consistent (Huszár 2015).
+#    MoMask (Guo et al., CVPR 2024, arXiv:2312.00063) demonstrated
+#    that per-batch random mask ratio + Bernoulli per-cell mask trains
+#    on every information mix, eliminating the train-test gap.
+#    Set: model.structured_head.downstream_mode="mask".
+#
+# B. Multi-hot binary GT + focal+dice loss + per-token sigmoid output.
+#    EgoChoir (NeurIPS 2024, arXiv:2405.13659) and Text2HOI (CVPR 2024,
+#    arXiv:2404.00562) both use per-token binary GT with focal+dice on
+#    sigmoid output. v8's KL-on-Gaussian-kernel + softmax was non-
+#    mainstream and over-constrained the model (top-K lift ratio fell
+#    from 12× → 7×, signature of argmax bouncing between adjacent
+#    valid-contact tokens).
+#    Set: target_loss_kind="focal_dice",
+#         model.structured_head.target_attn_output="logits".
+#    Multi-hot construction: tokens within τ_part of GT closest_xyz
+#    are positive. τ default matches v12_strict tight thresholds:
+#    hand 5cm, foot 3cm, pelvis 12cm.
+#
+# C. Drop consistency loss. v8 evidence shows the fixed-weight hinge
+#    was IGNORED by the optimizer (loss term increased 0.44 → 0.75
+#    during training while contributing only 1.7% of total). Modern
+#    fix is augmented Lagrangian (Cooper, NeurIPS 2025); for v8.1 we
+#    just drop it. If post-v8.1 evidence shows the constraint is
+#    needed, revisit via Cooper as v9.
+#    Set: consistency_weight: 0.0.
+#
+# Path B (selected): drop softmax-xyz back-compat output. Stage B
+# v8.1b will refactor InteractionTokenizer to consume contact_target_attn
+# (per-token sigmoid mask) directly. Predictor v8.1a ckpt is NOT
+# Stage-B-runnable until v8.1b lands.
+#
+# Hardware: 2 × A6000 48 GB, bf16, Accelerate DDP. ~6 h.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_predictor \
+#     --config configs/training/predictor_v8_1_masked.yaml
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    # v8.1: downstream conditioning via random mask (MoMask CVPR 2024)
+    # rather than scheduled sampling. Per-batch mask_ratio ~ U[0, 1],
+    # Bernoulli per cell.
+    downstream_mode: "mask"
+    # v8.1: target attention emits raw logits for per-token sigmoid +
+    # multi-hot binary supervision. No back-compat softmax xyz output.
+    target_attn_output: "logits"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2   # unused when use_kendall_weights=false
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+  # v8.1: teacher_forcing block ignored when downstream_mode="mask".
+  # Kept for reference; the Bernoulli mix happens inside the head.
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"   # ignored under target_loss_kind="focal_dice"
+
+  # v8.1 affordance loss
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  # τ per part (m): hand, hand, foot, foot, pelvis. Matches v12_strict
+  # tight thresholds. Adjust per dataset if needed.
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+
+  # v8.1: drop consistency loss (was ignored by optimizer in v8).
+  consistency_weight: 0.0
+
+  label_smoothing: 0.1
+  focal_gamma: 2.0   # for phase / support CE focal (separate from target focal)
+  use_logit_adjustment: false
+  logit_adjust_tau: 1.0
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v8_1_masked"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v8_1_masked"

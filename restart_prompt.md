@@ -38,8 +38,30 @@ Must read:
    v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
    local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
    branch is mid-loop residual refresh, NOT P2.
+14. `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md` -
+    **v8.1 plan (current Stage A action).** v8 mixed-result diagnosis
+    → 3 frontier-paper-grounded fixes (MoMask mask, focal+dice multi-
+    hot, drop consistency). Path B: drop xyz back-compat. 15/15 tests
+    pass. Pending server retrain.
+
+15. `analyses/2026-05-02_alternatives_to_scheduled_sampling.md` -
+    Survey: 7 SOTA alternatives to TF (2023-2026). MoMask, LLaDA,
+    Diffusion Forcing, Self Forcing. Bengio 2015 TF proven non-
+    consistent (Huszár 2015).
+
+16. `analyses/2026-05-02_hoi_affordance_sota_survey_post_move_as_you_say.md` -
+    Survey: HOI affordance SOTA post-Move-as-You-Say. EgoChoir
+    (per-frame motion-KV — v9 candidate), Text2HOI, HOI-Diff. All use
+    multi-hot binary GT + focal+dice. v8's 128 tokens is at lower
+    bound vs literature.
+
+17. `analyses/2026-05-02_mtl_dag_research_survey.md` -
+    Survey: multi-task DAG + gradient conflict + soft constraints.
+    TaskPrompter, DTME-MTL, Aligned-MTL, Cooper. No single paper
+    covers all 3; v9 stack candidate.
+
 12. `analyses/2026-05-05_predictor_v8_design.md` -
-    **v8 head re-architecture (current Stage A action).**
+    **v8 head re-architecture (superseded by v8.1).**
     Replaces world-coord xyz regression with Move-as-You-Say-style
     cross-attention over 128 object tokens (KL loss against Gaussian-
     kernelled GT distribution, σ=0.08 m); replaces 4 independent
@@ -100,7 +122,49 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-05 (latest update)
+## Current State, 2026-05-05 (latest update — v8.1 prototype)
+
+**Active branch**: Stage A v8.1 — three frontier-paper-grounded fixes
+on top of v8's mixed-result diagnosis. v8 server retrain showed:
+
+- pelvis target +18 pp on <10cm hit ← **architecture sound**
+- phase / support regressed; target_top1 = 0.093 ← **specific failure modes**
+
+v8.1 fixes traced via 3 surveys (`analyses/2026-05-02_*.md`):
+
+1. **MoMask CVPR 2024 random mask** replaces Bengio 2015 TF (proven
+   non-consistent by Huszár 2015)
+2. **focal + dice on multi-hot binary GT** (EgoChoir NeurIPS 2024 +
+   Text2HOI CVPR 2024 standard) replaces KL on Gaussian-kerneled
+   softmax — multi-hot is the literature's way of saying "small
+   spatial offset is also correct"
+3. **Drop consistency loss** (Bertsekas penalty-method pathology;
+   Cooper NeurIPS 2025 augmented Lagrangian as v9 fallback)
+
+**Path B**: drop softmax-xyz back-compat output. Stage B
+InteractionTokenizer must be refactored in v8.1b to consume
+`contact_target_attn (B,T,5,128)` directly — see
+`src/piano/models/interaction_tokenizer.py:255` (currently flattens
+`contact_target_xyz` to 15 dims).
+
+15/15 sanity tests pass (v7-fix bit-identical; v8 unchanged with
+softmax+TF defaults; v8.1 mask+logits+focal-dice path validated).
+
+Launch v8.1a server retrain:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+  -m piano.training.train_predictor \
+  --config configs/training/predictor_v8_1_masked.yaml
+```
+
+Acceptance gates:
+- multihot_mean_iou ≥ 0.30 (NEW primary metric)
+- contact / phase / support not regressed vs v8
+- pelvis target L2 ≤ 14.5 cm (keep v8 win)
+
+After v8.1a passes: Stage B v8.1b refactor → v18.
+
+## Earlier State, 2026-05-05 (v8 prototype)
 
 **Active branch**: Stage A v8 — affordance-attention target head +
 DAG-structured heads. Code prototype landed locally with 9/9 sanity

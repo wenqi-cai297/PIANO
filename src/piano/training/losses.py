@@ -117,6 +117,17 @@ class PredictorLoss(nn.Module):
         target_loss_kind: str = "smooth_l1",
         target_kernel_sigma: float = 0.08,
         consistency_weight: float = 0.0,
+        # v8.1 (2026-05-05): multi-hot binary GT under target_loss_kind="focal_dice".
+        # Per body part, tokens within radius τ_part of GT closest_xyz are
+        # positive; others negative. EgoChoir / Text2HOI HOI affordance
+        # convention. τ matches v12_strict pseudo-label tight thresholds.
+        target_focal_alpha: float = 0.25,
+        target_focal_gamma: float = 2.0,
+        target_dice_eps: float = 1e-6,
+        # τ per part: hand=5cm, foot=3cm, pelvis=12cm. Order matches
+        # PIANO body-part indexing (left/right hand, left/right foot,
+        # pelvis). Override per dataset via cfg.loss.target_tau_per_part.
+        target_tau_per_part: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -167,10 +178,10 @@ class PredictorLoss(nn.Module):
         #                 and forward() to receive ``object_xyz``. See
         #                 Move-as-You-Say CVPR'24 (arXiv 2403.18036) for the
         #                 affordance-heatmap precedent.
-        if target_loss_kind not in ("smooth_l1", "kl_div"):
+        if target_loss_kind not in ("smooth_l1", "kl_div", "focal_dice"):
             raise ValueError(
-                f"target_loss_kind must be 'smooth_l1' or 'kl_div', "
-                f"got {target_loss_kind!r}"
+                f"target_loss_kind must be 'smooth_l1', 'kl_div', or "
+                f"'focal_dice', got {target_loss_kind!r}"
             )
         self.target_loss_kind = target_loss_kind
         self.target_kernel_sigma = target_kernel_sigma
@@ -180,6 +191,18 @@ class PredictorLoss(nn.Module):
         # attention is high-entropy on no-contact frames. Weight 0
         # disables. Default 0 so legacy training reproduces v7-fix.
         self.consistency_weight = consistency_weight
+        # v8.1 focal+dice hyperparameters
+        self.target_focal_alpha = target_focal_alpha
+        self.target_focal_gamma = target_focal_gamma
+        self.target_dice_eps = target_dice_eps
+        if target_tau_per_part is None:
+            # Default matches v12_strict tight thresholds:
+            # hand 5 cm, foot 3 cm, pelvis 12 cm.
+            target_tau_per_part = (0.05, 0.05, 0.03, 0.03, 0.12)
+        self.register_buffer(
+            "target_tau_per_part",
+            torch.tensor(target_tau_per_part, dtype=torch.float32),
+        )
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -278,6 +301,27 @@ class PredictorLoss(nn.Module):
                 object_xyz=object_xyz,                   # (B, M, 3)
                 sigma=self.target_kernel_sigma,
             )  # (B, T, P)
+        elif self.target_loss_kind == "focal_dice":
+            if "contact_target_attn_logits" not in pred:
+                raise ValueError(
+                    "target_loss_kind='focal_dice' requires the predictor "
+                    "to emit 'contact_target_attn_logits' (use "
+                    "structured_head_target_attn_output='logits')."
+                )
+            if object_xyz is None:
+                raise ValueError(
+                    "target_loss_kind='focal_dice' requires object_xyz "
+                    "to be passed into PredictorLoss.forward()."
+                )
+            loss_target = self._focal_dice_target_loss(
+                pred_logits=pred["contact_target_attn_logits"],  # (B, T, P, M)
+                gt_xyz=gt_target,                                # (B, T, P, 3)
+                object_xyz=object_xyz,                           # (B, M, 3)
+                tau_per_part=self.target_tau_per_part,           # (P,)
+                focal_alpha=self.target_focal_alpha,
+                focal_gamma=self.target_focal_gamma,
+                dice_eps=self.target_dice_eps,
+            )  # (B, T, P)
         else:
             raise ValueError(self.target_loss_kind)  # unreachable
 
@@ -345,11 +389,13 @@ class PredictorLoss(nn.Module):
             (loss_contact * frame_mask.unsqueeze(-1)).sum()
             / (n_frames * num_parts)
         )
-        # KL-div target loss is only meaningful where the body part is
-        # actually contacting (closest-mesh-point is the contact site).
-        # Force "contact" gate regardless of target_gate_kind for kl_div.
-        # smooth_l1 retains the v7-fix "all" path for backward compat.
-        if self.target_loss_kind == "kl_div":
+        # KL-div / focal-dice target losses are only meaningful where
+        # the body part is actually contacting (closest-mesh-point is
+        # the contact site; outside contact frames the multi-hot mask
+        # would be all zero or noise). Force "contact" gate regardless
+        # of target_gate_kind. smooth_l1 retains the v7-fix "all" path
+        # for backward compat.
+        if self.target_loss_kind in ("kl_div", "focal_dice"):
             loss_target = (loss_target * contact_gate).sum() / n_contact
         elif self.target_gate_kind == "all":
             # Supervise every valid (frame, part) cell — closest-surface-
@@ -417,6 +463,81 @@ class PredictorLoss(nn.Module):
             "n_contact_frames": n_contact.detach(),
             **kendall_log,
         }
+
+    @staticmethod
+    def _focal_dice_target_loss(
+        pred_logits: Tensor,
+        gt_xyz: Tensor,
+        object_xyz: Tensor,
+        tau_per_part: Tensor,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        dice_eps: float = 1e-6,
+    ) -> Tensor:
+        """v8.1 affordance loss: focal BCE + dice on multi-hot binary GT.
+
+        For each (frame, body_part) cell, GT is the binary mask of
+        object tokens within ``τ_part`` of the GT closest-mesh-point
+        xyz. Multiple adjacent tokens can be positive — palm contact
+        covers a few cm region, multiple FPS-sampled tokens fall in it.
+        This is the EgoChoir (NeurIPS 2024) / Text2HOI (CVPR 2024)
+        convention for HOI affordance supervision.
+
+        Predicted output is per-token sigmoid (each token is an
+        independent binary classifier). Loss is focal BCE + dice on
+        the multi-hot mask.
+
+        Parameters
+        ----------
+        pred_logits : (B, T, P, M) — pre-sigmoid attention scores from
+            ``CrossAttentionWeightsOnly`` with ``output="logits"``.
+        gt_xyz : (B, T, P, 3) — closest-mesh-point xyz per body part,
+            object-local frame.
+        object_xyz : (B, M, 3) — object encoder centroid positions.
+        tau_per_part : (P,) — per-body-part contact radius (m).
+            Default (0.05, 0.05, 0.03, 0.03, 0.12) matches v12_strict
+            tight thresholds.
+        focal_alpha : positive class weight (Lin et al. ICCV 2017
+            RetinaNet default 0.25).
+        focal_gamma : focusing parameter (default 2.0).
+        dice_eps : numerical stability for dice denominator.
+
+        Returns
+        -------
+        loss_target : (B, T, P) — per-cell loss; caller applies the
+            contact gate before reduction.
+        """
+        B, T, P, _ = gt_xyz.shape
+        M = object_xyz.shape[1]
+        # (a) Build multi-hot GT: tokens within τ_part of GT_xyz are positive.
+        # gt_xyz: (B, T, P, 3) -> (B, T, P, 1, 3); object_xyz: (B, 1, 1, M, 3)
+        diff = gt_xyz.unsqueeze(-2) - object_xyz.view(B, 1, 1, M, 3)
+        d = diff.norm(dim=-1)                                      # (B, T, P, M)
+        tau = tau_per_part.to(d.device, dtype=d.dtype).view(1, 1, P, 1)
+        gt_mask = (d < tau).to(pred_logits.dtype)                  # (B, T, P, M)
+
+        # (b) Focal BCE per token
+        # F.binary_cross_entropy_with_logits is numerically stable.
+        bce = F.binary_cross_entropy_with_logits(
+            pred_logits, gt_mask, reduction="none",
+        )                                                           # (B, T, P, M)
+        pred = torch.sigmoid(pred_logits)
+        p_t = pred * gt_mask + (1.0 - pred) * (1.0 - gt_mask)
+        focal_mod = (1.0 - p_t).clamp(min=0.0).pow(focal_gamma)
+        alpha_t = focal_alpha * gt_mask + (1.0 - focal_alpha) * (1.0 - gt_mask)
+        loss_focal = (alpha_t * focal_mod * bce).mean(dim=-1)      # (B, T, P)
+
+        # (c) Soft Dice on the multi-hot mask. With pred ∈ [0, 1] and
+        # gt ∈ {0, 1}, dice = 2·|pred ∩ gt| / (|pred| + |gt|), and
+        # loss = 1 - dice. Per-cell: aggregate across the M-dim.
+        intersection = (pred * gt_mask).sum(dim=-1)                 # (B, T, P)
+        pred_sum = pred.sum(dim=-1)                                 # (B, T, P)
+        gt_sum = gt_mask.sum(dim=-1)                                # (B, T, P)
+        loss_dice = 1.0 - (
+            (2.0 * intersection + dice_eps) / (pred_sum + gt_sum + dice_eps)
+        )                                                           # (B, T, P)
+
+        return 0.5 * loss_focal + 0.5 * loss_dice                   # (B, T, P)
 
     @staticmethod
     def _kl_div_target_loss(

@@ -330,6 +330,34 @@ def _multiclass_metrics(
     }
 
 
+def _multihot_metrics(
+    all_iou: list[float],
+    all_f1: list[float],
+    all_precision: list[float],
+    all_recall: list[float],
+) -> dict[str, float | None]:
+    """v8.1 binary multi-hot mask metrics on contact-positive cells.
+
+    Output is the per-cell mean of IoU / F1 / precision / recall —
+    matching EgoChoir / Text2HOI evaluation convention.
+    """
+    if not all_iou:
+        return {
+            "multihot_mean_iou": None,
+            "multihot_mean_f1": None,
+            "multihot_mean_precision": None,
+            "multihot_mean_recall": None,
+            "multihot_n_cells": 0,
+        }
+    return {
+        "multihot_mean_iou": float(np.mean(all_iou)),
+        "multihot_mean_f1": float(np.mean(all_f1)),
+        "multihot_mean_precision": float(np.mean(all_precision)),
+        "multihot_mean_recall": float(np.mean(all_recall)),
+        "multihot_n_cells": len(all_iou),
+    }
+
+
 def _token_recall_metrics(
     all_pred_top_tokens: list[np.ndarray],
     all_gt_top1_token: list[np.ndarray],
@@ -442,6 +470,13 @@ def run_eval(
     # v8 token-recall accumulators (only populated when use_structured)
     all_pred_top_tokens: list[np.ndarray] = []   # (N_gated, 5) top-5 predicted tokens per cell
     all_gt_top1_token: list[np.ndarray] = []     # (N_gated,) GT argmax token id
+    # v8.1 multi-hot binary metrics (per contact-positive cell, accumulated
+    # across batches; computed against the predictor's actual FPS-token
+    # positions for that batch).
+    all_iou: list[float] = []                    # IoU(pred_mask, gt_mask)
+    all_f1: list[float] = []                     # F1(pred_mask, gt_mask)
+    all_precision: list[float] = []
+    all_recall: list[float] = []
     # Per-clip records for per-object aggregation. Each entry is
     # {subset, object_id, seq_id, n_frames_valid, n_gated_target,
     #  target_mean_l2_m_per_clip, contact_any_n_pos, contact_any_n_pred_pos,
@@ -531,8 +566,21 @@ def run_eval(
         # Target xyz regression (in object-local metres). Predicted vs
         # GT are (B, T, 5, 3); we flatten to (B*T, 5, 3) and gate by
         # gt_contact > 0.5 in the metrics step.
-        pred_txyz = pred_fp32["contact_target_xyz"].cpu().numpy()                 # (B, T, 5, 3)
         gt_txyz = batch["contact_target_xyz"].float().cpu().numpy()               # (B, T, 5, 3)
+        # v8.1 Path B: predictor may not emit contact_target_xyz (drop
+        # back-compat). Derive a best-effort xyz for legacy L2 metric
+        # by softmax-weighted token positions if attention is available.
+        # In v7-fix / v8 this field is emitted directly.
+        if "contact_target_xyz" in pred_fp32:
+            pred_txyz = pred_fp32["contact_target_xyz"].cpu().numpy()             # (B, T, 5, 3)
+        elif "contact_target_attn_logits" in pred_fp32 and obj_xyz is not None:
+            attn_logits_np = pred_fp32["contact_target_attn_logits"].cpu().numpy()
+            obj_xyz_np_for_xyz = obj_xyz.float().cpu().numpy()
+            attn_softmax = np.exp(attn_logits_np - attn_logits_np.max(axis=-1, keepdims=True))
+            attn_softmax = attn_softmax / attn_softmax.sum(axis=-1, keepdims=True)
+            pred_txyz = np.einsum("btpk,bkc->btpc", attn_softmax, obj_xyz_np_for_xyz)
+        else:
+            pred_txyz = np.zeros_like(gt_txyz)  # placeholder; legacy L2 metric will be vacuous
         all_pred_target_xyz.append(pred_txyz.reshape(-1, 5, 3)[valid])
         all_gt_target_xyz.append(gt_txyz.reshape(-1, 5, 3)[valid])
         all_contact_gate.append(gt_contact_v > 0.5)
@@ -547,6 +595,7 @@ def run_eval(
             # gt_txyz: (B, T, 5, 3), obj_xyz: (B, M, 3)
             diff = gt_txyz[:, :, :, None, :] - obj_xyz_np[:, None, None, :, :]
             d_sq = (diff ** 2).sum(axis=-1)                           # (B, T, 5, M)
+            d = np.sqrt(d_sq)
             gt_token = np.argmin(d_sq, axis=-1)                       # (B, T, 5)
             top5 = np.argsort(-attn, axis=-1)[..., :5]                # (B, T, 5, 5)
             # Flatten over (B, T) and gate by frame_mask + contact
@@ -556,6 +605,41 @@ def run_eval(
             top5_flat = top5[gate_mat]                                # (N_gated, 5)
             all_pred_top_tokens.append(top5_flat)
             all_gt_top1_token.append(gt_token_flat)
+
+            # v8.1 IoU / F1 on multi-hot binary mask
+            # Multi-hot GT: tokens within τ_part of GT closest_xyz.
+            tau_per_part = np.array([0.05, 0.05, 0.03, 0.03, 0.12])    # (5,)
+            gt_mask_multi = (d < tau_per_part.reshape(1, 1, -1, 1))    # (B, T, 5, M)
+            # Predicted multi-hot: sigmoid attention > 0.5. For
+            # softmax-output v8 mode the value is already in [0,1] but
+            # not sigmoid-calibrated; threshold 1/M is a fairer proxy
+            # in that case. Use 0.5 if logits-mode (v8.1), else
+            # max-token-only (v8 fallback).
+            if "contact_target_attn_logits" in pred_fp32:
+                pred_mask_multi = (attn > 0.5)                        # sigmoid path
+            else:
+                # softmax path: take top-K tokens whose cumulative mass
+                # exceeds threshold, then flag all of them
+                pred_mask_multi = (attn > (1.0 / attn.shape[-1] * 2.0))
+            for b in range(attn.shape[0]):
+                for t in range(attn.shape[1]):
+                    for p_idx in range(attn.shape[2]):
+                        if not gate_mat[b, t, p_idx]:
+                            continue
+                        gt_m = gt_mask_multi[b, t, p_idx]
+                        pred_m = pred_mask_multi[b, t, p_idx]
+                        if gt_m.sum() == 0:
+                            continue  # empty GT mask: skip (rare)
+                        inter = (gt_m & pred_m).sum()
+                        union = (gt_m | pred_m).sum()
+                        iou = inter / max(int(union), 1)
+                        prec = inter / max(int(pred_m.sum()), 1)
+                        rec = inter / max(int(gt_m.sum()), 1)
+                        f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+                        all_iou.append(float(iou))
+                        all_f1.append(float(f1))
+                        all_precision.append(float(prec))
+                        all_recall.append(float(rec))
 
         # Phase
         pred_phase = pred_fp32["phase_logits"].argmax(dim=-1).cpu().numpy()            # (B, T)
@@ -828,6 +912,7 @@ def run_eval(
             "total_gated_frames_x_parts": total_gated,
             "per_body_part": target_per_part_xyz,
             **_token_recall_metrics(all_pred_top_tokens, all_gt_top1_token),
+            **_multihot_metrics(all_iou, all_f1, all_precision, all_recall),
         },
         "phase": phase_metrics,
         "support": support_metrics,

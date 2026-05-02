@@ -263,6 +263,56 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-05 **v8.1 prototype landed (15/15 tests pass); v8 negative
+result diagnosed via 3 frontier-paper surveys**. v8 server retrain
+showed mixed results — pelvis target +18 pp on <10cm hit (architecture
+sound) but phase / support regressed and target_top1 0.093 due to
+specific failure modes traceable to 10-year-old methodology in the
+original v8 design:
+
+- **TF (Bengio NeurIPS 2015)** — proven non-consistent (Huszár 2015);
+  fixed by **MoMask CVPR 2024 random Bernoulli mask** (per-batch
+  ratio ~ U[0,1])
+- **KL on Gaussian-kerneled GT + softmax** — non-mainstream in HOI
+  literature; fixed by **focal+dice on multi-hot binary GT + sigmoid
+  output** (EgoChoir NeurIPS 2024 + Text2HOI CVPR 2024 standard)
+- **Fixed-weight hinge consistency** — provably ignored by optimizer
+  (Bertsekas penalty-method pathology); v8.1 drops it; Cooper NeurIPS
+  2025 augmented Lagrangian as v9 candidate
+
+**Path B selected**: drop softmax-xyz back-compat output. v8.1a is
+predictor-only retrain; v8.1b is Stage B InteractionTokenizer refactor
+to consume contact_target_attn (multi-hot mask) directly. v18 is now
+gated on v8.1a + v8.1b stack.
+
+Code state (3 commits pending):
+- `src/piano/models/interaction_predictor.py` — `CrossAttentionWeightsOnly`
+  +`output` flag; `StructuredHead` +`downstream_mode` +`target_attn_output`;
+  `_mix_with_gt` MoMask Bernoulli mask
+- `src/piano/training/losses.py` — `_focal_dice_target_loss` +
+  `target_loss_kind="focal_dice"` + `target_tau_per_part` config
+- `src/piano/training/train_predictor.py` — wires v8.1 flags + always-pass-GT
+  in mask mode
+- `scripts/stage_a_predictor/eval_predictor.py` — IoU/F1/precision/recall
+  on multi-hot mask + token_recall (deprecated, kept for v8 comparison)
+- `configs/training/predictor_v8_1_masked.yaml` — full v8.1 config
+- `tests/test_structured_head.py` — 15/15 tests pass (added 5 v8.1 cases)
+
+Acceptance gates (vs v8 best ep34):
+- multihot_mean_iou ≥ 0.30 (NEW primary)
+- multihot_mean_f1 ≥ 0.40 (NEW)
+- contact macro_f1 ≥ 0.24
+- phase macro F1 ≥ 0.62
+- support macro F1 ≥ 0.40
+- pelvis target L2 ≤ 14.5 cm (keep v8 win)
+
+Detail: `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md`,
+`analyses/2026-05-02_alternatives_to_scheduled_sampling.md`,
+`analyses/2026-05-02_hoi_affordance_sota_survey_post_move_as_you_say.md`,
+`analyses/2026-05-02_mtl_dag_research_survey.md`.
+
+Pending: server v8.1a retrain (~6 h).
+
 2026-05-05 **v8 predictor design + prototype landed; predictor is the
 ship-blocking bottleneck**. After reading the architecture against the
 pseudo-label extraction DAG and against Move-as-You-Say (CVPR 2024),
