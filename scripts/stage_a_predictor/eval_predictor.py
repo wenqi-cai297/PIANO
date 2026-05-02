@@ -342,27 +342,58 @@ def _multihot_metrics(
     all_f1: list[float],
     all_precision: list[float],
     all_recall: list[float],
+    all_topk_iou: list[float] | None = None,
+    all_topk_f1: list[float] | None = None,
+    all_topk_precision: list[float] | None = None,
+    all_topk_recall: list[float] | None = None,
+    topk: int = 3,
 ) -> dict[str, float | None]:
     """v8.1 binary multi-hot mask metrics on contact-positive cells.
 
     Output is the per-cell mean of IoU / F1 / precision / recall —
     matching EgoChoir / Text2HOI evaluation convention.
+
+    Two variants:
+    - ``multihot_mean_*``: legacy 0.5-threshold (sensitive to focal-
+      loss sigmoid calibration; can be misleading for v8.1+).
+    - ``topk{K}_mean_*``: v8.1.1 top-K based (threshold-free, robust).
     """
+    out: dict[str, float | None] = {}
     if not all_iou:
-        return {
+        out.update({
             "multihot_mean_iou": None,
             "multihot_mean_f1": None,
             "multihot_mean_precision": None,
             "multihot_mean_recall": None,
             "multihot_n_cells": 0,
-        }
-    return {
-        "multihot_mean_iou": float(np.mean(all_iou)),
-        "multihot_mean_f1": float(np.mean(all_f1)),
-        "multihot_mean_precision": float(np.mean(all_precision)),
-        "multihot_mean_recall": float(np.mean(all_recall)),
-        "multihot_n_cells": len(all_iou),
-    }
+        })
+    else:
+        out.update({
+            "multihot_mean_iou": float(np.mean(all_iou)),
+            "multihot_mean_f1": float(np.mean(all_f1)),
+            "multihot_mean_precision": float(np.mean(all_precision)),
+            "multihot_mean_recall": float(np.mean(all_recall)),
+            "multihot_n_cells": len(all_iou),
+        })
+    if all_topk_iou is not None:
+        prefix = f"topk{topk}_"
+        if not all_topk_iou:
+            out.update({
+                f"{prefix}mean_iou": None,
+                f"{prefix}mean_f1": None,
+                f"{prefix}mean_precision": None,
+                f"{prefix}mean_recall": None,
+                f"{prefix}n_cells": 0,
+            })
+        else:
+            out.update({
+                f"{prefix}mean_iou": float(np.mean(all_topk_iou)),
+                f"{prefix}mean_f1": float(np.mean(all_topk_f1 or [])),
+                f"{prefix}mean_precision": float(np.mean(all_topk_precision or [])),
+                f"{prefix}mean_recall": float(np.mean(all_topk_recall or [])),
+                f"{prefix}n_cells": len(all_topk_iou),
+            })
+    return out
 
 
 def _token_recall_metrics(
@@ -462,6 +493,14 @@ def run_eval(
         target_loss_kind=cfg.loss.get("target_loss_kind", "smooth_l1"),
         target_kernel_sigma=float(cfg.loss.get("target_kernel_sigma", 0.08)),
         consistency_weight=float(cfg.loss.get("consistency_weight", 0.0)),
+        target_focal_alpha=float(cfg.loss.get("target_focal_alpha", 0.25)),
+        target_focal_gamma=float(cfg.loss.get("target_focal_gamma", 2.0)),
+        target_tau_per_part=tuple(cfg.loss.get(
+            "target_tau_per_part", (0.05, 0.05, 0.03, 0.03, 0.12),
+        )),
+        target_topk_min_positives=int(cfg.loss.get(
+            "target_topk_min_positives", 0,
+        )),
     )
 
     # Accumulators
@@ -479,11 +518,21 @@ def run_eval(
     all_gt_top1_token: list[np.ndarray] = []     # (N_gated,) GT argmax token id
     # v8.1 multi-hot binary metrics (per contact-positive cell, accumulated
     # across batches; computed against the predictor's actual FPS-token
-    # positions for that batch).
-    all_iou: list[float] = []                    # IoU(pred_mask, gt_mask)
-    all_f1: list[float] = []                     # F1(pred_mask, gt_mask)
+    # positions for that batch). The 0.5-threshold variants (legacy)
+    # are sensitive to focal-loss sigmoid calibration — top-K based
+    # variants below (v8.1.1) avoid that issue.
+    all_iou: list[float] = []                    # IoU(pred>0.5, gt_mask) — legacy
+    all_f1: list[float] = []                     # F1 (legacy)
     all_precision: list[float] = []
     all_recall: list[float] = []
+    # v8.1.1 top-K metrics (threshold-free). Take top-K predictions
+    # per cell, compare to top-K GT positives. Robust to sigmoid
+    # calibration.
+    all_topk_iou: list[float] = []
+    all_topk_f1: list[float] = []
+    all_topk_precision: list[float] = []
+    all_topk_recall: list[float] = []
+    TOPK_EVAL = 3
     # Per-clip records for per-object aggregation. Each entry is
     # {subset, object_id, seq_id, n_frames_valid, n_gated_target,
     #  target_mean_l2_m_per_clip, contact_any_n_pos, contact_any_n_pred_pos,
@@ -628,25 +677,48 @@ def run_eval(
                 # softmax path: take top-K tokens whose cumulative mass
                 # exceeds threshold, then flag all of them
                 pred_mask_multi = (attn > (1.0 / attn.shape[-1] * 2.0))
+            # Top-K GT positive set (v8.1.1): K nearest tokens per cell
+            # is the model-agnostic GT (independent of τ). Combined
+            # with τ-based set if needed; simplest robust choice is
+            # pure top-K on distance.
+            gt_topk_idx = np.argsort(d, axis=-1)[..., :TOPK_EVAL]    # (B,T,5,K) — nearest K
+            # Top-K pred set
+            pred_topk_idx = np.argsort(-attn, axis=-1)[..., :TOPK_EVAL]
             for b in range(attn.shape[0]):
                 for t in range(attn.shape[1]):
                     for p_idx in range(attn.shape[2]):
                         if not gate_mat[b, t, p_idx]:
                             continue
+                        # Legacy 0.5-threshold IoU/F1
                         gt_m = gt_mask_multi[b, t, p_idx]
                         pred_m = pred_mask_multi[b, t, p_idx]
-                        if gt_m.sum() == 0:
-                            continue  # empty GT mask: skip (rare)
-                        inter = (gt_m & pred_m).sum()
-                        union = (gt_m | pred_m).sum()
-                        iou = inter / max(int(union), 1)
-                        prec = inter / max(int(pred_m.sum()), 1)
-                        rec = inter / max(int(gt_m.sum()), 1)
-                        f1 = 2 * prec * rec / max(prec + rec, 1e-8)
-                        all_iou.append(float(iou))
-                        all_f1.append(float(f1))
-                        all_precision.append(float(prec))
-                        all_recall.append(float(rec))
+                        if gt_m.sum() > 0:
+                            inter = (gt_m & pred_m).sum()
+                            union = (gt_m | pred_m).sum()
+                            iou = inter / max(int(union), 1)
+                            prec = inter / max(int(pred_m.sum()), 1)
+                            rec = inter / max(int(gt_m.sum()), 1)
+                            f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+                            all_iou.append(float(iou))
+                            all_f1.append(float(f1))
+                            all_precision.append(float(prec))
+                            all_recall.append(float(rec))
+
+                        # v8.1.1 top-K based F1/IoU (threshold-free).
+                        # Always defined since top-K always returns K
+                        # positives. Robust to sigmoid calibration.
+                        gt_set = set(gt_topk_idx[b, t, p_idx].tolist())
+                        pred_set = set(pred_topk_idx[b, t, p_idx].tolist())
+                        inter_k = len(gt_set & pred_set)
+                        union_k = len(gt_set | pred_set)
+                        topk_iou = inter_k / max(union_k, 1)
+                        topk_prec = inter_k / max(len(pred_set), 1)
+                        topk_rec = inter_k / max(len(gt_set), 1)
+                        topk_f1 = 2 * topk_prec * topk_rec / max(topk_prec + topk_rec, 1e-8)
+                        all_topk_iou.append(float(topk_iou))
+                        all_topk_f1.append(float(topk_f1))
+                        all_topk_precision.append(float(topk_prec))
+                        all_topk_recall.append(float(topk_rec))
 
         # Phase
         pred_phase = pred_fp32["phase_logits"].argmax(dim=-1).cpu().numpy()            # (B, T)
@@ -919,7 +991,11 @@ def run_eval(
             "total_gated_frames_x_parts": total_gated,
             "per_body_part": target_per_part_xyz,
             **_token_recall_metrics(all_pred_top_tokens, all_gt_top1_token),
-            **_multihot_metrics(all_iou, all_f1, all_precision, all_recall),
+            **_multihot_metrics(
+                all_iou, all_f1, all_precision, all_recall,
+                all_topk_iou, all_topk_f1, all_topk_precision, all_topk_recall,
+                topk=TOPK_EVAL,
+            ),
         },
         "phase": phase_metrics,
         "support": support_metrics,

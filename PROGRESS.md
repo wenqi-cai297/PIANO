@@ -263,6 +263,52 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-05 **v8.1 server retrain validated both core hypotheses;
+v8.1.1 prototype landed (18/18 tests pass) for foot regression + IoU
+metric fix.** Server eval results:
+
+| metric | v7-fix | v8 best | **v8.1 best** |
+|---|---:|---:|---:|
+| target <5cm hit | 4.5% | 5.6% | **11.6%** (+2.6×) |
+| target <10cm hit | 17.5% | 19.4% | **26.9%** |
+| phase macro F1 | 0.632 | 0.577 | **0.637** (gap fixed) |
+| pelvis pct<10cm | 33.9% | 51.9% | **59.1%** |
+| foot L2 (cm) | 25.3 | 27.4 | **42.7** ❌ (regression) |
+| multihot_mean_iou | n/a | n/a | 0.141 (metric ill-posed) |
+
+Both hypotheses confirmed: MoMask mask fixed phase TF-gap; multi-hot
+binary tripled position-precision metrics. Two issues remain:
+
+- **foot L2 regressed** — τ_foot=3cm < FPS-token spacing 8.8cm →
+  empty multi-hot masks → no foot supervision → foot head untrained
+- **multihot_mean_iou=0.141** — focal loss doesn't calibrate sigmoid
+  to 0.5 threshold; metric needs to be threshold-free
+
+**v8.1.1** = single config change: GT mask = (top-K=3 nearest) ∪
+(within-τ tokens). Guarantees ≥ K positives per cell regardless of
+density. Plus eval_predictor.py adds topk3_mean_iou/f1 alongside
+legacy 0.5-threshold metrics.
+
+Code state (commits pending):
+- `src/piano/training/losses.py` — `target_topk_min_positives` flag
+  on `_focal_dice_target_loss`; union of top-K and τ-mask
+- `src/piano/training/train_predictor.py` — wires the flag
+- `scripts/stage_a_predictor/eval_predictor.py` — top-K F1/IoU
+  metric (threshold-free)
+- `configs/training/predictor_v8_1_1_topk_mask.yaml` — new config
+- `tests/test_structured_head.py` — 18/18 tests pass
+
+Acceptance gates v8.1.1 (vs v8.1 best):
+- topk3_mean_iou ≥ 0.35 (NEW primary, threshold-free)
+- foot L2 ≤ 30 cm (FIX target)
+- target <5cm hit ≥ 11% (no regress)
+- contact / phase / support not regressed
+
+Detail: `analyses/2026-05-05_v81_results_and_v811_plan.md`.
+
+Pending: server v8.1.1 retrain (~6 h) OR re-eval v8.1 ckpt with new
+metric (zero-cost — confirms whether metric was the only issue).
+
 2026-05-05 **v8.1 prototype landed (15/15 tests pass); v8 negative
 result diagnosed via 3 frontier-paper surveys**. v8 server retrain
 showed mixed results — pelvis target +18 pp on <10cm hit (architecture

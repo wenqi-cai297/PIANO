@@ -1,0 +1,133 @@
+# Stage A v8.1.1: top-K minimum on multi-hot GT mask + top-K eval metric.
+#
+# v8.1 was a real success (target <5cm hit 4.5% → 11.6%, phase macro F1
+# 0.577 → 0.637) but two specific issues remained:
+#
+#   1. foot target L2 went from 25 → 42 cm. Diagnosed as empty multi-hot
+#      mask: τ_foot=3cm < average FPS-token spacing (8.8cm on 1m
+#      object), so foot cells often had 0 positive tokens → no
+#      supervision signal → foot head untrained.
+#
+#   2. multihot_mean_iou=0.141 looked like a failure but the metric is
+#      ill-posed: focal+dice trains sigmoid that doesn't cleanly cross
+#      0.5 (mean prediction at 0.2-0.4). Top-K-based F1 is the right
+#      threshold-free metric and is added in eval_predictor.py.
+#
+# v8.1.1 single change vs v8.1: GT mask = (top-K nearest tokens) ∪
+# (within-τ tokens). K=3 guarantees every cell has ≥3 positive tokens
+# regardless of FPS density. τ values unchanged from v8.1 (they only
+# ADD positives in dense regions like pelvis-on-chair).
+#
+# Detail: analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md +
+# eval analysis above.
+#
+# Hardware: 2 × A6000 48 GB, bf16, Accelerate DDP. ~6 h.
+#
+# Launch:
+#   accelerate launch --config_file configs/accelerate_config.yaml \
+#     -m piano.training.train_predictor \
+#     --config configs/training/predictor_v8_1_1_topk_mask.yaml
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+  # v8.1.1: guarantee at least K=3 positive tokens per cell. Fixes
+  # foot empty-mask bug.
+  target_topk_min_positives: 3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+  use_logit_adjustment: false
+  logit_adjust_tau: 1.0
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v8_1_1_topk_mask"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v8_1_1_topk_mask"

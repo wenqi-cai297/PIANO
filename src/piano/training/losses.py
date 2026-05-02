@@ -128,6 +128,13 @@ class PredictorLoss(nn.Module):
         # PIANO body-part indexing (left/right hand, left/right foot,
         # pelvis). Override per dataset via cfg.loss.target_tau_per_part.
         target_tau_per_part: tuple[float, ...] | None = None,
+        # v8.1.1 (2026-05-05): top-K minimum to avoid empty GT masks
+        # in low-density regions (e.g. foot τ=3cm has 0 tokens in
+        # neighborhood when 128 FPS spacing ~ 8.8cm). GT mask =
+        # (top-K nearest) ∪ (within-τ). K=0 disables (pure τ-only,
+        # v8.1 behaviour). K=3 is the v8.1.1 default — matches typical
+        # palm-contact region size.
+        target_topk_min_positives: int = 0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -203,6 +210,12 @@ class PredictorLoss(nn.Module):
             "target_tau_per_part",
             torch.tensor(target_tau_per_part, dtype=torch.float32),
         )
+        if int(target_topk_min_positives) < 0:
+            raise ValueError(
+                f"target_topk_min_positives must be >= 0, "
+                f"got {target_topk_min_positives}"
+            )
+        self.target_topk_min_positives = int(target_topk_min_positives)
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -321,6 +334,7 @@ class PredictorLoss(nn.Module):
                 focal_alpha=self.target_focal_alpha,
                 focal_gamma=self.target_focal_gamma,
                 dice_eps=self.target_dice_eps,
+                topk_min_positives=self.target_topk_min_positives,
             )  # (B, T, P)
         else:
             raise ValueError(self.target_loss_kind)  # unreachable
@@ -473,6 +487,7 @@ class PredictorLoss(nn.Module):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         dice_eps: float = 1e-6,
+        topk_min_positives: int = 0,
     ) -> Tensor:
         """v8.1 affordance loss: focal BCE + dice on multi-hot binary GT.
 
@@ -482,6 +497,13 @@ class PredictorLoss(nn.Module):
         covers a few cm region, multiple FPS-sampled tokens fall in it.
         This is the EgoChoir (NeurIPS 2024) / Text2HOI (CVPR 2024)
         convention for HOI affordance supervision.
+
+        v8.1.1 addition (2026-05-05): when ``topk_min_positives > 0``,
+        the GT mask is the union of (top-K nearest tokens) ∪
+        (within-τ tokens). This guarantees every cell has at least K
+        positives regardless of FPS density, fixing the v8.1 foot
+        regression where τ_foot=3cm produced empty masks at FPS
+        spacing ~8.8cm.
 
         Predicted output is per-token sigmoid (each token is an
         independent binary classifier). Loss is focal BCE + dice on
@@ -501,6 +523,9 @@ class PredictorLoss(nn.Module):
             RetinaNet default 0.25).
         focal_gamma : focusing parameter (default 2.0).
         dice_eps : numerical stability for dice denominator.
+        topk_min_positives : minimum positive tokens per cell. 0
+            disables (pure τ-only, v8.1 behaviour). 3 is the v8.1.1
+            recommended default.
 
         Returns
         -------
@@ -509,12 +534,24 @@ class PredictorLoss(nn.Module):
         """
         B, T, P, _ = gt_xyz.shape
         M = object_xyz.shape[1]
-        # (a) Build multi-hot GT: tokens within τ_part of GT_xyz are positive.
+        # (a) Build multi-hot GT.
         # gt_xyz: (B, T, P, 3) -> (B, T, P, 1, 3); object_xyz: (B, 1, 1, M, 3)
         diff = gt_xyz.unsqueeze(-2) - object_xyz.view(B, 1, 1, M, 3)
         d = diff.norm(dim=-1)                                      # (B, T, P, M)
         tau = tau_per_part.to(d.device, dtype=d.dtype).view(1, 1, P, 1)
-        gt_mask = (d < tau).to(pred_logits.dtype)                  # (B, T, P, M)
+        gt_mask_tau = (d < tau)                                    # (B, T, P, M) bool
+        # v8.1.1 top-K minimum: union with the K nearest tokens to
+        # guarantee at least K positives per cell. Avoids empty masks
+        # for parts whose τ is below FPS-token spacing (foot τ=3cm).
+        if topk_min_positives > 0 and topk_min_positives < M:
+            # topk on negated distance → nearest tokens
+            topk_idx = torch.topk(-d, k=topk_min_positives, dim=-1).indices  # (B, T, P, K)
+            gt_mask_topk = torch.zeros_like(gt_mask_tau)
+            gt_mask_topk.scatter_(-1, topk_idx, True)
+            gt_mask_bool = gt_mask_tau | gt_mask_topk
+        else:
+            gt_mask_bool = gt_mask_tau
+        gt_mask = gt_mask_bool.to(pred_logits.dtype)               # (B, T, P, M)
 
         # (b) Focal BCE per token
         # F.binary_cross_entropy_with_logits is numerically stable.

@@ -545,6 +545,9 @@ def run(config_path: str) -> None:
         target_tau_per_part=tuple(cfg.loss.get(
             "target_tau_per_part", (0.05, 0.05, 0.03, 0.03, 0.12),
         )),
+        target_topk_min_positives=int(cfg.loss.get(
+            "target_topk_min_positives", 0,
+        )),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(

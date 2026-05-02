@@ -581,6 +581,66 @@ def test_v81_config_yaml_end_to_end():
     print("[PASS] test_v81_config_yaml_end_to_end")
 
 
+def test_v811_topk_min_positives_no_empty_mask():
+    """v8.1.1: top-K minimum guarantees no empty GT masks even when
+    GT_xyz is far from all object tokens (the foot τ=3cm regression
+    case)."""
+    B, T, P, M = 2, 4, 5, 128
+    # GT far from any object token — under v8.1's pure-τ path this
+    # would produce empty masks.
+    gt_xyz = torch.full((B, T, P, 3), 100.0)        # very far
+    object_xyz = torch.randn(B, M, 3) * 0.5
+    tau = torch.tensor([0.05, 0.05, 0.03, 0.03, 0.12])
+    pred_logits = torch.randn(B, T, P, M)
+
+    # Pure τ-only (v8.1): mask should be all zero
+    loss_v81 = PredictorLoss._focal_dice_target_loss(
+        pred_logits, gt_xyz, object_xyz, tau,
+        topk_min_positives=0,
+    )
+    # Top-K=3 (v8.1.1): mask should always have K positives → loss
+    # not vacuous
+    loss_v811 = PredictorLoss._focal_dice_target_loss(
+        pred_logits, gt_xyz, object_xyz, tau,
+        topk_min_positives=3,
+    )
+    assert torch.isfinite(loss_v811).all()
+    # v8.1.1 loss should differ from v8.1 (because GT mask is now
+    # non-empty)
+    diff = (loss_v81 - loss_v811).abs().max()
+    assert diff > 1e-6, f"top-K should change loss, got diff={diff}"
+    print(f"[PASS] test_v811_topk_min_positives_no_empty_mask "
+          f"(v81_loss={loss_v81.mean():.3f}, v811_loss={loss_v811.mean():.3f})")
+
+
+def test_v811_topk_min_perfect_pred_gives_low_loss():
+    """v8.1.1: with top-K=3 GT and a perfect prediction on those K, loss is low."""
+    B, T, P, M = 2, 4, 5, 128
+    object_xyz = torch.randn(B, M, 3) * 0.5
+    # Far GT so τ-mask is empty; only top-K provides positives
+    gt_xyz = torch.full((B, T, P, 3), 100.0)
+    tau = torch.tensor([0.05, 0.05, 0.03, 0.03, 0.12])
+    K = 3
+
+    # Construct GT mask the way the loss does (top-K only here)
+    diff = gt_xyz.unsqueeze(-2) - object_xyz.view(B, 1, 1, M, 3)
+    d = diff.norm(dim=-1)
+    topk_idx = torch.topk(-d, k=K, dim=-1).indices
+    gt_mask = torch.zeros(B, T, P, M)
+    gt_mask.scatter_(-1, topk_idx, 1.0)
+
+    # Perfect logits
+    perfect_logits = (gt_mask * 10.0) + ((1 - gt_mask) * -10.0)
+    loss = PredictorLoss._focal_dice_target_loss(
+        perfect_logits, gt_xyz, object_xyz, tau,
+        topk_min_positives=K,
+    )
+    assert loss.max() < 0.05, \
+        f"perfect prediction on top-K GT should yield ~0 loss, got max {loss.max():.4f}"
+    print(f"[PASS] test_v811_topk_min_perfect_pred_gives_low_loss "
+          f"(loss_max={loss.max():.2e})")
+
+
 def test_v81_eval_build_models_propagates_flags():
     """Regression: scripts/stage_a_predictor/eval_predictor.py::_build_models
     must propagate v8.1 flags (downstream_mode + target_attn_output) to
@@ -635,5 +695,7 @@ if __name__ == "__main__":
     test_v81_focal_dice_target_loss()
     test_v81_full_loss_backward_no_unused_params()
     test_v81_config_yaml_end_to_end()
+    test_v811_topk_min_positives_no_empty_mask()
+    test_v811_topk_min_perfect_pred_gives_low_loss()
     test_v81_eval_build_models_propagates_flags()
-    print("\nAll v8 + v8.1 sanity tests passed.")
+    print("\nAll v8 + v8.1 + v8.1.1 sanity tests passed.")

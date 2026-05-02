@@ -44,7 +44,32 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
    - Drop consistency loss (was ignored by optimizer)
    - Path B: drop xyz back-compat (Stage B v8.1b will consume mask)
    Detail: `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md`.
-2c-3. 🟢 NEXT: **Stage A v8.1a server retrain** (~6 h). Launch:
+2c-3a. ✅ Stage A v8.1a server retrain DONE. Both hypotheses validated:
+   - phase F1 0.577 → 0.637 (TF gap fixed by MoMask mask)
+   - target <5cm hit 4.5% → 11.6% (multi-hot binary works)
+   - foot L2 25 → 42.7 cm (REGRESSION — empty mask issue)
+   Detail: `analyses/2026-05-05_v81_results_and_v811_plan.md`.
+2c-3b. ✅ **v8.1.1 prototype LANDED** (18/18 tests pass).
+   GT mask = (top-K=3 nearest) ∪ (within-τ) fixes empty-mask foot
+   regression; eval adds topk3_mean_iou/f1 (threshold-free metric).
+2c-3c. 🟢 NEXT: zero-cost re-eval of v8.1 ckpt with new top-K metric:
+   ```bash
+   python scripts/stage_a_predictor/eval_predictor.py \
+     --config configs/training/predictor_v8_1_masked.yaml \
+     --checkpoint runs/training/predictor_v8_1_masked/best_val.pt \
+     --split val \
+     --output runs/eval/stageA_predictor_v8_1_masked_val/predictor_v8_1_masked_val_best_with_topk.json
+   ```
+   Tells us if metric was the dominant issue (topk3_iou ≫ 0.141).
+2c-3d. 🟢 v8.1.1 server retrain (~6 h). Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v8_1_1_topk_mask.yaml
+   ```
+   Acceptance: topk3_mean_iou ≥ 0.35, foot L2 ≤ 30 cm, no regress on
+   phase / support / contact.
+2c-3-old. 🟢 NEXT: **Stage A v8.1a server retrain** (~6 h). Launch:
    ```bash
    accelerate launch --config_file configs/accelerate_config.yaml \
      -m piano.training.train_predictor \

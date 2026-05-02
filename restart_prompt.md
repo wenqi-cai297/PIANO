@@ -122,7 +122,46 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-05 (latest update — v8.1 prototype)
+## Current State, 2026-05-05 (latest — v8.1.1 prototype)
+
+**Active branch**: Stage A v8.1.1 — fixes 2 specific v8.1 issues
+identified at server eval. v8.1 validated both core hypotheses but
+foot L2 regressed (25→42.7 cm) due to empty multi-hot masks at
+low-density τ_foot=3cm, and multihot_mean_iou=0.141 was misleading
+(focal loss doesn't calibrate sigmoid to 0.5).
+
+v8.1.1 single change: GT mask = (top-K=3 nearest tokens) ∪ (within-τ
+tokens) — guarantees ≥K positives per cell regardless of FPS density.
+Plus eval adds threshold-free topk3_mean_iou/f1 alongside legacy 0.5
+metrics. Same architecture, single config flag.
+
+18/18 sanity tests pass. Two parallel actions:
+
+1. **Zero-cost validation**: re-eval v8.1 ckpt with new metric
+   ```bash
+   python scripts/stage_a_predictor/eval_predictor.py \
+     --config configs/training/predictor_v8_1_masked.yaml \
+     --checkpoint runs/training/predictor_v8_1_masked/best_val.pt \
+     --split val \
+     --output runs/eval/stageA_predictor_v8_1_masked_val/predictor_v8_1_masked_val_best_with_topk.json
+   ```
+   If topk3_iou ≫ 0.141 → metric was the only issue → v8.1 already
+   passes; skip v8.1.1 retrain and proceed to Stage B v8.1b refactor.
+
+2. **v8.1.1 retrain** (~6 h, fixes foot regression):
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v8_1_1_topk_mask.yaml
+   ```
+   Acceptance: topk3_mean_iou ≥ 0.35, foot L2 ≤ 30 cm, no regress.
+
+After v8.1 (or v8.1.1) passes: Stage B v8.1b refactor for
+InteractionTokenizer to consume contact_target_attn directly.
+
+Detail: `analyses/2026-05-05_v81_results_and_v811_plan.md`.
+
+## Earlier State, 2026-05-05 (v8.1 prototype)
 
 **Active branch**: Stage A v8.1 — three frontier-paper-grounded fixes
 on top of v8's mixed-result diagnosis. v8 server retrain showed:
