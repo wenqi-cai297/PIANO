@@ -660,13 +660,20 @@ def compute_class_priors(
     num_phases: int,
     num_support: int,
     sample_limit: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Tally per-class frequencies for phase + support over a dataset.
+    num_body_parts: int = 5,
+    contact_threshold: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Tally per-class frequencies for phase + support + per-part contact.
 
-    Used by Logit Adjustment (Menon ICLR'21) — needs ``log π_y`` for
-    each class, computed from the training-set marginal frequency.
-    Iterates the dataset's underlying npzs directly (cheap — phase
-    and support are int arrays with no augmentation needed).
+    Used by:
+    - Logit Adjustment (Menon ICLR'21) for phase + support — needs
+      ``log π_y`` for each class, computed from training-set marginals.
+    - v9 contact pos_weight for class-balanced BCE — needs π_part
+      (positive rate per body part) to set
+      ``pos_weight = (1 - π_part) / π_part``.
+
+    Iterates the dataset's underlying npzs directly (cheap — labels
+    are int / float arrays with no augmentation needed).
 
     Parameters
     ----------
@@ -675,11 +682,16 @@ def compute_class_priors(
     num_support : expected number of support classes
     sample_limit : if set, stop after this many sequences (for fast smoke).
         Default None = scan the whole dataset.
+    num_body_parts : number of body parts in contact_state (default 5)
+    contact_threshold : threshold to binarise soft contact_state when
+        counting positive frames per body part (default 0.5)
 
     Returns
     -------
     phase_freq : (num_phases,) float32 — sums to 1
     support_freq : (num_support,) float32 — sums to 1
+    contact_part_freq : (num_body_parts,) float32 — per-part positive
+        rate (NOT normalised to sum 1; each entry ∈ [0, 1])
     """
     from torch.utils.data import ConcatDataset as _ConcatDataset
 
@@ -690,6 +702,8 @@ def compute_class_priors(
 
     phase_counts = np.zeros(num_phases, dtype=np.int64)
     support_counts = np.zeros(num_support, dtype=np.int64)
+    contact_pos_counts = np.zeros(num_body_parts, dtype=np.int64)
+    contact_total_frames = 0
     n_seq = 0
     for sub in sub_datasets:
         if not isinstance(sub, HOIDataset):
@@ -708,13 +722,23 @@ def compute_class_priors(
             if "support" in data.files:
                 su = data["support"]
                 support_counts += np.bincount(su, minlength=num_support)[:num_support]
+            if "contact_state" in data.files:
+                cs = data["contact_state"]                              # (T, num_body_parts)
+                if cs.ndim == 2 and cs.shape[1] == num_body_parts:
+                    pos = (cs > contact_threshold).astype(np.int64)
+                    contact_pos_counts += pos.sum(axis=0)
+                    contact_total_frames += cs.shape[0]
             n_seq += 1
         if sample_limit is not None and n_seq >= sample_limit:
             break
 
     phase_freq = phase_counts.astype(np.float32) / max(phase_counts.sum(), 1)
     support_freq = support_counts.astype(np.float32) / max(support_counts.sum(), 1)
-    return phase_freq, support_freq
+    if contact_total_frames > 0:
+        contact_part_freq = contact_pos_counts.astype(np.float32) / contact_total_frames
+    else:
+        contact_part_freq = np.zeros(num_body_parts, dtype=np.float32)
+    return phase_freq, support_freq, contact_part_freq
 
 
 def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:

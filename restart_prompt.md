@@ -122,7 +122,57 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-05 (latest — v8.1.1 prototype)
+## Current State, 2026-05-03 (latest — v9 combined prototype)
+
+**Active branch**: Stage A v9 — three failure-mode-driven changes in
+one retrain. v8.1.1 server eval analysis traced 3 distinct failures
+to specific frontier-paper-known anti-patterns:
+
+1. **foot recall = 0 across v6 → v8.1.1 (LOSS BUG)**: contact head
+   was bare BCE with no pos_weight. focal_gamma in config only
+   applied to phase/support, NEVER to contact. With foot 3% positive,
+   BCE was dominated 32:1 by negatives → trivial "predict zero".
+   Fix: per-part pos_weight = (1-π)/π capped at 15. Following DECO
+   ICCV'23 + HACO NeurIPS'25. (Survey:
+   `analyses/2026-05-02_class_imbalance_sota_survey.md`.)
+
+2. **topk3_iou plateau at 0.13 (HEAD CAPACITY)**: single Q/K-only
+   cross-attn can't disambiguate adjacent tokens for moving contact
+   targets. Fix: 4-layer Mask3D / InteractVLM-style mask decoder
+   (self-attn + cross-attn + FFN per layer + Q·K^T mask projection).
+   InteractVLM CVPR'25 lifted DAMON contact F1 55→76 (+20pp) with
+   this exact change. (Survey:
+   `analyses/2026-05-02_predictor_v9_architecture_research.md`.)
+
+3. **Logit Adjustment never enabled**: code already in losses.py:236
+   for 6 months, every yaml had it off. Free 2-4 pp lift expected
+   (Menon ICLR'21).
+
+**Encoder explicitly NOT upgraded**: Heuken arXiv:2504.18355 ablation
+shows PointNet++ wins by 8.7 mIoU over PT V3 on dense affordance.
+
+22/22 sanity tests pass. Param 26.9M → 34.7M (+28.8%).
+
+Launch v9 server retrain (~7 h):
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+  -m piano.training.train_predictor \
+  --config configs/training/predictor_v9_combined.yaml
+```
+
+Acceptance gates (vs v8.1.1):
+- foot recall ≥ 0.15 (FIX from 0)
+- topk3_mean_iou ≥ 0.25 (was 0.133)
+- contact macro_f1 ≥ 0.30 (foot fix lifts macro)
+- phase macro F1 ≥ 0.65 (logit_adjust lift)
+- support macro F1 ≥ 0.42 (logit_adjust lift)
+- foot L2 ≤ 25 cm (FIX from 40)
+
+After v9 passes: Stage B v8.1b InteractionTokenizer refactor → v18.
+
+Detail: `analyses/2026-05-03_v9_combined_design.md`.
+
+## Earlier State, 2026-05-05 (v8.1.1 prototype)
 
 **Active branch**: Stage A v8.1.1 — fixes 2 specific v8.1 issues
 identified at server eval. v8.1 validated both core hypotheses but

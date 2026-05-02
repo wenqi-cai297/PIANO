@@ -263,6 +263,40 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-03 **v9 combined prototype landed (22/22 tests pass)**.
+Three failure-mode-driven changes in one retrain, each frontier-paper
+grounded:
+
+| change | failure | citation | expected lift |
+|---|---|---|---|
+| (A) per-part contact pos_weight | foot recall 0 | DECO ICCV'23, HACO NeurIPS'25 | foot 0 → 0.20-0.40 |
+| (B) Mask3D-style 4-layer mask decoder | topk3_iou 0.13 plateau | InteractVLM CVPR'25 (DAMON 55→76 +20pp) | topk3_iou 0.13 → 0.30+ |
+| (C) Logit Adjustment for phase + support | already coded, never enabled | Menon ICLR'21 | +2-4 pp free |
+
+Loss bug discovered at v8.1.1 eval analysis: contact head was bare
+BCE with no pos_weight (focal_gamma in config only applied to
+phase/support). Foot positive rate 3% → BCE dominated 32:1 by negatives
+→ recall=0 across v6/v7-fix/v8/v8.1/v8.1.1 — ALL prior versions had
+this bug.
+
+Param: 26.9M → 34.7M (+28.8%). Trunk + ObjectEncoder unchanged
+(Heuken arXiv:2504.18355 ablation: PointNet++ > PT V3 by 8.7 mIoU on
+dense affordance).
+
+22/22 sanity tests pass. New tests caught 1 DDP bug at
+StructuredHead.part_queries (now guarded under target_attn_kind).
+
+Acceptance gates v9 (vs v8.1.1):
+- foot recall ≥ 0.15 (FIX from 0)
+- topk3_mean_iou ≥ 0.25
+- contact macro_f1 ≥ 0.30 (foot fix lifts macro)
+- phase macro F1 ≥ 0.65, support ≥ 0.42 (logit_adjust lift)
+- foot L2 ≤ 25 cm (FIX from 40+)
+
+Detail: `analyses/2026-05-03_v9_combined_design.md`.
+
+Pending: server v9 retrain (~7 h).
+
 2026-05-05 **v8.1 server retrain validated both core hypotheses;
 v8.1.1 prototype landed (18/18 tests pass) for foot regression + IoU
 metric fix.** Server eval results:

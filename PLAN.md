@@ -44,6 +44,24 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
    - Drop consistency loss (was ignored by optimizer)
    - Path B: drop xyz back-compat (Stage B v8.1b will consume mask)
    Detail: `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md`.
+2c-4. ✅ **v9 combined prototype LANDED** (22/22 tests pass).
+   Three failure-mode-driven changes:
+   - (A) class-balanced contact BCE (DECO ICCV'23, HACO NeurIPS'25)
+     fixes foot recall=0 LOSS BUG present since v6
+   - (B) Mask3D-style 4-layer mask decoder (InteractVLM CVPR'25
+     DAMON +20pp) fixes topk3_iou 0.13 plateau
+   - (C) Logit Adjustment on phase/support (already coded, never
+     enabled, Menon ICLR'21)
+   Param 26.9M → 34.7M (+28.8%). Trunk + ObjectEncoder unchanged.
+   Detail: `analyses/2026-05-03_v9_combined_design.md`.
+2c-5. 🟢 NEXT: **v9 server retrain (~7 h)**. Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v9_combined.yaml
+   ```
+   Acceptance: foot recall ≥ 0.15 (FIX), topk3_iou ≥ 0.25, contact
+   macro_f1 ≥ 0.30, phase ≥ 0.65, support ≥ 0.42, foot L2 ≤ 25 cm.
 2c-3a. ✅ Stage A v8.1a server retrain DONE. Both hypotheses validated:
    - phase F1 0.577 → 0.637 (TF gap fixed by MoMask mask)
    - target <5cm hit 4.5% → 11.6% (multi-hot binary works)
@@ -134,6 +152,17 @@ training data turns out too sparse: fall back to Option B moderate
 thresholds (hand 7 / foot 5 / pelvis 15 cm).
 
 Detail: [analyses/2026-05-03_pseudo_label_v12_strict_design.md](analyses/2026-05-03_pseudo_label_v12_strict_design.md).
+
+### Side-track: foot-recall=0 data-side intervention (2026-05-02 survey)
+
+If v8 / v8.1 retrain still leaves foot-head recall = 0 (and `hand_support`
+recall = 0) on v12_strict's ~3 % foot-positive prior, the highest-ROI
+single fix from the 2026-05-02 SOTA survey is **clip-level
+WeightedRandomSampler + class-balanced focal loss on the foot heads**
+(~50 LoC, 1 day, no new data). Detail and decision tree:
+[analyses/2026-05-02_hoi_data_aug_synthetic_transfer_survey.md](analyses/2026-05-02_hoi_data_aug_synthetic_transfer_survey.md).
+Synthetic seeding (NIFTY-style) and Sonata point-feature transfer are
+queued behind that.
 
 ## Earlier Priority (deprioritised by v12 work)
 

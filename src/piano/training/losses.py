@@ -135,6 +135,16 @@ class PredictorLoss(nn.Module):
         # v8.1 behaviour). K=3 is the v8.1.1 default — matches typical
         # palm-contact region size.
         target_topk_min_positives: int = 0,
+        # v9 (2026-05-03): per-part pos_weight for contact BCE. Fixes
+        # the "passive zero" pathology where foot contact (~3% positive
+        # rate) BCE is dominated 32:1 by negatives → model trivially
+        # predicts negative everywhere → recall = 0. DECO ICCV 2023 +
+        # HACO NeurIPS 2025 confirm class-balanced BCE beats focal for
+        # per-element binary contact. Pass shape (num_body_parts,);
+        # None disables. Computed at train start as
+        # ((1 - π_part) / π_part).clamp(max=cap) where π_part is the
+        # training-set positive rate for that body part.
+        contact_pos_weight: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -216,6 +226,16 @@ class PredictorLoss(nn.Module):
                 f"got {target_topk_min_positives}"
             )
         self.target_topk_min_positives = int(target_topk_min_positives)
+        # v9: contact pos_weight for class-balanced BCE.
+        if contact_pos_weight is not None:
+            if contact_pos_weight.ndim != 1:
+                raise ValueError(
+                    f"contact_pos_weight must be 1-D (num_body_parts,), "
+                    f"got shape {tuple(contact_pos_weight.shape)}"
+                )
+            self.register_buffer("contact_pos_weight", contact_pos_weight.float())
+        else:
+            self.contact_pos_weight = None  # type: ignore[assignment]
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -283,10 +303,26 @@ class PredictorLoss(nn.Module):
         -------
         Dictionary with individual losses and total.
         """
-        # Contact: BCE on soft labels
-        loss_contact = F.binary_cross_entropy_with_logits(
-            pred["contact_logits"], gt_contact, reduction="none",
-        )  # (B, T, 5)
+        # Contact: BCE on soft labels.
+        # v9: per-part pos_weight when ``contact_pos_weight`` is set.
+        # Fixes the foot recall = 0 pathology (foot positive rate ~3%
+        # → negatives 32× over positives → BCE collapses to "predict
+        # zero everywhere"). DECO ICCV'23 / HACO NeurIPS'25 convention.
+        contact_pw = getattr(self, "contact_pos_weight", None)
+        if contact_pw is not None:
+            # Broadcast: (num_body_parts,) → (1, 1, num_body_parts)
+            pw = contact_pw.view(1, 1, -1).to(
+                device=pred["contact_logits"].device,
+                dtype=pred["contact_logits"].dtype,
+            )
+            loss_contact = F.binary_cross_entropy_with_logits(
+                pred["contact_logits"], gt_contact,
+                reduction="none", pos_weight=pw,
+            )
+        else:
+            loss_contact = F.binary_cross_entropy_with_logits(
+                pred["contact_logits"], gt_contact, reduction="none",
+            )  # (B, T, 5)
 
         # Target loss: dispatch on target_loss_kind.
         # smooth_l1 path is the legacy v6/v7/v7-fix Huber regression.

@@ -641,6 +641,140 @@ def test_v811_topk_min_perfect_pred_gives_low_loss():
           f"(loss_max={loss.max():.2e})")
 
 
+def test_v9_mask_decoder_forward_shape():
+    """v9 Mask3D-style mask decoder produces (B, T, P, M) logits and
+    every parameter receives gradient (DDP-safe)."""
+    from piano.models.interaction_predictor import AffordanceMaskDecoder
+    B, T, M, d, P = 2, 8, 64, 192, 5
+    head = AffordanceMaskDecoder(
+        d_model=d, num_body_parts=P, num_layers=2, num_heads=6,
+        dim_feedforward=384, dropout=0.0,
+    )
+    head.train()
+    frame_q = torch.randn(B, T, d, requires_grad=True)
+    obj_tokens = torch.randn(B, M, d, requires_grad=True)
+    out = head(frame_q, obj_tokens)
+    assert out.shape == (B, T, P, M)
+    out.sum().backward()
+    no_grad = [n for n, p in head.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not no_grad, f"Mask decoder params w/o grad: {no_grad}"
+    print(f"[PASS] test_v9_mask_decoder_forward_shape (out={out.shape})")
+
+
+def test_v9_structured_head_with_mask_decoder():
+    """StructuredHead with target_attn_kind='mask_decoder' produces
+    contact_target_attn_logits and is DDP-safe."""
+    inp = _make_inputs(T=8, d_model=192)
+    head = StructuredHead(
+        d_model=192, num_body_parts=5, num_phases=3, num_support_states=4,
+        downstream_mode="mask",
+        target_attn_output="logits",
+        target_attn_kind="mask_decoder",
+        target_decoder_layers=2,
+        head_hidden=128,
+    )
+    head.train()
+    out = head(
+        x=torch.randn(2, 8, 192),
+        object_tokens=torch.randn(2, 64, 192),
+        object_xyz=torch.randn(2, 64, 3),
+        gt_contact=inp["gt_contact"],
+        gt_phase=inp["gt_phase"],
+    )
+    assert "contact_target_attn_logits" in out
+    assert out["contact_target_attn_logits"].shape == (2, 8, 5, 64)
+    # DDP regression: every head param receives grad
+    loss = out["contact_target_attn_logits"].sum() + out["contact_logits"].sum() \
+         + out["phase_logits"].sum() + out["support_logits"].sum()
+    loss.backward()
+    no_grad = [n for n, p in head.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not no_grad, f"v9 StructuredHead params w/o grad: {no_grad}"
+    print("[PASS] test_v9_structured_head_with_mask_decoder")
+
+
+def test_v9_contact_pos_weight_increases_positive_loss():
+    """v9 contact pos_weight=32 (foot-style) makes positive-class loss
+    much larger than the unweighted BCE — addresses the 'passive zero'
+    pathology."""
+    B, T, P = 4, 16, 5
+    # All-zero predictions, mixed GT — pos_weight should push the
+    # gradient on positives way up.
+    contact_logits = torch.zeros(B, T, P)  # sigmoid = 0.5
+    gt_contact = torch.zeros(B, T, P)
+    gt_contact[..., 2:4] = 1.0  # foot indices = positive
+    pred = {
+        "contact_logits": contact_logits,
+        "contact_target_attn_logits": torch.zeros(B, T, P, 64),
+        "phase_logits": torch.zeros(B, T, 3),
+        "support_logits": torch.zeros(B, T, 4),
+        "contact_state": torch.sigmoid(contact_logits),
+        "phase": torch.softmax(torch.zeros(B, T, 3), dim=-1),
+        "support": torch.softmax(torch.zeros(B, T, 4), dim=-1),
+    }
+    pos_weight = torch.tensor([1.0, 1.0, 32.0, 32.0, 1.0])  # foot 32×
+
+    loss_no_pw = PredictorLoss(
+        contact_weight=1.0, target_weight=0.0,
+        phase_weight=0.0, support_weight=0.0,
+        target_loss_kind="focal_dice",
+        target_topk_min_positives=3,
+        contact_pos_weight=None,
+    )
+    loss_with_pw = PredictorLoss(
+        contact_weight=1.0, target_weight=0.0,
+        phase_weight=0.0, support_weight=0.0,
+        target_loss_kind="focal_dice",
+        target_topk_min_positives=3,
+        contact_pos_weight=pos_weight,
+    )
+    common = dict(
+        gt_contact=gt_contact,
+        gt_target=torch.zeros(B, T, P, 3),
+        gt_phase=torch.zeros(B, T, dtype=torch.long),
+        gt_support=torch.zeros(B, T, dtype=torch.long),
+        mask=torch.ones(B, T, dtype=torch.bool),
+        object_xyz=torch.randn(B, 64, 3),
+    )
+    out_no = loss_no_pw(pred, **common)
+    out_pw = loss_with_pw(pred, **common)
+    # With pos_weight=32 on the positive class (foot), foot-positive
+    # frames contribute much more to BCE loss than without weighting.
+    assert out_pw["loss_contact"].item() > out_no["loss_contact"].item() * 1.5, \
+        f"pos_weight should significantly increase contact loss, " \
+        f"got no_pw={out_no['loss_contact']:.4f} vs pw={out_pw['loss_contact']:.4f}"
+    print(f"[PASS] test_v9_contact_pos_weight_increases_positive_loss "
+          f"(no_pw={out_no['loss_contact']:.4f}, pw={out_pw['loss_contact']:.4f})")
+
+
+def test_v9_config_yaml_end_to_end():
+    """predictor_v9_combined.yaml builds a predictor with mask decoder
+    + multi-hot binary GT + pos_weight pipeline and runs end-to-end."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v9_combined.yaml"
+    )
+    model_cfg = OmegaConf.load(repo_root / cfg.model.config)
+    sh_cfg = OmegaConf.merge(
+        model_cfg.get("structured_head", {}),
+        cfg.model.get("structured_head", {}),
+    )
+    assert bool(sh_cfg.get("enabled", False))
+    assert str(sh_cfg.get("downstream_mode")) == "mask"
+    assert str(sh_cfg.get("target_attn_output")) == "logits"
+    assert str(sh_cfg.get("target_attn_kind")) == "mask_decoder"
+    assert int(sh_cfg.get("target_decoder_layers")) >= 2
+    assert cfg.loss.target_loss_kind == "focal_dice"
+    assert int(cfg.loss.target_topk_min_positives) >= 1
+    assert bool(cfg.loss.use_contact_pos_weight) is True
+    assert bool(cfg.loss.use_logit_adjustment) is True
+    print("[PASS] test_v9_config_yaml_end_to_end")
+
+
 def test_v81_eval_build_models_propagates_flags():
     """Regression: scripts/stage_a_predictor/eval_predictor.py::_build_models
     must propagate v8.1 flags (downstream_mode + target_attn_output) to
@@ -697,5 +831,9 @@ if __name__ == "__main__":
     test_v81_config_yaml_end_to_end()
     test_v811_topk_min_positives_no_empty_mask()
     test_v811_topk_min_perfect_pred_gives_low_loss()
+    test_v9_mask_decoder_forward_shape()
+    test_v9_structured_head_with_mask_decoder()
+    test_v9_contact_pos_weight_increases_positive_loss()
+    test_v9_config_yaml_end_to_end()
     test_v81_eval_build_models_propagates_flags()
-    print("\nAll v8 + v8.1 + v8.1.1 sanity tests passed.")
+    print("\nAll v8 + v8.1 + v8.1.1 + v9 sanity tests passed.")

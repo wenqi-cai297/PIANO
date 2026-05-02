@@ -456,6 +456,10 @@ def run(config_path: str) -> None:
         structured_head_target_attn_output=str(
             sh_cfg.get("target_attn_output", "softmax")
         ),
+        # v9: target attention kind + decoder hyperparameters.
+        structured_head_target_attn_kind=str(sh_cfg.get("target_attn_kind", "single_layer")),
+        structured_head_target_decoder_layers=int(sh_cfg.get("target_decoder_layers", 4)),
+        structured_head_target_decoder_ffn=int(sh_cfg.get("target_decoder_ffn", 1024)),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,
@@ -497,19 +501,39 @@ def run(config_path: str) -> None:
     # 6400 clips × 196 frames). Only computed when enabled.
     logit_adjust_phase = None
     logit_adjust_support = None
-    if cfg.loss.get("use_logit_adjustment", False):
-        accelerator.print("Computing class priors for Logit Adjustment...")
-        phase_freq, support_freq = compute_class_priors(
+    contact_pos_weight: torch.Tensor | None = None
+    # v9: when either Logit Adjustment OR contact pos_weight is on,
+    # we need to scan the training set once to compute per-class
+    # frequencies. Do it once for both signals.
+    needs_priors = (
+        cfg.loss.get("use_logit_adjustment", False)
+        or cfg.loss.get("use_contact_pos_weight", False)
+    )
+    if needs_priors:
+        accelerator.print("Computing class priors (logit adjust + contact pos_weight)...")
+        phase_freq, support_freq, contact_part_freq = compute_class_priors(
             dataset,
             num_phases=model_cfg.output.num_phases,
             num_support=model_cfg.output.num_support_states,
+            num_body_parts=model_cfg.output.num_body_parts,
         )
-        accelerator.print(f"  phase freq:   {phase_freq.round(4).tolist()}")
-        accelerator.print(f"  support freq: {support_freq.round(4).tolist()}")
+        accelerator.print(f"  phase freq:        {phase_freq.round(4).tolist()}")
+        accelerator.print(f"  support freq:      {support_freq.round(4).tolist()}")
+        accelerator.print(f"  contact part rate: {contact_part_freq.round(4).tolist()}")
         # log(p + eps) so empty bins don't blow up to -inf
         eps = 1e-12
-        logit_adjust_phase = torch.log(torch.from_numpy(phase_freq) + eps)
-        logit_adjust_support = torch.log(torch.from_numpy(support_freq) + eps)
+        if cfg.loss.get("use_logit_adjustment", False):
+            logit_adjust_phase = torch.log(torch.from_numpy(phase_freq) + eps)
+            logit_adjust_support = torch.log(torch.from_numpy(support_freq) + eps)
+        if cfg.loss.get("use_contact_pos_weight", False):
+            cap = float(cfg.loss.get("contact_pos_weight_cap", 15.0))
+            # pos_weight = (1 - π) / π for each body part. Capped to
+            # avoid blow-up on near-zero priors (e.g., foot if data
+            # extraction failed).
+            part_freq_t = torch.from_numpy(contact_part_freq).float().clamp(min=eps)
+            pw = ((1.0 - part_freq_t) / part_freq_t).clamp(max=cap)
+            contact_pos_weight = pw
+            accelerator.print(f"  contact pos_weight: {pw.round(decimals=3).tolist()}  (cap={cap})")
 
     # Loss and priors. With Kendall multi-task weights enabled, the
     # static contact/target/phase/support weights are ignored and the
@@ -548,6 +572,8 @@ def run(config_path: str) -> None:
         target_topk_min_positives=int(cfg.loss.get(
             "target_topk_min_positives", 0,
         )),
+        # v9 contact pos_weight (None when use_contact_pos_weight=false).
+        contact_pos_weight=contact_pos_weight,
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(

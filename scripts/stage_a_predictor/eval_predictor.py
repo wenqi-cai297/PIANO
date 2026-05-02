@@ -228,6 +228,11 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
     # loss then fails on.
     sh_downstream = str(sh_cfg.get("downstream_mode", "tf"))
     sh_target_out = str(sh_cfg.get("target_attn_output", "softmax"))
+    # v9 (2026-05-03): mask decoder flags. Without these the eval rebuilds
+    # a v9 ckpt under v8 single-layer defaults and state_dict load fails.
+    sh_target_kind = str(sh_cfg.get("target_attn_kind", "single_layer"))
+    sh_target_layers = int(sh_cfg.get("target_decoder_layers", 4))
+    sh_target_ffn = int(sh_cfg.get("target_decoder_ffn", 1024))
 
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
@@ -248,6 +253,9 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         structured_head_attn_heads=sh_attn,
         structured_head_downstream_mode=sh_downstream,
         structured_head_target_attn_output=sh_target_out,
+        structured_head_target_attn_kind=sh_target_kind,
+        structured_head_target_decoder_layers=sh_target_layers,
+        structured_head_target_decoder_ffn=sh_target_ffn,
     ).to(device).eval()
 
     object_encoder = ObjectEncoder(
@@ -501,6 +509,11 @@ def run_eval(
         target_topk_min_positives=int(cfg.loss.get(
             "target_topk_min_positives", 0,
         )),
+        # v9: contact_pos_weight is computed at training time from
+        # the dataset; for eval-only we leave it None — eval losses
+        # are diagnostic, not used for backprop, and class weighting
+        # doesn't change predicted values.
+        contact_pos_weight=None,
     )
 
     # Accumulators

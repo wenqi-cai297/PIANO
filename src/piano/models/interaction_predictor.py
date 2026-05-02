@@ -283,6 +283,113 @@ class CrossAttentionWeightsOnly(nn.Module):
 
 
 # ============================================================================
+# v9 helper: Mask3D-style multi-layer mask decoder for affordance
+# ============================================================================
+#
+# v8.1.1 measured topk3_iou plateauing at 0.13 on hand/foot moving
+# contact, ~ 2.5× below SOTA HOI affordance F1 (~ 0.45 EgoChoir).
+# Diagnosis: a single Q/K-only cross-attn layer (CrossAttentionWeightsOnly)
+# does not have enough capacity to disambiguate adjacent tokens for
+# moving contact targets — pelvis (stationary) works because the target
+# is fixed; hand/foot (moving) need per-frame query refinement.
+#
+# Direct precedent: InteractVLM (Dwivedi et al., CVPR 2025,
+# arXiv:2504.05303) replaced DECO's single-layer body-part attention
+# with a SAM-style mask decoder + focal+L1 loss → DAMON contact F1
+# 55.0% → 75.6% (+20pp). Mask3D (Schult et al., ICRA 2023,
+# arXiv:2210.03105) is the architectural reference for query decoders
+# over point-cloud-derived tokens.
+#
+# This module: N TransformerDecoder layers (self-attn over per-frame
+# per-part queries → cross-attn to obj_tokens → FFN), then a final mask
+# logit via dot product Q·K^T between projected queries and projected
+# keys. Same Q/K-only output as v8.1 (no V projection / out_proj — still
+# DDP-safe, no unused params).
+
+class AffordanceMaskDecoder(nn.Module):
+    """v9 mask decoder: stacked decoder layers + dot-product mask output.
+
+    Parameters
+    ----------
+    d_model : int
+    num_body_parts : int
+    num_layers : decoder depth (4 by default — Mask3D uses 6, InteractVLM
+        uses 6; 4 is a budget-conscious choice for our 30M predictor).
+    num_heads : multi-head attention heads.
+    dim_feedforward : FFN hidden dim.
+    dropout : applies to FFN + self-attn dropout, NOT to the final
+        Q·K^T mask logit (keeps the affordance heatmap output clean).
+
+    Output shape: (B, T, P, M) raw logits. Caller applies sigmoid +
+    focal/dice loss (training) or sigmoid + threshold/top-K (eval).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_body_parts: int,
+        num_layers: int = 4,
+        num_heads: int = 6,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_body_parts = num_body_parts
+        # Per-body-part learnable query token (5 distinct queries).
+        self.part_queries = nn.Parameter(
+            torch.randn(num_body_parts, d_model) * 0.02
+        )
+        # Frame feature → query base (mixed with part query inside forward).
+        # Caller is expected to pass already-contact-emb-conditioned x
+        # via target_query_proj — see StructuredHead.
+        # Decoder stack: TransformerDecoderLayer = self-attn(q) +
+        # cross-attn(q, kv) + FFN. Pre-norm for training stability.
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        # Final mask projections. Project queries and keys into a
+        # shared mask space, then dot-product. Mask3D / InteractVLM
+        # pattern. d_model // 2 keeps the projections compact.
+        mask_dim = d_model // 2
+        self.q_mask_proj = nn.Linear(d_model, mask_dim)
+        self.k_mask_proj = nn.Linear(d_model, mask_dim)
+        self._mask_scale = 1.0 / math.sqrt(mask_dim)
+
+    def forward(
+        self,
+        frame_q: Tensor,        # (B, T, d_model) — query base from frame feature
+        object_tokens: Tensor,  # (B, M, d_model)
+    ) -> Tensor:
+        """Return (B, T, P, M) raw mask logits.
+
+        Caller is responsible for sigmoid + loss/threshold.
+        """
+        B, T, _ = frame_q.shape
+        M = object_tokens.shape[1]
+        P = self.num_body_parts
+        # Build per-(frame, part) queries: q[b, t, p] = frame_q[b, t] + part_q[p]
+        q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
+        q_flat = q.reshape(B, T * P, -1)                                 # (B, T*P, d)
+        # Decoder stack: queries refine across layers via self-attn +
+        # cross-attn to object features.
+        q_refined = self.decoder(q_flat, object_tokens)                  # (B, T*P, d)
+        # Mask projection + dot product
+        q_proj = self.q_mask_proj(q_refined)                             # (B, T*P, mask_dim)
+        k_proj = self.k_mask_proj(object_tokens)                          # (B, M, mask_dim)
+        # Logits: (B, T*P, mask_dim) @ (B, mask_dim, M) → (B, T*P, M)
+        logits = torch.bmm(q_proj, k_proj.transpose(1, 2)) * self._mask_scale
+        return logits.reshape(B, T, P, M)
+
+
+# ============================================================================
 # v8 StructuredHead — affordance-style target attention + DAG conditioning
 # ============================================================================
 #
@@ -346,6 +453,12 @@ class StructuredHead(nn.Module):
         # (NeurIPS 2024, arXiv:2405.13659) and Text2HOI (CVPR 2024,
         # arXiv:2404.00562) — HOI affordance literature consensus.
         target_attn_output: str = "softmax",  # "softmax" (v8) | "logits" (v8.1)
+        # v9 (2026-05-03): replace single Q/K cross-attn with a Mask3D-
+        # style multi-layer mask decoder. Direct precedent: InteractVLM
+        # CVPR 2025 +20pp on DAMON contact F1.
+        target_attn_kind: str = "single_layer",  # "single_layer" (v8/v8.1) | "mask_decoder" (v9)
+        target_decoder_layers: int = 4,
+        target_decoder_ffn: int = 1024,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -364,6 +477,17 @@ class StructuredHead(nn.Module):
                 f"got {target_attn_output!r}"
             )
         self.target_attn_output = target_attn_output
+        if target_attn_kind not in ("single_layer", "mask_decoder"):
+            raise ValueError(
+                f"target_attn_kind must be 'single_layer' or 'mask_decoder', "
+                f"got {target_attn_kind!r}"
+            )
+        if target_attn_kind == "mask_decoder" and target_attn_output != "logits":
+            raise ValueError(
+                "target_attn_kind='mask_decoder' must pair with "
+                "target_attn_output='logits' (sigmoid + multi-hot binary GT)."
+            )
+        self.target_attn_kind = target_attn_kind
 
         # ── Level 0: contact (base) ──────────────────────────────
         self.contact_head = nn.Sequential(
@@ -385,25 +509,39 @@ class StructuredHead(nn.Module):
         # path per part — fixes the v7-fix W1 "single Linear cant
         # span 5-part output" issue). Distinct queries per part so
         # each part attends differently to object tokens.
-        self.part_queries = nn.Parameter(
-            torch.randn(num_body_parts, d_model) * 0.02
-        )
-        # Frame feature + contact context → query base. The attention
-        # sums frame_q + part_query[p] for each (frame, part) cell.
+        #
+        # Owned by StructuredHead under target_attn_kind="single_layer";
+        # under "mask_decoder" the AffordanceMaskDecoder owns its own
+        # part_queries — declaring them here would leave them unused
+        # under DDP and trip the unused-parameter check at backward.
+        if target_attn_kind == "single_layer":
+            self.part_queries = nn.Parameter(
+                torch.randn(num_body_parts, d_model) * 0.02
+            )
+        # Frame feature + contact context → query base. Always defined
+        # (used by both single_layer and mask_decoder paths).
         self.target_query_proj = nn.Linear(d_model + d_emb, d_model)
-        # Cross-attention emitting only the attention map.
-        # ``CrossAttentionWeightsOnly`` skips the V/out_proj path that
-        # ``nn.MultiheadAttention`` would otherwise leave unused (which
-        # crashes DDP at backward — see the helper module's docstring).
-        # output="softmax" (v8): each query has a probability dist over
-        # keys, supervised by KL against soft Gaussian GT.
-        # output="logits" (v8.1): raw QK^T scores averaged across heads,
-        # converted to per-token sigmoid + supervised by focal+dice
-        # against multi-hot binary GT.
-        self.target_attn = CrossAttentionWeightsOnly(
-            d_model=d_model, num_heads=num_attn_heads,
-            output=target_attn_output,
-        )
+        # Target attention. Two implementations:
+        # - "single_layer" (v8, v8.1, v8.1.1): CrossAttentionWeightsOnly
+        #   — single Q/K-only attention. Output is (B, T*P, M)
+        #   {softmax | logits} via head-averaging.
+        # - "mask_decoder" (v9): AffordanceMaskDecoder — N-layer
+        #   TransformerDecoder (self-attn + cross-attn + FFN) followed
+        #   by Q·K^T mask projection. Mask3D / InteractVLM style.
+        if target_attn_kind == "single_layer":
+            self.target_attn = CrossAttentionWeightsOnly(
+                d_model=d_model, num_heads=num_attn_heads,
+                output=target_attn_output,
+            )
+        else:
+            self.target_attn = AffordanceMaskDecoder(
+                d_model=d_model,
+                num_body_parts=num_body_parts,
+                num_layers=target_decoder_layers,
+                num_heads=num_attn_heads,
+                dim_feedforward=target_decoder_ffn,
+                dropout=dropout,
+            )
 
         # ── Level 1b: phase (cond on contact) ────────────────────
         self.phase_head = nn.Sequential(
@@ -486,16 +624,17 @@ class StructuredHead(nn.Module):
         # frame_q encodes frame feature + contact context per (B, T)
         x_with_c = torch.cat([x, contact_emb], dim=-1)             # (B, T, d + d_emb)
         frame_q = self.target_query_proj(x_with_c)                 # (B, T, d)
-        # Broadcast: per-part query = frame_q + part_query[p]
-        # frame_q.unsqueeze(2): (B, T, 1, d); part_queries: (P, d)
-        q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
-        q_flat = q.reshape(B, T * P, -1)                            # (B, T*P, d)
-        # Q/K-only cross-attention. With target_attn_output="softmax"
-        # (v8 default) emits a probability distribution over keys; with
-        # "logits" (v8.1) emits raw scores for per-key sigmoid +
-        # multi-hot binary supervision.
-        target_attn_raw = self.target_attn(q_flat, object_tokens)   # (B, T*P, M)
-        target_attn_raw = target_attn_raw.reshape(B, T, P, M)       # (B, T, P, M)
+        if self.target_attn_kind == "single_layer":
+            # v8 / v8.1 path: per-(frame, part) query → single Q/K cross-attn.
+            q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
+            q_flat = q.reshape(B, T * P, -1)                                 # (B, T*P, d)
+            target_attn_raw = self.target_attn(q_flat, object_tokens)        # (B, T*P, M)
+            target_attn_raw = target_attn_raw.reshape(B, T, P, M)            # (B, T, P, M)
+        else:
+            # v9 path: AffordanceMaskDecoder builds queries internally
+            # (frame_q + part_query) and runs the N-layer decoder. Output
+            # is (B, T, P, M) raw logits.
+            target_attn_raw = self.target_attn(frame_q, object_tokens)
 
         out: dict[str, Tensor] = {
             "contact_logits": contact_logits,
@@ -647,6 +786,13 @@ class InteractionPredictor(nn.Module):
         # "logits" emits raw scores for sigmoid + multi-hot binary GT
         # supervision (EgoChoir / Text2HOI HOI affordance literature).
         structured_head_target_attn_output: str = "softmax",
+        # v9 (2026-05-03): "single_layer" preserves v8/v8.1 single
+        # Q/K cross-attn; "mask_decoder" replaces it with Mask3D-style
+        # multi-layer decoder (Schult ICRA 2023, Dwivedi CVPR 2025
+        # InteractVLM). Pairs with target_attn_output="logits".
+        structured_head_target_attn_kind: str = "single_layer",
+        structured_head_target_decoder_layers: int = 4,
+        structured_head_target_decoder_ffn: int = 1024,
         # Legacy alias: older configs pass ``num_object_patches=16``;
         # ignored since the target head is now an xyz regressor.
         num_object_patches: int | None = None,
@@ -723,6 +869,9 @@ class InteractionPredictor(nn.Module):
                 dropout=dropout,
                 downstream_mode=structured_head_downstream_mode,
                 target_attn_output=structured_head_target_attn_output,
+                target_attn_kind=structured_head_target_attn_kind,
+                target_decoder_layers=structured_head_target_decoder_layers,
+                target_decoder_ffn=structured_head_target_decoder_ffn,
             )
         else:
             self.contact_head = nn.Linear(d_model, num_body_parts)
