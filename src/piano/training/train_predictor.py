@@ -406,7 +406,17 @@ def run(config_path: str) -> None:
 
     # Models
     tr_cfg = model_cfg.get("temporal_refine", {})
-    sh_cfg = model_cfg.get("structured_head", {})
+    # structured_head: model file holds the defaults; training yaml's
+    # ``cfg.model.structured_head`` block overrides per-key. This is
+    # what enables `predictor_v8_structured.yaml` to flip the flag on
+    # without editing the shared model file.
+    sh_cfg = OmegaConf.merge(
+        model_cfg.get("structured_head", {}),
+        cfg.model.get("structured_head", {}),
+    )
+    accelerator.print(
+        f"[predictor cfg] structured_head.enabled = {bool(sh_cfg.get('enabled', False))}"
+    )
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -603,10 +613,11 @@ def run(config_path: str) -> None:
     # only when structured_head is on AND a schedule block is provided.
     tf_schedule = None
     epochs_per_step = None
-    if bool(model_cfg.get("structured_head", {}).get("enabled", False)):
+    if bool(sh_cfg.get("enabled", False)):
         tf_block = cfg.training.get("teacher_forcing", None)
         if tf_block is not None:
-            tf_schedule = dict(tf_block) if not isinstance(tf_block, dict) else tf_block
+            tf_schedule = OmegaConf.to_container(tf_block, resolve=True) \
+                if hasattr(tf_block, "_content") else dict(tf_block)
             steps_per_epoch = max(1, len(dataloader) //
                                   max(1, int(cfg.training.get("gradient_accumulation_steps", 1))))
             epochs_per_step = 1.0 / float(steps_per_epoch)

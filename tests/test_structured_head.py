@@ -304,6 +304,90 @@ def test_object_encoder_return_xyz():
     print("[PASS] test_object_encoder_return_xyz")
 
 
+# --------------------------------------------------------------------------
+# Test 9: End-to-end yaml load → predictor → loss compatibility
+# --------------------------------------------------------------------------
+#
+# Regression test for the bug where ``structured_head`` was only read
+# from the model yaml file (default off), ignoring the training yaml's
+# override. Caught at server training start with ValueError on first
+# batch: predictor produced no ``contact_target_attn`` because it was
+# built with structured_head=False, but loss expected one because
+# target_loss_kind=kl_div was correctly read from the training yaml.
+
+def test_v8_config_yaml_end_to_end_compat():
+    """Loading predictor_v8_structured.yaml must produce a predictor
+    that emits contact_target_attn AND a loss configured for kl_div."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v8_structured.yaml"
+    )
+    model_cfg = OmegaConf.load(repo_root / cfg.model.config)
+    sh_cfg = OmegaConf.merge(
+        model_cfg.get("structured_head", {}),
+        cfg.model.get("structured_head", {}),
+    )
+    sh_enabled = bool(sh_cfg.get("enabled", False))
+    assert sh_enabled, \
+        "predictor_v8_structured.yaml must enable structured_head; got False"
+
+    # Build the loss with the same args train_predictor.py uses.
+    crit = PredictorLoss(
+        contact_weight=cfg.loss.contact_weight,
+        target_weight=cfg.loss.target_weight,
+        phase_weight=cfg.loss.phase_weight,
+        support_weight=cfg.loss.support_weight,
+        target_loss_kind=cfg.loss.get("target_loss_kind", "smooth_l1"),
+        target_kernel_sigma=float(cfg.loss.get("target_kernel_sigma", 0.08)),
+        consistency_weight=float(cfg.loss.get("consistency_weight", 0.0)),
+    )
+    assert crit.target_loss_kind == "kl_div", \
+        f"v8 yaml must request kl_div loss; got {crit.target_loss_kind!r}"
+
+    # Build the predictor with the merged config (matches train_predictor.py).
+    pred_model = InteractionPredictor(
+        d_model=int(model_cfg.encoder.d_model),
+        num_layers=2,  # smaller for unit-test speed
+        num_heads=int(model_cfg.encoder.num_heads),
+        dim_feedforward=int(model_cfg.encoder.dim_feedforward),
+        max_seq_length=8,
+        num_body_parts=int(model_cfg.output.num_body_parts),
+        num_phases=int(model_cfg.output.num_phases),
+        num_support_states=int(model_cfg.output.num_support_states),
+        structured_head=sh_enabled,
+        structured_head_d_emb=int(sh_cfg.get("d_emb", 64)),
+        structured_head_hidden=int(sh_cfg.get("hidden", 256)),
+        structured_head_attn_heads=int(sh_cfg.get("attn_heads", 6)),
+    )
+    pred_model.train()
+    inp = _make_inputs(T=8, d_model=int(model_cfg.encoder.d_model))
+    out = pred_model(
+        inp["text_tokens"], inp["object_tokens"], inp["init_pose"],
+        seq_length=8, object_xyz=inp["object_xyz"],
+        gt_contact=inp["gt_contact"], gt_phase=inp["gt_phase"],
+        teacher_forcing=False,
+    )
+    # Predictor must emit attn so the loss can compute KL.
+    assert "contact_target_attn" in out, \
+        "v8 yaml's structured_head=True must produce contact_target_attn"
+
+    # Full loss compute — this is the path that crashed at server startup.
+    loss_dict = crit(
+        out,
+        gt_contact=inp["gt_contact"],
+        gt_target=inp["gt_target"],
+        gt_phase=inp["gt_phase"].long(),
+        gt_support=inp["gt_support"].long(),
+        mask=torch.ones(2, 8, dtype=torch.bool),
+        object_xyz=inp["object_xyz"],
+    )
+    assert torch.isfinite(loss_dict["loss"])
+    print("[PASS] test_v8_config_yaml_end_to_end_compat")
+
+
 if __name__ == "__main__":
     test_structured_head_forward_shape()
     test_predictor_legacy_forward_unchanged()
@@ -314,4 +398,5 @@ if __name__ == "__main__":
     test_full_v8_loss_backward()
     test_v7fix_legacy_loss_unchanged()
     test_object_encoder_return_xyz()
+    test_v8_config_yaml_end_to_end_compat()
     print("\nAll v8 sanity tests passed.")
