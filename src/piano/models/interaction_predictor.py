@@ -215,6 +215,54 @@ class TemporalRefineBlock(nn.Module):
 
 
 # ============================================================================
+# v8 helper: cross-attention that returns ONLY the attention weights
+# ============================================================================
+#
+# `nn.MultiheadAttention` always computes V × output_projection even when
+# the caller only consumes ``attn_weights`` from ``need_weights=True``.
+# Under DDP, that leaves V's ``out_proj.weight`` and ``out_proj.bias``
+# without gradients, which trips ``find_unused_parameters`` and crashes
+# at the first backward step. The legacy fix is to set
+# ``find_unused_parameters=True``, but that adds DDP comms overhead and
+# masks future bugs of this class.
+#
+# Cleaner: a Q/K-only attention module. We emit the multi-head softmax
+# weights averaged across heads and skip the V path entirely. No wasted
+# compute, no unused params, no DDP find-unused workaround needed.
+
+class CrossAttentionWeightsOnly(nn.Module):
+    """Multi-head cross-attention emitting only the (averaged) attention map.
+
+    Output shape (B, Lq, Lk). No value projection, no output projection
+    — the affordance head consumes the soft distribution over keys
+    directly as its prediction.
+    """
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self._scale = 1.0 / math.sqrt(self.head_dim)
+
+    def forward(self, q: Tensor, k: Tensor) -> Tensor:
+        """Compute (B, Lq, Lk) attention weights, averaged across heads."""
+        B, Lq, _ = q.shape
+        Lk = k.shape[1]
+        q = self.q_proj(q).reshape(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(k).reshape(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+        # (B, h, Lq, Lk)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self._scale
+        attn = torch.softmax(scores, dim=-1)
+        return attn.mean(dim=1)
+
+
+# ============================================================================
 # v8 StructuredHead — affordance-style target attention + DAG conditioning
 # ============================================================================
 #
@@ -299,19 +347,15 @@ class StructuredHead(nn.Module):
         # Frame feature + contact context → query base. The attention
         # sums frame_q + part_query[p] for each (frame, part) cell.
         self.target_query_proj = nn.Linear(d_model + d_emb, d_model)
-        # Cross-attention over object tokens. need_weights=True at
-        # forward time to expose the attention map as the affordance
-        # output — the soft distribution over 128 tokens *is* the
-        # primary v8 target prediction.
-        #
-        # dropout=0 here is critical: torch's MultiheadAttention applies
-        # dropout to the post-softmax attention weights, then returns
-        # those (rescaled) weights via need_weights. With dropout > 0
-        # the returned weights no longer sum to 1, which breaks the
-        # KL-divergence loss formulation. The MLP heads carry the
-        # regularisation budget for v8 instead.
-        self.target_attn = nn.MultiheadAttention(
-            d_model, num_attn_heads, dropout=0.0, batch_first=True,
+        # Cross-attention emitting only the attention map.
+        # ``CrossAttentionWeightsOnly`` skips the V/out_proj path that
+        # ``nn.MultiheadAttention`` would otherwise leave unused (which
+        # crashes DDP at backward — see the helper module's docstring).
+        # Also: nothing to dropout here. The attention map IS the
+        # output; dropping it post-softmax would denormalise the
+        # probability distribution and break the KL loss.
+        self.target_attn = CrossAttentionWeightsOnly(
+            d_model=d_model, num_heads=num_attn_heads,
         )
 
         # ── Level 1b: phase (cond on contact) ────────────────────
@@ -399,14 +443,11 @@ class StructuredHead(nn.Module):
         # frame_q.unsqueeze(2): (B, T, 1, d); part_queries: (P, d)
         q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
         q_flat = q.reshape(B, T * P, -1)                            # (B, T*P, d)
-        # Cross-attention. average_attn_weights=False to expose per-head
-        # weights, then mean across heads to get a single affordance map.
-        _, attn_weights = self.target_attn(
-            q_flat, object_tokens, object_tokens,
-            need_weights=True, average_attn_weights=False,
-        )
-        # attn_weights: (B, num_attn_heads, T*P, M) → mean across heads → (B, T*P, M)
-        target_attn = attn_weights.mean(dim=1).reshape(B, T, P, M)  # (B, T, P, M)
+        # Q/K-only cross-attention; emits the head-averaged softmax map
+        # directly as the affordance heatmap. No V projection means no
+        # unused parameters under DDP.
+        target_attn = self.target_attn(q_flat, object_tokens)       # (B, T*P, M)
+        target_attn = target_attn.reshape(B, T, P, M)               # (B, T, P, M)
 
         # Back-compat xyz output: attention-weighted centroid positions.
         # (B, T, P, M) @ (B, M, 3) → (B, T, P, 3)

@@ -242,8 +242,18 @@ def test_full_v8_loss_backward():
     total.backward()
     # Spot-check: at least the structured head's parameters got grads
     assert pred_model.head.contact_head[0].weight.grad is not None
-    assert pred_model.head.target_attn.in_proj_weight.grad is not None
+    assert pred_model.head.target_attn.q_proj.weight.grad is not None
+    assert pred_model.head.target_attn.k_proj.weight.grad is not None
     assert pred_model.head.support_head[0].weight.grad is not None
+    # DDP regression: every StructuredHead parameter must receive grad
+    # under teacher_forcing=True. Catches the v8.1 bug where MHA's
+    # out_proj path was unused.
+    head_params_no_grad = [
+        n for n, p in pred_model.head.named_parameters()
+        if p.requires_grad and p.grad is None
+    ]
+    assert not head_params_no_grad, \
+        f"StructuredHead params without grad (DDP-fatal): {head_params_no_grad}"
     print(f"[PASS] test_full_v8_loss_backward "
           f"(loss={total.item():.4f}, "
           f"loss_target={loss_dict['loss_target'].item():.4f}, "
