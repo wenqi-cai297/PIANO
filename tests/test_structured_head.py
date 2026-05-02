@@ -581,6 +581,44 @@ def test_v81_config_yaml_end_to_end():
     print("[PASS] test_v81_config_yaml_end_to_end")
 
 
+def test_v81_eval_build_models_propagates_flags():
+    """Regression: scripts/stage_a_predictor/eval_predictor.py::_build_models
+    must propagate v8.1 flags (downstream_mode + target_attn_output) to
+    the rebuilt predictor. Otherwise a v8.1-trained ckpt loads under v8
+    defaults, predictor doesn't emit contact_target_attn_logits, and
+    the focal_dice loss crashes at the first val batch.
+
+    This is the symmetric fix to train_predictor.py:411 where the same
+    bug was caught for training.
+    """
+    import sys
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root / "scripts" / "stage_a_predictor"))
+    # Defer import to avoid heavy deps unless this test runs
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_eval_predictor_test", repo_root / "scripts/stage_a_predictor/eval_predictor.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v8_1_masked.yaml"
+    )
+    device = torch.device("cpu")
+    predictor, _ = mod._build_models(cfg, device)
+    head = getattr(predictor, "head", None)
+    assert head is not None, "structured_head must be built"
+    assert head.downstream_mode == "mask", \
+        f"v8.1 ckpt should rebuild with mask downstream, got {head.downstream_mode!r}"
+    assert head.target_attn_output == "logits", \
+        f"v8.1 ckpt should rebuild with logits output, got {head.target_attn_output!r}"
+    print("[PASS] test_v81_eval_build_models_propagates_flags")
+
+
 if __name__ == "__main__":
     test_structured_head_forward_shape()
     test_predictor_legacy_forward_unchanged()
@@ -597,4 +635,5 @@ if __name__ == "__main__":
     test_v81_focal_dice_target_loss()
     test_v81_full_loss_backward_no_unused_params()
     test_v81_config_yaml_end_to_end()
+    test_v81_eval_build_models_propagates_flags()
     print("\nAll v8 + v8.1 sanity tests passed.")

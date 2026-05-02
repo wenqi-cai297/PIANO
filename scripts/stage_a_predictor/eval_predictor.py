@@ -210,19 +210,24 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
     # Train-time structured_head config can be overridden in the
     # training yaml's ``model.structured_head`` block; eval honours
     # that override so checkpoints trained with structured heads load
-    # correctly.
-    sh_train = cfg.model.get("structured_head", None)
-    sh_model = model_cfg.get("structured_head", {})
-    if sh_train is not None:
-        sh_enabled = bool(sh_train.get("enabled", sh_model.get("enabled", False)))
-        sh_demb = int(sh_train.get("d_emb", sh_model.get("d_emb", 64)))
-        sh_hidden = int(sh_train.get("hidden", sh_model.get("hidden", 256)))
-        sh_attn = int(sh_train.get("attn_heads", sh_model.get("attn_heads", 6)))
-    else:
-        sh_enabled = bool(sh_model.get("enabled", False))
-        sh_demb = int(sh_model.get("d_emb", 64))
-        sh_hidden = int(sh_model.get("hidden", 256))
-        sh_attn = int(sh_model.get("attn_heads", 6))
+    # correctly. Merge takes the model yaml as defaults and the
+    # training yaml as per-key overrides — same pattern as
+    # train_predictor.py:411.
+    sh_cfg = OmegaConf.merge(
+        model_cfg.get("structured_head", {}),
+        cfg.model.get("structured_head", {}),
+    )
+    sh_enabled = bool(sh_cfg.get("enabled", False))
+    sh_demb = int(sh_cfg.get("d_emb", 64))
+    sh_hidden = int(sh_cfg.get("hidden", 256))
+    sh_attn = int(sh_cfg.get("attn_heads", 6))
+    # v8.1 flags must reach the predictor at eval time too — without
+    # these, a v8.1-trained ckpt rebuilds with v8 defaults
+    # (downstream_mode="tf", target_attn_output="softmax") and the
+    # forward path doesn't emit contact_target_attn_logits, which the
+    # loss then fails on.
+    sh_downstream = str(sh_cfg.get("downstream_mode", "tf"))
+    sh_target_out = str(sh_cfg.get("target_attn_output", "softmax"))
 
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
@@ -241,6 +246,8 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         structured_head_d_emb=sh_demb,
         structured_head_hidden=sh_hidden,
         structured_head_attn_heads=sh_attn,
+        structured_head_downstream_mode=sh_downstream,
+        structured_head_target_attn_output=sh_target_out,
     ).to(device).eval()
 
     object_encoder = ObjectEncoder(
