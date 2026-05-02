@@ -17,10 +17,8 @@ wandb/
 # Backbone repos (cloned, not tracked — clone on each machine)
 src/piano/models/backbones/momask/
 
-# Personal workflow helpers — kept locally, not part of the repo
-RESTART_PROMPT.md
-SUGGESTION.md
-ANALYSIS.md
-PLAN.md
-PROGRESS.md
-SPEC.md
+# Project-memory / planning / analyses .md files: kept locally, not
+# part of the remote repo. Only README.md (at any depth) is tracked.
+*.md
+!README.md
+!**/README.md

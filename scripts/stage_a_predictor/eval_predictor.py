@@ -467,6 +467,7 @@ def run_eval(
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    mask_joints: bool = False,
 ) -> dict:
     # Data
     dataset, splits_map, split_info = _build_eval_dataset(cfg, split)
@@ -588,6 +589,23 @@ def run_eval(
         # construction. Detect via the predictor flag.
         use_structured = bool(getattr(predictor, "structured_head", False))
 
+        # v9.2 motion-aware trunk: when the predictor has the joint-stream
+        # branch enabled, feed it the per-frame joints we already have on
+        # the batch. Pre-2026-05-04 eval forgot to pass these → predictor
+        # always fell into the all-mask branch (a learned constant
+        # intercept), making "motion-aware trunk" a no-op at eval.
+        #
+        # ``--mask-joints`` reproduces the old behaviour explicitly — use
+        # it to measure the Stage-B-equivalent inference path (where
+        # joints don't yet exist because generator hasn't run). Default
+        # (False) gives the upper-bound run that exposes whether the
+        # trunk would have helped if joints were available at inference.
+        # Together the two runs let us tell apart "trunk learned to use
+        # joints but eval can't expose it" from "trunk fundamentally
+        # didn't learn anything useful".
+        use_motion_aware = bool(getattr(predictor, "motion_aware_trunk", False))
+        pass_joints_this_step = use_motion_aware and not mask_joints
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             text_features, text_mask = encode_text_per_token(
                 clip_model, batch["text"], device,
@@ -600,17 +618,20 @@ def run_eval(
             B = batch["joints"].shape[0]
             init_pose = batch["joints"][:, 0, :, :].reshape(B, -1)
             max_T = batch["motion"].shape[1]
+            joints_per_frame = batch["joints"] if pass_joints_this_step else None
             if use_structured:
                 pred = predictor(
                     text_features, obj_tokens, init_pose,
                     seq_length=max_T, text_key_padding_mask=text_mask,
                     object_xyz=obj_xyz,
                     teacher_forcing=False,  # eval = no TF
+                    joints_per_frame=joints_per_frame,
                 )
             else:
                 pred = predictor(
                     text_features, obj_tokens, init_pose,
                     seq_length=max_T, text_key_padding_mask=text_mask,
+                    joints_per_frame=joints_per_frame,
                 )
 
         seq_len = batch["seq_len"]
@@ -1003,6 +1024,16 @@ def run_eval(
             "num_objects_used": split_info["num_objects_used"],
         })
 
+    # v9.2 motion-aware run mode: only meaningful when the predictor was
+    # built with motion_aware_trunk=True. Recorded so downstream readers
+    # of the JSON can tell whether topk_iou reflects the with-joints
+    # upper bound or the all-mask Stage-B-equivalent path.
+    motion_aware_enabled = bool(getattr(predictor, "motion_aware_trunk", False))
+    if motion_aware_enabled:
+        eval_motion_mode = "all_mask" if mask_joints else "joints_per_frame"
+    else:
+        eval_motion_mode = "n/a"
+
     report = {
         "checkpoint": str(ckpt_path),
         "epoch": meta["epoch"],
@@ -1012,6 +1043,7 @@ def run_eval(
         "num_clips": total_clips,
         "num_valid_frames": total_valid_frames,
         "eval_time_sec": round(elapsed, 1),
+        "eval_motion_mode": eval_motion_mode,
 
         "loss": loss_mean,
 
@@ -1178,6 +1210,17 @@ def main() -> int:
         "--output", type=Path, default=None,
         help="JSON output path (default: <ckpt>.eval_<split>.json)",
     )
+    parser.add_argument(
+        "--mask-joints", action="store_true",
+        help=(
+            "Force the motion-aware trunk into the all-mask branch even "
+            "when joints are available. Use to measure the Stage-B-"
+            "equivalent inference path (where the generator hasn't run "
+            "yet, so per-frame joints don't exist). Default off = pass "
+            "joints when motion_aware_trunk is on (upper-bound run). "
+            "No effect on predictors built without motion_aware_trunk."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.config.exists():
@@ -1203,6 +1246,7 @@ def main() -> int:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         device=device,
+        mask_joints=args.mask_joints,
     )
     _print_report(report)
 

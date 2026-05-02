@@ -450,6 +450,27 @@ def run(config_path: str) -> None:
     accelerator.print(
         f"[predictor cfg] structured_head.enabled = {bool(sh_cfg.get('enabled', False))}"
     )
+    # v9.2: motion-aware trunk + ASL contact loss activation log.
+    # Resolved here (not later) so a quick startup-log scan tells you
+    # which v9.x branch is actually running before the slow data-loading
+    # banner. Mirrors the PLAN.md "Startup log must show" checklist.
+    motion_cfg_merged = OmegaConf.merge(
+        model_cfg.get("motion_aware_trunk", {}),
+        cfg.model.get("motion_aware_trunk", {}),
+    )
+    accelerator.print(
+        f"[predictor cfg] motion_aware_trunk.enabled = "
+        f"{bool(motion_cfg_merged.get('enabled', False))} "
+        f"(joint_input_dim={int(motion_cfg_merged.get('joint_input_dim', 66))})"
+    )
+    accelerator.print(
+        f"[predictor cfg] contact_loss_kind = "
+        f"{str(cfg.loss.get('contact_loss_kind', 'bce'))} "
+        f"(asl_gamma_pos={float(cfg.loss.get('contact_asl_gamma_pos', 0.0))}, "
+        f"asl_gamma_neg={float(cfg.loss.get('contact_asl_gamma_neg', 4.0))}, "
+        f"asl_prob_shift={float(cfg.loss.get('contact_asl_prob_shift', 0.05))}, "
+        f"use_contact_pos_weight={bool(cfg.loss.get('use_contact_pos_weight', False))})"
+    )
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -481,15 +502,10 @@ def run(config_path: str) -> None:
         structured_head_target_attn_kind=str(sh_cfg.get("target_attn_kind", "single_layer")),
         structured_head_target_decoder_layers=int(sh_cfg.get("target_decoder_layers", 4)),
         structured_head_target_decoder_ffn=int(sh_cfg.get("target_decoder_ffn", 1024)),
-        # v9.2: motion-aware trunk + random masking.
-        motion_aware_trunk=bool(model_cfg.get("motion_aware_trunk", {}).get(
-            "enabled",
-            cfg.model.get("motion_aware_trunk", {}).get("enabled", False),
-        )),
-        motion_input_dim=int(model_cfg.get("motion_aware_trunk", {}).get(
-            "joint_input_dim",
-            cfg.model.get("motion_aware_trunk", {}).get("joint_input_dim", 66),
-        )),
+        # v9.2: motion-aware trunk + random masking. Merge model defaults
+        # with training-yaml overrides (same pattern as structured_head).
+        motion_aware_trunk=bool(motion_cfg_merged.get("enabled", False)),
+        motion_input_dim=int(motion_cfg_merged.get("joint_input_dim", 66)),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,

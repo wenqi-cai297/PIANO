@@ -1,0 +1,145 @@
+# Stage A v9.3: ASL γ_pos=1 sanity check on top of v9.1 baseline.
+#
+# v9.2 (ASL with γ_pos=0, MS-COCO defaults) collapsed foot prediction:
+# left_foot tp=1/3220 at best ckpt, both feet tp=0 at final
+# (analyses/2026-05-04_v92_results.md). Diagnosis: with γ_pos=0
+# positives reduce to plain BCE (no boost) while prob_shift=0.05
+# zeros out the negative loss for any prediction ≤ 0.05; for our
+# extreme imbalance + small absolute positive count (foot ~3000 in
+# val, ~20000 in train), "predict zero everywhere" becomes the
+# easiest local optimum.
+#
+# v9.3 = v9.1 baseline + ONE knob change: contact loss BCE+pos_weight
+# → ASL with γ_pos=1.0 (rest of ASL params from paper standard).
+# Goal: cheap sanity check on whether ASL framework itself is the
+# right tool for our regime — γ_pos=1 mirrors the ASL paper Table 4
+# settings on extreme-imbalance datasets like NUS-WIDE
+# (Ben-Baruch et al. ICCV 2021, arXiv:2009.14119).
+#
+# Motion-aware trunk REMOVED to isolate the contact-loss change.
+# v9.2 motion-aware trunk failure (zero topk_iou movement) was an
+# orthogonal eval-time issue (see eval_predictor.py --mask-joints
+# flag), not coupled to contact loss. Keeping it disabled here so
+# v9.3 metrics attribute cleanly to ASL γ_pos.
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~7 h.
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  output:
+    num_support_states: 3
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+    target_attn_kind: "mask_decoder"
+    target_decoder_layers: 4
+    target_decoder_ffn: 1024
+  # v9.3: motion-aware trunk OFF (see header note).
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  support_collapse_hand_support: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+  target_topk_min_positives: 3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+
+  # v9.3 (single knob change vs v9.1): replace contact BCE+pos_weight
+  # with ASL γ_pos=1. Rationale in header. γ_pos=1 gives positives
+  # a focal-up factor (1 - p)^1 symmetric to negatives' (1 - p)^4
+  # down-weighting → preserves positive gradient for rare classes.
+  contact_loss_kind: "asl"
+  contact_asl_gamma_pos: 1.0      # ↑ from v9.2's 0.0 — preserves rare-class positive gradient
+  contact_asl_gamma_neg: 4.0      # paper standard
+  contact_asl_prob_shift: 0.05    # paper standard
+  use_contact_pos_weight: false   # ASL handles imbalance; pos_weight off
+
+  use_logit_adjustment: true
+  logit_adjust_tau: 0.3
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v9_3_asl_gamma_pos"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v9_3_asl_gamma_pos"
