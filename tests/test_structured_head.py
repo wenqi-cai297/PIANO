@@ -1097,6 +1097,180 @@ def test_v81_eval_build_models_propagates_flags():
     print("[PASS] test_v81_eval_build_models_propagates_flags")
 
 
+# --------------------------------------------------------------------------
+# v9.4 tests — Phase 0 architectural optimization for contact_target_attn
+# (positional encoding + aux xyz L2 loss)
+# --------------------------------------------------------------------------
+
+def test_v94_positional_encoding_3d_shape_and_periodicity():
+    """PositionalEncoding3D maps (B, M, 3) → (B, M, d_model). Verify
+    output shape and that two distinct xyz produce different
+    embeddings (sanity that PE encodes position, not constant)."""
+    from piano.models.interaction_predictor import PositionalEncoding3D
+
+    pe = PositionalEncoding3D(d_model=384, num_frequencies=6, coord_scale=1.0)
+    xyz_a = torch.randn(2, 128, 3) * 0.5
+    xyz_b = torch.randn(2, 128, 3) * 0.5
+    emb_a = pe(xyz_a)
+    emb_b = pe(xyz_b)
+    assert emb_a.shape == (2, 128, 384), emb_a.shape
+    assert emb_b.shape == (2, 128, 384), emb_b.shape
+    # Different positions should give different embeddings (with very
+    # high probability — xyz are random, not identical)
+    diff = (emb_a - emb_b).abs().mean().item()
+    assert diff > 1e-3, f"PE should distinguish positions, got mean diff {diff}"
+    # Same position should give identical embedding (deterministic)
+    same = pe(xyz_a)
+    assert torch.allclose(emb_a, same), "PE must be deterministic"
+    print("[PASS] test_v94_positional_encoding_3d_shape_and_periodicity")
+
+
+def test_v94_mask_decoder_with_pe_shape_and_uses_xyz():
+    """AffordanceMaskDecoder with use_positional_encoding=True must:
+    1. accept object_xyz; 2. produce same output shape as without PE;
+    3. produce DIFFERENT logits when xyz changes (proves PE is used)."""
+    from piano.models.interaction_predictor import AffordanceMaskDecoder
+
+    torch.manual_seed(42)
+    B, T, M, d, P = 2, 8, 128, 384, 5
+    decoder = AffordanceMaskDecoder(
+        d_model=d, num_body_parts=P, num_layers=2, num_heads=6,
+        dim_feedforward=512, dropout=0.0,
+        use_positional_encoding=True, num_pe_frequencies=6,
+    ).eval()
+    frame_q = torch.randn(B, T, d)
+    object_tokens = torch.randn(B, M, d)
+    xyz_a = torch.randn(B, M, 3) * 0.5
+    xyz_b = xyz_a + 1.0  # shift positions by 1m
+
+    with torch.no_grad():
+        logits_a = decoder(frame_q, object_tokens, object_xyz=xyz_a)
+        logits_b = decoder(frame_q, object_tokens, object_xyz=xyz_b)
+    assert logits_a.shape == (B, T, P, M), logits_a.shape
+    diff = (logits_a - logits_b).abs().mean().item()
+    assert diff > 1e-3, (
+        f"PE-enabled decoder should produce different logits when xyz "
+        f"changes; got mean diff {diff}"
+    )
+    print("[PASS] test_v94_mask_decoder_with_pe_shape_and_uses_xyz")
+
+
+def test_v94_mask_decoder_pe_requires_xyz():
+    """Decoder built with use_positional_encoding=True must raise
+    when object_xyz is not passed."""
+    from piano.models.interaction_predictor import AffordanceMaskDecoder
+
+    decoder = AffordanceMaskDecoder(
+        d_model=384, num_body_parts=5, num_layers=2,
+        use_positional_encoding=True,
+    )
+    frame_q = torch.randn(2, 4, 384)
+    object_tokens = torch.randn(2, 128, 384)
+    try:
+        _ = decoder(frame_q, object_tokens, object_xyz=None)
+    except ValueError as e:
+        assert "object_xyz" in str(e), str(e)
+        print("[PASS] test_v94_mask_decoder_pe_requires_xyz")
+        return
+    raise AssertionError("decoder should have raised on missing object_xyz")
+
+
+def test_v94_aux_xyz_loss_adds_spatial_gradient():
+    """When target_aux_xyz_weight > 0 under focal_dice, the aux term
+    should fire and the total target loss should be > pure focal+dice
+    when prediction xyz is far from gt_target. Crucially, gradient
+    w.r.t. logits must be non-trivially informed by gt_target."""
+    torch.manual_seed(0)
+    B, T, P, M = 2, 4, 5, 128
+    object_xyz = torch.randn(B, M, 3) * 0.5
+    gt_xyz = torch.randn(B, T, P, 3) * 0.3
+    pred_logits = torch.randn(B, T, P, M, requires_grad=True)
+    pred = {"contact_target_attn_logits": pred_logits}
+    gt_contact = torch.ones(B, T, P)  # full contact so target loss fires
+    gt_phase = torch.zeros(B, T, dtype=torch.long)
+    gt_support = torch.zeros(B, T, dtype=torch.long)
+    pred["phase_logits"] = torch.zeros(B, T, 3)
+    pred["support_logits"] = torch.zeros(B, T, 4)
+    pred["contact_logits"] = torch.zeros(B, T, P)
+
+    base = PredictorLoss(
+        contact_weight=0, target_weight=1.0, phase_weight=0, support_weight=0,
+        target_loss_kind="focal_dice",
+        target_topk_min_positives=1,
+        target_aux_xyz_weight=0.0,
+    )
+    aux = PredictorLoss(
+        contact_weight=0, target_weight=1.0, phase_weight=0, support_weight=0,
+        target_loss_kind="focal_dice",
+        target_topk_min_positives=1,
+        target_aux_xyz_weight=0.5,
+    )
+    out_base = base(pred, gt_contact, gt_xyz, gt_phase, gt_support,
+                    mask=None, object_xyz=object_xyz)
+    out_aux = aux(pred, gt_contact, gt_xyz, gt_phase, gt_support,
+                  mask=None, object_xyz=object_xyz)
+    # Aux term should add positive contribution since pred is random
+    # → softmax-weighted xyz is far from gt_target.
+    assert out_aux["loss_target"].item() > out_base["loss_target"].item(), (
+        f"aux xyz term should add positive loss; "
+        f"base={out_base['loss_target'].item():.4f} "
+        f"aux={out_aux['loss_target'].item():.4f}"
+    )
+    print("[PASS] test_v94_aux_xyz_loss_adds_spatial_gradient")
+
+
+def test_v94_full_predictor_with_pe_backward_no_unused_params():
+    """End-to-end: build predictor with PE on, run forward+backward,
+    verify all parameters receive gradient (DDP-safe)."""
+    torch.manual_seed(0)
+    B, T = 2, 8
+    predictor = InteractionPredictor(
+        d_model=128, num_layers=2, num_heads=4, dim_feedforward=256,
+        text_dim=512, pose_dim=66, max_seq_length=T,
+        num_body_parts=5, num_phases=3, num_support_states=3,
+        structured_head=True,
+        structured_head_d_emb=32, structured_head_hidden=64,
+        structured_head_attn_heads=4,
+        structured_head_downstream_mode="mask",
+        structured_head_target_attn_output="logits",
+        structured_head_target_attn_kind="mask_decoder",
+        structured_head_target_decoder_layers=2,
+        structured_head_target_decoder_ffn=256,
+        structured_head_target_pos_enc=True,
+        structured_head_target_pos_enc_frequencies=6,
+    )
+    text_tokens = torch.randn(B, 77, 512)
+    object_tokens = torch.randn(B, 128, 128)
+    object_xyz = torch.randn(B, 128, 3) * 0.5
+    init_pose = torch.randn(B, 66) * 0.5
+    gt_contact = (torch.rand(B, T, 5) > 0.5).float()
+    out = predictor(
+        text_tokens, object_tokens, init_pose, seq_length=T,
+        object_xyz=object_xyz, gt_contact=gt_contact,
+        gt_phase=torch.zeros(B, T, dtype=torch.long),
+        teacher_forcing=False,
+    )
+    loss = (
+        out["contact_logits"].pow(2).mean()
+        + out["contact_target_attn_logits"].pow(2).mean()
+        + out["phase_logits"].pow(2).mean()
+        + out["support_logits"].pow(2).mean()
+    )
+    loss.backward()
+    unused = []
+    for name, p in predictor.named_parameters():
+        if p.requires_grad and p.grad is None:
+            unused.append(name)
+    assert not unused, f"Unused params (DDP-unsafe): {unused}"
+    # PE module must have received gradient
+    has_pe_grad = any(
+        "pe3d" in name and p.grad is not None and p.grad.abs().sum() > 0
+        for name, p in predictor.named_parameters()
+    )
+    assert has_pe_grad, "PositionalEncoding3D.proj must receive gradient"
+    print("[PASS] test_v94_full_predictor_with_pe_backward_no_unused_params")
+
+
 if __name__ == "__main__":
     test_structured_head_forward_shape()
     test_predictor_legacy_forward_unchanged()
@@ -1130,4 +1304,9 @@ if __name__ == "__main__":
     test_v92_motion_aware_ddp_safe()
     test_v92_config_yaml_end_to_end()
     test_v81_eval_build_models_propagates_flags()
-    print("\nAll v8 + v8.1 + v8.1.1 + v9 + v9.1 + v9.2 sanity tests passed.")
+    test_v94_positional_encoding_3d_shape_and_periodicity()
+    test_v94_mask_decoder_with_pe_shape_and_uses_xyz()
+    test_v94_mask_decoder_pe_requires_xyz()
+    test_v94_aux_xyz_loss_adds_spatial_gradient()
+    test_v94_full_predictor_with_pe_backward_no_unused_params()
+    print("\nAll v8 + v8.1 + v8.1.1 + v9 + v9.1 + v9.2 + v9.4 sanity tests passed.")

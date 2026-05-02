@@ -283,6 +283,75 @@ class CrossAttentionWeightsOnly(nn.Module):
 
 
 # ============================================================================
+# v9.4 helper: 3D positional encoding for object tokens (NeRF-style)
+# ============================================================================
+#
+# Standard cross-attention over object tokens uses feature-only inner
+# products (q·k). Positional structure must be inferred from the
+# features alone, which conflicts with PointNet++ SA's 30 cm-radius
+# ball-query smoothing — adjacent tokens (~9 cm apart) have highly
+# overlapping receptive fields → similar features → low spatial
+# discriminability for the dot-product mask.
+#
+# DETR (Carion ECCV 2020, arXiv:2005.12872) and Mask3D (Schult ICRA
+# 2023, arXiv:2210.03105) explicitly add positional encoding to keys
+# before cross-attn. We do the same here using a NeRF-style
+# (Mildenhall ECCV 2020, arXiv:2003.08934) sinusoidal expansion of the
+# 3D centroid xyz, projected to d_model via a learned linear.
+#
+# Frequencies: 2^k for k in [0, num_frequencies-1], scaled by π. With
+# objects in object-local frame (~ [-0.5, 0.5] m), 6 frequencies give
+# wavelengths from 2 m down to ~6 cm — covers from "which side of the
+# object" to "this token vs. its neighbour".
+
+class PositionalEncoding3D(nn.Module):
+    """NeRF-style sinusoidal positional encoding for 3D coordinates.
+
+    Maps (B, ..., 3) xyz coordinates to (B, ..., d_model) embeddings
+    via 2*F sinusoidal basis functions per axis followed by a learned
+    linear projection. F = num_frequencies.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_frequencies: int = 6,
+        coord_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.num_frequencies = int(num_frequencies)
+        self.coord_scale = float(coord_scale)
+        # Frequency bank: [2^0, 2^1, ..., 2^(F-1)] × π, registered as
+        # buffer so it follows .to(device) but isn't trainable.
+        freqs = (2.0 ** torch.arange(num_frequencies, dtype=torch.float32)) * math.pi
+        self.register_buffer("freqs", freqs, persistent=False)
+        # Input dim for the projection: 3 coords × F freqs × 2 (sin, cos)
+        in_dim = 3 * num_frequencies * 2
+        self.proj = nn.Linear(in_dim, d_model)
+
+    def forward(self, xyz: Tensor) -> Tensor:
+        """Encode xyz coordinates to d_model embeddings.
+
+        Parameters
+        ----------
+        xyz : (..., 3) — 3D coordinates in object-local frame.
+
+        Returns
+        -------
+        pe : (..., d_model) — additive positional encoding.
+        """
+        x = xyz * self.coord_scale                                       # (..., 3)
+        # Expand: (..., 3, F) by broadcasting
+        scaled = x.unsqueeze(-1) * self.freqs                            # (..., 3, F)
+        sin_emb = torch.sin(scaled)
+        cos_emb = torch.cos(scaled)
+        # Stack sin/cos along last axis, then flatten the last 3 dims.
+        pe = torch.stack([sin_emb, cos_emb], dim=-1)                     # (..., 3, F, 2)
+        pe = pe.reshape(*xyz.shape[:-1], -1)                             # (..., 3*F*2)
+        return self.proj(pe)                                             # (..., d_model)
+
+
+# ============================================================================
 # v9 helper: Mask3D-style multi-layer mask decoder for affordance
 # ============================================================================
 #
@@ -332,6 +401,12 @@ class AffordanceMaskDecoder(nn.Module):
         num_heads: int = 6,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
+        # v9.4 (2026-05-04): NeRF-style positional encoding on object
+        # token keys. Off by default for backward compat. When True,
+        # forward() requires object_xyz to be passed.
+        use_positional_encoding: bool = False,
+        num_pe_frequencies: int = 6,
+        pe_coord_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -340,6 +415,16 @@ class AffordanceMaskDecoder(nn.Module):
         self.part_queries = nn.Parameter(
             torch.randn(num_body_parts, d_model) * 0.02
         )
+        # v9.4: positional encoding for object token keys. Added to
+        # both the cross-attention input AND the mask-projection key
+        # input — DETR/Mask3D pattern. Optional via flag.
+        self.use_positional_encoding = bool(use_positional_encoding)
+        if self.use_positional_encoding:
+            self.pe3d = PositionalEncoding3D(
+                d_model=d_model,
+                num_frequencies=num_pe_frequencies,
+                coord_scale=pe_coord_scale,
+            )
         # Frame feature → query base (mixed with part query inside forward).
         # Caller is expected to pass already-contact-emb-conditioned x
         # via target_query_proj — see StructuredHead.
@@ -365,8 +450,9 @@ class AffordanceMaskDecoder(nn.Module):
 
     def forward(
         self,
-        frame_q: Tensor,        # (B, T, d_model) — query base from frame feature
-        object_tokens: Tensor,  # (B, M, d_model)
+        frame_q: Tensor,                  # (B, T, d_model) — query base from frame feature
+        object_tokens: Tensor,            # (B, M, d_model)
+        object_xyz: Tensor | None = None, # (B, M, 3) — required iff use_positional_encoding
     ) -> Tensor:
         """Return (B, T, P, M) raw mask logits.
 
@@ -375,15 +461,32 @@ class AffordanceMaskDecoder(nn.Module):
         B, T, _ = frame_q.shape
         M = object_tokens.shape[1]
         P = self.num_body_parts
+        # v9.4: positional encoding on keys. Object xyz is required at
+        # this point — guard explicitly so misconfiguration surfaces
+        # at the first forward, not at a downstream shape mismatch.
+        if self.use_positional_encoding:
+            if object_xyz is None:
+                raise ValueError(
+                    "AffordanceMaskDecoder built with "
+                    "use_positional_encoding=True requires object_xyz "
+                    "to be passed to forward()."
+                )
+            pe = self.pe3d(object_xyz.to(object_tokens.dtype))           # (B, M, d)
+            object_tokens_pe = object_tokens + pe                         # (B, M, d)
+        else:
+            object_tokens_pe = object_tokens
         # Build per-(frame, part) queries: q[b, t, p] = frame_q[b, t] + part_q[p]
         q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)  # (B, T, P, d)
         q_flat = q.reshape(B, T * P, -1)                                 # (B, T*P, d)
         # Decoder stack: queries refine across layers via self-attn +
-        # cross-attn to object features.
-        q_refined = self.decoder(q_flat, object_tokens)                  # (B, T*P, d)
-        # Mask projection + dot product
+        # cross-attn to object features (with PE if enabled).
+        q_refined = self.decoder(q_flat, object_tokens_pe)               # (B, T*P, d)
+        # Mask projection + dot product. Use PE-augmented keys here too
+        # (Mask3D pattern: PE participates in both cross-attn and
+        # mask-out projection so the dot product carries position
+        # discrimination consistent with the cross-attn).
         q_proj = self.q_mask_proj(q_refined)                             # (B, T*P, mask_dim)
-        k_proj = self.k_mask_proj(object_tokens)                          # (B, M, mask_dim)
+        k_proj = self.k_mask_proj(object_tokens_pe)                      # (B, M, mask_dim)
         # Logits: (B, T*P, mask_dim) @ (B, mask_dim, M) → (B, T*P, M)
         logits = torch.bmm(q_proj, k_proj.transpose(1, 2)) * self._mask_scale
         return logits.reshape(B, T, P, M)
@@ -459,6 +562,12 @@ class StructuredHead(nn.Module):
         target_attn_kind: str = "single_layer",  # "single_layer" (v8/v8.1) | "mask_decoder" (v9)
         target_decoder_layers: int = 4,
         target_decoder_ffn: int = 1024,
+        # v9.4 (2026-05-04): NeRF-style positional encoding on object
+        # tokens (DETR/Mask3D pattern). Only used under
+        # target_attn_kind="mask_decoder". Off for back-compat.
+        target_pos_enc: bool = False,
+        target_pos_enc_frequencies: int = 6,
+        target_pos_enc_coord_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -541,6 +650,9 @@ class StructuredHead(nn.Module):
                 num_heads=num_attn_heads,
                 dim_feedforward=target_decoder_ffn,
                 dropout=dropout,
+                use_positional_encoding=bool(target_pos_enc),
+                num_pe_frequencies=int(target_pos_enc_frequencies),
+                pe_coord_scale=float(target_pos_enc_coord_scale),
             )
 
         # ── Level 1b: phase (cond on contact) ────────────────────
@@ -633,8 +745,11 @@ class StructuredHead(nn.Module):
         else:
             # v9 path: AffordanceMaskDecoder builds queries internally
             # (frame_q + part_query) and runs the N-layer decoder. Output
-            # is (B, T, P, M) raw logits.
-            target_attn_raw = self.target_attn(frame_q, object_tokens)
+            # is (B, T, P, M) raw logits. v9.4: pass object_xyz so the
+            # decoder can add positional encoding to keys when enabled.
+            target_attn_raw = self.target_attn(
+                frame_q, object_tokens, object_xyz=object_xyz,
+            )
 
         out: dict[str, Tensor] = {
             "contact_logits": contact_logits,
@@ -793,6 +908,11 @@ class InteractionPredictor(nn.Module):
         structured_head_target_attn_kind: str = "single_layer",
         structured_head_target_decoder_layers: int = 4,
         structured_head_target_decoder_ffn: int = 1024,
+        # v9.4 (2026-05-04): NeRF-style positional encoding on object
+        # tokens for the mask decoder. Off for back-compat.
+        structured_head_target_pos_enc: bool = False,
+        structured_head_target_pos_enc_frequencies: int = 6,
+        structured_head_target_pos_enc_coord_scale: float = 1.0,
         # v9.2 (2026-05-03): motion-aware trunk with MoMask-style random
         # masking. When enabled, per-frame body kinematics
         # (joints_per_frame: B, T, 22, 3) are projected and added to
@@ -905,6 +1025,9 @@ class InteractionPredictor(nn.Module):
                 target_attn_kind=structured_head_target_attn_kind,
                 target_decoder_layers=structured_head_target_decoder_layers,
                 target_decoder_ffn=structured_head_target_decoder_ffn,
+                target_pos_enc=structured_head_target_pos_enc,
+                target_pos_enc_frequencies=structured_head_target_pos_enc_frequencies,
+                target_pos_enc_coord_scale=structured_head_target_pos_enc_coord_scale,
             )
         else:
             self.contact_head = nn.Linear(d_model, num_body_parts)

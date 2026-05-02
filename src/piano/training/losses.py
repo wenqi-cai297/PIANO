@@ -157,6 +157,16 @@ class PredictorLoss(nn.Module):
         contact_asl_gamma_pos: float = 0.0,
         contact_asl_gamma_neg: float = 4.0,
         contact_asl_prob_shift: float = 0.05,
+        # v9.4 (2026-05-04): auxiliary xyz L2 loss alongside focal+dice
+        # for the target_attn head. focal+dice operates on per-token
+        # binary mask but provides no gradient that distinguishes
+        # "closer to true xyz" from "farther but still in mask" within
+        # the GT positive set. The aux term computes a single xyz
+        # prediction via softmax(logits) @ object_xyz and Huber-
+        # regresses against gt_target. This injects the missing
+        # spatial-distance gradient.
+        # Only active when target_loss_kind="focal_dice" and weight > 0.
+        target_aux_xyz_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -258,6 +268,14 @@ class PredictorLoss(nn.Module):
         self.contact_asl_gamma_pos = float(contact_asl_gamma_pos)
         self.contact_asl_gamma_neg = float(contact_asl_gamma_neg)
         self.contact_asl_prob_shift = float(contact_asl_prob_shift)
+        # v9.4: aux xyz L2 weight on top of focal+dice. 0.3 default in
+        # the v9.4 config; 0 disables (legacy behaviour).
+        if float(target_aux_xyz_weight) < 0.0:
+            raise ValueError(
+                f"target_aux_xyz_weight must be >= 0, "
+                f"got {target_aux_xyz_weight}"
+            )
+        self.target_aux_xyz_weight = float(target_aux_xyz_weight)
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -405,6 +423,20 @@ class PredictorLoss(nn.Module):
                 dice_eps=self.target_dice_eps,
                 topk_min_positives=self.target_topk_min_positives,
             )  # (B, T, P)
+            # v9.4: auxiliary xyz L2 — softmax-weighted token xyz vs
+            # gt_target. Only adds spatial-distance gradient; per-cell
+            # additive, gated identically to focal+dice below.
+            if self.target_aux_xyz_weight > 0.0:
+                attn_softmax = F.softmax(
+                    pred["contact_target_attn_logits"], dim=-1,
+                )                                                # (B, T, P, M)
+                pred_xyz = torch.einsum(
+                    "btpm,bmc->btpc", attn_softmax, object_xyz,
+                )                                                # (B, T, P, 3)
+                aux_l2 = F.smooth_l1_loss(
+                    pred_xyz, gt_target, reduction="none",
+                ).sum(dim=-1)                                    # (B, T, P)
+                loss_target = loss_target + self.target_aux_xyz_weight * aux_l2
         else:
             raise ValueError(self.target_loss_kind)  # unreachable
 

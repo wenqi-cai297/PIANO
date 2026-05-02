@@ -243,6 +243,12 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
     sh_target_kind = str(sh_cfg.get("target_attn_kind", "single_layer"))
     sh_target_layers = int(sh_cfg.get("target_decoder_layers", 4))
     sh_target_ffn = int(sh_cfg.get("target_decoder_ffn", 1024))
+    # v9.4: positional encoding flags must reach the predictor at eval
+    # time too — without them, a v9.4 ckpt rebuilds without the
+    # PositionalEncoding3D submodule and state_dict load fails.
+    sh_target_pos_enc = bool(sh_cfg.get("target_pos_enc", False))
+    sh_target_pos_enc_freq = int(sh_cfg.get("target_pos_enc_frequencies", 6))
+    sh_target_pos_enc_scale = float(sh_cfg.get("target_pos_enc_coord_scale", 1.0))
 
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
@@ -266,6 +272,9 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         structured_head_target_attn_kind=sh_target_kind,
         structured_head_target_decoder_layers=sh_target_layers,
         structured_head_target_decoder_ffn=sh_target_ffn,
+        structured_head_target_pos_enc=sh_target_pos_enc,
+        structured_head_target_pos_enc_frequencies=sh_target_pos_enc_freq,
+        structured_head_target_pos_enc_coord_scale=sh_target_pos_enc_scale,
         # v9.2: motion-aware trunk. Read from training yaml's
         # ``model.motion_aware_trunk`` block; ckpt loads correctly when
         # the flag matches what training used.

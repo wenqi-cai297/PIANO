@@ -471,6 +471,25 @@ def run(config_path: str) -> None:
         f"asl_prob_shift={float(cfg.loss.get('contact_asl_prob_shift', 0.05))}, "
         f"use_contact_pos_weight={bool(cfg.loss.get('use_contact_pos_weight', False))})"
     )
+    # v9.4: target_attn architectural flags (positional encoding,
+    # aux xyz L2, top-K min positives). These three together are
+    # Phase 0 of analyses/2026-05-04_target_attn_architectural_optimization.md.
+    accelerator.print(
+        f"[predictor cfg] target_pos_enc = "
+        f"{bool(sh_cfg.get('target_pos_enc', False))} "
+        f"(frequencies={int(sh_cfg.get('target_pos_enc_frequencies', 6))}, "
+        f"coord_scale={float(sh_cfg.get('target_pos_enc_coord_scale', 1.0))})"
+    )
+    accelerator.print(
+        f"[predictor cfg] target_aux_xyz_weight = "
+        f"{float(cfg.loss.get('target_aux_xyz_weight', 0.0))} "
+        f"(focal_dice gets aux smooth_l1 spatial gradient when > 0)"
+    )
+    accelerator.print(
+        f"[predictor cfg] target_topk_min_positives = "
+        f"{int(cfg.loss.get('target_topk_min_positives', 0))} "
+        f"(GT mask = within-tau ∪ top-K nearest; K=1 unlocks IoU ceiling)"
+    )
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -502,6 +521,14 @@ def run(config_path: str) -> None:
         structured_head_target_attn_kind=str(sh_cfg.get("target_attn_kind", "single_layer")),
         structured_head_target_decoder_layers=int(sh_cfg.get("target_decoder_layers", 4)),
         structured_head_target_decoder_ffn=int(sh_cfg.get("target_decoder_ffn", 1024)),
+        # v9.4: positional encoding on object tokens for the mask decoder.
+        structured_head_target_pos_enc=bool(sh_cfg.get("target_pos_enc", False)),
+        structured_head_target_pos_enc_frequencies=int(
+            sh_cfg.get("target_pos_enc_frequencies", 6)
+        ),
+        structured_head_target_pos_enc_coord_scale=float(
+            sh_cfg.get("target_pos_enc_coord_scale", 1.0)
+        ),
         # v9.2: motion-aware trunk + random masking. Merge model defaults
         # with training-yaml overrides (same pattern as structured_head).
         motion_aware_trunk=bool(motion_cfg_merged.get("enabled", False)),
@@ -625,6 +652,8 @@ def run(config_path: str) -> None:
         contact_asl_gamma_pos=float(cfg.loss.get("contact_asl_gamma_pos", 0.0)),
         contact_asl_gamma_neg=float(cfg.loss.get("contact_asl_gamma_neg", 4.0)),
         contact_asl_prob_shift=float(cfg.loss.get("contact_asl_prob_shift", 0.05)),
+        # v9.4: aux xyz L2 loss alongside focal+dice.
+        target_aux_xyz_weight=float(cfg.loss.get("target_aux_xyz_weight", 0.0)),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(

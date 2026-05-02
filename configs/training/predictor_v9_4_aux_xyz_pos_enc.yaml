@@ -1,0 +1,182 @@
+# Stage A v9.4: Phase 0 architectural optimization for contact_target_attn.
+#
+# Track 1 re-eval (2026-05-04, see analyses/2026-05-04_v92_results.md
+# §"Update 2026-05-04 (later)") established that topk3_iou=0.13 is an
+# ARCHITECTURAL ceiling — even with GT future joints, ceiling is 0.137.
+# Information bound was wrong; the trunk extracts enough but the
+# loss/decoder lack spatial discriminability.
+#
+# Phase 0 = three orthogonal targeted fixes from
+# analyses/2026-05-04_target_attn_architectural_optimization.md:
+#
+# (A) Aux xyz L2 loss alongside focal+dice. focal+dice gives no
+#     gradient that distinguishes "closer to true xyz" from "farther
+#     but in mask" within the GT positive set. Aux term computes
+#     softmax(logits) @ object_xyz → single xyz prediction → Huber
+#     vs gt_target. Injects spatial-distance gradient.
+#     Weight 0.3 chosen so the new term contributes ~30% of target
+#     loss magnitude at init (prediction xyz ≈ object centroid in
+#     softmax-uniform regime, smooth_l1 vs gt_target ≈ 0.2 m for
+#     average part vs object centroid offset).
+#
+# (B) target_topk_min_positives: 3 → 1. v8.1.1 added top-K=3 to avoid
+#     empty masks for foot (τ=3cm < FPS spacing 8.8cm). But this caps
+#     achievable IoU at 1/3 even with perfect ranking, since GT mask
+#     for foot is ALWAYS the 3 nearest tokens regardless of distance
+#     (the 3rd nearest could be 12-20cm from true contact). With K=1
+#     the GT becomes "single nearest token" most of the time, mask
+#     IoU upper bound becomes 1.0. Combined with (A) which provides
+#     soft xyz gradient, (B) loosens the binary mask to be tighter
+#     (more selective) without losing recall via the L2 channel.
+#
+# (E) NeRF-style positional encoding on object tokens (DETR/Mask3D
+#     pattern). Decoder's q·k_T currently has no positional bias —
+#     adjacent tokens (~9cm apart) have similar PointNet++ features
+#     (30cm receptive field overlap), and the model has to learn
+#     that "feature similarity ≈ position similarity". Adding
+#     sinusoidal PE(token_xyz) makes position explicit in the
+#     key space. 6 frequencies span wavelengths 2 m → ~6 cm,
+#     covering "which side of object" → "this token vs neighbour".
+#
+# Tier 0 (D = target_gate_kind=contact) was dropped from this batch
+# because losses.py:481-482 forces gate to "contact" automatically
+# under target_loss_kind="focal_dice" — D is a no-op as currently
+# spec'd.
+#
+# All other knobs match v9.1 baseline (3-way support, contact
+# pos_weight, Mask3D 4-layer decoder, MoMask mask conditioning,
+# logit_adjust τ=0.3). v9.2 (motion-aware trunk, ASL contact loss)
+# stays disabled — the v9.2 loss change is being tested separately
+# in v9.3 (Track 2), and v9.2 motion-aware was confirmed no-op.
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~7 h.
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  output:
+    num_support_states: 3
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+    target_attn_kind: "mask_decoder"
+    target_decoder_layers: 4
+    target_decoder_ffn: 1024
+    # v9.4 (E): positional encoding for object token keys.
+    target_pos_enc: true
+    target_pos_enc_frequencies: 6
+    # Object-local frame coords ~ [-0.5, 0.5] m. Scale 1.0 keeps
+    # the lowest frequency (2π) at wavelength 1 m, highest
+    # (2π × 32) at wavelength ~6 cm.
+    target_pos_enc_coord_scale: 1.0
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  support_collapse_hand_support: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+
+  # v9.4 (B): top-K min positives 3 → 1. Unlocks IoU ceiling that was
+  # capped at 1/3 = 0.33 by the v8.1.1 fixed-3-nearest GT mask. With
+  # K=1, foot/hand GT is mostly single-token (the actual closest);
+  # within-τ union still keeps pelvis (τ=12cm > FPS spacing) as
+  # multi-token.
+  target_topk_min_positives: 1
+
+  # v9.4 (A): aux xyz L2 alongside focal+dice. 0.3 weight chosen so
+  # aux contributes ~30% of target loss magnitude at init.
+  target_aux_xyz_weight: 0.3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+
+  # v9.1 KEEPER: contact pos_weight (the dominant Stage A win).
+  use_contact_pos_weight: true
+  contact_pos_weight_cap: 15.0
+
+  use_logit_adjustment: true
+  logit_adjust_tau: 0.3
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v9_4_aux_xyz_pos_enc"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v9_4_aux_xyz_pos_enc"
