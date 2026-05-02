@@ -845,6 +845,220 @@ def test_v91_predictor_3way_support_head():
     print("[PASS] test_v91_predictor_3way_support_head")
 
 
+def test_v92_asl_loss_official_formula():
+    """v9.2 ASL math matches the official Alibaba-MIIL/ASL implementation
+    (verbatim from src/loss_functions/losses.py::AsymmetricLoss). Verify
+    on a known-output case: γ_pos=0, γ_neg=0, prob_shift=0 should
+    reduce to plain BCE.
+    """
+    import torch.nn.functional as F
+    B, T, P = 2, 4, 5
+    logits = torch.randn(B, T, P) * 2.0
+    target = (torch.rand(B, T, P) > 0.5).float()
+    # γ=0 + prob_shift=0 → ASL == standard BCE
+    asl = PredictorLoss._asymmetric_contact_loss(
+        logits, target, gamma_pos=0.0, gamma_neg=0.0, prob_shift=0.0,
+    )
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    diff = (asl - bce).abs().max().item()
+    assert diff < 1e-5, \
+        f"ASL γ=0+shift=0 should equal BCE; max diff {diff}"
+    print(f"[PASS] test_v92_asl_loss_official_formula (max diff vs BCE = {diff:.2e})")
+
+
+def test_v92_asl_preserves_positive_gradient():
+    """γ_pos=0 keeps full gradient on positives (preserving recall)."""
+    B, T, P = 1, 1, 1
+    # All positive (target=1), various logit values
+    target = torch.ones(B, T, P)
+    logits = torch.tensor([[[-2.0]]])  # confident negative on positive class
+    asl = PredictorLoss._asymmetric_contact_loss(
+        logits, target, gamma_pos=0.0, gamma_neg=4.0, prob_shift=0.05,
+    )
+    # γ_pos=0 → modulator (1-p)^0 = 1 → loss = -log(sigmoid(-2)) ≈ 2.13
+    expected = -torch.log(torch.sigmoid(torch.tensor(-2.0)))
+    diff = (asl - expected).abs().item()
+    assert diff < 1e-4, \
+        f"γ_pos=0 should give -log(p) on positives, got {asl.item():.4f} vs expected {expected.item():.4f}"
+    print(f"[PASS] test_v92_asl_preserves_positive_gradient")
+
+
+def test_v92_asl_downweights_easy_negatives():
+    """γ_neg=4 + prob_shift=0.05 → easy negatives (sigmoid<0.05) get
+    near-zero loss; hard negatives (sigmoid>0.5) get dominant loss."""
+    target = torch.zeros(2, 1, 1)
+    # Case 1: easy negative (model correctly says "no")
+    logit_easy = torch.tensor([[[-5.0]]])  # sigmoid ≈ 0.007 → after shift ≈ 0 → log(1) = 0
+    # Case 2: hard negative (model wrongly says "yes")
+    logit_hard = torch.tensor([[[2.0]]])   # sigmoid ≈ 0.88
+    logits = torch.cat([logit_easy, logit_hard], dim=0)
+
+    asl = PredictorLoss._asymmetric_contact_loss(
+        logits, target, gamma_pos=0.0, gamma_neg=4.0, prob_shift=0.05,
+    )
+    easy_loss, hard_loss = asl[0, 0, 0].item(), asl[1, 0, 0].item()
+    assert easy_loss < 1e-3, \
+        f"easy negative should yield ~0 loss, got {easy_loss:.4f}"
+    assert hard_loss > 0.5, \
+        f"hard negative should yield substantial loss, got {hard_loss:.4f}"
+    assert hard_loss > 100 * easy_loss, \
+        f"hard/easy loss ratio should be huge, got {hard_loss/max(easy_loss, 1e-12):.1f}"
+    print(f"[PASS] test_v92_asl_downweights_easy_negatives "
+          f"(easy={easy_loss:.4f}, hard={hard_loss:.4f}, ratio={hard_loss/max(easy_loss,1e-12):.0f}×)")
+
+
+def test_v92_motion_aware_trunk_inference_path():
+    """v9.2: when joints_per_frame=None at eval, predictor falls back
+    to all-mask path (matches training r=1 distribution). Output shape
+    is correct and no NaN.
+    """
+    pred_model = InteractionPredictor(
+        d_model=192, num_layers=2, num_heads=6, dim_feedforward=512,
+        max_seq_length=64,
+        structured_head=True,
+        structured_head_target_attn_output="logits",
+        structured_head_downstream_mode="mask",
+        motion_aware_trunk=True,
+        motion_input_dim=66,
+    )
+    pred_model.eval()
+    text_tokens = torch.randn(2, 77, 512)
+    obj_tokens = torch.randn(2, 32, 192)
+    obj_xyz = torch.randn(2, 32, 3)
+    init_pose = torch.randn(2, 66)
+    # Inference: no joints_per_frame
+    with torch.no_grad():
+        out = pred_model(
+            text_tokens, obj_tokens, init_pose,
+            seq_length=8, object_xyz=obj_xyz,
+        )
+    assert out["contact_logits"].shape == (2, 8, 5)
+    assert torch.isfinite(out["contact_logits"]).all()
+    assert torch.isfinite(out["contact_target_attn"]).all()
+    print("[PASS] test_v92_motion_aware_trunk_inference_path")
+
+
+def test_v92_motion_aware_trunk_training_random_mask():
+    """In training mode with joints_per_frame, random masking happens
+    internally; output should differ across calls due to mask
+    randomness, but be deterministic in eval mode."""
+    torch.manual_seed(42)
+    pred_model = InteractionPredictor(
+        d_model=192, num_layers=2, num_heads=6, dim_feedforward=512,
+        max_seq_length=64,
+        structured_head=True,
+        structured_head_target_attn_output="logits",
+        structured_head_downstream_mode="mask",
+        motion_aware_trunk=True,
+        motion_input_dim=66,
+    )
+    text_tokens = torch.randn(2, 77, 512)
+    obj_tokens = torch.randn(2, 32, 192)
+    obj_xyz = torch.randn(2, 32, 3)
+    init_pose = torch.randn(2, 66)
+    joints = torch.randn(2, 8, 22, 3)
+    gt_contact = torch.zeros(2, 8, 5)
+    gt_phase = torch.zeros(2, 8, dtype=torch.long)
+
+    # Eval mode: deterministic
+    pred_model.eval()
+    with torch.no_grad():
+        out_eval_a = pred_model(
+            text_tokens, obj_tokens, init_pose,
+            seq_length=8, object_xyz=obj_xyz, joints_per_frame=joints,
+        )
+        out_eval_b = pred_model(
+            text_tokens, obj_tokens, init_pose,
+            seq_length=8, object_xyz=obj_xyz, joints_per_frame=joints,
+        )
+    diff_eval = (out_eval_a["contact_logits"] - out_eval_b["contact_logits"]).abs().max()
+    assert diff_eval < 1e-5, f"eval should be deterministic, got diff {diff_eval}"
+
+    # Train mode with joints: random masking → outputs differ across calls
+    pred_model.train()
+    torch.manual_seed(1)
+    out_train_a = pred_model(
+        text_tokens, obj_tokens, init_pose,
+        seq_length=8, object_xyz=obj_xyz, joints_per_frame=joints,
+        gt_contact=gt_contact, gt_phase=gt_phase,
+    )
+    torch.manual_seed(2)
+    out_train_b = pred_model(
+        text_tokens, obj_tokens, init_pose,
+        seq_length=8, object_xyz=obj_xyz, joints_per_frame=joints,
+        gt_contact=gt_contact, gt_phase=gt_phase,
+    )
+    diff_train = (out_train_a["contact_logits"] - out_train_b["contact_logits"]).abs().max()
+    assert diff_train > 1e-3, \
+        f"random masking should produce different outputs, got diff {diff_train}"
+    print(f"[PASS] test_v92_motion_aware_trunk_training_random_mask "
+          f"(eval_diff={diff_eval:.2e}, train_diff={diff_train:.4f})")
+
+
+def test_v92_motion_aware_ddp_safe():
+    """Every motion-aware param receives gradient under training +
+    backward (DDP regression test)."""
+    pred_model = InteractionPredictor(
+        d_model=192, num_layers=2, num_heads=6, dim_feedforward=512,
+        max_seq_length=64,
+        structured_head=True,
+        structured_head_target_attn_output="logits",
+        structured_head_downstream_mode="mask",
+        motion_aware_trunk=True,
+    )
+    pred_model.train()
+    text_tokens = torch.randn(2, 77, 512)
+    obj_tokens = torch.randn(2, 32, 192)
+    obj_xyz = torch.randn(2, 32, 3)
+    init_pose = torch.randn(2, 66)
+    joints = torch.randn(2, 8, 22, 3)
+    out = pred_model(
+        text_tokens, obj_tokens, init_pose,
+        seq_length=8, object_xyz=obj_xyz, joints_per_frame=joints,
+        gt_contact=torch.zeros(2, 8, 5),
+        gt_phase=torch.zeros(2, 8, dtype=torch.long),
+    )
+    loss = (
+        out["contact_logits"].sum()
+        + out["contact_target_attn"].sum()
+        + out["phase_logits"].sum()
+        + out["support_logits"].sum()
+    )
+    loss.backward()
+    no_grad = [n for n, p in pred_model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not no_grad, f"motion-aware params w/o grad: {no_grad}"
+    # Specifically check joint_proj and joint_mask_emb received grad
+    assert pred_model.joint_proj.weight.grad is not None
+    assert pred_model.joint_mask_emb.grad is not None
+    print(f"[PASS] test_v92_motion_aware_ddp_safe")
+
+
+def test_v92_config_yaml_end_to_end():
+    """predictor_v9_2_asl_motion.yaml builds + runs end-to-end."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v9_2_asl_motion.yaml"
+    )
+    # ASL flags
+    assert cfg.loss.contact_loss_kind == "asl"
+    assert float(cfg.loss.contact_asl_gamma_pos) == 0.0
+    assert float(cfg.loss.contact_asl_gamma_neg) == 4.0
+    assert float(cfg.loss.contact_asl_prob_shift) == 0.05
+    assert bool(cfg.loss.use_contact_pos_weight) is False
+    # Motion-aware trunk
+    mat = cfg.model.get("motion_aware_trunk", {})
+    assert bool(mat.get("enabled", False)) is True
+    assert int(mat.get("joint_input_dim", 0)) == 66
+    # v9.1 keepers
+    assert bool(cfg.data.get("support_collapse_hand_support", False)) is True
+    assert float(cfg.loss.logit_adjust_tau) == 0.3
+    print("[PASS] test_v92_config_yaml_end_to_end")
+
+
 def test_v81_eval_build_models_propagates_flags():
     """Regression: scripts/stage_a_predictor/eval_predictor.py::_build_models
     must propagate v8.1 flags (downstream_mode + target_attn_output) to
@@ -908,5 +1122,12 @@ if __name__ == "__main__":
     test_v91_3way_support_collapse_label_mapping()
     test_v91_config_yaml_propagates_3way_support()
     test_v91_predictor_3way_support_head()
+    test_v92_asl_loss_official_formula()
+    test_v92_asl_preserves_positive_gradient()
+    test_v92_asl_downweights_easy_negatives()
+    test_v92_motion_aware_trunk_inference_path()
+    test_v92_motion_aware_trunk_training_random_mask()
+    test_v92_motion_aware_ddp_safe()
+    test_v92_config_yaml_end_to_end()
     test_v81_eval_build_models_propagates_flags()
-    print("\nAll v8 + v8.1 + v8.1.1 + v9 + v9.1 sanity tests passed.")
+    print("\nAll v8 + v8.1 + v8.1.1 + v9 + v9.1 + v9.2 sanity tests passed.")

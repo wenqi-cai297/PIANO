@@ -266,6 +266,11 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         structured_head_target_attn_kind=sh_target_kind,
         structured_head_target_decoder_layers=sh_target_layers,
         structured_head_target_decoder_ffn=sh_target_ffn,
+        # v9.2: motion-aware trunk. Read from training yaml's
+        # ``model.motion_aware_trunk`` block; ckpt loads correctly when
+        # the flag matches what training used.
+        motion_aware_trunk=bool(cfg.model.get("motion_aware_trunk", {}).get("enabled", False)),
+        motion_input_dim=int(cfg.model.get("motion_aware_trunk", {}).get("joint_input_dim", 66)),
     ).to(device).eval()
 
     object_encoder = ObjectEncoder(

@@ -145,6 +145,18 @@ class PredictorLoss(nn.Module):
         # ((1 - π_part) / π_part).clamp(max=cap) where π_part is the
         # training-set positive rate for that body part.
         contact_pos_weight: Tensor | None = None,
+        # v9.2 (2026-05-03): Asymmetric Loss for contact head. ASL
+        # decouples positive vs negative gradient handling — γ_pos=0
+        # keeps positives' full gradient (preserves recall) while
+        # γ_neg=4 down-weights easy negatives via (p_shifted)^γ_neg
+        # modulation, focusing gradient on hard negatives (FPs).
+        # Reference: Ben-Baruch et al. ICCV 2021, arXiv:2009.14119,
+        # github.com/Alibaba-MIIL/ASL (797★). Replaces pos_weight
+        # when contact_loss_kind="asl"; "bce" preserves v9 behaviour.
+        contact_loss_kind: str = "bce",
+        contact_asl_gamma_pos: float = 0.0,
+        contact_asl_gamma_neg: float = 4.0,
+        contact_asl_prob_shift: float = 0.05,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -236,6 +248,16 @@ class PredictorLoss(nn.Module):
             self.register_buffer("contact_pos_weight", contact_pos_weight.float())
         else:
             self.contact_pos_weight = None  # type: ignore[assignment]
+        # v9.2: ASL contact loss flags
+        if contact_loss_kind not in ("bce", "asl"):
+            raise ValueError(
+                f"contact_loss_kind must be 'bce' or 'asl', "
+                f"got {contact_loss_kind!r}"
+            )
+        self.contact_loss_kind = contact_loss_kind
+        self.contact_asl_gamma_pos = float(contact_asl_gamma_pos)
+        self.contact_asl_gamma_neg = float(contact_asl_gamma_neg)
+        self.contact_asl_prob_shift = float(contact_asl_prob_shift)
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -303,26 +325,37 @@ class PredictorLoss(nn.Module):
         -------
         Dictionary with individual losses and total.
         """
-        # Contact: BCE on soft labels.
-        # v9: per-part pos_weight when ``contact_pos_weight`` is set.
-        # Fixes the foot recall = 0 pathology (foot positive rate ~3%
-        # → negatives 32× over positives → BCE collapses to "predict
-        # zero everywhere"). DECO ICCV'23 / HACO NeurIPS'25 convention.
-        contact_pw = getattr(self, "contact_pos_weight", None)
-        if contact_pw is not None:
-            # Broadcast: (num_body_parts,) → (1, 1, num_body_parts)
-            pw = contact_pw.view(1, 1, -1).to(
-                device=pred["contact_logits"].device,
-                dtype=pred["contact_logits"].dtype,
-            )
-            loss_contact = F.binary_cross_entropy_with_logits(
-                pred["contact_logits"], gt_contact,
-                reduction="none", pos_weight=pw,
-            )
-        else:
-            loss_contact = F.binary_cross_entropy_with_logits(
-                pred["contact_logits"], gt_contact, reduction="none",
+        # Contact loss. Two modes:
+        # - "bce" (v9 default): BCE with optional per-part pos_weight.
+        # - "asl" (v9.2): Asymmetric Loss (Ben-Baruch et al. ICCV'21).
+        #   Decouples positive vs negative gradient handling. Fixes
+        #   the precision regression introduced by aggressive pos_weight
+        #   (foot precision 0.06 with pos_weight cap=15) without losing
+        #   recall.
+        if self.contact_loss_kind == "asl":
+            loss_contact = self._asymmetric_contact_loss(
+                logits=pred["contact_logits"],
+                target=gt_contact,
+                gamma_pos=self.contact_asl_gamma_pos,
+                gamma_neg=self.contact_asl_gamma_neg,
+                prob_shift=self.contact_asl_prob_shift,
             )  # (B, T, 5)
+        else:
+            # v9 BCE path (with optional pos_weight).
+            contact_pw = getattr(self, "contact_pos_weight", None)
+            if contact_pw is not None:
+                pw = contact_pw.view(1, 1, -1).to(
+                    device=pred["contact_logits"].device,
+                    dtype=pred["contact_logits"].dtype,
+                )
+                loss_contact = F.binary_cross_entropy_with_logits(
+                    pred["contact_logits"], gt_contact,
+                    reduction="none", pos_weight=pw,
+                )
+            else:
+                loss_contact = F.binary_cross_entropy_with_logits(
+                    pred["contact_logits"], gt_contact, reduction="none",
+                )  # (B, T, 5)
 
         # Target loss: dispatch on target_loss_kind.
         # smooth_l1 path is the legacy v6/v7/v7-fix Huber regression.
@@ -513,6 +546,81 @@ class PredictorLoss(nn.Module):
             "n_contact_frames": n_contact.detach(),
             **kendall_log,
         }
+
+    @staticmethod
+    def _asymmetric_contact_loss(
+        logits: Tensor,
+        target: Tensor,
+        gamma_pos: float = 0.0,
+        gamma_neg: float = 4.0,
+        prob_shift: float = 0.05,
+        eps: float = 1e-8,
+    ) -> Tensor:
+        """Asymmetric Loss for multi-label binary classification.
+
+        Verbatim implementation of Ben-Baruch et al. ICCV 2021,
+        arXiv:2009.14119 — see github.com/Alibaba-MIIL/ASL (797★)
+        ``src/loss_functions/losses.py::AsymmetricLoss``. Adaptations:
+        - Returns per-element loss (B, T, P) for masked-mean aggregation
+          by the caller, instead of the upstream ``-loss.sum()``.
+        - Default ``gamma_pos=0`` (paper's "passive zero protection"
+          recipe — keeps positives' full gradient to preserve recall;
+          upstream's default of 1 down-weights confident positives).
+        - Focal modulator gradient flow is enabled (we don't replicate
+          the upstream's ``disable_torch_grad_focal_loss`` because the
+          gradient through ``one_sided_w`` is harmless at our scale).
+
+        Mechanism (why it fixes our foot precision = 0.06):
+        - γ_pos = 0 → positives' (1 - p_t)^0 = 1 → no down-weighting.
+          Recall is preserved (same gradient as plain BCE on positives).
+        - γ_neg = 4 → easy negatives (p ≈ 0) get weight ≈ 0; hard
+          negatives (model wrongly says positive, p ≈ 0.7) get weight
+          ≈ (0.7)^4 ≈ 0.24 — dominant gradient signal. Optimizer
+          focuses on the False Positives we're trying to reduce.
+        - prob_shift (clip = 0.05) → for negatives, treat any p < 0.05
+          as fully correct. Protects against ~10 % pseudo-label noise
+          from making the model overcompensate on near-zero negatives.
+
+        Parameters
+        ----------
+        logits : (B, T, P) — pre-sigmoid scores from contact head
+        target : (B, T, P) — soft labels in [0, 1] (we use binarised
+            > 0.5 thresholding on the soft pseudo-labels in practice)
+        gamma_pos, gamma_neg : focusing parameters per class polarity
+        prob_shift : negative-class probability shift (asymmetric clip)
+        eps : log clamp
+
+        Returns
+        -------
+        loss : (B, T, P) — per-element non-negative loss
+        """
+        # Probabilities
+        x_sigmoid = torch.sigmoid(logits)
+        xs_pos = x_sigmoid
+        xs_neg = 1.0 - x_sigmoid
+
+        # Asymmetric clipping: shift negative-class probability up by
+        # prob_shift, clamp to 1. Negatives with sigmoid < prob_shift
+        # become "1 - 0" → log(1) = 0 → zero loss.
+        if prob_shift > 0:
+            xs_neg = (xs_neg + prob_shift).clamp(max=1.0)
+
+        # Cross-entropy per polarity (verbatim from upstream)
+        los_pos = target * torch.log(xs_pos.clamp(min=eps))
+        los_neg = (1.0 - target) * torch.log(xs_neg.clamp(min=eps))
+        loss = los_pos + los_neg
+
+        # Asymmetric focal modulator
+        if gamma_neg > 0 or gamma_pos > 0:
+            pt0 = xs_pos * target
+            pt1 = xs_neg * (1.0 - target)
+            pt = pt0 + pt1
+            one_sided_gamma = gamma_pos * target + gamma_neg * (1.0 - target)
+            one_sided_w = torch.pow(1.0 - pt, one_sided_gamma)
+            loss = loss * one_sided_w
+
+        # Per-element non-negative loss (caller does masked mean).
+        return -loss
 
     @staticmethod
     def _focal_dice_target_loss(

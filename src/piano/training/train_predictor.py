@@ -339,6 +339,14 @@ def build_predictor_step_fn(
                 tf_prob = high_prob + alpha * (low_prob - high_prob)
             teacher_forcing = bool(torch.rand(1).item() < tf_prob)
 
+        # v9.2: per-frame joints for motion-aware trunk. Pass in
+        # training (predictor's _build_joint_signal applies random
+        # masking internally) and during eval (no masking, full info).
+        # Stage A standalone inference (Stage B integration) calls
+        # predictor without joints → predictor falls back to all-mask.
+        underlying = predictor.module if hasattr(predictor, "module") else predictor
+        joints_per_frame = batch["joints"] if getattr(underlying, "motion_aware_trunk", False) else None
+
         # In mask mode, always pass GT — the head's _mix_with_gt does the
         # Bernoulli mix internally. In TF mode, only pass GT when the
         # coin flip says so (matches v8 behaviour).
@@ -352,12 +360,14 @@ def build_predictor_step_fn(
                 gt_contact=batch["contact_state"] if pass_gt else None,
                 gt_phase=batch["phase"].long() if pass_gt else None,
                 teacher_forcing=teacher_forcing,
+                joints_per_frame=joints_per_frame,
             )
         else:
             pred = predictor(
                 text_features, obj_tokens, init_pose,
                 seq_length=max_T,
                 text_key_padding_mask=text_mask,
+                joints_per_frame=joints_per_frame,
             )
 
         # Frame mask (True for valid, non-padded frames)
@@ -471,6 +481,15 @@ def run(config_path: str) -> None:
         structured_head_target_attn_kind=str(sh_cfg.get("target_attn_kind", "single_layer")),
         structured_head_target_decoder_layers=int(sh_cfg.get("target_decoder_layers", 4)),
         structured_head_target_decoder_ffn=int(sh_cfg.get("target_decoder_ffn", 1024)),
+        # v9.2: motion-aware trunk + random masking.
+        motion_aware_trunk=bool(model_cfg.get("motion_aware_trunk", {}).get(
+            "enabled",
+            cfg.model.get("motion_aware_trunk", {}).get("enabled", False),
+        )),
+        motion_input_dim=int(model_cfg.get("motion_aware_trunk", {}).get(
+            "joint_input_dim",
+            cfg.model.get("motion_aware_trunk", {}).get("joint_input_dim", 66),
+        )),
     )
     object_encoder = ObjectEncoder(
         num_input_points=obj_cfg.pointnet.num_input_points,
@@ -585,6 +604,11 @@ def run(config_path: str) -> None:
         )),
         # v9 contact pos_weight (None when use_contact_pos_weight=false).
         contact_pos_weight=contact_pos_weight,
+        # v9.2 ASL flags.
+        contact_loss_kind=str(cfg.loss.get("contact_loss_kind", "bce")),
+        contact_asl_gamma_pos=float(cfg.loss.get("contact_asl_gamma_pos", 0.0)),
+        contact_asl_gamma_neg=float(cfg.loss.get("contact_asl_gamma_neg", 4.0)),
+        contact_asl_prob_shift=float(cfg.loss.get("contact_asl_prob_shift", 0.05)),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(

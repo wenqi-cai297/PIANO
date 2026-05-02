@@ -793,6 +793,15 @@ class InteractionPredictor(nn.Module):
         structured_head_target_attn_kind: str = "single_layer",
         structured_head_target_decoder_layers: int = 4,
         structured_head_target_decoder_ffn: int = 1024,
+        # v9.2 (2026-05-03): motion-aware trunk with MoMask-style random
+        # masking. When enabled, per-frame body kinematics
+        # (joints_per_frame: B, T, 22, 3) are projected and added to
+        # time tokens as an extra signal. Random mask ratio per batch
+        # ~ Uniform[0, 1] (consistent estimator, Huszár 2015) handles
+        # train-test asymmetry: at inference, ``joints_per_frame=None``
+        # → all-mask path matches training's r=1 distribution.
+        motion_aware_trunk: bool = False,
+        motion_input_dim: int = 66,           # 22 SMPL joints × 3
         # Legacy alias: older configs pass ``num_object_patches=16``;
         # ignored since the target head is now an xyz regressor.
         num_object_patches: int | None = None,
@@ -815,6 +824,30 @@ class InteractionPredictor(nn.Module):
             self._sinusoidal_encoding(max_seq_length, d_model),
             persistent=False,
         )
+
+        # v9.2 (2026-05-03): motion-aware trunk. Per-frame joints get
+        # projected into d_model and added to time tokens during forward.
+        # Train-test asymmetry handled via MoMask CVPR 2024 random
+        # masking: each training batch samples mask_ratio ~ Uniform[0,1]
+        # and Bernoulli-masks per-frame joints with that ratio. At
+        # inference, joints_per_frame=None → mask_ratio=1 (all masked,
+        # matches a strict subset of the training distribution). The
+        # ``joint_mask_emb`` learnable [MASK] embedding fills masked
+        # positions — same primitive as our v8.1 contact / phase mask
+        # downstream conditioning.
+        #
+        # Reference: Guo et al., MoMask CVPR 2024, arXiv:2312.00063.
+        # Adaptation note: MoMask uses cosine schedule + top-k masking
+        # for discrete iterative generation; for continuous joint xyz
+        # features we use uniform mask ratio + per-frame Bernoulli
+        # (simpler, gives uniform train coverage, no iterative inference
+        # to bias toward).
+        self.motion_aware_trunk = bool(motion_aware_trunk)
+        if motion_aware_trunk:
+            self.joint_proj = nn.Linear(motion_input_dim, d_model)
+            self.joint_mask_emb = nn.Parameter(
+                torch.randn(1, 1, d_model) * 0.02
+            )
 
         # [POSE] token: pose projected into model space, carries initial
         # body state as its own sequence position (index 0)
@@ -890,6 +923,7 @@ class InteractionPredictor(nn.Module):
         gt_contact: Tensor | None = None,
         gt_phase: Tensor | None = None,
         teacher_forcing: bool = False,
+        joints_per_frame: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Predict interaction latents.
 
@@ -924,6 +958,15 @@ class InteractionPredictor(nn.Module):
         # Time tokens with sinusoidal positional encoding
         time_x = self.time_tokens[:, :T, :].expand(B, -1, -1).contiguous()
         time_x = time_x + self.pos_encoding[:T, :].unsqueeze(0)
+
+        # v9.2: motion-aware trunk. Per-frame joints (when provided)
+        # are projected to d_model and added to time tokens. Random
+        # masking handles train-test asymmetry.
+        if self.motion_aware_trunk:
+            time_x = time_x + self._build_joint_signal(
+                joints_per_frame=joints_per_frame, B=B, T=T,
+                device=time_x.device, dtype=time_x.dtype,
+            )
 
         # [POSE] token at index 0 — gets no positional offset (it's not a
         # frame). Self-attn propagates pose info to all time tokens.
@@ -982,6 +1025,66 @@ class InteractionPredictor(nn.Module):
             "phase_logits": phase_logits,
             "support_logits": support_logits,
         }
+
+    def _build_joint_signal(
+        self,
+        joints_per_frame: Tensor | None,
+        B: int,
+        T: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """v9.2 motion-aware time-token signal with random masking.
+
+        Three modes:
+        - inference (joints_per_frame is None): all-mask. Every time
+          token gets the [MASK] embedding. Equivalent to the
+          training distribution at mask_ratio = 1, so no distribution
+          shift.
+        - training with joints (and self.training): Bernoulli mask
+          with per-batch ratio r ~ Uniform[0, 1]. Each (b, t) cell
+          either keeps its projected joint or gets [MASK]. The model
+          is trained on every information mix, including r=1
+          (matches inference) and r=0 (full info regularizer).
+        - eval with joints (joints provided + self.eval()): no
+          masking, full info — used by Stage A independent eval if
+          we ever want to measure the "with privileged info" upper
+          bound; not the v18 production path.
+
+        Following Guo et al., MoMask (CVPR 2024, arXiv:2312.00063)
+        adapted for continuous joint xyz features:
+        - Per-batch uniform mask ratio (simpler than cosine schedule;
+          appropriate when there is no iterative inference)
+        - Per-(B, T) Bernoulli mask (simpler than top-k; we don't
+          require an exact masked-cell count)
+        - Single learnable [MASK] embedding fills masked positions
+        """
+        if joints_per_frame is None:
+            # Inference path: all-mask. Broadcast [MASK] embedding.
+            return self.joint_mask_emb.to(device=device, dtype=dtype).expand(B, T, -1)
+
+        if joints_per_frame.dim() == 4:
+            joints_flat = joints_per_frame.reshape(B, T, -1)
+        else:
+            joints_flat = joints_per_frame
+        if joints_flat.shape[-1] != self.joint_proj.in_features:
+            raise ValueError(
+                f"joints_per_frame last-dim must be {self.joint_proj.in_features} "
+                f"(matches motion_input_dim); got {joints_flat.shape[-1]}"
+            )
+        joints_emb = self.joint_proj(joints_flat.to(dtype))  # (B, T, d)
+        mask_emb = self.joint_mask_emb.to(device=device, dtype=dtype)
+
+        if self.training:
+            # Per-batch uniform mask ratio in [0, 1]; a (B, T, 1)
+            # Bernoulli mask gates GT joints vs [MASK].
+            mask_ratio = torch.rand((), device=device, dtype=dtype).item()
+            keep = torch.bernoulli(
+                torch.full((B, T, 1), 1.0 - mask_ratio, device=device, dtype=dtype)
+            )
+            return keep * joints_emb + (1.0 - keep) * mask_emb
+        # Eval with joints provided: no masking.
+        return joints_emb
 
     @staticmethod
     def _sinusoidal_encoding(length: int, d_model: int) -> Tensor:

@@ -1,0 +1,159 @@
+# Stage A v9.2: Asymmetric Loss for contact + motion-aware trunk.
+#
+# Two orthogonal targeted fixes on top of v9.1 — each addresses a
+# specific failure mode identified in v9.1's absolute quality audit:
+#
+# (A) Contact precision pathology (foot precision = 0.057, hand 0.40):
+#     pos_weight at cap=15 saved recall but trashed precision.
+#     Replaces with Asymmetric Loss (Ben-Baruch et al. ICCV 2021,
+#     arXiv:2009.14119, github.com/Alibaba-MIIL/ASL — 797★).
+#     γ_pos=0 keeps positives' full gradient (preserves recall);
+#     γ_neg=4 down-weights easy negatives via (p)^4, focuses
+#     gradient on hard FPs. Predicted: foot precision 0.06 → 0.20+,
+#     contact macro F1 0.37 → 0.50+ without losing recall.
+#
+# (B) Token-level ranking plateau at topk3_iou=0.13:
+#     v8.1 → v9 → v9.1 trajectory shows architecture (mask decoder)
+#     and loss (focal+dice, top-K mask) are saturated. Diagnosis:
+#     trunk lacks per-frame body kinematics → frame query can't
+#     localise hand/foot moving contact target. EgoChoir NeurIPS
+#     2024 (arXiv:2405.13659) addresses with parallel motion-stream KV.
+#
+#     Train-test asymmetry handled via MoMask CVPR 2024
+#     (arXiv:2312.00063) random masking — each batch samples
+#     mask_ratio ~ Uniform[0,1], Bernoulli-masks per-frame joint
+#     input, [MASK] embedding fills masked positions. At inference
+#     (joints_per_frame=None), all-mask path matches training's
+#     r=1 distribution → no distribution shift (Huszár 2015
+#     consistency).
+#
+# Keep all v9.1 wins:
+# - Contact pos_weight infrastructure (disabled when ASL active)
+# - Mask3D 4-layer decoder (control variable for clean ablation)
+# - 3-way support (drop hand_support)
+# - Logit Adjustment τ=0.3
+# - All v8.1.1 multi-hot binary GT + top-K + focal+dice + MoMask
+#   downstream conditioning mask
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~7 h.
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  output:
+    num_support_states: 3
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+    target_attn_kind: "mask_decoder"
+    target_decoder_layers: 4
+    target_decoder_ffn: 1024
+  # v9.2: motion-aware trunk + random masking.
+  motion_aware_trunk:
+    enabled: true
+    joint_input_dim: 66          # 22 SMPL joints × 3
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  support_collapse_hand_support: true   # v9.1
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+  target_topk_min_positives: 3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+
+  # v9.2 (A): replace pos_weight with Asymmetric Loss.
+  contact_loss_kind: "asl"
+  contact_asl_gamma_pos: 0.0      # preserve recall on positives
+  contact_asl_gamma_neg: 4.0      # focus gradient on hard FP negatives
+  contact_asl_prob_shift: 0.05    # ignore p < 0.05 negatives (noise tolerance)
+  use_contact_pos_weight: false   # ASL handles imbalance; pos_weight off
+
+  # v9.1 KEEPER: Logit Adjustment for phase + 3-way support.
+  use_logit_adjustment: true
+  logit_adjust_tau: 0.3
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v9_2_asl_motion"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v9_2_asl_motion"

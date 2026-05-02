@@ -1,604 +1,111 @@
 # Restart Orientation
 
-Purpose: restore enough PIANO project context after a fresh session to make
-correct decisions without loading the old experiment logs. This file is a
-pointer and checklist, not a full lab notebook.
+Quick recovery checklist for fresh sessions. **Don't trust this file
+alone — verify against `git log -10 --oneline` + the current state of
+`PROGRESS.md` / `PLAN.md`.**
 
-## First Commands
+## First commands
 
 From repo root:
 
 ```bash
 git status --short --branch
-git log -5 --oneline
+git log -10 --oneline
+ls runs/training/ 2>/dev/null | head -10
 ```
 
-Latest pushed commit should be checked with `git log -5 --oneline`; after the
-v15/v16 local work, do not assume local `.md` files are fresher than git until
-`git status` is checked.
+## Read order (priority)
 
-## Read Order
+1. **`PROGRESS.md`** — current snapshot, key absolute metrics, recent decisions
+2. **`PLAN.md`** — next executable actions
+3. **`analyses/stageA_compact.md`** — Stage A predictor history + lessons
+4. **`analyses/stageB_compact.md`** — Stage B v0-v17 trajectory
+5. **`ANALYSIS.md`** — index into reference docs (surveys, design docs)
+6. **`SPEC.md`** — stable project design (read once)
 
-Must read:
+Reference docs (read on demand):
+- `analyses/2026-05-03_v92_asl_motion_aware_design.md` — current pending Stage A retrain
+- `analyses/2026-05-03_pseudo_label_v12_strict_design.md` — v12 label spec
+- `analyses/2026-05-02_*_survey.md` — 6 frontier-paper surveys (TF alternatives, class imbalance, HOI affordance, MTL DAG, predictor architecture, data aug)
 
-1. `PROGRESS.md` - current state, best numbers, active artifacts.
-2. `PLAN.md` - next actions and routes that are no longer worth running.
-3. `ANALYSIS.md` - compact index for durable analysis docs.
-4. `analyses/stageB_compact.md` - consolidated Stage B evidence and decisions.
-5. `analyses/2026-05-01_per_step_guidance_design.md` - v17 design + ablation.
-6. `analyses/2026-05-01_v17_per_step_result.md` - v17-C single-sample SOTA
-   result (matches v14 K=16 oracle on local error; per-step inner loop flips
-   60.67% of base tokens). Load alongside the design doc.
-7. `analyses/2026-05-01_v17_re_diagnosis.md` - source-level re-diagnosis
-   landed 2026-05-01 (after v17-G close-out). Surfaces 2 un-tested
-   inference-side levers (final.pt re-eval; part_margin + segment_consistency
-   in per-step loss); revises P2 to lower-risk γ_init candidates. Read this
-   BEFORE acting on the v17g_gamma_int_boost_result.md P2 plan.
-8. `analyses/2026-05-02_v17h_results.md` - B1+B2+B3 server results.
-   v17-E.50 + final.pt is new project SOTA (correct-part 0.292,
-   local 36.11 cm). B2 NEGATIVE; B3 drift explains failure. Next
-   branch is mid-loop residual refresh, NOT P2.
-14. `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md` -
-    **v8.1 plan (current Stage A action).** v8 mixed-result diagnosis
-    → 3 frontier-paper-grounded fixes (MoMask mask, focal+dice multi-
-    hot, drop consistency). Path B: drop xyz back-compat. 15/15 tests
-    pass. Pending server retrain.
+## Current state, 2026-05-03
 
-15. `analyses/2026-05-02_alternatives_to_scheduled_sampling.md` -
-    Survey: 7 SOTA alternatives to TF (2023-2026). MoMask, LLaDA,
-    Diffusion Forcing, Self Forcing. Bengio 2015 TF proven non-
-    consistent (Huszár 2015).
+**Active branch**: Stage A v9.2 — ASL contact loss + motion-aware
+trunk with MoMask random masking. v9.1 is ship-ready (production
+ckpt below); v9.2 targets the 2 specific remaining failures.
 
-16. `analyses/2026-05-02_hoi_affordance_sota_survey_post_move_as_you_say.md` -
-    Survey: HOI affordance SOTA post-Move-as-You-Say. EgoChoir
-    (per-frame motion-KV — v9 candidate), Text2HOI, HOI-Diff. All use
-    multi-hot binary GT + focal+dice. v8's 128 tokens is at lower
-    bound vs literature.
+**Production Stage A predictor** (current `z_int` source):
+```
+runs/training/predictor_v9_1_3way_support/best_val.pt  (ep 19)
+```
+Key metrics:
+- contact any_part F1 0.70 (recall 0.89, precision 0.58)
+- target topk3_iou 0.133, centroid <5cm hit 10.9%
+- phase macro F1 0.62, support 3-way macro F1 0.645
+- foot precision 0.06 ← v9.2 ASL targets this
+- topk3_iou plateaus 0.13 ← v9.2 motion-aware trunk targets this
 
-17. `analyses/2026-05-02_mtl_dag_research_survey.md` -
-    Survey: multi-task DAG + gradient conflict + soft constraints.
-    TaskPrompter, DTME-MTL, Aligned-MTL, Cooper. No single paper
-    covers all 3; v9 stack candidate.
+**Stage B**: blocked. Last evaluated ckpt
+`runs/training/generator_v14_sampled_st_contact/best_contact.pt`.
+v18 retrain queued behind Stage A v9.2 acceptance + v8.1b refactor.
 
-12. `analyses/2026-05-05_predictor_v8_design.md` -
-    **v8 head re-architecture (superseded by v8.1).**
-    Replaces world-coord xyz regression with Move-as-You-Say-style
-    cross-attention over 128 object tokens (KL loss against Gaussian-
-    kernelled GT distribution, σ=0.08 m); replaces 4 independent
-    Linear heads with DAG conditioning (contact → {target, phase} →
-    support) + 4 hinge consistency losses + scheduled-sampling
-    teacher forcing. Code prototype + 9/9 sanity tests passed locally.
-    Pending server retrain. v18 BLOCKED on this — γ_int = 0.02 shows
-    Stage B already ignores z_int. **READ THIS BEFORE TOUCHING
-    STAGE A.**
-
-13. `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md` -
-    **v7-fix accepted as v12-strict baseline; 2026-05-04 v7 disaster
-    claim RETRACTED.** Same eval set: v6 21.13 cm, v7 21.66 cm,
-    v7-fix 21.77 cm. The "v6 baseline ~5-10 cm" was fabricated.
-    21 cm is the architecture's normal performance — exactly why v8
-    re-architects the head. Companion (retracted, kept for history):
-    `analyses/2026-05-04_predictor_v7_target_diagnosis.md`.
-
-11. `analyses/2026-05-03_pseudo_label_v12_strict_design.md` -
-    **v12 strict pseudo-label design (r3) — current active work.**
-    Replaces v11 "approach within 12 cm" with "real contact" (5 cm
-    palm-touch + engagement + drift filter). Two-case OR (kinematic
-    OR static), loose-distance gate, kin_local_sigma 0.06 m. PC-eval
-    frame frac 45% (v11 78%). Server runner ready
-    (`scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`);
-    pending server-side re-extraction → Stage A retrain → Stage B
-    v18 retrain. v18 predicted raw correct_part 0.176 → 0.30+,
-    guided 0.292 → 0.40+. **READ THIS FOR THE CURRENT MAIN BRANCH.**
-
-10. `analyses/2026-05-03_unified_metric_results.md` - Unified metric
-    overhaul + **training-vs-inference bottleneck diagnosis**.
-    Training is dominant bottleneck (52% of correct-part headroom
-    uncaptured even by best inference config; per-step pays jerk×8
-    plausibility tax). New ship gates: penetration (N1/N2),
-    weighted_local (N3), soft IoU (N6), jerk + KS (N7). v17-E.50 +
-    final.pt has 4 metric-gaming flags — **DO NOT SHIP**. New ship
-    default: v17-E.20 + final.pt. Next training-side branches:
-    B4 (γ_init ∈ {0.05, 0.1, 0.2}) → B6 (alignment-aware VQ retrain).
-
-9. `analyses/2026-05-02_codec_floor_baselines.md` - VQ codec floor
-   on alignment metrics measured for the first time (paradigm
-   shift). Codec floor: moving correct-part 0.393, moving same-part
-   local 28.61 cm, moving IoU 0.640. v17-E.50+final.pt has absorbed
-   ~74% of correct-part headroom. v17-E.50 mean_min_dist 16.86 <
-   codec floor 18.47 = **metric gaming**. **READ THIS BEFORE
-   reading any v17 result number** — model gaps need to be
-   reinterpreted relative to codec floor, not relative to perfect
-   1.0/0.0.
-
-Read when touching that area:
-
-- `SPEC.md` - stable project design and code layout.
-- `analyses/pseudo_label_pipeline.md` - Stage 1 labels and thresholds.
-- `analyses/stageA_design.md` - Stage A predictor v6 shipped state.
-- `analyses/early_setup.md` - one-time server/data/backbone gotchas.
-- `scripts/README.md` - script layout convention.
-
-Do not read old dated Stage B notes; they were merged into
-`analyses/stageB_compact.md` on 2026-04-29.
-
-## Current State, 2026-05-03 (latest — v9.1 prototype after v9 mixed result)
-
-**Active branch**: Stage A v9.1 — surgical fix to v9. v9 server eval
-(2026-05-03) showed contact pos_weight as the dominant win (foot
-recall 0 → 0.79/0.84, contact any_part recall 0.36 → 0.85, contact
-macro F1 0.227 → 0.371). Two issues remained:
-
-- Mask3D decoder added 7.7M params but topk3_iou flat (0.133 → 0.136)
-- Logit Adjustment τ=1.0 over-pushed rare classes; support both_feet
-  F1 collapsed 0.94 → 0.000, support macro F1 0.404 → 0.218
-
-User insight (key): "InterAct has no gymnastic poses with feet
-airborne, so hand_support in our data is just both_feet+hand-bracing
-— Stage B can derive it from contact_state[hand]". Drop the class.
-
-**v9.1 = 2 changes**:
-
-1. Drop hand_support class (3% of frames, compound class). Dataloader
-   maps id=3 → id=0; npz unchanged; num_support_states 4 → 3.
-2. Logit Adjustment τ=1.0 → τ=0.3 (Menon ICLR'21 range allows < 1 for
-   extreme imbalance).
-
-Keep contact pos_weight (dominant win) + Mask3D decoder (control for
-clean ablation in case v9.1 still flat on topk3_iou).
-
-25/25 sanity tests pass. Param 34.7M → 34.7M (head dim same; only
-support output projection drops by 1 dim ~ 0.8K params).
-
-Launch v9.1 server retrain:
+**Next action** (PLAN.md §Immediate Priority):
 ```bash
 accelerate launch --config_file configs/accelerate_config.yaml \
   -m piano.training.train_predictor \
-  --config configs/training/predictor_v9_1_3way_support.yaml
+  --config configs/training/predictor_v9_2_asl_motion.yaml
 ```
 
-Acceptance gates (vs v9 best):
-- support macro F1 ≥ 0.55 (recover from 0.218)
-- both_feet F1 ≥ 0.85 (recover from 0.000)
-- phase macro F1 ≥ 0.62 (recover from 0.541)
-- foot recall ≥ 0.70 (keep v9 win)
-- contact macro_f1 ≥ 0.35 (keep v9 win)
-
-After v9.1 passes: Stage B v8.1b InteractionTokenizer refactor → v18.
-
-## Earlier State, 2026-05-03 (v9 combined prototype)
-
-**Active branch**: Stage A v9 — three failure-mode-driven changes in
-one retrain. v8.1.1 server eval analysis traced 3 distinct failures
-to specific frontier-paper-known anti-patterns:
-
-1. **foot recall = 0 across v6 → v8.1.1 (LOSS BUG)**: contact head
-   was bare BCE with no pos_weight. focal_gamma in config only
-   applied to phase/support, NEVER to contact. With foot 3% positive,
-   BCE was dominated 32:1 by negatives → trivial "predict zero".
-   Fix: per-part pos_weight = (1-π)/π capped at 15. Following DECO
-   ICCV'23 + HACO NeurIPS'25. (Survey:
-   `analyses/2026-05-02_class_imbalance_sota_survey.md`.)
-
-2. **topk3_iou plateau at 0.13 (HEAD CAPACITY)**: single Q/K-only
-   cross-attn can't disambiguate adjacent tokens for moving contact
-   targets. Fix: 4-layer Mask3D / InteractVLM-style mask decoder
-   (self-attn + cross-attn + FFN per layer + Q·K^T mask projection).
-   InteractVLM CVPR'25 lifted DAMON contact F1 55→76 (+20pp) with
-   this exact change. (Survey:
-   `analyses/2026-05-02_predictor_v9_architecture_research.md`.)
-
-3. **Logit Adjustment never enabled**: code already in losses.py:236
-   for 6 months, every yaml had it off. Free 2-4 pp lift expected
-   (Menon ICLR'21).
-
-**Encoder explicitly NOT upgraded**: Heuken arXiv:2504.18355 ablation
-shows PointNet++ wins by 8.7 mIoU over PT V3 on dense affordance.
-
-22/22 sanity tests pass. Param 26.9M → 34.7M (+28.8%).
-
-Launch v9 server retrain (~7 h):
-```bash
-accelerate launch --config_file configs/accelerate_config.yaml \
-  -m piano.training.train_predictor \
-  --config configs/training/predictor_v9_combined.yaml
-```
-
-Acceptance gates (vs v8.1.1):
-- foot recall ≥ 0.15 (FIX from 0)
-- topk3_mean_iou ≥ 0.25 (was 0.133)
-- contact macro_f1 ≥ 0.30 (foot fix lifts macro)
-- phase macro F1 ≥ 0.65 (logit_adjust lift)
-- support macro F1 ≥ 0.42 (logit_adjust lift)
-- foot L2 ≤ 25 cm (FIX from 40)
-
-After v9 passes: Stage B v8.1b InteractionTokenizer refactor → v18.
-
-Detail: `analyses/2026-05-03_v9_combined_design.md`.
-
-## Earlier State, 2026-05-05 (v8.1.1 prototype)
-
-**Active branch**: Stage A v8.1.1 — fixes 2 specific v8.1 issues
-identified at server eval. v8.1 validated both core hypotheses but
-foot L2 regressed (25→42.7 cm) due to empty multi-hot masks at
-low-density τ_foot=3cm, and multihot_mean_iou=0.141 was misleading
-(focal loss doesn't calibrate sigmoid to 0.5).
-
-v8.1.1 single change: GT mask = (top-K=3 nearest tokens) ∪ (within-τ
-tokens) — guarantees ≥K positives per cell regardless of FPS density.
-Plus eval adds threshold-free topk3_mean_iou/f1 alongside legacy 0.5
-metrics. Same architecture, single config flag.
-
-18/18 sanity tests pass. Two parallel actions:
-
-1. **Zero-cost validation**: re-eval v8.1 ckpt with new metric
-   ```bash
-   python scripts/stage_a_predictor/eval_predictor.py \
-     --config configs/training/predictor_v8_1_masked.yaml \
-     --checkpoint runs/training/predictor_v8_1_masked/best_val.pt \
-     --split val \
-     --output runs/eval/stageA_predictor_v8_1_masked_val/predictor_v8_1_masked_val_best_with_topk.json
-   ```
-   If topk3_iou ≫ 0.141 → metric was the only issue → v8.1 already
-   passes; skip v8.1.1 retrain and proceed to Stage B v8.1b refactor.
-
-2. **v8.1.1 retrain** (~6 h, fixes foot regression):
-   ```bash
-   accelerate launch --config_file configs/accelerate_config.yaml \
-     -m piano.training.train_predictor \
-     --config configs/training/predictor_v8_1_1_topk_mask.yaml
-   ```
-   Acceptance: topk3_mean_iou ≥ 0.35, foot L2 ≤ 30 cm, no regress.
-
-After v8.1 (or v8.1.1) passes: Stage B v8.1b refactor for
-InteractionTokenizer to consume contact_target_attn directly.
-
-Detail: `analyses/2026-05-05_v81_results_and_v811_plan.md`.
-
-## Earlier State, 2026-05-05 (v8.1 prototype)
-
-**Active branch**: Stage A v8.1 — three frontier-paper-grounded fixes
-on top of v8's mixed-result diagnosis. v8 server retrain showed:
-
-- pelvis target +18 pp on <10cm hit ← **architecture sound**
-- phase / support regressed; target_top1 = 0.093 ← **specific failure modes**
-
-v8.1 fixes traced via 3 surveys (`analyses/2026-05-02_*.md`):
-
-1. **MoMask CVPR 2024 random mask** replaces Bengio 2015 TF (proven
-   non-consistent by Huszár 2015)
-2. **focal + dice on multi-hot binary GT** (EgoChoir NeurIPS 2024 +
-   Text2HOI CVPR 2024 standard) replaces KL on Gaussian-kerneled
-   softmax — multi-hot is the literature's way of saying "small
-   spatial offset is also correct"
-3. **Drop consistency loss** (Bertsekas penalty-method pathology;
-   Cooper NeurIPS 2025 augmented Lagrangian as v9 fallback)
-
-**Path B**: drop softmax-xyz back-compat output. Stage B
-InteractionTokenizer must be refactored in v8.1b to consume
-`contact_target_attn (B,T,5,128)` directly — see
-`src/piano/models/interaction_tokenizer.py:255` (currently flattens
-`contact_target_xyz` to 15 dims).
-
-15/15 sanity tests pass (v7-fix bit-identical; v8 unchanged with
-softmax+TF defaults; v8.1 mask+logits+focal-dice path validated).
-
-Launch v8.1a server retrain:
-```bash
-accelerate launch --config_file configs/accelerate_config.yaml \
-  -m piano.training.train_predictor \
-  --config configs/training/predictor_v8_1_masked.yaml
-```
-
-Acceptance gates:
-- multihot_mean_iou ≥ 0.30 (NEW primary metric)
-- contact / phase / support not regressed vs v8
-- pelvis target L2 ≤ 14.5 cm (keep v8 win)
-
-After v8.1a passes: Stage B v8.1b refactor → v18.
-
-## Earlier State, 2026-05-05 (v8 prototype)
-
-**Active branch**: Stage A v8 — affordance-attention target head +
-DAG-structured heads. Code prototype landed locally with 9/9 sanity
-tests passing. Server retrain (~6 h) is the next action; v18 is
-**blocked on v8**. Reason: predictor quality is the ship-blocker, not
-Stage B inference (γ_int = 0.02 evidence). v7-fix (21 cm L2, contact
-F1 0.237) cannot drive Stage B above the current floor — re-architect
-the head per `analyses/2026-05-05_predictor_v8_design.md`.
-
-Launch:
-```bash
-accelerate launch --config_file configs/accelerate_config.yaml \
-  -m piano.training.train_predictor \
-  --config configs/training/predictor_v8_structured.yaml
-```
-
-Acceptance for v8 (vs v7-fix):
-- target top-1 token recall ≥ 0.30
-- target xyz L2 (back-compat) ≤ 18 cm
-- contact macro_f1 ≥ 0.24, phase / support not regressed
-
-After v8 passes, launch Stage B v18.
-
-## Earlier State, 2026-05-05
-
-**Active branch**: v12 strict pseudo-label pipeline. Stage A v7-fix
-retrained on v12 labels and accepted as v12-strict baseline. Replaced
-by v8 design above.
-
-Key correction over 2026-05-04 thread: the "v7 21 cm L2 disaster"
-claim was based on a fabricated v6 baseline (~5-10 cm). v6 actually
-has 21.13 cm overall L2 on the same metric — 21 cm is the architecture's
-normal performance, not a regression. v7-fix's value is the +22 % rel.
-contact macro_f1 improvement (0.195 → 0.237), useful for downstream
-z_int conditioning. Detail:
-`analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md`.
-
-**Stage A predictor of record (v12-strict)**:
-`runs/training/predictor_v7fix_v12strict/best_val.pt` (epoch 34).
-contact macro_f1 0.237, target overall L2 21.77 cm,
-phase macro F1 0.632, support macro F1 0.397.
-
-Pending: Stage B v18 retrain (~1 day server). Launch:
-```bash
-bash scripts/stage_b_generator/run_v18_v12strict.sh
-```
-
-v8 backlog (not blocking): if downstream visual still shows "approach
-but not contact" after v18, revisit Stage A target head with
-representation change (pelvis-relative or object-anchored xyz, or
-coarse 16-way classification fallback).
-
-## Earlier Snapshot 2026-05-03
-
-**Active branch**: v12 strict pseudo-label re-extraction + Stage B v18
-retrain. Triggered by visual review of v17-E.50 + final.pt failing
-("人没真正接触到物体，只是有点靠近而已") + training-vs-inference
-diagnosis showing 52% of correct-part headroom uncaptured by best
-inference, with per-step paying jerk × 8 plausibility tax. Root cause:
-v11 pseudo-label defines hand contact as "wrist within 12 cm of mesh"
-which is "approach", not "touch". v12 strict redefines using
-OMOMO/CHOIS convention (5 cm palm + engagement + drift filter).
-
-Current state: server runner ready (`scripts/stage1_pseudo_labels/extract_v12_strict_interact.sh`),
-greenlight'd. Pending server execution: re-extract → Stage A retrain →
-Stage B v18 retrain → unified metric eval.
-
-## Earlier Snapshot 2026-05-01
-
-Project goal: PIANO generates object-adaptive human motion by inserting a
-structured interaction latent `z_int` between text/object inputs and the
-motion generator.
-
-Stage 1 pseudo-labels: current InterAct pseudo-label track is v11.
-
-Stage A predictor: shipped v6. Predictor of record is the server checkpoint
-identified as `runs/training/predictor/final.pt`; local sync may contain only
-its eval JSONs, not the `.pt` file.
-
-Stage B generator: active bottleneck. Current best evaluated one-shot contact
-checkpoint after v14 sampled-ST training is:
-
-- server checkpoint identifier:
-  `runs/training/generator_v14_sampled_st_contact/best_contact.pt`
-- full contact on matched 80-clip eval: `27.37 cm`
-- text_only: `57.82 cm`
-- swap: `74.79 cm`
-- moving-object coupled frame fraction: `0.2765`
-- v14 K=16 distance oracle: `16.80 cm`
-- v14 K=16 composite oracle: `17.17 cm` oracle, `17.94 cm` saved-best
-  remeasure, moving-coupled `0.3715`
-- v14 K=16 composite contact alignment to GT roundtrip: moving contact IoU
-  `0.4472`, moving correct GT-part recall `0.2378`, same-part object-local
-  position error `46.32 cm`
-- v14 K=64 alignment oracle: `17.92 cm` oracle, `18.71 cm` saved-best
-  remeasure, moving-coupled `0.3339`, moving contact IoU `0.4516`, correct
-  GT-part recall `0.2496`, same-part object-local position error `40.30 cm`
-- GT original: `13.09 cm`
-- GT VQ roundtrip: `18.47 cm`
-
-Interpretation: `z_int` is active and v14 is the first clear single-sample
-spatial-contact gain after the v12/v13 plateau. The v14 K=16 candidate pool is
-also better than v12 K=16 and reaches GT-roundtrip contact with better coupling.
-Visual review and contact alignment show the selected samples are still not
-GT-quality: distance/composite can be good while the wrong body part, wrong
-phase, or wrong object-local patch is used. K=64 alignment-aware selection is
-not enough: it improves local position error modestly but worsens coupling, and
-the best available K=64 candidates still have `37.0 cm` mean primary alignment
-error and only `0.165` best moving same-part recall. The remaining problem is
-the generated distribution's lack of aligned manipulation samples, not just a
-reranker weakness.
-
-Latest evaluated branch:
-
-- config: `configs/training/generator_v15_alignment_guided.yaml`
-- runner: `scripts/stage_b_generator/run_v15_alignment_guided.sh`
-- result: negative/neutral. `best_contact` raw full is `27.62 cm`,
-  `full_guided` is `31.57 cm`, moving contact IoU is `0.3804`, moving correct
-  GT-part recall is `0.1684`, and moving same-part local error is `55.09 cm`.
-- local visualization: `runs/visualizations/stageB_v0_15_bc_review/{full,full_guided}`.
-
-Latest evaluated branch (v16):
-
-- config: `configs/training/generator_v16_alignment_mirror.yaml`
-- runner: `scripts/stage_b_generator/run_v16_alignment_mirror.sh`
-- data change: deterministic MoMask/HumanML3D-style mirror doubling for train
-  only via `augmentation.mirror_duplicate=true`.
-- validation/eval remain unaugmented.
-- result: partial positive. `best_contact full` 26.79 cm (vs v15 27.62);
-  `full_guided` 28.91 cm (vs v15 31.57). Best non-oracle correct GT-part
-  recall to date: `0.1990` on `final` ckpt. Same-part local 52.91-53.49 cm
-  (vs v15 54.24-59.92). Still 8-13 cm short of v14 K=16/K=64 oracle. Decision-
-  gate verdict: keep mirror-doubling, but the next iteration must change
-  the mechanism, not the data/loss knob.
-
-Latest evaluated branch (v17-C):
-
-- runner: `scripts/stage_b_generator/run_v17_per_step_guidance.sh`
-- design: `analyses/2026-05-01_per_step_guidance_design.md`
-- result: `analyses/2026-05-01_v17_per_step_result.md`
-- mechanism: per-step decoded-geometric guidance — replaces the baseline
-  MaskGIT loop with a re-rolled version that runs N AdamW inner steps on the
-  predicted logits at each MaskGIT iteration before commit, using a
-  relaxed-decode geometric loss with frozen baseline residuals
-  (MaskControl ICCV 2025 `each_iter` half of the recipe; PIANO previously
-  ran only the `iter_last` post-hoc half).
-- inference-time only — runs on existing v14/v15/v16 `best_contact.pt`
-  unchanged, no retraining.
-- v17-C config: `PER_STEP_ITERS=10`, `GUIDANCE_STEPS=0` (per-step only).
-- single-sample 80-clip result: contact `21.77 cm` / coupled `0.3428` /
-  IoU `0.4388` / correct-part recall `0.2020` / same-part local `46.13 cm`.
-  Same-part local matches v14 K=16 composite oracle (46.32 cm); coupling
-  beats v14 K=64 alignment oracle (0.3339). Per-step inner loop flips
-  60.67% of base tokens vs naive baseline.
-
-Latest evaluated sweep (v17-D + v17-E, 2026-05-01):
-
-- v17-D stacked (per_step=10 + post_hoc=30) is *worse* than v17-C → MaskControl's
-  canonical stack does not stack on PIANO; do not pursue post-hoc.
-- v17-E.20 (per_step=20 only): contact `18.62 cm`, correct-part `0.2639`.
-- v17-E.50 (per_step=50 only): contact `16.50 cm` (below GT VQ roundtrip
-  18.47 — metric-gaming red flag), correct-part `0.2746`. User visual review:
-  visibly better than v16 raw, but contact patches still misaligned.
-
-Latest follow-up findings (2026-05-01):
-
-- D-A: γ_int ≈ 0.02 final after v14/v15/v16 training (zero-init grew to 0.02
-  over 80 epochs). IntXAttn is heavily underused — architectural lever
-  exists but deferred until v17-F decides whether inference TTT is enough.
-- MaskControl source-verified: pretrained MoMask VQ + frozen base + pure
-  CE training → **VQ codebook is not the bottleneck**. Codebook re-training
-  deprioritised.
-
-Latest evaluated sweep (v17-F Gumbel, 2026-05-01) — NEGATIVE:
-
-- v17-F.10 / v17-F.20 (Gumbel ON) regress every metric vs Gumbel-OFF
-  sanity reruns at both budgets. Root cause: PIANO's frozen baseline
-  residual_emb_sum dominates the decode embedding magnitude, so Gumbel
-  noise on the small base contribution destabilises inner-loop
-  gradients. MaskControl ignores residual during per-iter so same
-  injection works for them. Same multi-quantizer-residual
-  incompatibility that killed v17-D.
-- **Do not ship Gumbel on PIANO**. Default `--per-step-gumbel-scale=0.0`.
-- Sanity reruns (v17-C-ng / v17-E.20-ng, Gumbel OFF) match originals
-  within 0.5 cm — pipeline is consistent.
-
-**Inference path now near-saturated**: post-hoc stacking and Gumbel
-both regress; budget sweep at diminishing returns. Ship configs:
-**v17-E.20** (contact 18.62, correct-part 0.264, local 42.09 cm) or
-**v17-E.50** (contact 16.50, correct-part 0.275, local 39.02 cm; with
-metric-gaming caveat per visual review).
-
-Latest evaluated sweep (v17-G γ_int inference boost, 2026-05-01) —
-NEGATIVE:
-
-- boost ∈ {1, 2, 5, 10, 20} on top of v17-E.20 base config.
-- boost = 1 sanity reproduces v17-E.20 within RNG noise.
-- boost = 2 mixed: raw IoU +4.3 pp BUT raw correct-part −2.5 pp; per-step
-  every metric flat-to-worse.
-- boost ≥ 5 catastrophic: contact > 100 cm, correct-part < 0.05.
-- Confirms γ_int boost mechanism works (swap column blows up
-  monotonically: 69.67 → 230.85), but trained MaskTransformer is
-  calibrated to γ_int ≈ 0.02 and goes OOD at inference-time boost.
-- **Do not ship γ_int boost on PIANO**.
-
-**v17 inference-side path SATURATED.** Five levers tested over
-2026-05-01: per-step (positive), post-hoc stacking (negative), Gumbel
-(negative), γ_int boost (negative), residual context (deferred).
-Ship configs frozen: **v17-E.20** (default; contact 18.62, correct-part
-0.264, local 42.09 cm) or **v17-E.50** (best metrics, with metric-
-gaming risk per visual review).
-
-Latest implementation status (P2 NOT yet implemented):
-
-- Hypothesis (analyses/2026-05-01_v17g_gamma_int_boost_result.md):
-  γ_int is undertrained, not under-applied — re-init γ_int at positive
-  constant + finetune Stage B from v16 ckpt may unlock the gate.
-- Sweep plan: γ_init ∈ {0.1, 0.5, 1.0}, finetune 5–10 epochs, ~9 h
-  server time. Implementation cost ~1 day.
-- Awaiting greenlight before coding.
-
-## Current Decision
-
-Stop blind training-parameter sweeps for Stage B. v14 sampled-ST helps contact
-and candidate-pool quality, but K=64 alignment oracle shows pure reranking is
-near exhausted.
-
-Next work:
-
-1. Run v17-D + v17-E sweep on the server with the new wrapper:
-   `bash scripts/stage_b_generator/run_v17_sweep.sh`. Three back-to-back
-   conditions (v17-D stacked, v17-E.20, v17-E.50). Sync back
-   `runs/eval/stageB_v0_17_v16bc_{stacked,per_step_iters20,per_step_iters50}_*`.
-2. Compare each variant against v17-C baseline (contact `21.77`, coupled
-   `0.3428`, IoU `0.4388`, correct-part `0.2020`, same-part local `46.13`).
-   The remaining design threshold to clear is correct-part recall ≥ 0.22.
-3. v17-D > v17-C on correct-part → ship v17-D. v17-E.20 ≈ v17-C → 10 iters
-   saturated; drop v17-E.50. v17-E.50 > v17-E.20 by ≥ 1 cm contact and 1 pp
-   correct-part → consider full 100. correct-part stays < 0.22 across all
-   variants → pivot to OMOMO-style hand-position intermediate target.
-
-Do not spend another main iteration on larger K, rerank-weight tuning, or
-data-symmetry knobs.
-
-## Stage B Routes Already Tested
-
-Meaningful gains:
-
-- v0.4: fixed MoMask encoder normalization; solved token/body collapse.
-- B0: added contact distance metric; changed the objective from subjective
-  mp4 viewing to a measured body-object distance.
-- v0.6: per-head gamma improved the canonical 5-clip contact result.
-- v0.9: decoded contact auxiliary loss made `z_int` matter for contact.
-- v0.10: full-RVQ decoded-contact path helped on 20 clips, but did not close
-  the gap.
-- v14: sampled-ST full-RVQ decoded auxiliary path improved one-shot contact to
-  `27.37 cm`; v14 K=16 composite reaches `17.94 cm` with coupled `0.3715`.
-- v14 K=64 alignment oracle: improves same-part local error to `40.30 cm`, but
-  contact/coupling do not improve and the candidate pool is still poorly
-  aligned.
-
-Negative or exhausted routes:
-
-- More CE training: lowered CE but worsened contact.
-- Stochastic mirror augmentation v0.7 (`mirror_prob=0.5`): mathematically
-  correct but regressed contact. Deterministic mirror doubling is now separated
-  as v16 because MoMask/HumanML3D train data is mirrored.
-- Trainable-copy InterControl variant: fixed dead init, still regressed.
-- B3 inference-time base-logit guidance: produced mixed wins/losses; base
-  logits are not a stable binding lever.
-- C1 residual `z_int` wiring alone: failed.
-- C2b decoded-contact weight sweep: surrogate improved; generated contact did
-  not.
-
-## Operational Notes
-
-Server repo path used in previous runs:
-
-```bash
-cd /media/gpu-server-1/4TB_for_data/Cai/PIANO/PIANO
-conda activate piano
-```
-
-Current train/eval runner:
-
-```bash
-bash scripts/stage_b_generator/run_v16_alignment_mirror.sh
-```
-
-Local Windows workspace:
-
-```text
-e:\Project\2026-04-13
-```
-
-Most root memory docs and `analyses/` are gitignored local workflow files. If
-the user asks to commit them, force-add explicitly.
-
-## Before Acting
-
-Read files before answering repo-specific questions. Prefer official/upstream
-functions for MoMask, SMPL, VQ decode, rotations, and motion recovery; do not
-reimplement nontrivial math unless no upstream path exists. Keep Python
-src-layout: library code in `src/piano/`, direct scripts in `scripts/`.
+## Hard-won lessons (durable, applicable to any future iteration)
+
+These are in `analyses/stageA_compact.md` "Key lessons" but worth
+front-loading here:
+
+1. **Always read the actual eval JSON before claiming regression.** The
+   "v7 21cm L2 disaster" was based on a fabricated v6 baseline; v6 was
+   also 21cm. Cross-check before fixing imaginary problems.
+2. **Bengio scheduled sampling is non-consistent (Huszár 2015).** Use
+   MoMask random masking (Uniform[0,1] mask ratio per batch) for
+   train-test asymmetry — every information mix gets trained.
+3. **Multi-hot binary GT + focal+dice is HOI literature standard**, not
+   KL on Gaussian softmax. EgoChoir / Text2HOI / DECO all use this.
+4. **pos_weight is a sledgehammer**: helps recall, trashes precision.
+   For multi-label binary with extreme imbalance, ASL (γ_pos=0,
+   γ_neg=4, prob_shift=0.05) is the proper fix.
+5. **Logit Adjustment τ=1.0 over-corrects on extreme imbalance.** Use
+   τ ∈ [0.3, 0.5] for our 27:1 ratio dataset.
+6. **Compound classes**: don't try to learn `A ∧ B ∧ C` end-to-end at
+   3% positive rate. Decompose at extraction (e.g., we dropped
+   hand_support entirely; Stage B can derive it from contact_state[hand]).
+7. **Encoder upgrade is a trap on dense affordance.** Heuken
+   arXiv:2504.18355 — PointNet++ wins by 8.7 mIoU over PT V3.
+8. **Token-level ranking ceiling at ~0.13 is architectural.** Adding
+   head capacity (Mask3D 4-layer +7.7M params) didn't help. The fix
+   is making per-frame body kinematics directly available to the trunk
+   (motion-aware trunk in v9.2).
+9. **Sanity tests catch DDP / unused-parameter bugs early.** Any new
+   trainable parameter under DDP must receive gradient at backward —
+   we caught 2 such bugs (MHA out_proj v8 → v8.1, part_queries
+   v9 → v9.1) only because tests check this explicitly.
+10. **One change per commit + retrain.** Multi-knob changes break
+    attribution. v9 combined ASL + Mask3D + logit_adjust into one
+    retrain — couldn't tell which helped or hurt until a 2nd retrain
+    isolated each.
+
+## Hardware
+
+2 × A6000 48 GB. bf16 mixed precision via HuggingFace Accelerate DDP.
+Predictor train ~6-7 h; Stage B generator train ~24 h.
+
+## Common gotchas
+
+- **`git status` shows `analyses/` untracked**: yes, gitignored. Use
+  `git add -f analyses/<file>.md` to commit. Already-committed files
+  in `analyses/` show normally.
+- **Accelerate launch on Windows**: dev environment is Windows
+  PowerShell, training environment is Linux server. Don't try to
+  launch on Windows.
+- **`piano-train-predictor` vs `python scripts/...`**: the former is a
+  console script (`accelerate launch -m piano.training.train_predictor`
+  is the canonical form for training); scripts/stage_a_predictor/*.py
+  are direct-invocation utilities.

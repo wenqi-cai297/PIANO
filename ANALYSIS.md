@@ -1,116 +1,62 @@
 # PIANO Analysis Index
 
-This is the compact map of durable analysis docs. Dated Stage B logs were
-merged on 2026-04-29 to reduce context load.
+Compact index for durable analysis docs. Old dated docs (v17 era,
+v6/v7/v8 trial-and-error) were consolidated into compact summaries
+on 2026-05-03 to reduce context load.
 
-## Must-Read Docs
+## Compact summaries (read these first)
 
 | File | Purpose |
 |---|---|
-| `analyses/stageB_compact.md` | Consolidated Stage B design, literature/code evidence, result timeline, negative results, and next diagnostics. |
-| `analyses/stageA_design.md` | Stage A Interaction Predictor v6 shipped state and revisit triggers. |
-| `analyses/pseudo_label_pipeline.md` | Current pseudo-label fields, thresholds, abandoned label paths, and known label risks. |
-| `analyses/early_setup.md` | Server/data/backbone setup facts that are easy to forget. |
-| `analyses/2026-05-01_per_step_guidance_design.md` | v17 per-step decoded-geometric guidance design — MaskControl source-code refs, PIANO-specific multi-quantizer adaptation, hyperparameter starting points, ablation matrix v17-A..E with decision rule, risk register. v17-C done; v17-D/E pending. |
-| `analyses/2026-05-01_v17_per_step_result.md` | v17-C result — single-sample SOTA on v16 best_contact ckpt. contact 21.77 cm; same-part local 46.13 cm matches v14 K=16 composite oracle; moving_coupled 0.3428 beats v14 K=64 alignment oracle. Per-step trace shows 60.67% base-token flip rate. |
-| `analyses/2026-05-01_v17_diagnostics_and_gumbel.md` | v17 follow-up — γ_int audit (final ≈ 0.02, IntXAttn heavily underused) + MaskControl source diff verification (VQ codebook is not the bottleneck) + Gumbel-Softmax relaxation added to per-step inner loop (matches MaskControl `each_iter`). |
-| `analyses/2026-05-01_v17f_gumbel_result_and_p1_plan.md` | v17-F result (Gumbel **negative** on PIANO — regresses every metric at both budgets; multi-quantizer residual incompatibility) + P1 γ_int inference-boost plan (v17-G sweep at boost ∈ {1, 2, 5, 10, 20}). Inference path near-saturated; remaining lever is architectural γ_int gate. |
-| `analyses/2026-05-01_v17g_gamma_int_boost_result.md` | v17-G result (γ_int boost-at-inference **negative** — boost ≥ 5 catastrophic, boost = 2 mixed) + close-out summary of v17 inference-side series + P2 plan (re-init γ_int + finetune Stage B; first training-side experiment after 6 weeks of inference iteration). |
-| `analyses/2026-05-01_v17_re_diagnosis.md` | **Source-level re-diagnosis of the v17 series.** Refines (does not refute) the "γ_int undertrained" diagnosis. Surfaces 2 un-tested inference-side levers: (1) `final.pt` was never tested with v17-E (correct-part 0.199 vs best_contact 0.176); (2) per-step inner loss is a strict subset of training loss (no `part_margin` or `segment_consistency`). Revised decision tree B1–B5 with B1+B2 cheaper than P2. |
-| `analyses/2026-05-02_v17h_results.md` | **B1+B2+B3 server results.** B1 v17-E.50 + final.pt → project SOTA (correct-part 0.292, local 36.11 cm). B2 part_margin / segment_consistency NEGATIVE on PIANO. B3 residual drift mean 6–12 cm explains B2 failure (drift scales with part_margin weight). New ship config `v17-E.50 + final.pt` pending visual review. Next branch: N2 = mid-loop residual refresh `--per-step-residual-refresh-every`. |
-| `analyses/2026-05-02_codec_floor_baselines.md` | **VQ codec floor on alignment metrics — paradigm shift.** Previously-unmeasured: GT_roundtrip vs GT_orig codec floor on moving correct-part recall is **0.393** (not 1.0); same-part local **28.61 cm**; IoU **0.640**. v17-E.50+final.pt has absorbed 74% of inference-side correct-part headroom. v17-E.50 mean_min_dist 16.86 < codec floor 18.47 = direct metric-gaming evidence. **VQ codec is the dominant remaining bottleneck on alignment metrics** (contradicts prior claim based on mean_min_dist). Ship default switched to v17-E.20+final.pt pending penetration metric. New possible branch B6: alignment-aware VQ retrain. |
-| `analyses/2026-05-03_gamma_int_re_evaluation.md` | **γ_int re-evaluation — supersedes prior "1/25 of ControlNet" framing.** Full v4–v16 trajectory: all converge to 0.017–0.036; v05 (160 epochs) reaches 0.036, slow growth past 80 epochs (extrapolated γ=0.05 ≈ 480 epochs). z_int contribution at γ=0.02 measured: correct-part +6.6 pp vs text_only (23 % of z_int headroom captured). ControlNet is NOT directly comparable (no scalar γ); LLaMA-Adapter is the right anchor, ratio holds for architectural reasons (gradient path × 8 layers, 100 × less data, lower-rank conditioning). Realistic P2 upside revised: +3–6 pp correct-part. P2 candidates revised to {0.05, 0.10, 0.20}; 0.5/1.0 EXCLUDED. |
-| `analyses/2026-05-03_pseudo_label_v12_strict_design.md` | **v12 strict pseudo-label design (r3, two-case OR loose-distance).** Replaces v11's "approach within 12 cm" with "real contact" criteria matching OMOMO/CHOIS/InterDiff convention. PC-eval frame frac r3 45% vs v11 78% (neuraldome 25% → 36%, chairs 26% → 73%, imhd 19% → 33%, omomo 7% → 38%). User reviewed two false-negative reports (racket+glove case → r2 OR; sit at 16 cm pelvis dist → r3 loose). 24/27 r2-dropped clips recovered under r3. Server runner + verify script landed (commit `e16a59d`). |
-| `analyses/2026-05-04_predictor_v7_target_diagnosis.md` | **RETRACTED 2026-05-05.** "v6 baseline 5-10 cm" column was fabricated; actual v6 L2 is 21.13 cm. See 2026-05-05 doc for correction. |
-| `analyses/2026-05-05_v7fix_results_and_v6_baseline_correction.md` | **v7-fix accepted; v6 baseline correction.** Same eval set: v6 21.13 cm, v7 21.66 cm, v7-fix 21.77 cm — 21 cm is the architecture's normal performance, not a regression. v7-fix improvements: contact macro_f1 +22 % rel. (0.195 → 0.237), target L2 ~unchanged. v7-fix wandb csv synced from server is bit-identical to v7's (re-export error); eval JSONs are genuine. |
-| `analyses/2026-05-02_alternatives_to_scheduled_sampling.md` | **Survey: 7 SOTA alternatives to scheduled sampling (2023-2026).** MoMask CVPR 2024 / LLaDA ICLR 2025 / Diffusion Forcing NeurIPS 2024 / Self Forcing NeurIPS 2025 — all use random mask + iterative unmasking instead of Bengio TF. Huszár 2015 proved TF non-consistent. Direct prescription for v8.1 mask mode. |
-| `analyses/2026-05-02_hoi_affordance_sota_survey_post_move_as_you_say.md` | **Survey: HOI affordance prediction SOTA post-Move-as-You-Say.** EgoChoir NeurIPS 2024 (per-frame, motion-KV stream), Text2HOI CVPR 2024, HOI-Diff APDM, GenHOI 2025. Found: (a) all use multi-hot binary GT + focal+dice (not KL+softmax); (b) per-frame moving contact is under-served — only EgoChoir solves it via motion-stream KV (v9 candidate); (c) v8's 128 tokens is at lower bound vs SOTA. |
-| `analyses/2026-05-02_mtl_dag_research_survey.md` | **Survey: multi-task DAG + gradient conflict + soft constraints (2023-2026).** TaskPrompter ICLR 2023 (327★), DTME-MTL ICCV 2025, Aligned-MTL CVPR 2023, Cooper NeurIPS 2025 (158★) — augmented Lagrangian fixes ignored hinge consistency loss. No single paper covers DAG + grad conflict + train-test consistency; need a stack. |
-| `analyses/2026-05-03_v9_results_and_v91_plan.md` | **v9 results + v9.1 plan (current).** v9 server eval: contact pos_weight DOMINANT WIN (foot recall 0 → 0.79/0.84, contact macro F1 0.227 → 0.371). Mask3D decoder no lift. logit_adjust τ=1.0 caused support both_feet F1 collapse 0.94 → 0.000. **v9.1 = 2 surgical changes**: (1) drop hand_support class (user insight: InterAct has no feet-airborne poses → hand_support is "both_feet+hand bracing", redundant with contact_state[hand]); (2) τ=1.0 → τ=0.3. Keep contact pos_weight + Mask3D decoder. 25/25 sanity tests. |
-| `analyses/2026-05-03_v9_combined_design.md` | **v9 combined design.** Three failure-mode-driven changes in one retrain: (A) per-part contact pos_weight fixes foot recall=0 LOSS BUG that was present since v6 (DECO ICCV'23, HACO NeurIPS'25); (B) Mask3D-style 4-layer mask decoder replaces single Q/K cross-attn for moving-contact ranking (InteractVLM CVPR'25 +20pp); (C) Logit Adjustment on phase/support already coded but never enabled (Menon ICLR'21). Trunk + PointNet++ unchanged (Heuken arXiv:2504.18355 ablation). Param 26.9M → 34.7M. 22/22 tests pass. |
-| `analyses/2026-05-02_class_imbalance_sota_survey.md` | **Survey: class imbalance for per-frame structured prediction (2023-2026).** Found contact BCE bug (no pos_weight). DECO/HACO use class-balanced BCE not focal. ASL is upgrade if pos_weight insufficient. Compound class hand_support: literature says decompose, not regularize. |
-| `analyses/2026-05-02_predictor_v9_architecture_research.md` | **Survey: HOI architecture options for v9.** Mask3D / InteractVLM mask decoder is highest ROI. Encoder upgrade to PT V3/Sonata explicitly NOT recommended (Heuken 2025: PointNet++ wins by 8.7 mIoU on dense affordance). Trunk capacity not bottleneck (DiT scaling laws say 10K clips far below saturation). |
-| `analyses/2026-05-02_hoi_data_aug_synthetic_transfer_survey.md` | **Survey: HOI data augmentation + transfer learning.** Clip-level WeightedRandomSampler + class-balanced BCE highest ROI. Synthetic data (CHOIS/HOI-Diff) ruled out — same prior leakage. |
-| `analyses/2026-05-05_v81_results_and_v811_plan.md` | **v8.1 results + v8.1.1 plan.** Both hypotheses validated: MoMask mask fixed phase TF-gap (0.577→0.637); multi-hot binary tripled <5cm hit (4.5%→11.6%); pelvis pct<10cm 33.9%→59.1%. Two issues: foot L2 25→42.7cm (empty multi-hot mask when τ_foot<FPS spacing) and IoU=0.141 (focal+dice doesn't calibrate sigmoid to 0.5). v8.1.1 fixes both via top-K minimum mask (≥K positives per cell) + threshold-free top-K F1/IoU eval metric. Single config change, no architecture rework. 18/18 sanity tests pass. |
-| `analyses/2026-05-05_v8_round1_diagnosis_and_v81_plan.md` | **v8 round 1 diagnosis + v8.1 plan.** Diagnosis: pelvis target +18pp on <10cm hit (real architectural win); phase/support regression caused by TF; target_top1 0.093 caused by KL+softmax over-constraining; consistency loss ignored. v8.1 = 3 paired frontier-paper-grounded fixes (MoMask mask, focal+dice multi-hot, drop consistency). Path B selected (drop xyz back-compat; Stage B v8.1b refactor follows). 15/15 sanity tests pass. |
-| `analyses/2026-05-05_predictor_v8_design.md` | **v8 design — affordance-style target attention + structured DAG heads.** Two-coupled-fix design motivated by Move-as-You-Say (CVPR 2024) + the actual `extract_*.py` DAG. Target head replaced with cross-attention over the 128 object tokens with per-body-part queries (Move-as-You-Say-style affordance heatmap); supervised by KL(GT_attn ‖ pred_attn) where GT_attn is Gaussian-kernelled (σ=0.08 m). 4 independent Linear heads → DAG conditioning (contact → {target, phase} → support) + 4 hinge consistency losses + scheduled-sampling teacher forcing (Bengio NeurIPS'15). Param Δ: +1.1 M (4 %). Code prototype + 9/9 sanity tests passed. Acceptance: top-1 token recall ≥ 0.30, target xyz l2 ≤ 18 cm, contact macro_f1 ≥ 0.24. **v18 BLOCKED on v8** — γ_int = 0.02 evidence shows Stage B already ignores z_int. |
-| `analyses/2026-05-03_unified_metric_results.md` | **Unified metric overhaul + training-vs-inference diagnosis.** New ship gates (N1/N2 penetration, N3 weighted_local, N6 soft IoU, N7 jerk + KS) measured on GT_orig + GT_roundtrip + 22 v17 conditions. v17-E.50+final.pt has 4 independent metric-gaming flags (mean_min_dist < codec floor; penetration +0.4 cm; pen-2cm frac +13 pp; jerk **8 × GT_orig**). **Training is the dominant bottleneck** (52% of correct-part headroom uncaptured by best inference; per-step pays jerk×8 plausibility tax). Ship default → v17-E.20+final.pt; next training-side branch is B4 (γ_init ∈ {0.05, 0.1, 0.2}) followed by B6 (codec retrain). |
+| `analyses/stageA_compact.md` | Stage A predictor v6 → v9.2 evolution: per-version verdict + 10 durable lessons. Read before touching predictor. |
+| `analyses/stageB_compact.md` | Stage B generator v0 → v17 evolution: training/inference/eval branches + decisions. |
+| `analyses/early_setup.md` | Server / data / backbone setup gotchas. |
+| `analyses/pseudo_label_pipeline.md` | Stage 1 label fields, thresholds, abandoned paths. |
+| `analyses/stageA_design.md` | Stage A v6 shipped state (legacy reference). |
 
-Root memory docs:
+## Specs / current designs
+
+| File | Purpose |
+|---|---|
+| `analyses/2026-05-03_pseudo_label_v12_strict_design.md` | v12 strict label definition (current production). |
+| `analyses/2026-05-03_v92_asl_motion_aware_design.md` | **Stage A v9.2 — current pending retrain.** ASL contact loss + motion-aware trunk with MoMask random masking. |
+| `analyses/2026-05-01_per_step_guidance_design.md` | v17 per-step decoded-geometric guidance design (Stage B inference). |
+| `analyses/2026-05-02_codec_floor_baselines.md` | VQ codec floor on alignment metrics — paradigm shift. |
+| `analyses/2026-05-03_unified_metric_results.md` | Unified Stage B ship metrics (penetration / weighted_local / soft IoU / jerk). |
+| `analyses/2026-05-03_gamma_int_re_evaluation.md` | γ_int trajectory v4 → v16 + downstream interpretation. |
+
+## Frontier surveys (read on demand for new design decisions)
+
+| File | When to consult |
+|---|---|
+| `analyses/2026-05-02_alternatives_to_scheduled_sampling.md` | Train-test gap, masking, scheduled sampling alternatives. |
+| `analyses/2026-05-02_class_imbalance_sota_survey.md` | Long-tail / FP / ASL / pos_weight tradeoffs. |
+| `analyses/2026-05-02_hoi_affordance_sota_survey_post_move_as_you_say.md` | HOI affordance prediction architectures (EgoChoir, Text2HOI, etc.). |
+| `analyses/2026-05-02_hoi_data_aug_synthetic_transfer_survey.md` | Data augmentation, synthetic data, transfer learning. |
+| `analyses/2026-05-02_mtl_dag_research_survey.md` | Multi-task DAG / gradient conflict / consistency loss. |
+| `analyses/2026-05-02_predictor_v9_architecture_research.md` | Architecture options (encoders, decoders, heads). |
+
+## Root memory docs
 
 | File | Purpose |
 |---|---|
 | `restart_prompt.md` | Fast recovery checklist for fresh sessions. |
-| `PROGRESS.md` | Current numbers and artifact state. |
-| `PLAN.md` | Next actions and routes not worth repeating. |
-| `SPEC.md` | Stable compact project specification. |
+| `PROGRESS.md` | Current numbers + active branches + recent decisions. |
+| `PLAN.md` | Next executable actions. |
+| `SPEC.md` | Stable project design + code layout. |
 | `SUGGESTION.md` | Current recommendation memo. |
 
-## Current Stage B Conclusion
-
-v12 weight sweep is a negative result for more parameter tuning: stronger
-decoded-contact surrogate and larger gradient share did not improve generated
-contact. v13 target-trajectory loss also stayed near the same hard-sampling
-line (`31.57 cm`, moving coupled `0.265`).
-
-v14 sampled-ST is a positive result: `best_contact` reaches `27.37 cm` full
-contact on the matched 80-clip eval, versus GT roundtrip `18.47 cm`. More
-importantly, v14 K=16 reaches GT-roundtrip contact and improves coupling:
-distance oracle `16.80 cm`; composite oracle `17.17 cm`, saved-best remeasure
-`17.94 cm`, moving coupled `0.3715`.
-
-Visual review and the new contact-alignment diagnostic show that this is still
-not GT-quality generation. v14 K=16 composite reaches the distance band but has
-only `0.4472` moving contact IoU against GT roundtrip, only `0.2378` correct
-GT-body-part recall on moving GT-contact frames, and about `46 cm` same-part
-object-local position error. The remaining bottleneck is now more specific
-than "sample selection": the metric/guidance must be body-part and
-contact-target aware.
-
-The v14 K=64 alignment-aware oracle is a useful negative result. It improves
-same-part local position error to `40.30 cm`, but contact remeasure is
-`18.71 cm`, moving-coupled frame fraction falls to `0.3339`, moving contact IoU
-is only `0.4516`, and correct GT-part recall is only `0.2496`. Across the full
-K=64 pool, the best primary alignment error per clip is still `37.0 cm` on
-average and the best moving same-part recall is only `0.165`. So this is not
-just an underpowered K=16 reranking issue; v14 usually does not contain a truly
-GT-aligned manipulation sample to select.
-
-Latest result and implementation:
-
-- v15 has been evaluated and is negative/neutral: `best_contact` raw full is
-  `27.62 cm`, moving contact IoU is `0.3804`, moving correct GT-part recall is
-  `0.1684`, and same-part local error is `55.09 cm`. `full_guided` worsens
-  contact to `31.57 cm`.
-- v15's code remains as the alignment-loss baseline: wrong-part margin,
-  contact-segment consistency, strict contact-eval alignment metrics, and
-  `--guidance-layers full_rvq`.
-- v16 is now the active next implementation in
-  `configs/training/generator_v16_alignment_mirror.yaml` and
-  `scripts/stage_b_generator/run_v16_alignment_mirror.sh`: it keeps v15's
-  objective and enables deterministic original+mirror training-set doubling.
-
-Next analysis should be:
-
-1. Run v16 on the server and compare raw `full` vs guided `full_guided`, using
-   predicted/conditioned contact body part, object-local target, local-frame
-   coupling, and the mirror-doubled training distribution.
-2. Evaluate with contact distance, temporal coupling, and
-   `scripts/stage_b_generator/measure_contact_alignment.py`.
-3. Subset/hard-case review, especially IMHD and NeuralDome moving-object
-   failures that remain above `25-40 cm`.
-
-## Analysis Hygiene
+## Hygiene
 
 When a new experiment finishes:
 
-1. Record only durable facts: config, checkpoint, eval set, metric table,
-   interpretation, and decision.
-2. Update `PROGRESS.md` and `PLAN.md`.
-3. If the result changes Stage B direction, append or revise
-   `analyses/stageB_compact.md`.
-4. Avoid creating long dated notes unless the result cannot yet be merged.
-5. Delete or merge dated notes once the decision has settled.
-
-Keep citations compact. Prefer full details in code comments, configs, and
-artifact paths rather than pasting long source excerpts.
+1. Update `PROGRESS.md` (snapshot section) and `PLAN.md` (next action).
+2. If the result changes a Stage's direction, append to or revise the
+   stage's compact doc (`stageA_compact.md` / `stageB_compact.md`).
+3. Avoid creating new dated `analyses/YYYY-MM-DD_*.md` unless the doc
+   is a multi-page design / survey that won't fit in the compact doc.
+4. Do not create per-version dated docs (`v9_design`, `v9.1_results`,
+   etc.) — they accumulate and create noise. Update the compact doc
+   instead.
+5. Once a result is stable, cite via the compact doc, not the dated
+   intermediate.
