@@ -263,6 +263,62 @@ was incomplete. Two un-tested inference-side levers exist:
    to target_world. The visual "right area, wrong patch" failure is
    directly explainable by missing `part_margin`.
 
+2026-05-03 **v9 server eval done — mixed result. v9.1 prototype
+landed (25/25 tests pass)** — 3-way support + softened logit_adjust.
+
+v9 server eval (best ep19):
+
+| outcome | metric | v8.1.1 → v9 | verdict |
+|---|---|---|---|
+| ✅✅✅ | foot recall | 0/0 → 0.79/0.84 | DOMINANT WIN, contact pos_weight fix |
+| ✅✅ | hand recall | 17-25% → 64-68% | same fix |
+| ✅✅ | contact any_part recall | 0.36 → 0.85 | same fix |
+| ✅ | contact macro_f1 | 0.227 → 0.371 | +63% rel |
+| ⚠️ | topk3_iou | 0.133 → 0.136 | Mask3D decoder no lift |
+| ❌ | phase macro F1 | 0.637 → 0.541 | logit_adjust τ=1.0 over-pushed rare classes |
+| ❌❌ | support macro F1 | 0.404 → 0.218 | both_feet F1 collapsed 0.94 → 0.000 |
+
+Per-change verdict: contact pos_weight is the single dominant change.
+Mask3D decoder neutral. Logit Adjustment τ=1.0 caused regression.
+
+**v9.1 = 2 surgical changes**:
+
+1. **Drop hand_support class** (3.06% of frames, compound class).
+   User insight: InterAct has no gymnastic poses with feet airborne,
+   so hand_support is "both_feet on floor + extra hand bracing" —
+   adds zero info beyond contact_state[hand]. Stage B can derive it.
+   Implementation: HOIDataset.support_collapse_hand_support flag maps
+   id=3 → id=0 at load time; npz files unchanged; num_support_states 4 → 3.
+
+2. **Soften Logit Adjustment τ=1.0 → τ=0.3**. Menon ICLR'21 says τ
+   ∈ [0, 1.5]; extreme imbalance needs τ < 1. With support 3-way
+   (less imbalanced after dropping hand_support), τ=0.3 should give
+   the rare-class lift without collapsing dominant.
+
+Keep contact pos_weight (dominant win) and Mask3D decoder (control
+variable for next iteration — can revisit if v9.1 still flat on
+topk3_iou).
+
+Code (commits pending):
+- `src/piano/data/dataset.py` — `support_collapse_hand_support` flag
+  on HOIDataset; mapping in `_load_pseudo_labels`
+- `src/piano/training/train_predictor.py` + `eval_predictor.py` —
+  `output_cfg = merge(model_cfg.output, cfg.model.output)` for
+  num_support override; flag passed through dataset construction
+- `configs/training/predictor_v9_1_3way_support.yaml` — new config
+- `tests/test_structured_head.py` — 3 v9.1 tests (25/25 pass)
+
+Acceptance gates v9.1 (vs v9 best):
+- support macro F1 ≥ 0.55 (recover from 0.218; new 3-way distribution
+  is heavily favored toward both_feet so easy ceiling)
+- both_feet F1 ≥ 0.85 (recover from 0.000)
+- phase macro F1 ≥ 0.62 (recover from 0.541)
+- foot recall ≥ 0.70 (keep v9's win, was 0.79/0.84)
+- contact macro_f1 ≥ 0.35 (keep v9's win, was 0.371)
+
+Detail: see commit message + `analyses/2026-05-03_v9_combined_design.md`
+(amend with v9 results + v9.1 plan).
+
 2026-05-03 **v9 combined prototype landed (22/22 tests pass)**.
 Three failure-mode-driven changes in one retrain, each frontier-paper
 grounded:

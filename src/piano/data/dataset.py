@@ -159,6 +159,17 @@ class HOIDataset(Dataset):
         augment: AugmentConfig | None = None,
         surface_obj_pose: bool = False,
         force_world_frame: bool = False,
+        # v9.1 (2026-05-03): collapse hand_support (id=3) into both_feet
+        # (id=0) at load time. The compound class hand_support
+        # = (hand_contact ∧ pelvis_static ∧ phase_stable) is essentially
+        # "both_feet on floor + extra hand bracing" in InterAct (no
+        # gymnastic poses with feet airborne); collapsing it discards
+        # zero useful information for Stage B (which can derive the
+        # hand-bracing condition from contact_state[hand] + phase).
+        # When True, num_support_states should be 3 in the model
+        # config and SUPPORT_NAMES is implicitly truncated to the
+        # first 3 names.
+        support_collapse_hand_support: bool = False,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
@@ -172,6 +183,7 @@ class HOIDataset(Dataset):
         # Off by default so Stage A predictor training (which doesn't
         # need them) doesn't pay the MoMask-recovery import cost.
         self.surface_obj_pose = surface_obj_pose
+        self.support_collapse_hand_support = bool(support_collapse_hand_support)
         # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
         # True, the obj-pose channels are returned in WORLD frame instead
         # of body-canonical frame. Tests Hypothesis E (frame-choice
@@ -486,6 +498,16 @@ class HOIDataset(Dataset):
             if key in data:
                 arr = data[key].astype(np.float32) if key not in ("phase", "support") else data[key]
                 result[key] = arr[:seq_len]
+        # v9.1: collapse hand_support (id=3) → both_feet (id=0) at load
+        # time. Saves re-extracting 8475 npzs while letting the model
+        # train as 3-way support. See HOIDataset docstring for rationale.
+        if (
+            getattr(self, "support_collapse_hand_support", False)
+            and result["support"] is not None
+        ):
+            sup = result["support"].copy()
+            sup[sup == 3] = 0  # SUPPORT_HAND → SUPPORT_BOTH_FEET
+            result["support"] = sup
 
         # 1. Preferred path: exact closest-surface-point GT from the
         # extractor. Always use this when the npz has it.

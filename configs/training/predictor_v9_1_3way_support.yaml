@@ -1,0 +1,154 @@
+# Stage A v9.1: surgical fix to v9 — drop hand_support class +
+# soften logit_adjust τ. Keep contact pos_weight (the dominant win)
+# and the Mask3D decoder (control variable for next iteration).
+#
+# v9 server eval (2026-05-03) was a mixed result:
+#
+#   ✅ contact pos_weight: foot recall 0 → 0.79/0.84, hand recall
+#       17-25% → 64-68%, contact macro_f1 0.227 → 0.371. DOMINANT WIN.
+#
+#   ⚠️ Mask3D 4-layer decoder: topk3_iou 0.133 → 0.136 (no lift).
+#       Architecture didn't help token-level ranking. Kept here as
+#       control to avoid confounding the v9.1 ablation.
+#
+#   ❌ Logit Adjustment τ=1.0: phase 0.637 → 0.541, support 0.404
+#       → 0.218 (both_feet F1 collapsed 0.94 → 0.000). τ=1.0
+#       over-pushed rare classes; dominant class abandoned.
+#
+# Two changes vs v9:
+#
+# 1. **Drop hand_support class** (3.06 % of frames, compound class
+#    `hand_contact ∧ pelvis_static ∧ phase_stable`). User insight:
+#    InterAct has no gymnastic poses with feet airborne, so
+#    hand_support in our data is "both_feet on floor + extra hand
+#    bracing" — adds no information beyond contact_state[hand]. Stage
+#    B can derive hand-bracing condition directly. Implementation:
+#    HOIDataset.support_collapse_hand_support=true maps id 3 → 0
+#    at load time; npz files unchanged; num_support_states: 4 → 3.
+#
+# 2. **Soften Logit Adjustment**: τ=1.0 → τ=0.3. Menon ICLR'21 says
+#    τ ∈ [0, 1.5]; extreme imbalance datasets need lower τ. With
+#    support now 3-way (less imbalanced after dropping hand_support),
+#    a milder τ should give the +2-4 pp lift without collapsing
+#    dominant class.
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~7 h.
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  # v9.1: override num_support_states from model file's 4 → 3.
+  output:
+    num_support_states: 3
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+    target_attn_kind: "mask_decoder"
+    target_decoder_layers: 4
+    target_decoder_ffn: 1024
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  # v9.1: drop hand_support — collapse id=3 → id=0 (both_feet) at
+  # load time. npz files stay 4-way for back-compat.
+  support_collapse_hand_support: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+  target_topk_min_positives: 3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+
+  # v9 KEEPER: class-balanced contact BCE (the dominant win).
+  use_contact_pos_weight: true
+  contact_pos_weight_cap: 15.0
+
+  # v9.1 SOFTENED: τ=1.0 over-pushed rare classes in v9. With support
+  # 3-way (after dropping hand_support), τ=0.3 should give the
+  # rare-class lift without collapsing dominant class.
+  use_logit_adjustment: true
+  logit_adjust_tau: 0.3
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v9_1_3way_support"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v9_1_3way_support"

@@ -54,7 +54,29 @@ duration + engagement) with PIANO-specific wrap-grip tolerance.
      enabled, Menon ICLR'21)
    Param 26.9M → 34.7M (+28.8%). Trunk + ObjectEncoder unchanged.
    Detail: `analyses/2026-05-03_v9_combined_design.md`.
-2c-5. 🟢 NEXT: **v9 server retrain (~7 h)**. Launch:
+2c-5a. ✅ v9 server retrain DONE. Mixed result:
+   - contact pos_weight: foot recall 0 → 0.79/0.84 (DOMINANT WIN)
+   - Mask3D decoder: topk3_iou flat (no lift)
+   - logit_adjust τ=1.0: support macro F1 0.404 → 0.218 (REGRESSION)
+2c-5b. ✅ **v9.1 prototype LANDED** (25/25 tests pass). 2 surgical
+   changes:
+   - Drop hand_support class (3% of frames, compound; user insight:
+     InterAct has no feet-airborne poses → hand_support adds no info
+     beyond contact_state[hand]). num_support_states 4 → 3 via
+     dataloader collapse (npz unchanged).
+   - logit_adjust τ=1.0 → τ=0.3 (Menon ICLR'21 range; with 3-way
+     support being less imbalanced, milder τ should give rare-class
+     lift without collapsing dominant)
+   Keep: contact pos_weight (dominant win) + Mask3D decoder (control).
+2c-5c. 🟢 NEXT: **v9.1 server retrain (~7 h)**. Launch:
+   ```bash
+   accelerate launch --config_file configs/accelerate_config.yaml \
+     -m piano.training.train_predictor \
+     --config configs/training/predictor_v9_1_3way_support.yaml
+   ```
+   Acceptance: support macro F1 ≥ 0.55, both_feet F1 ≥ 0.85, phase ≥
+   0.62, foot recall ≥ 0.70 (keep), contact macro_f1 ≥ 0.35 (keep).
+2c-5-old. 🟢 NEXT: **v9 server retrain (~7 h)**. Launch:
    ```bash
    accelerate launch --config_file configs/accelerate_config.yaml \
      -m piano.training.train_predictor \

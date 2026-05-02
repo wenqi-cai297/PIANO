@@ -775,6 +775,76 @@ def test_v9_config_yaml_end_to_end():
     print("[PASS] test_v9_config_yaml_end_to_end")
 
 
+def test_v91_3way_support_collapse_label_mapping():
+    """v9.1: HOIDataset.support_collapse_hand_support=True maps id=3
+    (HAND_SUPPORT) → id=0 (BOTH_FEET) at load time without touching
+    the npz files."""
+    import numpy as np
+    # Synthetic support array with all 4 classes
+    sup_4way = np.array([0, 1, 2, 3, 3, 2, 1, 0], dtype=np.int64)
+
+    # Simulate what HOIDataset._load_pseudo_labels does:
+    sup_collapsed = sup_4way.copy()
+    sup_collapsed[sup_collapsed == 3] = 0
+    expected = np.array([0, 1, 2, 0, 0, 2, 1, 0], dtype=np.int64)
+    assert np.array_equal(sup_collapsed, expected)
+    # All previous hand_support frames are now both_feet
+    assert (sup_collapsed != 3).all()
+    print("[PASS] test_v91_3way_support_collapse_label_mapping")
+
+
+def test_v91_config_yaml_propagates_3way_support():
+    """v9.1 yaml builds a 3-way support head + collapse flag enabled."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(
+        repo_root / "configs/training/predictor_v9_1_3way_support.yaml"
+    )
+    model_cfg = OmegaConf.load(repo_root / cfg.model.config)
+    output_cfg = OmegaConf.merge(
+        model_cfg.output,
+        cfg.model.get("output", {}),
+    )
+    assert int(output_cfg.num_support_states) == 3, \
+        f"v9.1 yaml should set num_support_states=3, got {output_cfg.num_support_states}"
+    assert bool(cfg.data.get("support_collapse_hand_support", False)) is True, \
+        "v9.1 yaml should enable support_collapse_hand_support"
+    assert float(cfg.loss.logit_adjust_tau) == 0.3, \
+        f"v9.1 yaml should soften logit_adjust to τ=0.3, got {cfg.loss.logit_adjust_tau}"
+    assert bool(cfg.loss.use_contact_pos_weight) is True, \
+        "v9.1 must keep v9's contact pos_weight (the dominant win)"
+    print("[PASS] test_v91_config_yaml_propagates_3way_support")
+
+
+def test_v91_predictor_3way_support_head():
+    """InteractionPredictor with num_support_states=3 builds correctly
+    and produces (B, T, 3) support logits."""
+    pred_model = InteractionPredictor(
+        d_model=192, num_layers=2, num_heads=6, dim_feedforward=512,
+        max_seq_length=64,
+        num_support_states=3,
+        structured_head=True,
+        structured_head_target_attn_output="logits",
+        structured_head_downstream_mode="mask",
+        structured_head_target_attn_kind="single_layer",
+    )
+    pred_model.eval()
+    text_tokens = torch.randn(2, 77, 512)
+    obj_tokens = torch.randn(2, 32, 192)
+    obj_xyz = torch.randn(2, 32, 3)
+    init_pose = torch.randn(2, 66)
+    with torch.no_grad():
+        out = pred_model(
+            text_tokens, obj_tokens, init_pose,
+            seq_length=8, object_xyz=obj_xyz,
+        )
+    assert out["support_logits"].shape == (2, 8, 3), \
+        f"3-way support head should emit (B, T, 3), got {out['support_logits'].shape}"
+    print("[PASS] test_v91_predictor_3way_support_head")
+
+
 def test_v81_eval_build_models_propagates_flags():
     """Regression: scripts/stage_a_predictor/eval_predictor.py::_build_models
     must propagate v8.1 flags (downstream_mode + target_attn_output) to
@@ -835,5 +905,8 @@ if __name__ == "__main__":
     test_v9_structured_head_with_mask_decoder()
     test_v9_contact_pos_weight_increases_positive_loss()
     test_v9_config_yaml_end_to_end()
+    test_v91_3way_support_collapse_label_mapping()
+    test_v91_config_yaml_propagates_3way_support()
+    test_v91_predictor_3way_support_head()
     test_v81_eval_build_models_propagates_flags()
-    print("\nAll v8 + v8.1 + v8.1.1 + v9 sanity tests passed.")
+    print("\nAll v8 + v8.1 + v8.1.1 + v9 + v9.1 sanity tests passed.")

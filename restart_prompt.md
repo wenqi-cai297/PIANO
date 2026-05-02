@@ -122,7 +122,51 @@ Read when touching that area:
 Do not read old dated Stage B notes; they were merged into
 `analyses/stageB_compact.md` on 2026-04-29.
 
-## Current State, 2026-05-03 (latest — v9 combined prototype)
+## Current State, 2026-05-03 (latest — v9.1 prototype after v9 mixed result)
+
+**Active branch**: Stage A v9.1 — surgical fix to v9. v9 server eval
+(2026-05-03) showed contact pos_weight as the dominant win (foot
+recall 0 → 0.79/0.84, contact any_part recall 0.36 → 0.85, contact
+macro F1 0.227 → 0.371). Two issues remained:
+
+- Mask3D decoder added 7.7M params but topk3_iou flat (0.133 → 0.136)
+- Logit Adjustment τ=1.0 over-pushed rare classes; support both_feet
+  F1 collapsed 0.94 → 0.000, support macro F1 0.404 → 0.218
+
+User insight (key): "InterAct has no gymnastic poses with feet
+airborne, so hand_support in our data is just both_feet+hand-bracing
+— Stage B can derive it from contact_state[hand]". Drop the class.
+
+**v9.1 = 2 changes**:
+
+1. Drop hand_support class (3% of frames, compound class). Dataloader
+   maps id=3 → id=0; npz unchanged; num_support_states 4 → 3.
+2. Logit Adjustment τ=1.0 → τ=0.3 (Menon ICLR'21 range allows < 1 for
+   extreme imbalance).
+
+Keep contact pos_weight (dominant win) + Mask3D decoder (control for
+clean ablation in case v9.1 still flat on topk3_iou).
+
+25/25 sanity tests pass. Param 34.7M → 34.7M (head dim same; only
+support output projection drops by 1 dim ~ 0.8K params).
+
+Launch v9.1 server retrain:
+```bash
+accelerate launch --config_file configs/accelerate_config.yaml \
+  -m piano.training.train_predictor \
+  --config configs/training/predictor_v9_1_3way_support.yaml
+```
+
+Acceptance gates (vs v9 best):
+- support macro F1 ≥ 0.55 (recover from 0.218)
+- both_feet F1 ≥ 0.85 (recover from 0.000)
+- phase macro F1 ≥ 0.62 (recover from 0.541)
+- foot recall ≥ 0.70 (keep v9 win)
+- contact macro_f1 ≥ 0.35 (keep v9 win)
+
+After v9.1 passes: Stage B v8.1b InteractionTokenizer refactor → v18.
+
+## Earlier State, 2026-05-03 (v9 combined prototype)
 
 **Active branch**: Stage A v9 — three failure-mode-driven changes in
 one retrain. v8.1.1 server eval analysis traced 3 distinct failures

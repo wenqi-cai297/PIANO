@@ -227,6 +227,10 @@ def _build_dataset(
             object_id_filter=split_info["object_id_filter"],
             subject_id_filter=split_info["subject_id_filter"],
             augment=augment,
+            # v9.1: collapse hand_support → both_feet at dataloader.
+            support_collapse_hand_support=bool(
+                cfg.data.get("support_collapse_hand_support", False)
+            ),
         )
         datasets.append(ds)
 
@@ -416,6 +420,13 @@ def run(config_path: str) -> None:
     model_cfg = OmegaConf.load(cfg.model.config)
     obj_cfg = OmegaConf.load(cfg.model.object_encoder_config)
 
+    # v9.1: allow training yaml to override model/output fields (e.g.,
+    # num_support_states from 4 → 3 when collapsing hand_support).
+    output_cfg = OmegaConf.merge(
+        model_cfg.output,
+        cfg.model.get("output", {}),
+    )
+
     # Models
     tr_cfg = model_cfg.get("temporal_refine", {})
     # structured_head: model file holds the defaults; training yaml's
@@ -438,10 +449,10 @@ def run(config_path: str) -> None:
         text_dim=model_cfg.input.text_dim,
         pose_dim=model_cfg.input.pose_dim,
         max_seq_length=model_cfg.sequence.max_length,
-        num_body_parts=model_cfg.output.num_body_parts,
-        target_coord_dim=model_cfg.output.get("target_coord_dim", 3),
-        num_phases=model_cfg.output.num_phases,
-        num_support_states=model_cfg.output.num_support_states,
+        num_body_parts=int(output_cfg.num_body_parts),
+        target_coord_dim=int(output_cfg.get("target_coord_dim", 3)),
+        num_phases=int(output_cfg.num_phases),
+        num_support_states=int(output_cfg.num_support_states),
         temporal_refine_enabled=bool(tr_cfg.get("enabled", True)),
         temporal_refine_kernel_size=int(tr_cfg.get("kernel_size", 5)),
         temporal_refine_dropout=float(tr_cfg.get("dropout", 0.1)),
@@ -513,9 +524,9 @@ def run(config_path: str) -> None:
         accelerator.print("Computing class priors (logit adjust + contact pos_weight)...")
         phase_freq, support_freq, contact_part_freq = compute_class_priors(
             dataset,
-            num_phases=model_cfg.output.num_phases,
-            num_support=model_cfg.output.num_support_states,
-            num_body_parts=model_cfg.output.num_body_parts,
+            num_phases=int(output_cfg.num_phases),
+            num_support=int(output_cfg.num_support_states),
+            num_body_parts=int(output_cfg.num_body_parts),
         )
         accelerator.print(f"  phase freq:        {phase_freq.round(4).tolist()}")
         accelerator.print(f"  support freq:      {support_freq.round(4).tolist()}")

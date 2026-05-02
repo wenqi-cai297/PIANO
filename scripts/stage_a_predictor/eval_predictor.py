@@ -193,6 +193,10 @@ def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict, dict]:
             object_id_filter=object_id_filter,
             subject_id_filter=subject_id_filter,
             augment=AugmentConfig(enabled=False),   # eval → deterministic
+            # v9.1: respect support 3-way collapse during eval too.
+            support_collapse_hand_support=bool(
+                cfg.data.get("support_collapse_hand_support", False)
+            ),
         )
         for entry in cfg.data.datasets
     ]
@@ -206,6 +210,12 @@ def _build_eval_dataset(cfg, split: str) -> tuple[ConcatDataset, dict, dict]:
 def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, ObjectEncoder]:
     model_cfg = OmegaConf.load(cfg.model.config)
     obj_cfg = OmegaConf.load(cfg.model.object_encoder_config)
+
+    # v9.1: allow training yaml to override model output fields.
+    output_cfg = OmegaConf.merge(
+        model_cfg.output,
+        cfg.model.get("output", {}),
+    )
 
     # Train-time structured_head config can be overridden in the
     # training yaml's ``model.structured_head`` block; eval honours
@@ -243,10 +253,10 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         text_dim=model_cfg.input.text_dim,
         pose_dim=model_cfg.input.pose_dim,
         max_seq_length=model_cfg.sequence.max_length,
-        num_body_parts=model_cfg.output.num_body_parts,
-        num_object_patches=model_cfg.output.num_object_patches,
-        num_phases=model_cfg.output.num_phases,
-        num_support_states=model_cfg.output.num_support_states,
+        num_body_parts=int(output_cfg.num_body_parts),
+        num_object_patches=int(output_cfg.get("num_object_patches", 16)),
+        num_phases=int(output_cfg.num_phases),
+        num_support_states=int(output_cfg.num_support_states),
         structured_head=sh_enabled,
         structured_head_d_emb=sh_demb,
         structured_head_hidden=sh_hidden,
@@ -853,12 +863,21 @@ def run_eval(
         class_names=list(PHASE_NAMES),
     )
 
-    # Support
+    # Support. v9.1+ collapses hand_support into both_feet at the
+    # dataloader (pseudo_labels stay 4-way on disk; data config flag
+    # ``support_collapse_hand_support`` triggers the mapping). When
+    # collapsed, num_support_states=3.
+    from omegaconf import OmegaConf as _OC
+    _mcfg = _OC.load(cfg.model.config)
+    _output_cfg = _OC.merge(_mcfg.output, cfg.model.get("output", {}))
+    num_support = int(_output_cfg.num_support_states)
+    full_names = ["both_feet", "single_foot", "sitting", "hand_support"]
+    support_class_names = full_names[:num_support]
     su_pred = np.concatenate(all_pred_support, axis=0)
     su_gt = np.concatenate(all_gt_support, axis=0)
     support_metrics = _multiclass_metrics(
-        su_pred, su_gt, num_classes=4,
-        class_names=["both_feet", "single_foot", "sitting", "hand_support"],
+        su_pred, su_gt, num_classes=num_support,
+        class_names=support_class_names,
     )
 
     # ------------------------------------------------------------------
