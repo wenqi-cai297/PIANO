@@ -249,6 +249,8 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
     sh_target_pos_enc = bool(sh_cfg.get("target_pos_enc", False))
     sh_target_pos_enc_freq = int(sh_cfg.get("target_pos_enc_frequencies", 6))
     sh_target_pos_enc_scale = float(sh_cfg.get("target_pos_enc_coord_scale", 1.0))
+    # v9.5: hierarchical mask decoder patch count must reach eval too.
+    sh_target_num_patches = int(sh_cfg.get("target_num_patches", 16))
 
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
@@ -275,6 +277,7 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         structured_head_target_pos_enc=sh_target_pos_enc,
         structured_head_target_pos_enc_frequencies=sh_target_pos_enc_freq,
         structured_head_target_pos_enc_coord_scale=sh_target_pos_enc_scale,
+        structured_head_target_num_patches=sh_target_num_patches,
         # v9.2: motion-aware trunk. Read from training yaml's
         # ``model.motion_aware_trunk`` block; ckpt loads correctly when
         # the flag matches what training used.

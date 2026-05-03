@@ -1,4 +1,5 @@
-# Stage A v9.5: encoder-side optimization for contact_target_attn.
+# Stage A v9.5: encoder-side + hierarchical-decoder optimization
+# for contact_target_attn.
 #
 # v9.4 (Phase 0: aux xyz L2 + top-K=1 + positional encoding) gave
 # topk_iou 0.133 → 0.138 (+4%) and token_top1_recall 0.087 → 0.100
@@ -41,13 +42,37 @@
 # are KEPT — they delivered small but real gains and don't
 # interact with encoder hyperparameters.
 #
-# Memory note: 256 tokens doubles the M dimension in cross-attn.
-# AffordanceMaskDecoder logits: (B=32, T=196, P=5, M=256) =
-# 8.0 M cells per forward (was 4.0 M). bf16 fits comfortably on
-# A6000 48 GB.
+# (Hier) Hierarchical mask decoder. Replace AffordanceMaskDecoder
+#     with HierarchicalMaskDecoder. Two complementary mechanisms:
 #
-# Hardware: 2 × A6000 48 GB, bf16. ~7-8 h (slightly longer due to
-# 256-token cross-attention).
+#     1. Mask2Former-style iterative mask attention
+#        (Cheng et al. CVPR 2022, arXiv:2112.01527,
+#        github.com/facebookresearch/Mask2Former 2.7k★): each
+#        decoder layer's predicted token mask serves as the
+#        memory_mask for the next layer's cross-attention.
+#        Iteratively focuses attention on high-confidence regions.
+#        Mask3D (Schult et al. ICRA 2023, arXiv:2210.03105) extends
+#        the same pattern to 3D point clouds.
+#
+#     2. Explicit patch-level supervision per the user-requested
+#        coarse-then-fine framing. At runtime, FPS over object_xyz
+#        gives K=16 super-centroids; each token is assigned to its
+#        nearest super-centroid (token_to_patch). A separate query
+#        head produces patch_logits (B, T, P, K). GT patch =
+#        token_to_patch[nearest_token_to_gt_xyz]. Loss = cross-
+#        entropy over K patches. Provides clean "right region"
+#        signal (1-of-16, ~18 cm scale) that is much less encoder-
+#        smoothness-bound than the 1-of-256 token task (~6 cm).
+#        Combines with iterative mask attention to give two
+#        complementary training signals.
+#
+# Memory note: 256 tokens doubles the M dimension in cross-attn.
+# Hierarchical decoder logits: (B=32, T=196, P=5, M=256) = 8.0 M
+# token cells + (B, T, P, K=16) = 0.5 M patch cells per forward.
+# bf16 fits comfortably on A6000 48 GB.
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~8-9 h (slightly longer due to
+# 256-token cross-attention + per-layer mask refinement).
 
 model:
   config: configs/model/interaction_predictor.yaml
@@ -63,10 +88,17 @@ model:
     attn_heads: 6
     downstream_mode: "mask"
     target_attn_output: "logits"
-    target_attn_kind: "mask_decoder"
+    # v9.5 (Hier): hierarchical mask decoder replaces single-stage
+    # mask_decoder. Mask2Former-style iterative mask attention +
+    # explicit patch-level head. K=16 super-centroids at runtime
+    # via FPS on the encoder's 256 token positions.
+    target_attn_kind: "hierarchical_mask_decoder"
     target_decoder_layers: 4
     target_decoder_ffn: 1024
-    # v9.4 KEEPER: positional encoding for object token keys.
+    target_num_patches: 16
+    # v9.4 KEEPER: positional encoding for object token keys (added
+    # to BOTH cross-attn input and mask-projection key, also added
+    # to patch features in the hierarchical head).
     target_pos_enc: true
     target_pos_enc_frequencies: 6
     target_pos_enc_coord_scale: 1.0
@@ -150,6 +182,19 @@ loss:
   # but real gains; carry forward into v9.5.
   target_topk_min_positives: 1
   target_aux_xyz_weight: 0.3
+
+  # v9.5 (Hier): hierarchical patch CE. Weight 0.3 so the patch term
+  # contributes ~30% of target loss magnitude — same scale as
+  # aux_xyz_weight. This provides explicit "right region" signal
+  # alongside the focal+dice token loss and the aux xyz L2 spatial
+  # gradient. Three complementary loss components targeting different
+  # failure modes:
+  #   - focal+dice (1.0):     "right tokens in mask" (per-token binary)
+  #   - aux xyz L2 (0.3):     "smooth-distance to true xyz" (regression)
+  #   - patch CE (0.3):       "right region (1-of-16)" (categorical)
+  # Only fires when target_attn_kind="hierarchical_mask_decoder" and
+  # the predictor emits contact_target_patch_logits.
+  target_patch_weight: 0.3
 
   consistency_weight: 0.0
   label_smoothing: 0.1

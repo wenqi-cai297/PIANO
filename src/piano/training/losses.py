@@ -167,6 +167,15 @@ class PredictorLoss(nn.Module):
         # spatial-distance gradient.
         # Only active when target_loss_kind="focal_dice" and weight > 0.
         target_aux_xyz_weight: float = 0.0,
+        # v9.5 (2026-05-04): hierarchical patch-level CE loss for the
+        # HierarchicalMaskDecoder. Only fires when the predictor emits
+        # ``contact_target_patch_logits`` and ``contact_target_token_to_patch``.
+        # Provides explicit "right region" supervision (1-of-K patches,
+        # K=16) — much cleaner training signal than the 1-of-256 token
+        # task which is encoder-smoothness-bound. Per-cell loss is
+        # F.cross_entropy(patch_logits, gt_patch_id) gated by contact.
+        # Weight 0.3 default — same magnitude as aux_xyz_weight.
+        target_patch_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.contact_weight = contact_weight
@@ -276,6 +285,13 @@ class PredictorLoss(nn.Module):
                 f"got {target_aux_xyz_weight}"
             )
         self.target_aux_xyz_weight = float(target_aux_xyz_weight)
+        # v9.5: hierarchical patch CE weight. 0 disables.
+        if float(target_patch_weight) < 0.0:
+            raise ValueError(
+                f"target_patch_weight must be >= 0, "
+                f"got {target_patch_weight}"
+            )
+        self.target_patch_weight = float(target_patch_weight)
         if use_kendall_weights:
             self.kendall = KendallTaskWeights(
                 task_names=("contact", "target", "phase", "support"),
@@ -437,6 +453,44 @@ class PredictorLoss(nn.Module):
                     pred_xyz, gt_target, reduction="none",
                 ).sum(dim=-1)                                    # (B, T, P)
                 loss_target = loss_target + self.target_aux_xyz_weight * aux_l2
+            # v9.5: hierarchical patch CE — gt_patch_id derived from
+            # gt_target via "find nearest token, look up its patch_id".
+            # Only fires when the predictor emits patch_logits +
+            # token_to_patch (HierarchicalMaskDecoder path).
+            has_patch = (
+                self.target_patch_weight > 0.0
+                and "contact_target_patch_logits" in pred
+                and "contact_target_token_to_patch" in pred
+            )
+            if has_patch:
+                patch_logits = pred["contact_target_patch_logits"]   # (B, T, P, K)
+                token_to_patch = pred["contact_target_token_to_patch"]  # (B, M)
+                B_, T_, P_, K_ = patch_logits.shape
+                M_ = token_to_patch.shape[1]
+                # Find nearest token to gt_target per (frame, part) cell:
+                # gt_target (B, T, P, 3) vs object_xyz (B, M, 3).
+                diff = gt_target.unsqueeze(-2) - object_xyz.view(
+                    B_, 1, 1, M_, 3,
+                )                                                # (B, T, P, M, 3)
+                d2 = diff.pow(2).sum(dim=-1)                     # (B, T, P, M)
+                nearest_token = d2.argmin(dim=-1)                # (B, T, P) ∈ [0, M)
+                # Gather token_to_patch[b, nearest_token[b, t, p]]
+                # → (B, T, P) ∈ [0, K)
+                gt_patch_id = torch.gather(
+                    token_to_patch.unsqueeze(1).unsqueeze(1).expand(
+                        -1, T_, P_, -1,
+                    ),
+                    -1, nearest_token.unsqueeze(-1),
+                ).squeeze(-1)                                    # (B, T, P)
+                # Per-cell CE — flatten B*T*P, run F.cross_entropy.
+                patch_logits_flat = patch_logits.reshape(-1, K_)
+                gt_patch_id_flat = gt_patch_id.reshape(-1).long()
+                loss_patch_flat = F.cross_entropy(
+                    patch_logits_flat, gt_patch_id_flat,
+                    reduction="none",
+                )                                                # (B*T*P,)
+                loss_patch = loss_patch_flat.reshape(B_, T_, P_)
+                loss_target = loss_target + self.target_patch_weight * loss_patch
         else:
             raise ValueError(self.target_loss_kind)  # unreachable
 

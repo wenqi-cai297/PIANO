@@ -493,6 +493,316 @@ class AffordanceMaskDecoder(nn.Module):
 
 
 # ============================================================================
+# v9.5 helper: hierarchical mask decoder (Mask2Former mask attention +
+# explicit patch-level supervision)
+# ============================================================================
+#
+# v9.4 result (analyses/2026-05-04_v92_results.md): topk_iou 0.133 → 0.138
+# (+4%). token_top1_recall 0.087 → 0.100 (+15%). 0/4 critical L2 gates
+# pass. Architectural ceiling robust to loss/decoder/PE interventions.
+#
+# Diagnosis: focal+dice on multi-hot binary mask treats ALL positive
+# tokens equally — no gradient that prefers "right region" over "wrong
+# region". The 1-of-256 ranking task lacks a hierarchical training
+# signal.
+#
+# v9.5 hierarchical decoder addresses this with a dual-mechanism design,
+# directly modelled on:
+#
+# 1. Mask2Former (Cheng et al. CVPR 2022, arXiv:2112.01527,
+#    github.com/facebookresearch/Mask2Former 2.7k★) "masked attention":
+#    each decoder layer's predicted mask serves as the cross-attention
+#    memory_mask for the next layer. Iteratively focuses attention on
+#    high-confidence regions. SOTA on COCO panoptic / instance / semantic.
+#
+# 2. Mask3D (Schult et al. ICRA 2023, arXiv:2210.03105,
+#    github.com/JonasSchult/Mask3D) extends the same pattern to 3D point
+#    clouds. Hierarchical sampling + iterative mask refinement.
+#
+# 3. ADDITIONAL explicit patch-level head per the user-requested
+#    coarse-then-fine framing. At runtime, run FPS on the M=256 token
+#    positions to get K=16 super-centroids; each token assigned to its
+#    nearest super-centroid (token_to_patch). Patch features = scatter-
+#    mean of within-patch token features. A separate query-projection
+#    cross-attends to the K patch features → patch_logits (B, T, P, K).
+#    This gives a clean "right region" training signal (1-of-16) that
+#    is much less encoder-smoothness-bound than the 1-of-256 token task
+#    (patches ~18 cm apart vs tokens ~6 cm).
+#
+# Difference vs single-stage AffordanceMaskDecoder:
+# - Replaces ``nn.TransformerDecoder`` with manual layer-by-layer
+#   iteration so each layer's mask logits can serve as the next layer's
+#   memory_mask (Mask2Former pattern; PyTorch's TransformerDecoder
+#   doesn't support per-layer mask injection).
+# - Emits patch_logits alongside token mask logits.
+
+class HierarchicalMaskDecoder(nn.Module):
+    """v9.5 hierarchical mask decoder.
+
+    Iterative mask attention (Mask2Former-style) over M object tokens,
+    plus an explicit patch-level prediction head over K super-centroids.
+
+    Parameters
+    ----------
+    d_model : int
+    num_body_parts : int
+    num_layers : decoder depth (4 default; Mask2Former uses 9, Mask3D 6).
+    num_heads : multi-head attention heads.
+    dim_feedforward : FFN hidden dim.
+    dropout : applies to FFN + self-attn dropout.
+    num_patches : K, number of super-centroids for the patch-level head.
+        16 default — at M=256 / K=16 each patch holds ~16 tokens; at
+        M=128 / K=16 each patch holds 8 tokens.
+    use_positional_encoding : add 3D NeRF-style PE to object token keys.
+    num_pe_frequencies, pe_coord_scale : PE hyperparameters.
+
+    Output: dict with
+      - "token_logits" : (B, T, P, M) per-token mask logits (final layer)
+      - "patch_logits" : (B, T, P, K) per-patch logits
+      - "token_to_patch" : (B, M) integer assignment for downstream loss
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_body_parts: int,
+        num_layers: int = 4,
+        num_heads: int = 6,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        num_patches: int = 16,
+        use_positional_encoding: bool = False,
+        num_pe_frequencies: int = 6,
+        pe_coord_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_body_parts = num_body_parts
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+        self.num_patches = int(num_patches)
+
+        self.part_queries = nn.Parameter(
+            torch.randn(num_body_parts, d_model) * 0.02
+        )
+
+        # Positional encoding for object token keys (DETR/Mask3D pattern).
+        self.use_positional_encoding = bool(use_positional_encoding)
+        if self.use_positional_encoding:
+            self.pe3d = PositionalEncoding3D(
+                d_model=d_model,
+                num_frequencies=num_pe_frequencies,
+                coord_scale=pe_coord_scale,
+            )
+
+        # Manual layer-by-layer decoder stack — Mask2Former pattern
+        # requires per-layer mask injection, which nn.TransformerDecoder
+        # doesn't expose.
+        self.decoder_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Mask projections — same pattern as AffordanceMaskDecoder.
+        mask_dim = d_model // 2
+        self.q_mask_proj = nn.Linear(d_model, mask_dim)
+        self.k_mask_proj = nn.Linear(d_model, mask_dim)
+        # Separate query projection for the patch head — different
+        # decision boundary from the token head, so different projection.
+        self.q_patch_proj = nn.Linear(d_model, mask_dim)
+        # Note: patch features (mean-pooled) reuse k_mask_proj — same
+        # space, since we want patch_logits to be comparable to within-
+        # patch token logits.
+        self._mask_scale = 1.0 / math.sqrt(mask_dim)
+
+    @staticmethod
+    def _fps(xyz: Tensor, num_samples: int) -> Tensor:
+        """Batched farthest point sampling.
+
+        Mirror of ``object_encoder.SetAbstractionLayer._fps`` so the
+        decoder can run FPS on the encoder's output positions without
+        importing the encoder. (B, N, 3) → (B, num_samples) indices.
+        """
+        B, N, _ = xyz.shape
+        device = xyz.device
+        centroids = torch.zeros(B, num_samples, dtype=torch.long, device=device)
+        distance = torch.full((B, N), 1e10, device=device, dtype=xyz.dtype)
+        farthest = torch.randint(0, N, (B,), device=device)
+        for i in range(num_samples):
+            centroids[:, i] = farthest
+            centroid_xyz = xyz[torch.arange(B, device=device), farthest].unsqueeze(1)
+            dist = torch.sum((xyz - centroid_xyz) ** 2, dim=-1)
+            distance = torch.minimum(distance, dist)
+            farthest = distance.argmax(dim=-1)
+        return centroids
+
+    @staticmethod
+    def _scatter_mean(
+        src: Tensor,                 # (B, M, d)
+        idx: Tensor,                 # (B, M) ∈ [0, K)
+        num_groups: int,             # K
+    ) -> Tensor:
+        """Per-batch scatter-mean: average ``src`` rows whose ``idx``
+        equals each group, returns (B, K, d).
+
+        Pure PyTorch implementation, no torch_scatter dependency. Empty
+        groups (no source rows assigned) return zeros — caller must be
+        aware (we mask such patches in the patch logits output).
+        """
+        B, M, d = src.shape
+        K = num_groups
+        device = src.device
+        out = torch.zeros(B, K, d, device=device, dtype=src.dtype)
+        cnt = torch.zeros(B, K, 1, device=device, dtype=src.dtype)
+        idx_d = idx.unsqueeze(-1).expand(-1, -1, d)             # (B, M, d)
+        out.scatter_add_(1, idx_d, src)
+        ones = torch.ones(B, M, 1, device=device, dtype=src.dtype)
+        idx_1 = idx.unsqueeze(-1)                                # (B, M, 1)
+        cnt.scatter_add_(1, idx_1, ones)
+        return out / cnt.clamp(min=1.0)
+
+    def forward(
+        self,
+        frame_q: Tensor,                  # (B, T, d_model)
+        object_tokens: Tensor,            # (B, M, d_model)
+        object_xyz: Tensor,               # (B, M, 3) — REQUIRED for FPS + patch
+    ) -> dict[str, Tensor]:
+        """Run the hierarchical mask decoder.
+
+        Returns
+        -------
+        out : dict with keys
+            "token_logits"   : (B, T, P, M) — final-layer token mask logits.
+            "patch_logits"   : (B, T, P, K) — patch-level logits.
+            "token_to_patch" : (B, M) long — patch assignment per token.
+            "patch_xyz"      : (B, K, 3) — super-centroid positions.
+        """
+        if object_xyz is None:
+            raise ValueError(
+                "HierarchicalMaskDecoder requires object_xyz to compute "
+                "patch assignments (FPS over object_xyz)."
+            )
+        B, T, _ = frame_q.shape
+        M = object_tokens.shape[1]
+        P = self.num_body_parts
+        K = self.num_patches
+        if K > M:
+            raise ValueError(
+                f"num_patches ({K}) must be <= num object tokens ({M})"
+            )
+
+        # Step 1: patch assignments via FPS on object_xyz.
+        # Cast xyz to fp32 for numerically stable distance computation
+        # (cdist with bf16 has been a source of bugs — see
+        # SetAbstractionLayer._ball_query_and_group comment).
+        with torch.autocast(device_type="cuda", enabled=False):
+            xyz_fp32 = object_xyz.float()
+            patch_idx = self._fps(xyz_fp32, K)                            # (B, K) ∈ [0, M)
+            patch_xyz = torch.gather(
+                xyz_fp32, 1, patch_idx.unsqueeze(-1).expand(-1, -1, 3),
+            )                                                              # (B, K, 3)
+            # Each token's nearest super-centroid: argmin pairwise dist.
+            d = torch.cdist(xyz_fp32, patch_xyz)                          # (B, M, K)
+            token_to_patch = d.argmin(dim=-1)                              # (B, M) ∈ [0, K)
+        token_to_patch = token_to_patch.long()
+        patch_xyz = patch_xyz.to(object_tokens.dtype)
+
+        # Step 2: positional encoding on object token keys (if enabled).
+        if self.use_positional_encoding:
+            pe_token = self.pe3d(object_xyz.to(object_tokens.dtype))      # (B, M, d)
+            object_tokens_pe = object_tokens + pe_token
+            pe_patch = self.pe3d(patch_xyz)                                # (B, K, d)
+        else:
+            object_tokens_pe = object_tokens
+            pe_patch = None
+
+        # Step 3: build queries.
+        q = frame_q.unsqueeze(2) + self.part_queries.view(1, 1, P, -1)    # (B, T, P, d)
+        q_flat = q.reshape(B, T * P, -1)                                   # (B, T*P, d)
+        Q = T * P
+
+        # Step 4: iterative mask attention (Mask2Former pattern).
+        #
+        # At each layer:
+        #   (a) cross-attn + self-attn + FFN, with memory_mask from
+        #       the PREVIOUS layer's predicted mask
+        #   (b) compute mask logits = q_proj @ k_proj.T
+        #   (c) convert to attn_mask for next layer
+        #
+        # Failsafe (verbatim from Mask2Former
+        # `mask2former_transformer_decoder.py`): if attn_mask masks out
+        # all keys for some query, set its mask to all-False so attention
+        # can still happen (otherwise softmax over -inf gives NaN).
+        token_logits: Tensor | None = None
+        memory_mask: Tensor | None = None  # (B*nhead, Q, M) bool, True = masked out
+        for layer_idx, layer in enumerate(self.decoder_layers):
+            q_flat = layer(
+                q_flat, object_tokens_pe,
+                memory_mask=memory_mask,
+            )
+            # Mask projection.
+            q_proj = self.q_mask_proj(q_flat)                              # (B, Q, mask_dim)
+            k_proj = self.k_mask_proj(object_tokens_pe)                    # (B, M, mask_dim)
+            token_logits = torch.bmm(
+                q_proj, k_proj.transpose(1, 2),
+            ) * self._mask_scale                                           # (B, Q, M)
+
+            # Build memory_mask for the NEXT layer (skip on last layer).
+            if layer_idx < self.num_layers - 1:
+                with torch.no_grad():
+                    raw = (token_logits.sigmoid() < 0.5)                  # (B, Q, M) bool
+                    # Failsafe: any query whose mask covers EVERYTHING
+                    # gets unmasked (all-False) so attention proceeds.
+                    all_masked = raw.sum(dim=-1) == M                      # (B, Q)
+                    raw[all_masked] = False
+                    # Expand to (B*nhead, Q, M) — PyTorch
+                    # MultiheadAttention's per-head mask format.
+                    memory_mask = (
+                        raw.unsqueeze(1)
+                        .expand(-1, self.num_heads, -1, -1)
+                        .reshape(B * self.num_heads, Q, M)
+                    )
+
+        assert token_logits is not None
+        token_logits = token_logits.reshape(B, T, P, M)
+
+        # Step 5: explicit patch-level head.
+        # Patch features = mean of within-patch token features. Use the
+        # original (non-PE) features for aggregation, then add patch PE
+        # back in the key projection space — matches DETR/Mask3D pattern
+        # where PE is added at attention time.
+        patch_features = self._scatter_mean(
+            object_tokens, token_to_patch, K,
+        )                                                                  # (B, K, d)
+        if pe_patch is not None:
+            patch_features_pe = patch_features + pe_patch
+        else:
+            patch_features_pe = patch_features
+
+        q_patch = self.q_patch_proj(q_flat)                                # (B, Q, mask_dim)
+        k_patch = self.k_mask_proj(patch_features_pe)                      # (B, K, mask_dim)
+        patch_logits = torch.bmm(
+            q_patch, k_patch.transpose(1, 2),
+        ) * self._mask_scale                                               # (B, Q, K)
+        patch_logits = patch_logits.reshape(B, T, P, K)
+
+        return {
+            "token_logits": token_logits,
+            "patch_logits": patch_logits,
+            "token_to_patch": token_to_patch,
+            "patch_xyz": patch_xyz,
+        }
+
+
+# ============================================================================
 # v8 StructuredHead — affordance-style target attention + DAG conditioning
 # ============================================================================
 #
@@ -559,15 +869,22 @@ class StructuredHead(nn.Module):
         # v9 (2026-05-03): replace single Q/K cross-attn with a Mask3D-
         # style multi-layer mask decoder. Direct precedent: InteractVLM
         # CVPR 2025 +20pp on DAMON contact F1.
-        target_attn_kind: str = "single_layer",  # "single_layer" (v8/v8.1) | "mask_decoder" (v9)
+        # "single_layer" (v8/v8.1) | "mask_decoder" (v9) |
+        # "hierarchical_mask_decoder" (v9.5)
+        target_attn_kind: str = "single_layer",
         target_decoder_layers: int = 4,
         target_decoder_ffn: int = 1024,
         # v9.4 (2026-05-04): NeRF-style positional encoding on object
-        # tokens (DETR/Mask3D pattern). Only used under
-        # target_attn_kind="mask_decoder". Off for back-compat.
+        # tokens (DETR/Mask3D pattern). Used under "mask_decoder" and
+        # "hierarchical_mask_decoder". Off for back-compat.
         target_pos_enc: bool = False,
         target_pos_enc_frequencies: int = 6,
         target_pos_enc_coord_scale: float = 1.0,
+        # v9.5 (2026-05-04): hierarchical mask decoder — number of
+        # super-centroids (patches) for the patch-level head. 16 default
+        # at M=256: each patch ≈ 16 tokens. Only used under
+        # target_attn_kind="hierarchical_mask_decoder".
+        target_num_patches: int = 16,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -586,14 +903,17 @@ class StructuredHead(nn.Module):
                 f"got {target_attn_output!r}"
             )
         self.target_attn_output = target_attn_output
-        if target_attn_kind not in ("single_layer", "mask_decoder"):
+        if target_attn_kind not in (
+            "single_layer", "mask_decoder", "hierarchical_mask_decoder",
+        ):
             raise ValueError(
-                f"target_attn_kind must be 'single_layer' or 'mask_decoder', "
-                f"got {target_attn_kind!r}"
+                f"target_attn_kind must be 'single_layer', 'mask_decoder', "
+                f"or 'hierarchical_mask_decoder', got {target_attn_kind!r}"
             )
-        if target_attn_kind == "mask_decoder" and target_attn_output != "logits":
+        if target_attn_kind in ("mask_decoder", "hierarchical_mask_decoder") \
+                and target_attn_output != "logits":
             raise ValueError(
-                "target_attn_kind='mask_decoder' must pair with "
+                f"target_attn_kind={target_attn_kind!r} must pair with "
                 "target_attn_output='logits' (sigmoid + multi-hot binary GT)."
             )
         self.target_attn_kind = target_attn_kind
@@ -642,7 +962,7 @@ class StructuredHead(nn.Module):
                 d_model=d_model, num_heads=num_attn_heads,
                 output=target_attn_output,
             )
-        else:
+        elif target_attn_kind == "mask_decoder":
             self.target_attn = AffordanceMaskDecoder(
                 d_model=d_model,
                 num_body_parts=num_body_parts,
@@ -650,6 +970,19 @@ class StructuredHead(nn.Module):
                 num_heads=num_attn_heads,
                 dim_feedforward=target_decoder_ffn,
                 dropout=dropout,
+                use_positional_encoding=bool(target_pos_enc),
+                num_pe_frequencies=int(target_pos_enc_frequencies),
+                pe_coord_scale=float(target_pos_enc_coord_scale),
+            )
+        else:  # "hierarchical_mask_decoder" (v9.5)
+            self.target_attn = HierarchicalMaskDecoder(
+                d_model=d_model,
+                num_body_parts=num_body_parts,
+                num_layers=target_decoder_layers,
+                num_heads=num_attn_heads,
+                dim_feedforward=target_decoder_ffn,
+                dropout=dropout,
+                num_patches=int(target_num_patches),
                 use_positional_encoding=bool(target_pos_enc),
                 num_pe_frequencies=int(target_pos_enc_frequencies),
                 pe_coord_scale=float(target_pos_enc_coord_scale),
@@ -742,7 +1075,7 @@ class StructuredHead(nn.Module):
             q_flat = q.reshape(B, T * P, -1)                                 # (B, T*P, d)
             target_attn_raw = self.target_attn(q_flat, object_tokens)        # (B, T*P, M)
             target_attn_raw = target_attn_raw.reshape(B, T, P, M)            # (B, T, P, M)
-        else:
+        elif self.target_attn_kind == "mask_decoder":
             # v9 path: AffordanceMaskDecoder builds queries internally
             # (frame_q + part_query) and runs the N-layer decoder. Output
             # is (B, T, P, M) raw logits. v9.4: pass object_xyz so the
@@ -750,6 +1083,18 @@ class StructuredHead(nn.Module):
             target_attn_raw = self.target_attn(
                 frame_q, object_tokens, object_xyz=object_xyz,
             )
+        else:
+            # v9.5 path: HierarchicalMaskDecoder. Output is a dict with
+            # token_logits (B, T, P, M), patch_logits (B, T, P, K),
+            # token_to_patch (B, M), patch_xyz (B, K, 3). The token
+            # logits are the "primary" output — all downstream consumers
+            # treat this just like the mask_decoder branch's output. The
+            # patch logits + assignment are surfaced separately for the
+            # auxiliary loss.
+            hierarchical_out = self.target_attn(
+                frame_q, object_tokens, object_xyz=object_xyz,
+            )
+            target_attn_raw = hierarchical_out["token_logits"]
 
         out: dict[str, Tensor] = {
             "contact_logits": contact_logits,
@@ -769,6 +1114,12 @@ class StructuredHead(nn.Module):
             # back-compat xyz emitted (Path B).
             out["contact_target_attn_logits"] = target_attn_raw
             out["contact_target_attn"] = torch.sigmoid(target_attn_raw)
+            # v9.5: hierarchical decoder also surfaces patch-level logits
+            # + token-to-patch assignment for the auxiliary patch loss.
+            if self.target_attn_kind == "hierarchical_mask_decoder":
+                out["contact_target_patch_logits"] = hierarchical_out["patch_logits"]
+                out["contact_target_token_to_patch"] = hierarchical_out["token_to_patch"]
+                out["contact_target_patch_xyz"] = hierarchical_out["patch_xyz"]
 
         # ── Level 1b: phase ──────────────────────────────────────
         phase_logits = self.phase_head(x_with_c)                    # (B, T, num_phases)
@@ -913,6 +1264,8 @@ class InteractionPredictor(nn.Module):
         structured_head_target_pos_enc: bool = False,
         structured_head_target_pos_enc_frequencies: int = 6,
         structured_head_target_pos_enc_coord_scale: float = 1.0,
+        # v9.5 (2026-05-04): hierarchical mask decoder patch count.
+        structured_head_target_num_patches: int = 16,
         # v9.2 (2026-05-03): motion-aware trunk with MoMask-style random
         # masking. When enabled, per-frame body kinematics
         # (joints_per_frame: B, T, 22, 3) are projected and added to
@@ -1028,6 +1381,7 @@ class InteractionPredictor(nn.Module):
                 target_pos_enc=structured_head_target_pos_enc,
                 target_pos_enc_frequencies=structured_head_target_pos_enc_frequencies,
                 target_pos_enc_coord_scale=structured_head_target_pos_enc_coord_scale,
+                target_num_patches=structured_head_target_num_patches,
             )
         else:
             self.contact_head = nn.Linear(d_model, num_body_parts)

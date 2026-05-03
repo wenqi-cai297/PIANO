@@ -490,6 +490,19 @@ def run(config_path: str) -> None:
         f"{int(cfg.loss.get('target_topk_min_positives', 0))} "
         f"(GT mask = within-tau ∪ top-K nearest; K=1 unlocks IoU ceiling)"
     )
+    # v9.5: hierarchical decoder + patch CE.
+    accelerator.print(
+        f"[predictor cfg] target_attn_kind = "
+        f"{str(sh_cfg.get('target_attn_kind', 'single_layer'))} "
+        f"(hierarchical_mask_decoder: Mask2Former/Mask3D mask attention "
+        f"+ explicit patch head; num_patches="
+        f"{int(sh_cfg.get('target_num_patches', 16))})"
+    )
+    accelerator.print(
+        f"[predictor cfg] target_patch_weight = "
+        f"{float(cfg.loss.get('target_patch_weight', 0.0))} "
+        f"(hierarchical patch CE; only fires under hierarchical_mask_decoder)"
+    )
     predictor = InteractionPredictor(
         d_model=model_cfg.encoder.d_model,
         num_layers=model_cfg.encoder.num_layers,
@@ -528,6 +541,10 @@ def run(config_path: str) -> None:
         ),
         structured_head_target_pos_enc_coord_scale=float(
             sh_cfg.get("target_pos_enc_coord_scale", 1.0)
+        ),
+        # v9.5: hierarchical mask decoder patch count.
+        structured_head_target_num_patches=int(
+            sh_cfg.get("target_num_patches", 16)
         ),
         # v9.2: motion-aware trunk + random masking. Merge model defaults
         # with training-yaml overrides (same pattern as structured_head).
@@ -679,6 +696,9 @@ def run(config_path: str) -> None:
         contact_asl_prob_shift=float(cfg.loss.get("contact_asl_prob_shift", 0.05)),
         # v9.4: aux xyz L2 loss alongside focal+dice.
         target_aux_xyz_weight=float(cfg.loss.get("target_aux_xyz_weight", 0.0)),
+        # v9.5: hierarchical patch CE loss (only fires when predictor
+        # emits contact_target_patch_logits — see HierarchicalMaskDecoder).
+        target_patch_weight=float(cfg.loss.get("target_patch_weight", 0.0)),
     )
     criterion = criterion.to(device)
     priors = PhysicalPriors(
