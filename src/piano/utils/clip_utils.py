@@ -69,24 +69,37 @@ def encode_text_per_token(
 def load_clip_text_encoder(
     device: torch.device,
     model_name: str = "ViT-B/32",
+    download_root: str | None = None,
 ) -> nn.Module:
     """Load OpenAI CLIP, freeze all parameters, and move to *device*.
 
     Only the text tower is used downstream, but ``clip.load`` returns the
     full model — the visual tower stays on device with no gradients and
     no forward passes.
+
+    Parameters
+    ----------
+    download_root : optional override for where CLIP weights are
+        downloaded / loaded from. Defaults to ``~/.cache/clip`` (OpenAI
+        CLIP default). Pass a workspace-local path (e.g. ``./cache/clip``)
+        to keep the ~340 MB ``ViT-B-32.pt`` weights inside the project
+        directory rather than the user-home cache.
     """
     try:
         import clip
     except ImportError as e:  # pragma: no cover — server-only path
         raise ImportError(
             "OpenAI CLIP is required. Install via "
-            "`pip install ftfy regex git+https://github.com/openai/CLIP.git`."
+            "`pip install ftfy regex git+https://github.com/openai/CLIP.git` "
+            "or the PyPI mirror `pip install ftfy regex clip-anytorch`."
         ) from e
 
     # jit=False keeps Python-level access to the internals we need for
     # per-token feature extraction.
-    model, _ = clip.load(model_name, device=device, jit=False)
+    model, _ = clip.load(
+        model_name, device=device, jit=False,
+        download_root=download_root,
+    )
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)

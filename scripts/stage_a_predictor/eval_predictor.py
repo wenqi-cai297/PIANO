@@ -527,9 +527,12 @@ def run_eval(
     meta = _load_checkpoint(ckpt_path, predictor, object_encoder)
     print(f"Loaded checkpoint: epoch={meta['epoch']} global_step={meta['global_step']}")
 
-    # Frozen CLIP
+    # Frozen CLIP. ``cfg.model.clip_download_root`` (optional) keeps the
+    # ~340 MB weights file inside the workspace; default falls back to
+    # OpenAI CLIP's ~/.cache/clip.
     clip_model = load_clip_text_encoder(
         device=device, model_name=cfg.model.get("text_encoder", "ViT-B/32"),
+        download_root=cfg.model.get("clip_download_root", None),
     )
 
     # Loss object — same weights + label_smoothing as training, so

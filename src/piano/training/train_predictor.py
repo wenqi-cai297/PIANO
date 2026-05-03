@@ -593,9 +593,17 @@ def run(config_path: str) -> None:
     # CLIP text encoder (frozen). Kept OUT of accelerator.prepare() so
     # it doesn't get wrapped by DDP — it has no trainable parameters.
     # HF Accelerate's recommended pattern for frozen sub-modules.
+    #
+    # ``cfg.model.clip_download_root`` (optional) overrides where CLIP
+    # weights are downloaded / loaded from. Default is OpenAI CLIP's
+    # ``~/.cache/clip`` (user-home cache). Set this to a workspace-local
+    # path (e.g. ``cache/clip``) when training in environments where
+    # writes outside the workspace are undesirable.
+    clip_dl_root = cfg.model.get("clip_download_root", None)
     clip_model = load_clip_text_encoder(
         device=device,
         model_name=cfg.model.get("text_encoder", "ViT-B/32"),
+        download_root=clip_dl_root,
     )
 
     # Build the train dataset early — Logit Adjustment class priors
