@@ -22,3 +22,14 @@ src/piano/models/backbones/momask/
 *.md
 !README.md
 !**/README.md
+
+# Local single-machine cache (CLIP weights, HF cache, torch hub, etc).
+# Workspace-local but should not be committed.
+cache/
+
+# Local-machine training configs / accelerate configs. Server runs use
+# the non-_local versions of each yaml. Local variants typically have
+# Windows paths and single-GPU dynamics tuning, so they don't belong
+# in the shared repo. Keep them in the working tree for personal use.
+configs/accelerate_local_*.yaml
+configs/training/*_local.yaml
