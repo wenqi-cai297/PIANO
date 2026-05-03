@@ -209,23 +209,52 @@ class ObjectEncoder(nn.Module):
         num_input_points: int = 1024,
         num_output_tokens: int = 128,
         feature_dim: int = 384,
+        # v9.5 (2026-05-04): expose SA1/SA2 ball-query hyperparameters.
+        # v9.1 defaults below preserve all earlier behaviour. v9.5
+        # encoder-side optimization probes:
+        #   sa2_radius 0.30 → 0.15 (more discriminative tokens via
+        #     smaller receptive field — addresses the ~30 cm token
+        #     receptive field overlap diagnosed in
+        #     analyses/2026-05-04_target_attn_architectural_optimization.md)
+        #   num_output_tokens 128 → 256 (finer FPS spacing 9 cm → 6 cm,
+        #     proxy for affordance-prior FPS without the preprocessing
+        #     cost; full K-proper deferred to v9.6)
+        #   sa2_num_samples 64 → 32 (standard PointNet++ scaling when
+        #     halving radius; preserves per-token "feature richness")
+        sa1_num_points: int = 512,
+        sa1_radius: float = 0.15,
+        sa1_num_samples: int = 32,
+        sa2_radius: float = 0.30,
+        sa2_num_samples: int = 64,
     ) -> None:
         super().__init__()
         self.num_output_tokens = num_output_tokens
+        # Surface for log-printing / sanity checks.
+        self.sa1_num_points = int(sa1_num_points)
+        self.sa1_radius = float(sa1_radius)
+        self.sa1_num_samples = int(sa1_num_samples)
+        self.sa2_radius = float(sa2_radius)
+        self.sa2_num_samples = int(sa2_num_samples)
 
-        # Two SA stages: 1024 → 512 → 128
+        # Two SA stages: num_input_points → sa1_num_points → num_output_tokens.
         self.sa1 = SetAbstractionLayer(
-            num_points=512, radius=0.15, num_samples=32,
-            in_channels=0, mlp_channels=[64, 128],
+            num_points=sa1_num_points,
+            radius=sa1_radius,
+            num_samples=sa1_num_samples,
+            in_channels=0,
+            mlp_channels=[64, 128],
         )
         self.sa2 = SetAbstractionLayer(
-            num_points=num_output_tokens, radius=0.3, num_samples=64,
-            in_channels=128, mlp_channels=[128, 256, feature_dim],
+            num_points=num_output_tokens,
+            radius=sa2_radius,
+            num_samples=sa2_num_samples,
+            in_channels=128,
+            mlp_channels=[128, 256, feature_dim],
         )
 
         # PointNeXt-style refinement on the final centroid features.
         # Cheap (one block) and lets the encoder mix information across
-        # the 128 tokens after max-pool already summarised each group.
+        # the M tokens after max-pool already summarised each group.
         self.refine = InvResMLPBlock(feature_dim, expansion=4, dropout=0.0)
 
     def forward(

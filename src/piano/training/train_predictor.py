@@ -534,10 +534,35 @@ def run(config_path: str) -> None:
         motion_aware_trunk=bool(motion_cfg_merged.get("enabled", False)),
         motion_input_dim=int(motion_cfg_merged.get("joint_input_dim", 66)),
     )
+    # v9.5: allow training-yaml to override object_encoder hyperparameters.
+    # Same pattern as structured_head — model file holds defaults
+    # (`obj_cfg.pointnet.*`), training yaml's `cfg.model.object_encoder`
+    # block overrides per-key. Used by v9.5 to enable smaller SA2
+    # radius + more output tokens without forking the encoder yaml.
+    obj_overrides = cfg.model.get("object_encoder", {})
     object_encoder = ObjectEncoder(
-        num_input_points=obj_cfg.pointnet.num_input_points,
-        num_output_tokens=obj_cfg.pointnet.num_output_tokens,
-        feature_dim=obj_cfg.pointnet.feature_dim,
+        num_input_points=int(obj_overrides.get(
+            "num_input_points", obj_cfg.pointnet.num_input_points,
+        )),
+        num_output_tokens=int(obj_overrides.get(
+            "num_output_tokens", obj_cfg.pointnet.num_output_tokens,
+        )),
+        feature_dim=int(obj_overrides.get(
+            "feature_dim", obj_cfg.pointnet.feature_dim,
+        )),
+        # v9.5: SA stage hyperparameters. Defaults preserve v9.1 behaviour.
+        sa1_num_points=int(obj_overrides.get("sa1_num_points", 512)),
+        sa1_radius=float(obj_overrides.get("sa1_radius", 0.15)),
+        sa1_num_samples=int(obj_overrides.get("sa1_num_samples", 32)),
+        sa2_radius=float(obj_overrides.get("sa2_radius", 0.30)),
+        sa2_num_samples=int(obj_overrides.get("sa2_num_samples", 64)),
+    )
+    accelerator.print(
+        f"[object encoder cfg] num_output_tokens={object_encoder.num_output_tokens} "
+        f"sa2_radius={object_encoder.sa2_radius:.2f} "
+        f"sa2_num_samples={object_encoder.sa2_num_samples} "
+        f"(sa1: r={object_encoder.sa1_radius:.2f}, "
+        f"num_samples={object_encoder.sa1_num_samples})"
     )
 
     # SyncBatchNorm on the object encoder under multi-GPU DDP. The

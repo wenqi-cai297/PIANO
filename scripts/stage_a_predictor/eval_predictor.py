@@ -282,10 +282,25 @@ def _build_models(cfg, device: torch.device) -> tuple[InteractionPredictor, Obje
         motion_input_dim=int(cfg.model.get("motion_aware_trunk", {}).get("joint_input_dim", 66)),
     ).to(device).eval()
 
+    # v9.5: training-yaml-level override of object_encoder hyperparameters
+    # must reach eval too — without these, a v9.5 ckpt rebuilds with v9.1
+    # encoder shape (128 tokens, sa2_r=0.30) and state_dict load fails.
+    obj_overrides = cfg.model.get("object_encoder", {})
     object_encoder = ObjectEncoder(
-        num_input_points=obj_cfg.pointnet.num_input_points,
-        num_output_tokens=obj_cfg.pointnet.num_output_tokens,
-        feature_dim=obj_cfg.pointnet.feature_dim,
+        num_input_points=int(obj_overrides.get(
+            "num_input_points", obj_cfg.pointnet.num_input_points,
+        )),
+        num_output_tokens=int(obj_overrides.get(
+            "num_output_tokens", obj_cfg.pointnet.num_output_tokens,
+        )),
+        feature_dim=int(obj_overrides.get(
+            "feature_dim", obj_cfg.pointnet.feature_dim,
+        )),
+        sa1_num_points=int(obj_overrides.get("sa1_num_points", 512)),
+        sa1_radius=float(obj_overrides.get("sa1_radius", 0.15)),
+        sa1_num_samples=int(obj_overrides.get("sa1_num_samples", 32)),
+        sa2_radius=float(obj_overrides.get("sa2_radius", 0.30)),
+        sa2_num_samples=int(obj_overrides.get("sa2_num_samples", 64)),
     ).to(device).eval()
 
     return predictor, object_encoder

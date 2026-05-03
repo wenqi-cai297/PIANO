@@ -1,0 +1,178 @@
+# Stage A v9.5: encoder-side optimization for contact_target_attn.
+#
+# v9.4 (Phase 0: aux xyz L2 + top-K=1 + positional encoding) gave
+# topk_iou 0.133 → 0.138 (+4%) and token_top1_recall 0.087 → 0.100
+# (+15%) but failed all 4 critical L2 gates. Same magnitude as the
+# v9.2 with-GT-joints upper bound (0.137 topk_iou) → architectural
+# ceiling robust to loss / decoder / PE interventions.
+#
+# Diagnosis (analyses/2026-05-04_target_attn_architectural_optimization.md
+# Phase 1 hypothesis): bottleneck is the PointNet++ ENCODER's
+# discriminability, not the decoder. Evidence:
+#
+# - SA2 radius=0.30 m means each token's feature pools 64 neighbours
+#   within 30 cm. Adjacent tokens (~9 cm spacing) have receptive
+#   fields that overlap by 6× — features are highly correlated
+#   regardless of decoder design.
+# - token_top1_recall = 0.10 vs random 0.0078 → model gets the
+#   single closest token right only 10% of the time. If features
+#   were maximally discriminative, we'd expect 50%+. The cap
+#   reflects feature smoothness.
+# - Phase 0's PE addition lifted top1_recall +15%, the only
+#   PE-relevant metric — so explicit position helped, but explicit
+#   position can't fix degenerate FEATURES.
+#
+# v9.5 = encoder-side changes on top of v9.1 baseline:
+#
+# (C) SA2 radius 0.30 m → 0.15 m. Each token now pools neighbours
+#     within 15 cm only. Receptive field overlap with adjacent
+#     tokens (~9 cm) drops to ~2× from 6×. Standard PointNet++
+#     scaling: when halving radius, also halve num_samples
+#     (64 → 32) to preserve "feature richness" per token.
+#
+# (K-cheap) num_output_tokens 128 → 256. FPS spacing 9 cm → 6 cm,
+#     finer spatial resolution. Proxy for "affordance-prior FPS"
+#     which would concentrate token resolution where contact
+#     happens — proper version (v9.6 if needed) requires
+#     precomputed contact heatmaps + custom probability-weighted
+#     FPS, ~3-4× more engineering.
+#
+# Phase 0 wins (A: aux xyz L2, B: topk=1, E: positional encoding)
+# are KEPT — they delivered small but real gains and don't
+# interact with encoder hyperparameters.
+#
+# Memory note: 256 tokens doubles the M dimension in cross-attn.
+# AffordanceMaskDecoder logits: (B=32, T=196, P=5, M=256) =
+# 8.0 M cells per forward (was 4.0 M). bf16 fits comfortably on
+# A6000 48 GB.
+#
+# Hardware: 2 × A6000 48 GB, bf16. ~7-8 h (slightly longer due to
+# 256-token cross-attention).
+
+model:
+  config: configs/model/interaction_predictor.yaml
+  object_encoder_config: configs/model/object_encoder.yaml
+  text_encoder: "ViT-B/32"
+  freeze_text_encoder: true
+  output:
+    num_support_states: 3
+  structured_head:
+    enabled: true
+    d_emb: 64
+    hidden: 256
+    attn_heads: 6
+    downstream_mode: "mask"
+    target_attn_output: "logits"
+    target_attn_kind: "mask_decoder"
+    target_decoder_layers: 4
+    target_decoder_ffn: 1024
+    # v9.4 KEEPER: positional encoding for object token keys.
+    target_pos_enc: true
+    target_pos_enc_frequencies: 6
+    target_pos_enc_coord_scale: 1.0
+
+  # v9.5 (C + K-cheap): encoder-side overrides. Keys not in this
+  # block fall back to obj_cfg.pointnet defaults.
+  object_encoder:
+    num_output_tokens: 256          # K-cheap: was 128, doubled for finer FPS spacing
+    sa2_radius: 0.15                # C: was 0.30, halved for less receptive-field overlap
+    sa2_num_samples: 32             # standard PointNet++ scaling when halving radius
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/chairs"
+    - name: "imhd"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/imhd"
+    - name: "neuraldome"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v12_strict"
+  motion_repr: "humanml3d"
+  max_seq_length: 196
+  fps: 20
+  support_collapse_hand_support: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+    split: "train"
+
+  object_split:
+    enabled: false
+    train_pct: 85
+    val_pct: 8
+    test_pct: 7
+    seed: 42
+    split: "train"
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 32
+  num_epochs: 100
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    kendall_lr: 1.0e-2
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  val_every_epochs: 5
+  val_best_key: "loss_unweighted"
+
+loss:
+  use_kendall_weights: false
+  contact_weight: 2.0
+  target_weight: 5.0
+  phase_weight: 0.3
+  support_weight: 0.1
+  target_gate_kind: "all"
+
+  target_loss_kind: "focal_dice"
+  target_focal_alpha: 0.25
+  target_focal_gamma: 2.0
+  target_tau_per_part: [0.05, 0.05, 0.03, 0.03, 0.12]
+
+  # v9.4 KEEPERS: aux xyz L2 + top-K=1 GT mask. Both delivered small
+  # but real gains; carry forward into v9.5.
+  target_topk_min_positives: 1
+  target_aux_xyz_weight: 0.3
+
+  consistency_weight: 0.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0
+
+  # v9.1 KEEPER: contact pos_weight (the dominant Stage A win).
+  use_contact_pos_weight: true
+  contact_pos_weight_cap: 15.0
+
+  use_logit_adjustment: true
+  logit_adjust_tau: 0.3
+
+priors:
+  reachability_weight: 0.0
+  contact_persistence_weight: 0.1
+  support_smoothness_weight: 0.05
+  phase_monotonicity_weight: 0.0
+  prior_warmup_steps: 500
+
+logging:
+  project: "piano"
+  run_name: "predictor_stageA_v9_5_finer_encoder"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/predictor_v9_5_finer_encoder"
