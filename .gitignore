@@ -33,3 +33,8 @@ cache/
 # in the shared repo. Keep them in the working tree for personal use.
 configs/accelerate_local_*.yaml
 configs/training/*_local.yaml
+
+# Local-machine launch scripts (PowerShell, Windows-specific paths).
+# Server uses bash + paths in PLAN.md.
+scripts/**/run_*_local_*.ps1
+*.ps1
