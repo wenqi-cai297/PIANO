@@ -482,6 +482,38 @@ def _token_recall_metrics(
     }
 
 
+def _patch_metrics(
+    all_pred_top1: list[np.ndarray],
+    all_pred_top3: list[np.ndarray],
+    all_gt: list[np.ndarray],
+) -> dict[str, float | int | None]:
+    """v9.5 hierarchical decoder patch-level accuracy.
+
+    Empty dict when no patch data was collected (legacy decoders without
+    a HierarchicalMaskDecoder). When present, reports patch_top1_acc
+    and patch_top3_acc on contact-gated cells, plus the cell count.
+
+    The patch task is 1-of-K=16. Random baseline for top1 is 1/16 ≈
+    0.0625; for top3 is 3/16 ≈ 0.1875. Compare against these baselines
+    to assess whether the patch head learned meaningful structure.
+    """
+    if not all_pred_top1 or not all_gt:
+        return {}
+    pred1 = np.concatenate(all_pred_top1, axis=0)   # (N,)
+    pred3 = np.concatenate(all_pred_top3, axis=0)   # (N, 3)
+    gt = np.concatenate(all_gt, axis=0)             # (N,)
+    n = int(gt.shape[0])
+    if n == 0:
+        return {}
+    top1 = float((pred1 == gt).mean())
+    top3 = float((pred3 == gt[:, None]).any(axis=-1).mean())
+    return {
+        "patch_top1_acc": top1,
+        "patch_top3_acc": top3,
+        "patch_n_cells": n,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Eval loop
 # ---------------------------------------------------------------------------
@@ -592,6 +624,15 @@ def run_eval(
     all_topk_precision: list[float] = []
     all_topk_recall: list[float] = []
     TOPK_EVAL = 3
+    # v9.5 hierarchical decoder accumulators. Only populated when the
+    # predictor emits ``contact_target_patch_logits`` +
+    # ``contact_target_token_to_patch`` (HierarchicalMaskDecoder path).
+    # GT patch id is derived per (frame, part) cell from
+    # token_to_patch[nearest_token_to_gt_xyz], same as the training-time
+    # patch CE GT.
+    all_pred_patch_top1: list[np.ndarray] = []   # (N_gated,) argmax patch
+    all_pred_patch_top3: list[np.ndarray] = []   # (N_gated, 3) top-3 patches
+    all_gt_patch: list[np.ndarray] = []          # (N_gated,) GT patch id
     # Per-clip records for per-object aggregation. Each entry is
     # {subset, object_id, seq_id, n_frames_valid, n_gated_target,
     #  target_mean_l2_m_per_clip, contact_any_n_pos, contact_any_n_pred_pos,
@@ -798,6 +839,45 @@ def run_eval(
                         all_topk_f1.append(float(topk_f1))
                         all_topk_precision.append(float(topk_prec))
                         all_topk_recall.append(float(topk_rec))
+
+        # v9.5 hierarchical decoder: patch-level metrics.
+        # Only fires when both fields are present (HierarchicalMaskDecoder).
+        # GT patch id = token_to_patch[nearest_token_to_gt_xyz], matching
+        # the training-time patch CE GT (losses.py inside focal_dice
+        # branch). Gate by frame_mask + contact (same as token-level).
+        if (
+            use_structured
+            and "contact_target_patch_logits" in pred_fp32
+            and "contact_target_token_to_patch" in pred_fp32
+            and obj_xyz is not None
+        ):
+            patch_logits = pred_fp32["contact_target_patch_logits"].cpu().numpy()
+            #   (B, T, P, K)
+            t2p = pred_fp32["contact_target_token_to_patch"].cpu().numpy()
+            #   (B, M)
+            obj_xyz_np_p = obj_xyz.float().cpu().numpy()    # (B, M, 3)
+            # Find nearest token to gt_xyz per (b, t, p) — re-use the
+            # `gt_token` already computed above when token_recall fired.
+            # If gt_token isn't in scope (would require shared variable),
+            # recompute here.
+            diff_p = gt_txyz[:, :, :, None, :] - obj_xyz_np_p[:, None, None, :, :]
+            d_sq_p = (diff_p ** 2).sum(axis=-1)             # (B, T, P, M)
+            nearest_token_p = d_sq_p.argmin(axis=-1)        # (B, T, P)
+            # Gather: gt_patch[b, t, p] = t2p[b, nearest_token_p[b, t, p]]
+            gt_patch_full = np.take_along_axis(
+                t2p[:, None, None, :].repeat(nearest_token_p.shape[1], axis=1)
+                                     .repeat(nearest_token_p.shape[2], axis=2),
+                nearest_token_p[..., None], axis=-1,
+            ).squeeze(-1)                                   # (B, T, P)
+            # Predictions
+            pred_patch_top1 = patch_logits.argmax(axis=-1)  # (B, T, P)
+            pred_patch_top3 = np.argsort(-patch_logits, axis=-1)[..., :3]  # (B, T, P, 3)
+            # Gate by contact + frame_mask
+            valid_t_p = mask_np[..., None]                   # (B, T, 1)
+            gate_mat_p = (gt_contact_np > 0.5) & valid_t_p.astype(bool)  # (B, T, 5)
+            all_gt_patch.append(gt_patch_full[gate_mat_p])
+            all_pred_patch_top1.append(pred_patch_top1[gate_mat_p])
+            all_pred_patch_top3.append(pred_patch_top3[gate_mat_p])
 
         # Phase
         pred_phase = pred_fp32["phase_logits"].argmax(dim=-1).cpu().numpy()            # (B, T)
@@ -1095,6 +1175,13 @@ def run_eval(
                 all_topk_iou, all_topk_f1, all_topk_precision, all_topk_recall,
                 topk=TOPK_EVAL,
             ),
+            # v9.5 hierarchical patch metrics. Empty dict when the
+            # predictor isn't a HierarchicalMaskDecoder, so the JSON
+            # field is just absent — back-compat for v9.1/v9.2/v9.4
+            # eval JSON readers.
+            **_patch_metrics(
+                all_pred_patch_top1, all_pred_patch_top3, all_gt_patch,
+            ),
         },
         "phase": phase_metrics,
         "support": support_metrics,
@@ -1161,6 +1248,25 @@ def _print_report(r: dict) -> None:
         print(f"  {bp:<14s} {m['mean_l2_m']*100:>12.2f} {m['median_l2_m']*100:>11.2f} "
               f"{m['pct_within_5cm']*100:>7.1f}% {m['pct_within_10cm']*100:>7.1f}% "
               f"{m['pct_within_20cm']*100:>7.1f}% {m['support']:>8d}")
+
+    # v9.5 hierarchical patch metrics (only present when the predictor
+    # used a HierarchicalMaskDecoder). Random baselines for K=16: top1
+    # 1/16 ≈ 0.063, top3 3/16 ≈ 0.188 — print alongside so the user
+    # can immediately see whether the head learned structure.
+    if t.get("patch_top1_acc") is not None:
+        n_p = t.get("patch_n_cells", 0)
+        print(
+            f"\n[hierarchical patch (1-of-K) — gated by gt_contact > 0.5]"
+        )
+        print(
+            f"  patch top1_acc: {t['patch_top1_acc']:.4f}  "
+            f"(random baseline 1/K)"
+        )
+        print(
+            f"  patch top3_acc: {t['patch_top3_acc']:.4f}  "
+            f"(random baseline 3/K)"
+        )
+        print(f"  n_cells: {n_p}")
 
     for section_name, section in [("phase", r["phase"]), ("support", r["support"])]:
         print(f"\n[{section_name}]")
