@@ -14,11 +14,36 @@ from scipy.spatial import cKDTree
 # Mesh loading & surface sampling
 # ---------------------------------------------------------------------------
 
+_MESH_RECENTER_THRESHOLD_M: float = 0.05
+
+
 def load_mesh(path: str) -> trimesh.Trimesh:
-    """Load a triangle mesh from file (obj, ply, stl, etc.)."""
+    """Load a triangle mesh and ensure it is centered at origin.
+
+    Some InterAct subsets (notably neuraldome and imhd) export per-object
+    `.obj` files in the **original capture-frame coordinates** rather than
+    the canonical object-local frame where the mesh is centered on the
+    origin. Concrete example:
+
+        neuraldome/box/box_face1000.obj  bbox_center = (-0.52, 0.92, 2.59)
+
+    The pseudo-label pipeline assumes meshes are pre-centered, because
+    `world_to_object_local(body_world, object_positions, object_rotations)`
+    places the body in a frame anchored at `object_positions[t]`. Distance
+    to mesh is then meaningless if the mesh sits 1-3 m from the origin
+    in this frame — every contact gate trivially fails. See
+    analyses/2026-05-05_v12_root_cause_mesh_centering.md.
+
+    Defensive fix: when the mesh's bbox centroid is more than 5 cm from
+    the origin, re-center it. Already-centered meshes (omomo, chairs,
+    neuraldome/chair) pass through untouched.
+    """
     mesh = trimesh.load(path, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError(f"Expected a single Trimesh, got {type(mesh)} from {path}")
+    centroid = mesh.bounding_box.centroid
+    if float(np.linalg.norm(centroid)) > _MESH_RECENTER_THRESHOLD_M:
+        mesh.vertices = mesh.vertices - centroid
     return mesh
 
 
