@@ -478,10 +478,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Default: runs/visualizations/<timestamp>/")
         p.add_argument("--fps", type=float, default=20.0)
         p.add_argument("--mean", type=Path, default=None,
-                       help="HumanML3D mean.npy — required to denormalize "
-                            "MoMask-generated motion back to world units")
+                       help="HumanML3D mean.npy. ONLY pass this when the source "
+                            "motion_263 is in NORMALIZED scale. qual_eval.py and "
+                            "gt_vq_roundtrip.py already denormalize before saving "
+                            "generated.npz, so passing --mean/--std on those "
+                            "outputs DOUBLE-denormalizes and squashes root motion "
+                            "to dataset mean (all bodies look like 'walk forward "
+                            "in +z at 0.17 m/s'). Pass only if you have a custom "
+                            "pipeline that saves normalized motion_263.")
         p.add_argument("--std", type=Path, default=None,
-                       help="HumanML3D std.npy — paired with --mean")
+                       help="HumanML3D std.npy — paired with --mean. Same caveat: "
+                            "do not pass on qual_eval / gt_vq_roundtrip outputs.")
         p.add_argument("--use-recovery", action="store_true",
                        help="Force motion_263 → recover_from_ric path even for "
                             "real samples. Useful for validating that the "

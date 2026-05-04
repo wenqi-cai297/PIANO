@@ -91,9 +91,8 @@ def main() -> int:
         ckpts.residual_transformer, device=device,
     )
 
-    from piano.models.motion_generator import (
-        InteractionMaskTransformer, ResidualTransformerWithInteraction,
-    )
+    from piano.models.motion_generator import InteractionMaskTransformer
+    from piano.models.motion_generator_residual import ResidualTransformerWithInteraction
     from piano.models.interaction_tokenizer import InteractionTokenizer
 
     # Build the same wrappers train_generator builds. Defaults match the
@@ -118,10 +117,8 @@ def main() -> int:
 
     residual_wrapper = ResidualTransformerWithInteraction(
         residual_transformer=residual_transformer,
-        d_model=mask_transformer.latent_dim,
-        num_heads=mask_transformer.seqTransEncoder.layers[0].self_attn.num_heads
-                  if hasattr(mask_transformer.seqTransEncoder, "layers")
-                  else 6,
+        d_model=int(model_cfg.residual_transformer.latent_dim),
+        num_heads=int(model_cfg.residual_transformer.num_heads),
         dropout=float(rint_cfg.get("dropout", 0.1)),
         zero_init_gamma=bool(rint_cfg.get("zero_init_gamma", True)),
         gamma_kind=str(rint_cfg.get("gamma_kind", "per_head")),
@@ -171,7 +168,7 @@ def main() -> int:
             m_lens_tok=m_lens_tok,
             int_tokens_bf=int_tokens_bf,
             int_padding_mask_bf=int_pad_mask_bf,
-            cfg_drop_buckets={"drop_both": 0.1, "drop_int_only": 0.1, "drop_text_only": 0.05},
+            cfg_drop_buckets=(0.10, 0.10, 0.05),  # (drop_both, drop_int_only, drop_text_only)
             return_logits=False,
         )
 
