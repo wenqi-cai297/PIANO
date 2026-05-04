@@ -20,10 +20,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from piano.data.humanml3d_repr import denormalize_motion
-from piano.models.interaction_cross_attn import InteractionTokenizer
+from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.interaction_predictor import InteractionPredictor
 from piano.models.backbones.momask_adapter import load_momask_vqvae
 from piano.models.motion_generator import InteractionMaskTransformer
@@ -86,6 +87,8 @@ class PIANOPipeline:
         text: str,
         object_pc: np.ndarray,
         init_pose: np.ndarray | None = None,
+        obj_com_canonical: np.ndarray | None = None,
+        obj_rot6d_canonical: np.ndarray | None = None,
         config: GenerationConfig | None = None,
     ) -> dict[str, np.ndarray]:
         """Generate motion from text and object.
@@ -102,10 +105,11 @@ class PIANOPipeline:
         -------
         Dictionary with:
             ``motion_263`` : (T, 263) HumanML3D features (denormalized if stats provided)
-            ``contact_state`` : (T, 5) predicted contact
-            ``contact_target`` : (T, 5, K) predicted contact target
-            ``phase`` : (T, P) predicted phase
-            ``support`` : (T, S) predicted support
+            ``contact_state`` : (T, 5) predicted contact (sigmoid probabilities)
+            ``contact_target_xyz`` : (T, 5, 3) predicted contact xyz in
+                                     object-local frame (5 body parts × 3 coords)
+            ``phase`` : (T, P) predicted phase (softmax probabilities)
+            ``support`` : (T, S) predicted support (softmax probabilities)
             ``token_ids`` : (S,) generated VQ token indices
         """
         if config is None:
@@ -120,11 +124,16 @@ class PIANOPipeline:
         text_pooled = self._encode_text_pooled(text)   # (1, clip_dim)
 
         # --- Encode object ---
+        # The structured_head predictor (v8+) needs both token features
+        # AND token centroid xyz for affordance attention / hierarchical
+        # mask decoder. Use return_xyz=True to get both.
         obj_pc_tensor = torch.from_numpy(object_pc).float().unsqueeze(0).to(self.device)
         if obj_pc_tensor.shape[1] != config.num_object_points:
             indices = np.random.choice(len(object_pc), config.num_object_points, replace=True)
             obj_pc_tensor = torch.from_numpy(object_pc[indices]).float().unsqueeze(0).to(self.device)
-        obj_tokens = self.object_encoder(obj_pc_tensor)  # (1, M, d)
+        obj_xyz_tensor, obj_tokens = self.object_encoder(
+            obj_pc_tensor, return_xyz=True,
+        )  # (1, M, 3), (1, M, d)
 
         # --- Initial pose (66-d: SMPL-22 joint xyz) ---
         if init_pose is not None:
@@ -133,18 +142,49 @@ class PIANOPipeline:
             pose_tensor = torch.zeros(1, config.init_pose_dim, device=self.device)
 
         # --- Predict interaction latent ---
+        # The predictor's output dict keys are:
+        #   contact_state         (B, T, num_body_parts) — sigmoid probs
+        #   contact_target_xyz    (B, T, num_body_parts, 3) — closest-mesh-
+        #                          point xyz in object-local frame
+        #   phase                 (B, T, num_phases) — softmax probs
+        #   support               (B, T, num_support) — softmax probs
+        # When ``structured_head.target_attn_kind="hierarchical_mask_decoder"``
+        # (v9.5) the dict ALSO contains contact_target_attn /
+        # contact_target_patch_logits, but those are not consumed by the
+        # tokenizer here — the v8.1b refactor that would consume them
+        # directly is deferred (see analyses/2026-05-04_v95_local_results.md).
         pred = self.predictor(
             text_features, obj_tokens, pose_tensor,
             seq_length=config.num_frames,
             text_key_padding_mask=text_mask,
+            object_xyz=obj_xyz_tensor,
         )
 
         # --- Build interaction tokens ---
-        interaction_tokens = self.interaction_tokenizer(
-            pred["contact_state"],
-            pred["contact_target"],
-            pred["phase"],
-            pred["support"],
+        # InteractionTokenizer.forward signature requires per-frame object
+        # pose channels (obj_com_canonical / obj_rot6d_canonical) when
+        # num_obj_pose_channels > 0 — caller must canonicalize world-frame
+        # object trajectories first via
+        # ``piano.utils.canonical_frame.world_to_canonical_object_pose``.
+        # See interaction_tokenizer.py:265-281 for the contract.
+        if obj_com_canonical is None or obj_rot6d_canonical is None:
+            raise ValueError(
+                "PIANOPipeline.generate requires obj_com_canonical + "
+                "obj_rot6d_canonical for the v0.2 InteractionTokenizer "
+                "(num_obj_pose_channels=9). Pass per-frame canonicalized "
+                "object COM (T, 3) and 6D rotation (T, 6) — convert via "
+                "piano.utils.canonical_frame.world_to_canonical_object_pose "
+                "before calling."
+            )
+        obj_com_t = torch.from_numpy(obj_com_canonical).float().unsqueeze(0).to(self.device)
+        obj_rot6d_t = torch.from_numpy(obj_rot6d_canonical).float().unsqueeze(0).to(self.device)
+        interaction_tokens, _ = self.interaction_tokenizer(
+            contact_state=pred["contact_state"],
+            contact_target_xyz=pred["contact_target_xyz"],
+            phase=pred["phase"],
+            support=pred["support"],
+            obj_com_canonical=obj_com_t,
+            obj_rot6d_canonical=obj_rot6d_t,
         )  # (1, S_int, d_model)
 
         # --- Generate motion tokens ---
@@ -180,7 +220,7 @@ class PIANOPipeline:
         return {
             "motion_263": motion_263,
             "contact_state": pred["contact_state"][0].cpu().numpy(),
-            "contact_target": pred["contact_target"][0].cpu().numpy(),
+            "contact_target_xyz": pred["contact_target_xyz"][0].cpu().numpy(),
             "phase": pred["phase"][0].cpu().numpy(),
             "support": pred["support"][0].cpu().numpy(),
             "token_ids": token_ids[0].cpu().numpy(),

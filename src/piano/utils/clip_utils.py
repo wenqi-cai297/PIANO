@@ -66,6 +66,52 @@ def encode_text_per_token(
     return x, key_padding_mask
 
 
+def set_clip_cache_root(path: str) -> None:
+    """Monkeypatch ``clip.load``'s default ``download_root`` to ``path``.
+
+    OpenAI CLIP's ``load(name, device, jit, download_root=None)`` defaults
+    download_root to ``~/.cache/clip`` (hardcoded). Some upstream
+    dependencies (notably MoMask's ``load_and_freeze_clip`` in
+    ``backbones/momask/models/mask_transformer/transformer.py:178``)
+    call ``clip.load`` directly without exposing the kwarg, so they
+    write to the user-home cache.
+
+    This helper monkeypatches ``clip.load`` at the module level so all
+    subsequent calls — even from third-party code — use the supplied
+    cache root. Idempotent: safe to call multiple times. The original
+    function is preserved on a private attribute so unit tests can
+    restore it if needed.
+
+    Use case: keep all model weights co-located with the project
+    workspace so the project directory is self-contained.
+
+    Parameters
+    ----------
+    path : str
+        Directory to use as ``download_root``. Created on demand by
+        ``clip.load`` if missing.
+    """
+    import os
+    import clip
+
+    target = os.path.abspath(os.path.expanduser(path))
+    os.makedirs(target, exist_ok=True)
+
+    # Save original on first patch only (so repeated calls don't
+    # re-wrap the patched version into infinite recursion).
+    if not hasattr(clip, "_piano_orig_load"):
+        clip._piano_orig_load = clip.load
+
+    orig = clip._piano_orig_load
+
+    def _patched_load(name, device="cpu", jit=False, download_root=None):
+        if download_root is None:
+            download_root = target
+        return orig(name, device=device, jit=jit, download_root=download_root)
+
+    clip.load = _patched_load
+
+
 def load_clip_text_encoder(
     device: torch.device,
     model_name: str = "ViT-B/32",

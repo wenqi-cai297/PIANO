@@ -58,6 +58,7 @@ from piano.models.backbones.momask_adapter import (
 )
 from piano.models.interaction_tokenizer import InteractionTokenizer
 from piano.models.motion_generator import InteractionMaskTransformer
+from piano.utils.clip_utils import set_clip_cache_root
 from piano.models.motion_generator_residual import ResidualTransformerWithInteraction
 from piano.training.contact_eval import build_contact_eval_fn
 from piano.training.decoded_contact_loss import decoded_contact_aux_loss
@@ -739,6 +740,17 @@ def build_generator_step_fn(
 def run(config_path: str) -> None:
     cfg = OmegaConf.load(config_path)
     set_seed(cfg.training.get("seed", 42))
+
+    # Workspace-local CLIP cache (optional). MoMask's transformer.py
+    # internally calls ``clip.load(...)`` without exposing
+    # ``download_root``, defaulting to ``~/.cache/clip``. When the
+    # training config sets ``model.clip_download_root``, monkeypatch
+    # ``clip.load`` so the user-home cache is bypassed and weights are
+    # written / read from the configured (typically workspace-local)
+    # directory. None default preserves legacy behaviour.
+    clip_dl_root = cfg.model.get("clip_download_root", None)
+    if clip_dl_root is not None:
+        set_clip_cache_root(clip_dl_root)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
