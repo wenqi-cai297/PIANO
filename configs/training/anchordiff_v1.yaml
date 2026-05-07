@@ -1,0 +1,100 @@
+# PIANO-AnchorDiff v1: OMOMO-style anchor-conditioned continuous diffusion.
+#
+# Replaces the closed MoMask Stage B track. Trained on official-process
+# four-subset data + v18 pseudo labels with GT z_int conditioning + 15%
+# classifier-free dropout. Inference will run with Stage A v10 predicted
+# z_int.
+#
+# Design source of truth:
+#     analyses/2026-05-08_piano_anchordiff_design.md
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+
+  z_int:
+    num_parts: 5            # left/right hand, left/right foot, pelvis
+    phase_classes: 3        # non_contact / stable_contact / manipulation
+    support_classes: 3      # both_feet / single_foot / sitting (3-way collapsed)
+
+  denoiser:
+    motion_dim: 263         # HumanML3D motion_263
+    object_traj_dim: 9      # 3 (com) + 6 (rot6d) per frame
+    init_pose_dim: 66       # SMPL-22 joints flattened
+    text_dim: 512           # CLIP ViT-B/32 per-token feature
+    object_token_dim: 256   # match object_encoder.feature_dim below
+    object_num_tokens: 128  # match object_encoder.num_output_tokens below
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.5
+    rotate_around_y_prob: 1.0
+    pc_jitter_std: 0.005
+
+training:
+  batch_size: 16
+  num_epochs: 100
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 200
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 5
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v1"
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+output_dir: "runs/training/stageB_anchordiff_v1"
