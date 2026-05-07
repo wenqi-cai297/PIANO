@@ -196,6 +196,53 @@ def _per_clip_canon_transform(
     )
 
 
+def _build_motion_feature_weights(
+    device: torch.device,
+    motion_dim: int,
+    weights_cfg: dict | None,
+) -> Tensor:
+    """Build a per-feature weight vector for motion_263 MSE.
+
+    motion_263 layout (HumanML3D, 22 joints):
+        [0]      : root rotation velocity
+        [1:3]    : root linear velocity (XZ in body frame)
+        [3]      : root height Y
+        [4:67]   : joint local positions (21 × 3)
+        [67:193] : joint rotations (21 × 6D)
+        [193:259]: joint velocities (22 × 3)
+        [259:263]: foot contact labels (4)
+
+    Defaults from MDM / OMOMO recipes:
+        root_rot_vel: 100  (the spin-causing channel; needs 1/0.4% boost)
+        root_lin_vel: 30
+        root_height_y: 30
+        joint_pos_local: 1
+        joint_rot_6d: 1
+        joint_velocity: 1
+        foot_contact: 5
+    """
+    defaults = {
+        "root_rot_vel": 100.0,
+        "root_lin_vel": 30.0,
+        "root_height_y": 30.0,
+        "joint_pos_local": 1.0,
+        "joint_rot_6d": 1.0,
+        "joint_velocity": 1.0,
+        "foot_contact": 5.0,
+    }
+    if weights_cfg is not None:
+        defaults.update(dict(weights_cfg))
+    w = torch.ones(motion_dim, device=device, dtype=torch.float32)
+    w[0] = defaults["root_rot_vel"]
+    w[1:3] = defaults["root_lin_vel"]
+    w[3] = defaults["root_height_y"]
+    w[4:67] = defaults["joint_pos_local"]
+    w[67:193] = defaults["joint_rot_6d"]
+    w[193:259] = defaults["joint_velocity"]
+    w[259:263] = defaults["foot_contact"]
+    return w.view(1, 1, -1)                                         # (1, 1, 263)
+
+
 def build_anchordiff_step_fn(
     model: MotionAnchorDiff,
     object_encoder: ObjectEncoder,
@@ -203,7 +250,11 @@ def build_anchordiff_step_fn(
     anchor_cfg: AnchorConsistencyConfig,
     z_dims: ZIntDims,
     device: torch.device,
+    motion_feature_weights: dict | None = None,
 ):
+    feat_weights = _build_motion_feature_weights(
+        device, motion_dim=263, weights_cfg=motion_feature_weights,
+    )
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
         motion = batch["motion"].to(device)                       # (B, T, 263)
         joints = batch["joints"].to(device)                       # (B, T, 22, 3)
@@ -263,10 +314,15 @@ def build_anchordiff_step_fn(
         x0_pred = out["x0_pred"]
         x0_target = out["x0_target"]
 
-        # x₀ MSE — masked to valid frames (padded frames have undefined
-        # motion, would bias the gradient).
-        mse = (x0_pred - x0_target).pow(2).sum(-1)                  # (B, T)
-        mse = (mse * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
+        # x₀ MSE — masked to valid frames. FEATURE-WEIGHTED to recover
+        # motion_263 root channels (rot_vel, lin_vel, height) that plain
+        # MSE drowns under 99.6% of joint-position dimensions. Without
+        # weighting, the 1-d per-frame Y-rotation velocity is
+        # undertrained → cumsum integrates to body spinning over T
+        # frames. Standard fix in MDM/OMOMO/HumanML3D pipelines.
+        mse_per_dim = (x0_pred - x0_target).pow(2)                  # (B, T, 263)
+        weighted = (mse_per_dim * feat_weights).sum(-1)             # (B, T)
+        mse = (weighted * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
 
         # Anchor consistency in WORLD frame (uniform-skel canonical lifted
         # to world via per-clip (R_y, T_xz, T_y); see
@@ -421,6 +477,10 @@ def main() -> None:
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
+    motion_feat_weights = (
+        OmegaConf.to_container(cfg.loss.motion_feature_weights, resolve=True)
+        if "motion_feature_weights" in cfg.loss else None
+    )
     step_fn = build_anchordiff_step_fn(
         model=model,
         object_encoder=object_encoder,
@@ -428,6 +488,7 @@ def main() -> None:
         anchor_cfg=anchor_cfg,
         z_dims=z_dims,
         device=device,
+        motion_feature_weights=motion_feat_weights,
     )
 
     # --- Smoke test: one batch through forward + backward ---
