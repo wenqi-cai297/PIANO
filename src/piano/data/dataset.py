@@ -640,22 +640,20 @@ class HOIDataset(Dataset):
                     object_rotations[..., 1] *= -1.0
                     object_rotations[..., 2] *= -1.0
 
-        # 2. Random rotation around world Y (up axis). Rotates every
-        #    joint frame by the same θ. Labels are rotation-invariant
-        #    (object-local frame). Object PC in object-local frame is
-        #    untouched. NOTE: when surface_obj_pose=True, ``motion_263``
-        #    is in body-canonical frame (rotation-invariant by
-        #    construction) but ``object_positions`` is world-frame and
-        #    WOULD need rotation. Currently rotate_around_y is disabled
-        #    for Stage B configs (``rotate_around_y_prob: 0``) — if
-        #    enabled, object world pose would need a parallel rotation.
+        # 2. Random rotation around world Y (up axis). Rotates the body's
+        #    world-frame joints AND (when surface_obj_pose=True) the
+        #    object's world pose by the same θ, so the human-object
+        #    spatial relationship is preserved. ``motion_263`` is
+        #    body-canonical (rotation-invariant by construction) so it
+        #    needs no update. ``contact_target_xyz`` is object-local so
+        #    it also needs no update.
         if (
             self.augment.rotate_around_y_prob > 0
             and random.random() < self.augment.rotate_around_y_prob
         ):
             theta = random.uniform(-math.pi, math.pi)
             c, s = math.cos(theta), math.sin(theta)
-            # R @ v for v = (x, y, z):  (c x + s z, y, -s x + c z)
+            # R_y @ v for v = (x, y, z):  (c x + s z, y, -s x + c z)
             x = joints[..., 0]
             z = joints[..., 2]
             new_x = c * x + s * z
@@ -663,6 +661,62 @@ class HOIDataset(Dataset):
             joints = joints.copy()
             joints[..., 0] = new_x
             joints[..., 2] = new_z
+
+            # Stage B: rotate the object's world pose by the same θ.
+            # object_positions: rotate XZ.
+            # object_rotations: axis-angle. Composition R_obj_aug =
+            # R_y(θ) @ R_obj. Done via quaternion multiplication; the
+            # naïve "rotate the axis by R_y, keep angle" is WRONG —
+            # rotation composition is non-commutative and the resulting
+            # axis-angle's angle changes too. Do proper quat * quat.
+            if object_positions is not None:
+                # Compute both rotated coordinates BEFORE assigning back —
+                # `op_x = object_positions[..., 0]` is a view, and writing
+                # to `object_positions[..., 0]` would mutate it before
+                # `object_positions[..., 2]`'s formula uses it. Numpy
+                # in-place-on-view bug.
+                op_x = object_positions[..., 0].copy()
+                op_z = object_positions[..., 2].copy()
+                object_positions = object_positions.copy()
+                object_positions[..., 0] = c * op_x + s * op_z
+                object_positions[..., 2] = -s * op_x + c * op_z
+            if object_rotations is not None:
+                aa = object_rotations.astype(np.float32, copy=True)
+                angle = np.linalg.norm(aa, axis=-1, keepdims=True)
+                safe_angle = np.where(angle < 1e-12, 1.0, angle)
+                axis = aa / safe_angle
+                # quaternion of in_rot: (cos(angle/2), axis*sin(angle/2))
+                ha = (angle * 0.5).squeeze(-1)
+                cha = np.cos(ha)
+                sha = np.sin(ha)
+                qw = cha
+                qx = axis[..., 0] * sha
+                qy = axis[..., 1] * sha
+                qz = axis[..., 2] * sha
+                # Y-rotation quat: (cos(θ/2), 0, sin(θ/2), 0)
+                hy = theta * 0.5
+                yw = math.cos(hy)
+                ys = math.sin(hy)
+                # q_y * q_obj  (apply object rotation FIRST in world,
+                # then Y-rotation)
+                nw = yw * qw - 0   - ys * qy - 0
+                nx = yw * qx + 0   + ys * qz - 0   # = yw*qx + ys*qz
+                ny = yw * qy - 0   + ys * qw + 0   # = yw*qy + ys*qw
+                nz = yw * qz + 0   - ys * qx + 0   # = yw*qz - ys*qx
+                # Quaternion → axis-angle.
+                # angle_new = 2 * atan2(|imag|, real)
+                imag_norm = np.sqrt(nx * nx + ny * ny + nz * nz)
+                new_angle = 2.0 * np.arctan2(imag_norm, nw)
+                safe_in = np.where(imag_norm < 1e-12, 1.0, imag_norm)
+                new_axis_x = nx / safe_in
+                new_axis_y = ny / safe_in
+                new_axis_z = nz / safe_in
+                object_rotations = np.stack(
+                    [new_axis_x * new_angle,
+                     new_axis_y * new_angle,
+                     new_axis_z * new_angle],
+                    axis=-1,
+                ).astype(np.float32)
 
         # 3. Small Gaussian jitter on the object point cloud. PointNeXt
         #    training recipe. Label-independent.
