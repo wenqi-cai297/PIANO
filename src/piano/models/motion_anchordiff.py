@@ -4,6 +4,12 @@ OMOMO-style anchor conditioning (z_int as primary per-frame channel)
 on top of an MDM-style transformer encoder denoiser, trained with
 classifier-free guidance dropout. Operates on HumanML3D motion_263.
 
+Prediction parameterisation: **x₀-prediction** (sample-prediction).
+MDM, OMOMO, HOI-Dyn all use x₀; ε-prediction would force the anchor
+consistency loss through a 1/√ᾱ_t derivation that explodes at high
+noise levels. See ``analyses/2026-05-08_diffusion_prediction_target_review.md``
+for the full rationale and source citations.
+
 Design source of truth:
     analyses/2026-05-08_piano_anchordiff_design.md
 
@@ -93,6 +99,27 @@ class GaussianDiffusion(nn.Module):
             - _extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
         )
 
+    def posterior_mean_from_x0(
+        self, x_start: Tensor, x_t: Tensor, t: Tensor,
+    ) -> Tensor:
+        """Closed-form posterior mean μ(x_{t-1} | x_t, x_0) from DDPM:
+
+            μ = (√ᾱ_{t-1} β_t / (1 - ᾱ_t)) x_0
+              + (√α_t (1 - ᾱ_{t-1}) / (1 - ᾱ_t)) x_t
+        """
+        coef_x0 = (
+            self.alphas_cumprod_prev.sqrt() * self.betas
+            / (1 - self.alphas_cumprod)
+        )
+        coef_xt = (
+            (1 - self.alphas_cumprod_prev) * (1 - self.betas).sqrt()
+            / (1 - self.alphas_cumprod)
+        )
+        return (
+            _extract(coef_x0, t, x_t.shape) * x_start
+            + _extract(coef_xt, t, x_t.shape) * x_t
+        )
+
     @torch.no_grad()
     def p_sample_loop(
         self,
@@ -102,28 +129,25 @@ class GaussianDiffusion(nn.Module):
         cfg_scale: float = 1.0,
         device: torch.device | None = None,
     ) -> Tensor:
-        """Ancestral sampling with optional classifier-free guidance.
+        """Ancestral sampling with optional classifier-free guidance,
+        operating on x₀-prediction outputs.
 
         ``cond`` follows the same dict spec as ``AnchorDenoiser.forward``.
-        ``cfg_scale > 1`` enables CFG: ε = ε_uncond + s·(ε_cond - ε_uncond).
+        ``cfg_scale > 1`` enables CFG: x_0 = x_0_uncond + s·(x_0_cond - x_0_uncond).
         """
         device = device or self.betas.device
         x = torch.randn(shape, device=device)
         for t_int in reversed(range(self.num_steps)):
             t = torch.full((shape[0],), t_int, device=device, dtype=torch.long)
-            eps_cond = denoiser(x, t, cond, cond_drop_mask=None)
+            x0_cond = denoiser(x, t, cond, cond_drop_mask=None)
             if cfg_scale != 1.0:
                 drop = torch.ones(shape[0], dtype=torch.bool, device=device)
-                eps_uncond = denoiser(x, t, cond, cond_drop_mask=drop)
-                eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+                x0_uncond = denoiser(x, t, cond, cond_drop_mask=drop)
+                x0 = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
             else:
-                eps = eps_cond
+                x0 = x0_cond
 
-            x0 = self.predict_x0_from_eps(x, t, eps)
-            mean = (
-                _extract(self.alphas_cumprod_prev.sqrt() * self.betas, t, x.shape) * x0
-                + _extract((1 - self.alphas_cumprod_prev) * (1 - self.betas).sqrt(), t, x.shape) * x
-            ) / (1 - _extract(self.alphas_cumprod, t, x.shape))
+            mean = self.posterior_mean_from_x0(x0, x, t)
             if t_int == 0:
                 x = mean
             else:
@@ -236,7 +260,13 @@ class AnchorDenoiserConfig:
 
 
 class AnchorDenoiser(nn.Module):
-    """ε-prediction transformer-encoder denoiser with anchor conditioning.
+    """x₀-prediction transformer-encoder denoiser with anchor conditioning.
+
+    Output is the predicted clean motion ``x_0``, not ε. This matches MDM /
+    OMOMO / HOI-Dyn and lets geometric losses (anchor consistency, future
+    foot contact) attach directly to the network output without going
+    through a 1/√ᾱ_t derivation. See
+    ``analyses/2026-05-08_diffusion_prediction_target_review.md``.
 
     Per-frame conditioning (concatenated to the projected motion before
     transformer):
@@ -363,8 +393,8 @@ class AnchorDenoiser(nn.Module):
 
         # --- Drop the two prepended tokens; project to motion_dim ---
         h_out = seq[:, 2:, :]                                            # (B, T, D)
-        eps = self.out_proj(h_out)                                       # (B, T, motion_dim)
-        return eps
+        x0 = self.out_proj(h_out)                                        # (B, T, motion_dim)
+        return x0
 
 
 # ============================================================================
@@ -397,8 +427,14 @@ class MotionAnchorDiff(nn.Module):
         self.denoiser = AnchorDenoiser(cfg.denoiser)
 
     def training_step(self, x_start: Tensor, cond: dict) -> dict:
-        """One forward pass: sample t, sample noise, predict ε, return ε
-        and target (caller computes the actual MSE + anchor loss).
+        """One forward pass: sample t, sample noise, predict x_0, return
+        prediction + ground-truth target (caller computes MSE + anchor loss).
+
+        Under x₀-prediction the denoiser's output IS the predicted
+        clean motion. No `predict_x0_from_eps` derivation is needed,
+        which means the anchor consistency loss applied on `x0_pred`
+        flows directly through the network without the 1/√ᾱ_t
+        Jacobian explosion at high noise levels.
         """
         B, T, _ = x_start.shape
         device = x_start.device
@@ -408,13 +444,11 @@ class MotionAnchorDiff(nn.Module):
 
         # CFG dropout: per-sample bernoulli over the full conditioning.
         drop_mask = torch.rand(B, device=device) < self.cfg.cfg_drop_prob
-        eps_pred = self.denoiser(x_t, t, cond, cond_drop_mask=drop_mask)
+        x0_pred = self.denoiser(x_t, t, cond, cond_drop_mask=drop_mask)
 
-        x0_pred = self.diffusion.predict_x0_from_eps(x_t, t, eps_pred)
         return {
-            "eps_pred": eps_pred,
-            "eps_target": noise,
             "x0_pred": x0_pred,
+            "x0_target": x_start,
             "x_t": x_t,
             "t": t,
         }

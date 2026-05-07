@@ -207,18 +207,17 @@ def build_anchordiff_step_fn(
             "object_tokens": obj_tokens,
         }
 
-        # --- Diffusion training step ---
+        # --- Diffusion training step (x₀-prediction) ---
         out = model.training_step(motion, cond)
-        eps_pred = out["eps_pred"]
-        eps_target = out["eps_target"]
         x0_pred = out["x0_pred"]
+        x0_target = out["x0_target"]
 
-        # ε MSE — masked to valid frames (padded frames have arbitrary
-        # noise targets, would bias the gradient).
-        mse = (eps_pred - eps_target).pow(2).sum(-1)               # (B, T)
+        # x₀ MSE — masked to valid frames (padded frames have undefined
+        # motion, would bias the gradient).
+        mse = (x0_pred - x0_target).pow(2).sum(-1)                  # (B, T)
         mse = (mse * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
 
-        # Anchor consistency on the predicted x_0
+        # Anchor consistency directly on the network output.
         anchor = anchor_consistency_loss(
             x0_pred=x0_pred,
             contact_state_gt=contact_state,
@@ -232,7 +231,7 @@ def build_anchordiff_step_fn(
         total = mse + anchor
         return {
             "loss": total,
-            "mse_eps": mse.detach(),
+            "mse_x0": mse.detach(),
             "anchor_l2": anchor.detach(),
         }
 
@@ -382,7 +381,7 @@ def main() -> None:
         out = step_fn(model, batch, global_step=0)
         accelerator.print(
             f"  loss={out['loss'].item():.4f}  "
-            f"mse_eps={out['mse_eps'].item():.4f}  "
+            f"mse_x0={out['mse_x0'].item():.4f}  "
             f"anchor_l2={out['anchor_l2'].item():.4f}"
         )
         accelerator.backward(out["loss"])
