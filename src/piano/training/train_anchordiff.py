@@ -153,6 +153,49 @@ def _support_to_softmax(support_idx: Tensor, num_classes: int) -> Tensor:
     return _phase_to_softmax(support_idx, num_classes)
 
 
+def _per_clip_canon_transform(
+    joints_world: Tensor,          # (B, T, 22, 3)
+    motion_263: Tensor,            # (B, T, 263)
+    seq_len: Tensor,               # (B,)
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute per-clip canonical→world (R_y, T_xz, T_y) on-device.
+
+    Mirrors :func:`piano.utils.canonical_frame.get_canonicalize_transform_from_clip`
+    but in torch and batched. Cheap: one frame-0 reduction per clip.
+    """
+    from piano.training.anchor_consistency_loss import lift_motion263_to_joints
+    canon = lift_motion263_to_joints(motion_263)                   # (B, T, 22, 3)
+    B = joints_world.shape[0]
+    R_y_list, T_xz_list, T_y_list = [], [], []
+    for b in range(B):
+        T_b = max(int(seq_len[b].item()), 1)
+        wt0 = joints_world[b, 0]                                   # (22, 3)
+        ct0 = canon[b, 0]
+        across_w = (wt0[17] - wt0[16]) + (wt0[2] - wt0[1])
+        across_c = (ct0[17] - ct0[16]) + (ct0[2] - ct0[1])
+        fw_w = torch.atan2(across_w[2], -across_w[0])
+        fw_c = torch.atan2(across_c[2], -across_c[0])
+        R_y = fw_w - fw_c
+        # XZ translation: world_pelvis_t0 - R_y(canon_pelvis_t0) on XZ
+        cos_, sin_ = R_y.cos(), R_y.sin()
+        Rmat = torch.stack([
+            torch.stack([cos_, torch.zeros_like(cos_), sin_]),
+            torch.stack([torch.zeros_like(cos_), torch.ones_like(cos_), torch.zeros_like(cos_)]),
+            torch.stack([-sin_, torch.zeros_like(cos_), cos_]),
+        ])
+        rot_pelv = Rmat @ ct0[0]
+        T_xz = torch.stack([wt0[0, 0] - rot_pelv[0], wt0[0, 2] - rot_pelv[2]])
+        T_y = wt0[0, 1] - ct0[0, 1]
+        R_y_list.append(R_y)
+        T_xz_list.append(T_xz)
+        T_y_list.append(T_y)
+    return (
+        torch.stack(R_y_list),                                     # (B,)
+        torch.stack(T_xz_list),                                    # (B, 2)
+        torch.stack(T_y_list),                                     # (B,)
+    )
+
+
 def build_anchordiff_step_fn(
     model: MotionAnchorDiff,
     object_encoder: ObjectEncoder,
@@ -171,11 +214,19 @@ def build_anchordiff_step_fn(
         support = batch["support"].to(device)                     # (B, T)
         obj_com = batch["obj_com_canonical"].to(device)           # (B, T, 3)
         obj_rot6d = batch["obj_rot6d_canonical"].to(device)       # (B, T, 6)
+        obj_pos_world = batch["object_positions"].to(device)      # (B, T, 3)
+        obj_rot_world = batch["object_rotations"].to(device)      # (B, T, 3) axis-angle
         seq_len = batch["seq_len"].to(device)                     # (B,)
 
         B, T, _ = motion.shape
         seq_idx = torch.arange(T, device=device).unsqueeze(0)
         seq_mask = (seq_idx < seq_len.unsqueeze(1)).float()        # (B, T)
+
+        # Per-clip canonical→world transform (cheap; one frame-0 op per clip).
+        with torch.no_grad():
+            R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
+                joints, motion, seq_len,
+            )
 
         # --- Pack z_int (training: GT contact + GT target + GT phase/support) ---
         phase_soft = _phase_to_softmax(phase, z_dims.phase_classes)
@@ -217,13 +268,18 @@ def build_anchordiff_step_fn(
         mse = (x0_pred - x0_target).pow(2).sum(-1)                  # (B, T)
         mse = (mse * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
 
-        # Anchor consistency directly on the network output.
+        # Anchor consistency in WORLD frame (uniform-skel canonical lifted
+        # to world via per-clip (R_y, T_xz, T_y); see
+        # analyses/2026-05-08_anchordiff_frame_bug_fix.md).
         anchor = anchor_consistency_loss(
             x0_pred=x0_pred,
             contact_state_gt=contact_state,
             contact_target_xyz_local=contact_target_xyz,
-            obj_com_canonical=obj_com,
-            obj_rot6d_canonical=obj_rot6d,
+            object_positions=obj_pos_world,
+            object_rotations=obj_rot_world,
+            R_y=R_y,
+            T_xz=T_xz_canon,
+            T_y=T_y_canon,
             cfg=anchor_cfg,
             seq_mask=seq_mask.bool(),
         )

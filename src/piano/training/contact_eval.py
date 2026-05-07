@@ -562,7 +562,13 @@ def build_contact_eval_fn(
             continue
         motion_src_t = torch.from_numpy(motion_src_cpu[i, :T_i]).float().unsqueeze(0)
         canon_src = recover_from_ric(motion_src_t, 22).squeeze(0).cpu().numpy().astype(np.float32)
-        R_y, T_xz = get_canonicalize_transform_from_clip(
+        # NOTE: legacy MoMask Stage B path. T_y is the new third element
+        # returned by get_canonicalize_transform_from_clip after the
+        # 2026-05-08 frame-bug fix; we don't propagate it here because
+        # this contact_eval is only used by the closed v0.1–v20 generator
+        # track and isn't part of AnchorDiff. See
+        # analyses/2026-05-08_anchordiff_frame_bug_fix.md.
+        R_y, T_xz, _T_y = get_canonicalize_transform_from_clip(
             joints_src_cpu[i, :T_i], canon_src,
         )
         src_R_y.append(float(R_y))

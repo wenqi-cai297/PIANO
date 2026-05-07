@@ -445,11 +445,11 @@ class HOIDataset(Dataset):
             .numpy()
             .astype(np.float32)
         )
-        R_y, T_xz = get_canonicalize_transform_from_clip(
+        R_y, T_xz, T_y = get_canonicalize_transform_from_clip(
             joints_world, canonical_joints,
         )
         return world_to_canonical_object_pose(
-            object_positions, object_rotations, R_y, T_xz,
+            object_positions, object_rotations, R_y, T_xz, T_y=T_y,
         )
 
     @staticmethod

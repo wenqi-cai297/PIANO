@@ -100,24 +100,56 @@ def y_rotation_matrix(angle: float) -> np.ndarray:
 # Canonicalization transform derivation
 # ============================================================================
 
-def _hip_line_angle_y(joints_t0: np.ndarray) -> float:
-    """Y-axis angle of the right-hip → left-hip line at frame 0.
+def _facing_angle_y(joints_t0: np.ndarray) -> float:
+    """Y-axis angle of the body's facing direction at frame 0.
 
-    Uses joint 1 (left hip) and joint 2 (right hip) in the SMPL-22
-    convention. The hip line is roughly horizontal across the pelvis
-    and rotates with the body's facing direction — exactly the signal
-    HumanML3D canonicalization aligns to +Z. Returns the angle whose
-    rotation around +Y maps canonical hip-line to world hip-line.
+    Replicates HumanML3D's ``process_file`` canonicalisation convention
+    (MoMask ``motion_process.py``):
+
+        across   = (sdr_R − sdr_L) + (hip_R − hip_L)
+        forward  = up × across,   up = (0, 1, 0)
+        target   = +Z
+
+    so canonical frame is rotated so that ``forward = +Z``. The two-line
+    average (shoulders + hips) is much more robust than the hip line
+    alone — when one of them is nearly aligned with X, the other still
+    carries Z-component, so ``atan2(forward_X, forward_Z)`` is stable.
+
+    Returns angle whose rotation around +Y maps canonical (forward=+Z)
+    to world (forward=this clip's actual heading).
+
+    SMPL-22 indices:
+        1 = left_hip,  2 = right_hip,
+       16 = left_shoulder, 17 = right_shoulder
     """
-    hip = joints_t0[2] - joints_t0[1]                          # (3,)
-    return float(math.atan2(hip[0], hip[2]))
+    across = (joints_t0[17] - joints_t0[16]) + (joints_t0[2] - joints_t0[1])
+    # forward = up × across, with up = +Y
+    forward_x = -across[2]
+    forward_z = across[0]
+    return float(math.atan2(forward_x, forward_z))
 
 
 def get_canonicalize_transform_from_clip(
     joints_world: np.ndarray,
     canonical_joints: np.ndarray,
-) -> tuple[float, np.ndarray]:
-    """Recover ``(R_y_angle, T_xz)`` mapping canonical → world for one clip.
+) -> tuple[float, np.ndarray, float]:
+    """Recover ``(R_y_angle, T_xz, T_y)`` mapping canonical → world.
+
+    Returns
+    -------
+    R_y_angle : float
+        Rotation around +Y, in radians, mapping canonical heading to
+        world heading. Derived from frame-0 facing direction
+        (``forward = up × across_avg``) — robust to hip-line-axis
+        degeneracy that broke the earlier hip-only derivation.
+    T_xz : (2,) float32
+        XZ translation: ``world_pelvis[0,X,Z] = R_y(canon_pelvis[0,X,Z]) + T_xz``.
+    T_y : float
+        Y translation: ``world_pelvis[t,Y] = canon_pelvis[t,Y] + T_y``,
+        where ``T_y`` is the constant per-clip ``floor_height`` MoMask's
+        ``process_file`` subtracts in canonicalisation
+        (``positions[:,:,1] -= positions.min(axis=0).min(axis=0)[1]``).
+        Recovered as ``world_pelvis[0,Y] - canon_pelvis[0,Y]``.
 
     Parameters
     ----------
@@ -126,24 +158,17 @@ def get_canonicalize_transform_from_clip(
     canonical_joints : (T, 22, 3)
         Canonical-frame SMPL-22 joints (output of MoMask's
         ``recover_from_ric`` on ``motion_263``).
-
-    Returns
-    -------
-    R_y_angle : float
-        Rotation around +Y, in radians, that takes canonical → world.
-    T_xz : (2,) float32
-        XZ translation that takes canonical → world. Y is preserved by
-        canonicalization, so no T_y component.
     """
     world_t0 = joints_world[0]
     canon_t0 = canonical_joints[0]
-    R_y_angle = _hip_line_angle_y(world_t0) - _hip_line_angle_y(canon_t0)
-    # After applying the rotation to the canonical pelvis, the
-    # remaining gap to the world pelvis is the translation.
+    R_y_angle = _facing_angle_y(world_t0) - _facing_angle_y(canon_t0)
+    # XZ translation from the rotated canonical pelvis to world pelvis.
     R = y_rotation_matrix(R_y_angle)
     rotated_canon_pelvis = R @ canon_t0[0]
     T_xz = (world_t0[0, [0, 2]] - rotated_canon_pelvis[[0, 2]]).astype(np.float32)
-    return R_y_angle, T_xz
+    # Y translation = MoMask's process_file floor_height (constant per clip).
+    T_y = float(world_t0[0, 1] - canon_t0[0, 1])
+    return R_y_angle, T_xz, T_y
 
 
 # ============================================================================
@@ -155,13 +180,22 @@ def world_to_canonical_object_pose(
     obj_rot_world_axis_angle: np.ndarray,       # (T, 3) per-frame axis-angle
     R_y_angle: float,
     T_xz: np.ndarray,                           # (2,) — canonical→world
+    T_y: float = 0.0,                           # canonical→world Y offset
 ) -> tuple[np.ndarray, np.ndarray]:
     """Express world-frame object pose in body's canonical frame.
 
-    Inverts ``(R_y, T_xz)`` to map world points back into canonical:
-    ``canonical = R_y(-θ) @ (world - T_xz)``. Y is unchanged. The
-    rotation portion of the object pose is similarly composed:
-    ``R_obj_canonical = R_y(-θ) @ R_obj_world``, then converted to 6D.
+    Forward map: ``world = R_y(canonical) + (T_xz[0], T_y, T_xz[1])``.
+    Inverse used here:
+        ``canonical = R_y(-θ) @ (world − (T_xz[0], T_y, T_xz[1]))``.
+
+    The rotation portion is composed without translation:
+        ``R_obj_canonical = R_y(-θ) @ R_obj_world``.
+
+    ``T_y`` defaults to 0 for backward compat with callers that don't
+    yet pass it; production callers should pass the per-clip floor
+    offset returned by :func:`get_canonicalize_transform_from_clip` so
+    object Y is in the same frame as canonical body Y. See
+    ``analyses/2026-05-08_anchordiff_frame_bug_fix.md``.
 
     Returns
     -------
@@ -174,9 +208,10 @@ def world_to_canonical_object_pose(
     # Inverse rotation matrix (rotation around +Y by -angle).
     R_inv = y_rotation_matrix(-R_y_angle)                      # (3, 3)
 
-    # Position: subtract translation, then rotate.
+    # Position: subtract translation (XYZ now), then rotate.
     pos_centered = obj_pos_world.copy()
     pos_centered[..., 0] -= float(T_xz[0])
+    pos_centered[..., 1] -= float(T_y)
     pos_centered[..., 2] -= float(T_xz[1])
     obj_com_canonical = pos_centered @ R_inv.T                 # (T, 3)
 

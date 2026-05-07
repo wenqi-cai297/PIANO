@@ -39,12 +39,35 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
+import torch.nn.functional as F
+
 from piano.data.dataset import HOIDataset, collate_hoi
 from piano.training.anchor_consistency_loss import (
     PART_TO_JOINT,
     lift_motion263_to_joints,
-    lift_object_local_to_canonical,
 )
+
+
+def lift_object_local_to_canonical(
+    target_local: torch.Tensor,           # (B, T, P, 3)
+    obj_com_canonical: torch.Tensor,      # (B, T, 3)
+    obj_rot6d_canonical: torch.Tensor,    # (B, T, 6)
+) -> torch.Tensor:
+    """Diagnostic-only: lift a contact target into body-canonical frame
+    using ``obj_*_canonical`` (the dataset's pre-fix path).
+
+    Production AnchorDiff training does NOT use this — it lifts via
+    world frame (see anchor_consistency_loss). Kept here so the
+    diagnostic can show the canonical column as a baseline reference.
+    """
+    a1 = obj_rot6d_canonical[..., :3]
+    a2 = obj_rot6d_canonical[..., 3:6]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    R = torch.stack([b1, b2, b3], dim=-1)
+    rotated = (R.unsqueeze(2) @ target_local.unsqueeze(-1)).squeeze(-1)
+    return rotated + obj_com_canonical.unsqueeze(2)
 
 
 def _axis_angle_to_matrix(aa: torch.Tensor) -> torch.Tensor:
@@ -131,7 +154,7 @@ def main() -> None:
     triples = _load_subsets(cfg, args.num_clips)
 
     # Per-(frame, subset, part) accumulators: list of frame distances.
-    # frame ∈ {"canonical", "world"}.
+    # frame ∈ {"canonical", "world", "lifted_uniform_to_world"}.
     per_subset_part: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     overall_part: dict[tuple[str, str], list[float]] = defaultdict(list)
     per_clip_summary: list[dict] = []
@@ -142,11 +165,16 @@ def main() -> None:
     # Process clip by clip (B=1) to keep memory low and easy bookkeeping.
     n_done = 0
     part_idx = torch.tensor(PART_TO_JOINT, device=device, dtype=torch.long)
+
+    from piano.utils.canonical_frame import (
+        get_canonicalize_transform_from_clip,
+        y_rotation_matrix,
+    )
     for ds, clip_idx, subset in triples:
         sample = ds[clip_idx]
         batch = collate_hoi([sample])
         motion = batch["motion"].to(device)                   # (1, T, 263)
-        joints_world = batch["joints"].to(device)             # (1, T, 22, 3)
+        joints_world = batch["joints"].to(device)             # (1, T, 22, 3) raw-skel
         contact_state = batch["contact_state"].to(device)     # (1, T, 5)
         contact_target_xyz = batch["contact_target_xyz"].to(device)  # (1, T, 5, 3)
         obj_com = batch["obj_com_canonical"].to(device)       # (1, T, 3)
@@ -155,7 +183,7 @@ def main() -> None:
         obj_rot_world = batch["object_rotations"].to(device)  # (1, T, 3) axis-angle
         seq_len = int(batch["seq_len"][0])
 
-        # --- Canonical-frame variant ---
+        # --- Canonical-frame variant (uniform-skel from recover_from_ric) ---
         joints_canon = lift_motion263_to_joints(motion)        # (1, T, 22, 3)
         target_canon = lift_object_local_to_canonical(
             contact_target_xyz, obj_com, obj_rot6d,
@@ -163,12 +191,28 @@ def main() -> None:
         pred_canon = joints_canon.index_select(2, part_idx)    # (1, T, 5, 3)
         dist_canon = (pred_canon - target_canon).pow(2).sum(-1).sqrt().squeeze(0)
 
-        # --- World-frame variant ---
+        # --- World-frame variant using joints_world directly (raw-skel) ---
         target_world = lift_object_local_to_world(
             contact_target_xyz, obj_pos_world, obj_rot_world,
         )                                                       # (1, T, 5, 3)
         pred_world = joints_world.index_select(2, part_idx)    # (1, T, 5, 3)
         dist_world = (pred_world - target_world).pow(2).sum(-1).sqrt().squeeze(0)
+
+        # --- Hybrid: lift recover_from_ric (uniform-skel canon) to world via
+        # (R_y, T_xz, T_y) and compare against target_world. This is what the
+        # AnchorDiff training-time loss would actually compute since
+        # the model predicts motion_263 (uniform-skel canonical).
+        joints_world_np = joints_world.squeeze(0).cpu().numpy()
+        canon_np = joints_canon.squeeze(0).cpu().numpy()
+        R_y, T_xz, T_y = get_canonicalize_transform_from_clip(joints_world_np, canon_np)
+        R = torch.from_numpy(y_rotation_matrix(R_y)).to(device)         # (3, 3)
+        # canon → world: R_y @ canon + (T_xz[0], T_y, T_xz[1])
+        joints_lifted = (joints_canon @ R.T)
+        joints_lifted[..., 0] += float(T_xz[0])
+        joints_lifted[..., 1] += float(T_y)
+        joints_lifted[..., 2] += float(T_xz[1])
+        pred_lifted = joints_lifted.index_select(2, part_idx)
+        dist_lifted = (pred_lifted - target_world).pow(2).sum(-1).sqrt().squeeze(0)
 
         cs = contact_state.squeeze(0)                           # (T, 5)
 
@@ -180,13 +224,17 @@ def main() -> None:
                 continue
             d_canon = dist_canon[:seq_len, p_idx][mask].cpu().numpy()
             d_world = dist_world[:seq_len, p_idx][mask].cpu().numpy()
+            d_lift = dist_lifted[:seq_len, p_idx][mask].cpu().numpy()
             per_subset_part[("canonical", subset, part_name)].extend(d_canon.tolist())
             per_subset_part[("world", subset, part_name)].extend(d_world.tolist())
+            per_subset_part[("lifted_uniform_to_world", subset, part_name)].extend(d_lift.tolist())
             overall_part[("canonical", part_name)].extend(d_canon.tolist())
             overall_part[("world", part_name)].extend(d_world.tolist())
+            overall_part[("lifted_uniform_to_world", part_name)].extend(d_lift.tolist())
             clip_part_summary[part_name] = {
                 "canonical_mean_m": float(d_canon.mean()),
                 "world_mean_m": float(d_world.mean()),
+                "lifted_uniform_to_world_mean_m": float(d_lift.mean()),
             }
 
         per_clip_summary.append({
@@ -217,7 +265,7 @@ def main() -> None:
         }
 
     overall_summary: dict[str, dict[str, dict]] = {}
-    for frame in ("canonical", "world"):
+    for frame in ("canonical", "world", "lifted_uniform_to_world"):
         overall_summary[frame] = {
             part: {
                 **stats(overall_part[(frame, part)]),
@@ -264,10 +312,11 @@ def main() -> None:
 
     _print_table("canonical")
     _print_table("world")
+    _print_table("lifted_uniform_to_world")
 
-    print("\n=== Per-subset median distance (canonical / world) ===\n")
+    print("\n=== Per-subset median distance (canonical / world / lifted) ===\n")
     subsets = sorted(per_subset_summary.get("canonical", {}).keys())
-    header = f"{'part':>11} | " + " | ".join(f"{s:>20}" for s in subsets)
+    header = f"{'part':>11} | " + " | ".join(f"{s:>26}" for s in subsets)
     print(header)
     print("-" * len(header))
     for part in PART_NAMES:
@@ -275,13 +324,15 @@ def main() -> None:
         for s in subsets:
             c = per_subset_summary.get("canonical", {}).get(s, {}).get(part)
             w = per_subset_summary.get("world", {}).get(s, {}).get(part)
+            l = per_subset_summary.get("lifted_uniform_to_world", {}).get(s, {}).get(part)
             if c is None or c.get("n", 0) == 0:
                 cells.append("--")
             else:
                 c_med = c["median_m"] * 100
                 w_med = w["median_m"] * 100 if w else float("nan")
-                cells.append(f"{c_med:5.1f} / {w_med:5.1f}")
-        print(f"{part:>11} | " + " | ".join(f"{c:>20}" for c in cells))
+                l_med = l["median_m"] * 100 if l else float("nan")
+                cells.append(f"{c_med:5.1f}/{w_med:5.1f}/{l_med:5.1f}")
+        print(f"{part:>11} | " + " | ".join(f"{c:>26}" for c in cells))
 
     print(f"\nFull JSON: {out_dir/'summary.json'}")
 
