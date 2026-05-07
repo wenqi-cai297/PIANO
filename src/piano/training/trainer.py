@@ -152,6 +152,7 @@ def run_training_loop(
     train_report_keys: list[str] | tuple[str, ...] | None = None,
     val_report_keys: list[str] | tuple[str, ...] | None = None,
     contact_report_keys: list[str] | tuple[str, ...] | None = None,
+    epoch_end_hook: Callable[..., None] | None = None,
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -476,6 +477,18 @@ def run_training_loop(
             _save_checkpoint(
                 accelerator, model, optimizer, epoch, global_step, output_dir,
                 extra_modules=extra_modules,
+            )
+
+        # User-supplied per-epoch hook (e.g. dynamic loss-weight update)
+        if epoch_end_hook is not None:
+            epoch_end_hook(
+                epoch=epoch + 1,
+                accelerator=accelerator,
+                model=model,
+                global_step=global_step,
+                output_dir=output_dir,
+                metrics_appender=_append_metrics,
+                wandb_run=wandb_run,
             )
 
     # Final save
