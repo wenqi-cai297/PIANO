@@ -17,6 +17,11 @@ wandb/
 # Backbone repos (cloned, not tracked — clone on each machine)
 src/piano/models/backbones/momask/
 
+# External upstream repos used as local references/adapters. Keep them
+# reproducible but out of project source control.
+src/external/
+external/
+
 # Project-memory / planning / analyses .md files: kept locally, not
 # part of the remote repo. Only README.md (at any depth) is tracked.
 *.md

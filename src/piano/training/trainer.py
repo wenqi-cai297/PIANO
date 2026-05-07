@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import inspect
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -205,9 +206,29 @@ def run_training_loop(
         historical "report everything" behaviour.
     """
     output_dir = ensure_dir(output_dir)
+    metrics_jsonl = Path(output_dir) / "metrics.jsonl"
     global_step = 0
     best_val_loss: float = float("inf")
     best_contact_dist: float = float("inf")
+
+    def _append_metrics(event: str, payload: dict[str, Any]) -> None:
+        if not accelerator.is_main_process:
+            return
+        record: dict[str, Any] = {"event": event, "time": time.time()}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.item()
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                record[key] = value
+                continue
+            try:
+                record[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        with metrics_jsonl.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
 
     # Backward-compatible hand-off of optimizer-step count to step_fn.
     # New stage scripts (predictor) declare ``global_step`` so their
@@ -226,6 +247,14 @@ def run_training_loop(
             f"best-ckpt key = {val_best_key!r}",
         )
     accelerator.print(f"  Output: {output_dir}")
+    _append_metrics(
+        "start",
+        {
+            "num_epochs": num_epochs,
+            "batches_per_epoch": len(dataloader),
+            "val_every_epochs": val_every_epochs if val_enabled else 0,
+        },
+    )
 
     for epoch in range(num_epochs):
         model.train()
@@ -286,6 +315,15 @@ def run_training_loop(
                         v = val
                     msg += f" | {key}={v:.4f}"
                 accelerator.print(msg)
+                _append_metrics(
+                    "step",
+                    {
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "lr": lr,
+                        **_select_report_metrics(loss_dict, train_report_keys),
+                    },
+                )
 
         # Epoch summary — printed to console AND pushed to wandb as one
         # data point per epoch (x-axis = epoch number). ``epoch_losses``
@@ -306,6 +344,16 @@ def run_training_loop(
             for key, val in avg_report.items():
                 msg += f" | {key}={val:.4f}"
             accelerator.print(msg)
+            _append_metrics(
+                "epoch",
+                {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "lr": lr,
+                    "epoch_time_sec": epoch_time,
+                    **avg_report,
+                },
+            )
 
             if wandb_run is not None:
                 log_dict = dict(avg_report)
@@ -332,6 +380,14 @@ def run_training_loop(
                 for key, val in val_report.items():
                     msg += f" | val_{key}={val:.4f}"
                 accelerator.print(msg)
+                _append_metrics(
+                    "val",
+                    {
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        **{f"val_{k}": v for k, v in val_report.items()},
+                    },
+                )
                 if wandb_run is not None:
                     wandb_run.log(
                         {f"val_{k}": v for k, v in val_report.items()},
@@ -388,6 +444,14 @@ def run_training_loop(
                     for k, v in contact_report.items():
                         msg += f" | contact_{k}={v:.4f}"
                     accelerator.print(msg)
+                    _append_metrics(
+                        "contact",
+                        {
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                            **{f"contact_{k}": v for k, v in contact_report.items()},
+                        },
+                    )
                     if wandb_run is not None:
                         wandb_run.log(
                             {f"contact_{k}": v for k, v in contact_report.items()},
@@ -420,6 +484,7 @@ def run_training_loop(
         name="final", extra_modules=extra_modules,
     )
     accelerator.print("Training complete.")
+    _append_metrics("complete", {"global_step": global_step})
 
 
 def _select_report_metrics(

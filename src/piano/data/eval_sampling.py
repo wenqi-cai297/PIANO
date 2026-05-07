@@ -140,6 +140,21 @@ def describe_eval_clip_selection(dataset: Any, indices: list[int]) -> list[dict[
     return rows
 
 
+def select_eval_clip_indices_by_seq_id(dataset: Any, seq_ids: list[str]) -> list[int]:
+    """Resolve explicit seq_ids to dataset indices, preserving request order."""
+    candidates = _collect_candidates(dataset)
+    by_seq: dict[str, EvalClipCandidate] = {}
+    for cand in candidates:
+        by_seq.setdefault(cand.seq_id, cand)
+
+    missing = [seq_id for seq_id in seq_ids if seq_id not in by_seq]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise KeyError(f"seq_id(s) not found in eval dataset: {preview}")
+
+    return [by_seq[seq_id].index for seq_id in seq_ids]
+
+
 def _collect_candidates(dataset: Any) -> list[EvalClipCandidate]:
     if isinstance(dataset, ConcatDataset):
         out: list[EvalClipCandidate] = []

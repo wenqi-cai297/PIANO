@@ -54,6 +54,7 @@ Output: integer support array of shape ``(T,)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 import numpy as np
 
@@ -339,17 +340,33 @@ def _pelvis_object_below_mask(
         threshold=config.sitting_below_upward_normal_threshold,
     )
 
-    # Sample surface points + face normals. Low-poly meshes (8-vertex
-    # primitive boxes) don't give uniform coverage via mesh.vertices,
-    # so sample_surface gives the cylinder test a fair density.
-    n_samples = min(3000, max(500, 4 * len(object_mesh.vertices)))
-    surface_pts, face_idx = trimesh.sample.sample_surface(object_mesh, n_samples)
-    surface_normals = object_mesh.face_normals[face_idx]
+    cache_key = (
+        "piano_seat_pts",
+        str(object_id),
+        float(config.sitting_below_upward_normal_threshold),
+    )
+    cache = object_mesh.metadata.setdefault("_piano_support_cache", {})
+    if cache_key in cache:
+        seat_pts = cache[cache_key]
+    else:
+        # Sample surface points + face normals. Low-poly meshes (8-vertex
+        # primitive boxes) don't give uniform coverage via mesh.vertices,
+        # so sample_surface gives the cylinder test a fair density. Cache per
+        # loaded mesh: run_all reuses one mesh object across all clips sharing
+        # an object id, so this avoids resampling hundreds of times.
+        n_samples = min(3000, max(500, 4 * len(object_mesh.vertices)))
+        seed_src = f"{object_id or ''}:{len(object_mesh.vertices)}:{n_samples}"
+        seed = int(hashlib.md5(seed_src.encode("utf-8")).hexdigest()[:8], 16)
+        surface_pts, face_idx = trimesh.sample.sample_surface(
+            object_mesh, n_samples, seed=seed,
+        )
+        surface_normals = object_mesh.face_normals[face_idx]
 
-    # "Seat-like" = normal aligned with the detected up axis.
-    alignment = surface_normals @ up_local
-    upward = alignment > config.sitting_below_upward_normal_threshold
-    seat_pts = surface_pts[upward].astype(np.float32)
+        # "Seat-like" = normal aligned with the detected up axis.
+        alignment = surface_normals @ up_local
+        upward = alignment > config.sitting_below_upward_normal_threshold
+        seat_pts = surface_pts[upward].astype(np.float32)
+        cache[cache_key] = seat_pts
 
     if len(seat_pts) == 0:
         # No upward-facing surface in this axis → cannot support a seated pose.

@@ -299,7 +299,7 @@ def extract_strict_contact_state(
     contact : (T, 5) — soft contact in [0, 1]; > 0.5 means 'real contact'
         per the v12 strict definition.
     """
-    from piano.data.pseudo_labels._object_transform import world_to_object_local
+    from piano.data.pseudo_labels._object_transform import world_points_batch_to_local
 
     if strict_config is None:
         strict_config = StrictContactConfig()
@@ -319,7 +319,14 @@ def extract_strict_contact_state(
 
     T = len(joints)
     contact = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
-    body_locals = np.zeros((T, NUM_BODY_PARTS, 3), dtype=np.float32)
+    bp_worlds = joints[:, BODY_PART_INDICES, :]
+    body_locals = world_points_batch_to_local(
+        bp_worlds, object_positions, object_rotations,
+    )
+    distances_all, _ = points_to_mesh_distance(
+        body_locals.reshape(-1, 3), object_mesh,
+    )
+    distances_all = distances_all.reshape(T, NUM_BODY_PARTS)
 
     # Per-frame object speed for static-engagement detection
     trans_vel = np.zeros(T, dtype=np.float32)
@@ -331,14 +338,13 @@ def extract_strict_contact_state(
 
     kin_window = max(3, int(round(base_kin_config.kin_window_sec * strict_config.fps)))
 
-    for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
+    for bp_idx in range(NUM_BODY_PARTS):
         bp_name = BODY_PART_NAMES[bp_idx]
-        bp_world = joints[:, joint_idx, :]                               # (T, 3)
-        bp_local = world_to_object_local(bp_world, object_positions, object_rotations)
-        body_locals[:, bp_idx, :] = bp_local
+        bp_world = bp_worlds[:, bp_idx, :]                               # (T, 3)
+        bp_local = body_locals[:, bp_idx, :]
 
         # Distance scores — both tight (case_static) and loose (case_kinematic)
-        distances, _ = points_to_mesh_distance(bp_local, object_mesh)
+        distances = distances_all[:, bp_idx]
         tight_thr = strict_config.distance_thresholds.get(
             bp_name, STRICT_DISTANCE_THRESHOLDS[bp_name]
         )

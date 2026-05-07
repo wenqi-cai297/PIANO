@@ -7,7 +7,7 @@ the object surface* the body part touches. Two outputs:
   surface in object-local coordinates per body part per frame. This
   is the ground truth for the predictor's xyz regression head
   (HOI-Diff / CG-HOI / ContactGen convention). Computed via
-  ``trimesh.proximity.closest_point`` once per body part. New as of
+  ``trimesh.proximity.closest_point`` in a batched mesh query. New as of
   the v10 pseudo-label pass.
 - ``contact_target (T, B, K)`` — legacy soft distribution over K FPS
   patches. Kept for backward compatibility, downstream visualisation,
@@ -29,11 +29,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from piano.utils.geometry import (
-    build_kdtree,
     cluster_surface_patches,
     points_to_mesh_distance,
-    query_nearest,
-    soft_patch_assignment,
 )
 from piano.utils.smpl_utils import BODY_PART_INDICES, NUM_BODY_PARTS
 
@@ -51,6 +48,10 @@ class TargetConfig:
     # BB diag ~0.5-1.0 m, K=16 patches → neighbour spacing ~0.15-0.3 m).
     soft_sigma: float = 0.12
     contact_threshold: float = 0.5   # minimum contact score to assign target
+    # Preserve historical dense labels by default. For current gated
+    # Stage A/B losses, pseudo-label extraction can set this False and
+    # skip closest-point queries on non-contact frame/body-part cells.
+    query_all_frames: bool = True
 
 
 def extract_contact_target(
@@ -61,6 +62,8 @@ def extract_contact_target(
     object_rotations: np.ndarray | None = None,
     config: TargetConfig | None = None,
     patch_centers: np.ndarray | None = None,
+    anchor_points_world: np.ndarray | None = None,
+    target_points_local_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract per-frame contact target region on the object surface.
 
@@ -95,6 +98,13 @@ def extract_contact_target(
         across sequences of the same object (required for downstream
         classification). If None, patches are recomputed from the mesh with
         a non-deterministic FPS start — only use for one-off debugging.
+    anchor_points_world : (T, 5, 3) or None
+        Optional per-body-part surface anchor positions in world frame. When
+        present, closest-surface targets are computed from these anchors
+        instead of the coarse 22-joint body-part positions. This is useful
+        for hand contact labels derived from official InterAct surface
+        markers: the marker sits on the hand surface, while the 22-joint
+        wrist can be 5-20 cm away from the object handle.
 
     Returns
     -------
@@ -102,8 +112,6 @@ def extract_contact_target(
     target : (T, 5, K) — soft K-way assignment per body part (legacy)
     patch_centers : (K, 3) — patch center positions in object-local frame
     """
-    from piano.data.pseudo_labels._object_transform import world_to_object_local
-
     if config is None:
         config = TargetConfig()
 
@@ -127,32 +135,58 @@ def extract_contact_target(
                 f"config.num_patches={K}; re-run patch atlas precomputation."
             )
 
-    for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
-        bp_positions_world = joints[:, joint_idx, :]  # (T, 3)
+    if anchor_points_world is not None and anchor_points_world.shape != (T, NUM_BODY_PARTS, 3):
+        raise ValueError(
+            f"anchor_points_world shape {anchor_points_world.shape} does not "
+            f"match expected {(T, NUM_BODY_PARTS, 3)}"
+        )
+    if (
+        target_points_local_override is not None
+        and target_points_local_override.shape != (T, NUM_BODY_PARTS, 3)
+    ):
+        raise ValueError(
+            f"target_points_local_override shape {target_points_local_override.shape} "
+            f"does not match expected {(T, NUM_BODY_PARTS, 3)}"
+        )
 
-        # Inverse-transform each frame's joint to object-local frame
-        if object_positions is not None:
-            bp_positions_local = world_to_object_local(
-                bp_positions_world, object_positions, object_rotations,
-            )
-        else:
-            bp_positions_local = bp_positions_world
+    if anchor_points_world is None:
+        bp_positions_world = joints[:, BODY_PART_INDICES, :]
+    else:
+        bp_positions_world = anchor_points_world
 
-        # Closest-surface-point for the xyz GT (every frame, even when
-        # not in contact — the loss gates downstream so non-contact rows
-        # are masked out, but having the array fully populated keeps
-        # the npz schema clean).
-        _, closest_pts = points_to_mesh_distance(bp_positions_local, object_mesh)
-        target_xyz_gt[:, bp_idx, :] = closest_pts.astype(np.float32)
+    if object_positions is not None:
+        from piano.data.pseudo_labels._object_transform import world_points_batch_to_local
 
-        # Legacy soft K-way distribution, contact-gated.
-        for t in range(T):
-            if contact_state[t, bp_idx] < config.contact_threshold:
-                continue
-            target[t, bp_idx] = soft_patch_assignment(
-                bp_positions_local[t],
-                patch_centers,
-                sigma=config.soft_sigma,
-            )
+        bp_positions_local = world_points_batch_to_local(
+            bp_positions_world, object_positions, object_rotations,
+        )
+    else:
+        bp_positions_local = bp_positions_world.astype(np.float32)
+
+    contact_mask = contact_state >= config.contact_threshold
+    override_mask = np.zeros((T, NUM_BODY_PARTS), dtype=bool)
+    if target_points_local_override is not None:
+        override_mask = np.isfinite(target_points_local_override).all(axis=-1)
+        target_xyz_gt[override_mask] = target_points_local_override[override_mask].astype(np.float32)
+
+    query_mask = (
+        np.ones((T, NUM_BODY_PARTS), dtype=bool)
+        if config.query_all_frames
+        else contact_mask
+    )
+    query_mask = query_mask & ~override_mask
+    if np.any(query_mask):
+        # Batch all selected body parts into one trimesh proximity query to
+        # reuse the mesh spatial index instead of querying it once per part.
+        _, closest_pts = points_to_mesh_distance(bp_positions_local[query_mask], object_mesh)
+        target_xyz_gt[query_mask] = closest_pts.astype(np.float32)
+
+    if np.any(contact_mask):
+        query = target_xyz_gt[contact_mask]
+        dists = np.linalg.norm(query[:, None, :] - patch_centers[None, :, :], axis=-1)
+        logits = -(dists ** 2) / (2.0 * config.soft_sigma ** 2)
+        logits -= logits.max(axis=1, keepdims=True)
+        weights = np.exp(logits)
+        target[contact_mask] = (weights / weights.sum(axis=1, keepdims=True)).astype(np.float32)
 
     return target_xyz_gt, target, patch_centers

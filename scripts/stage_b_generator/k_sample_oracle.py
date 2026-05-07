@@ -27,6 +27,7 @@ from piano.data.eval_sampling import (
     describe_eval_clip_selection,
     resolve_eval_clip_count,
     select_eval_clip_indices,
+    select_eval_clip_indices_by_seq_id,
 )
 from piano.data.pseudo_labels.extract_contact import ContactConfig
 from piano.data.humanml3d_repr import load_motion_stats
@@ -365,6 +366,15 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("runs/eval/stageB_v0_12_w02_bv_k_sample_oracle"))
     parser.add_argument("--num-clips", type=int, default=80)
     parser.add_argument(
+        "--seq-id",
+        action="append",
+        default=None,
+        help=(
+            "Explicit validation seq_id to evaluate. Can be repeated; when set, "
+            "overrides --num-clips/--num-clips-per-subset selection."
+        ),
+    )
+    parser.add_argument(
         "--num-clips-per-subset",
         type=int,
         default=20,
@@ -473,16 +483,21 @@ def main() -> int:
     motion_mean, motion_std = load_motion_stats(cfg.model.checkpoints.vq_vae)
 
     val_dataset = _build_val_dataset(cfg)
-    num_clips = resolve_eval_clip_count(
-        val_dataset,
-        num_clips=int(args.num_clips),
-        num_clips_per_subset=(
-            int(args.num_clips_per_subset)
-            if args.num_clips_per_subset is not None and int(args.num_clips_per_subset) > 0
-            else None
-        ),
-    )
-    sampled_idx = select_eval_clip_indices(val_dataset, num_clips, seed=args.seed)
+    if args.seq_id:
+        requested_seq_ids = [str(s) for s in args.seq_id]
+        sampled_idx = select_eval_clip_indices_by_seq_id(val_dataset, requested_seq_ids)
+        num_clips = len(sampled_idx)
+    else:
+        num_clips = resolve_eval_clip_count(
+            val_dataset,
+            num_clips=int(args.num_clips),
+            num_clips_per_subset=(
+                int(args.num_clips_per_subset)
+                if args.num_clips_per_subset is not None and int(args.num_clips_per_subset) > 0
+                else None
+            ),
+        )
+        sampled_idx = select_eval_clip_indices(val_dataset, num_clips, seed=args.seed)
     selected_rows = describe_eval_clip_selection(val_dataset, sampled_idx)
     samples = [val_dataset[i] for i in sampled_idx]
 

@@ -114,13 +114,20 @@ def _build_val_dataset(cfg) -> ConcatDataset:
         seed=subj_cfg.seed,
     )
     val_filter = splits["val"]
-    pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
+    pseudo_label_dir_global = cfg.data.get("pseudo_label_dir", None)
+    pseudo_label_subdir = cfg.data.get("pseudo_label_subdir", None)
     # v0.3-α: pick up force_world_frame from training config so eval
     # uses the same frame the model was trained on. Defaults to v0.2
     # behaviour (body-canonical) when key is absent.
     force_world_frame = bool(cfg.data.get("force_world_frame", False))
     datasets = []
     for entry in cfg.data.datasets:
+        if pseudo_label_dir_global is not None:
+            pseudo_label_dir = pseudo_label_dir_global
+        elif pseudo_label_subdir is not None:
+            pseudo_label_dir = str(Path(entry.root) / pseudo_label_subdir)
+        else:
+            pseudo_label_dir = None
         ds = HOIDataset(
             root=entry.root,
             pseudo_label_dir=pseudo_label_dir,

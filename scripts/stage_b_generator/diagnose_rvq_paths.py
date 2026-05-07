@@ -32,7 +32,11 @@ import torch
 from omegaconf import OmegaConf
 from torch import Tensor
 
-from piano.data.eval_sampling import describe_eval_clip_selection, select_eval_clip_indices
+from piano.data.eval_sampling import (
+    describe_eval_clip_selection,
+    select_eval_clip_indices,
+    select_eval_clip_indices_by_seq_id,
+)
 from piano.data.humanml3d_repr import load_motion_stats
 from piano.training.decoded_contact_loss import (
     _base_logits_to_bsv,
@@ -287,6 +291,15 @@ def main() -> int:
     parser.add_argument("--ckpt", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-clips", type=int, default=80)
+    parser.add_argument(
+        "--seq-id",
+        action="append",
+        default=None,
+        help=(
+            "Explicit validation seq_id to diagnose. Can be repeated; when set, "
+            "overrides --num-clips selection."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--w-text", type=float, default=4.0)
@@ -331,7 +344,13 @@ def main() -> int:
     vocab_size = int(vq_model.quantizer.codebooks.shape[1])
 
     val_dataset = _build_val_dataset(cfg)
-    sampled_idx = select_eval_clip_indices(val_dataset, args.num_clips, seed=args.seed)
+    if args.seq_id:
+        sampled_idx = select_eval_clip_indices_by_seq_id(
+            val_dataset,
+            [str(s) for s in args.seq_id],
+        )
+    else:
+        sampled_idx = select_eval_clip_indices(val_dataset, args.num_clips, seed=args.seed)
     selected_rows = describe_eval_clip_selection(val_dataset, sampled_idx)
     samples = [val_dataset[i] for i in sampled_idx]
 

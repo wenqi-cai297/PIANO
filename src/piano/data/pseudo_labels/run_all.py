@@ -20,10 +20,14 @@ from tqdm import tqdm
 
 import hashlib
 
+from scipy.ndimage import median_filter
+
+from piano.data.preprocess_interact import downsample_temporal
 from piano.data.pseudo_labels.extract_contact import ContactConfig, extract_contact_state
 from piano.data.pseudo_labels.extract_strict_contact import (
     StrictContactConfig,
     extract_strict_contact_state,
+    _filter_short_contacts,
 )
 from piano.data.pseudo_labels.extract_phase import PhaseConfig, extract_interaction_phase
 from piano.data.pseudo_labels.extract_support import SupportConfig, extract_support_state
@@ -40,9 +44,38 @@ from piano.data.pseudo_labels.stats import (
 )
 from piano.utils.geometry import cluster_surface_patches, load_mesh
 from piano.utils.io_utils import ensure_dir, load_json, save_json, save_npz
+from piano.utils.smpl_utils import BODY_PART_INDICES, BODY_PART_NAMES, NUM_BODY_PARTS
 
 
 DEFAULT_FPS: float = 20.0  # PIANO preprocessed data rate
+OFFICIAL_MARKER_MOTION_CONTACT_OFFSET: int = 231 + 231 + 7 + 7 + 9 + 9
+OFFICIAL_MARKER_COUNT: int = 77
+DEFAULT_OFFICIAL_MARKER_OBJECTS: tuple[str, ...] = ("*",)
+DEFAULT_OFFICIAL_MARKER_PARTS: tuple[str, ...] = (
+    "left_hand",
+    "right_hand",
+    "left_foot",
+    "right_foot",
+    "pelvis",
+)
+DEFAULT_OFFICIAL_MARKER_THRESHOLDS_M: dict[str, float] = {
+    "left_hand": 0.05,
+    "right_hand": 0.05,
+    "left_foot": 0.05,
+    "right_foot": 0.05,
+    "pelvis": 0.20,
+}
+# Official InterAct 77-marker semantic groups, from
+# src/external/InterAct_official/visualization/visualize_marker.py.
+# Hands include both hand and finger markers; feet include foot and toe
+# markers. Pelvis keeps the existing joint-nearest fallback because the
+# upstream marker groups do not expose a dedicated pelvis set.
+OFFICIAL_MARKER_SEMANTIC_INDICES: dict[str, tuple[int, ...]] = {
+    "left_hand": (10, 11, 14, 31, 13, 17, 23, 28, 27, 72, 73, 74, 75, 76),
+    "right_hand": (60, 43, 44, 47, 62, 46, 51, 57, 67, 68, 69, 70, 71),
+    "left_foot": (29, 30, 18, 19, 7, 2, 15, 32, 25, 20, 21, 16),
+    "right_foot": (61, 52, 53, 40, 34, 49, 40, 54, 55, 59, 64, 50, 55),
+}
 
 
 def _object_patch_seed(obj_id: str) -> int:
@@ -94,6 +127,190 @@ def _resolve_fps(data_dir: Path, fps_override: float | None) -> float:
     return DEFAULT_FPS
 
 
+def _official_sequence_dir(
+    official_interact_root: Path,
+    subset: str,
+    seq_id: str,
+) -> Path:
+    """Resolve an official InterAct sequence directory for one clip."""
+    candidates = (
+        official_interact_root / subset / "sequences_canonical" / seq_id,
+        official_interact_root / "sequences_canonical" / seq_id,
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def _load_official_marker_contact_data(
+    seq_dir: Path,
+    T: int,
+    target_fps: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load official marker-to-object distances and targets from ``motion.npy``.
+
+    Official InterAct canonical motion has 962 channels:
+    77 marker positions, marker velocities, two 7-marker foot-height blocks,
+    object pose/velocity, then 78 * 6 contact channels. For each marker,
+    the first three contact channels are the vector from the marker to the
+    closest transformed object point, and the last three are that object's
+    canonical/local coordinates. Marker index 77 is an extra ground marker,
+    so PIANO only uses the first 77 body markers.
+    """
+    motion_path = seq_dir / "motion.npy"
+    if not motion_path.exists():
+        return None
+    motion = np.load(motion_path, allow_pickle=False)
+    contact_flat = motion[:, OFFICIAL_MARKER_MOTION_CONTACT_OFFSET:]
+    expected = (OFFICIAL_MARKER_COUNT + 1) * 6
+    if contact_flat.shape[1] != expected:
+        raise ValueError(
+            f"Unexpected official motion contact width {contact_flat.shape[1]} "
+            f"at {motion_path}; expected {expected}"
+        )
+    contact = contact_flat.reshape(len(motion), OFFICIAL_MARKER_COUNT + 1, 6)
+    distances = np.linalg.norm(contact[:, :OFFICIAL_MARKER_COUNT, :3], axis=-1)
+    targets_local = contact[:, :OFFICIAL_MARKER_COUNT, 3:6]
+    distances_ds = downsample_temporal(distances, 30.0, target_fps)[:T].astype(np.float32)
+    targets_ds = downsample_temporal(targets_local, 30.0, target_fps)[:T].astype(np.float32)
+    return distances_ds, targets_ds
+
+
+def _load_official_markers(seq_dir: Path, T: int, target_fps: float) -> np.ndarray | None:
+    markers_path = seq_dir / "markers.npy"
+    if not markers_path.exists():
+        return None
+    markers = np.load(markers_path, allow_pickle=False)
+    if markers.ndim != 3 or markers.shape[1:] != (OFFICIAL_MARKER_COUNT, 3):
+        raise ValueError(f"Unexpected markers.npy shape at {markers_path}: {markers.shape}")
+    return downsample_temporal(markers, 30.0, target_fps)[:T].astype(np.float32)
+
+
+def _nearest_marker_indices(
+    markers: np.ndarray,
+    joints: np.ndarray,
+    *,
+    body_part: str,
+    k: int,
+) -> np.ndarray:
+    """Pick surface markers closest to one PIANO body-part joint."""
+    joint_idx = BODY_PART_INDICES[BODY_PART_NAMES.index(body_part)]
+    distances = np.linalg.norm(markers - joints[:, None, joint_idx, :], axis=-1)
+    return np.argsort(distances.mean(axis=0))[:k]
+
+
+def _official_marker_indices(
+    markers: np.ndarray,
+    joints: np.ndarray,
+    *,
+    body_part: str,
+    k: int,
+) -> np.ndarray:
+    """Pick official surface markers for one PIANO body part."""
+    semantic = OFFICIAL_MARKER_SEMANTIC_INDICES.get(body_part)
+    if semantic is not None:
+        return np.asarray(semantic, dtype=np.int64)
+    return _nearest_marker_indices(markers, joints, body_part=body_part, k=k)
+
+
+def _postprocess_marker_binary(
+    contact: np.ndarray,
+    *,
+    median_size: int,
+    min_duration: int,
+) -> np.ndarray:
+    """Match strict-contact temporal smoothing for marker-derived signals."""
+    out = contact.astype(np.float32, copy=True)
+    for idx in range(out.shape[1]):
+        out[:, idx] = median_filter(out[:, idx], size=median_size)
+    return (_filter_short_contacts(out, min_duration) > 0.5).astype(np.float32)
+
+
+def _official_marker_contact_prior(
+    *,
+    official_interact_root: Path | None,
+    subset: str,
+    seq_id: str,
+    object_id: str,
+    joints: np.ndarray,
+    target_fps: float,
+    enabled_objects: set[str],
+    enabled_parts: tuple[str, ...],
+    distance_thresholds_m: dict[str, float],
+    num_markers_per_part: int,
+    median_filter_size: int,
+    min_contact_duration: int,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Return optional contact extra labels from official surface markers.
+
+    The official InterAct representation stores nearest-object vectors for
+    77 body surface markers. These are closer to physical contact than the
+    coarse 22-joint proxies, especially for hands (wrist offset), feet (ankle
+    / mid-foot offset), and sitting/lying poses (pelvis joint offset).
+    """
+    if official_interact_root is None:
+        return None, None, None
+    object_key = str(object_id).lower()
+    if "*" not in enabled_objects and object_key not in enabled_objects:
+        return None, None, None
+
+    T = len(joints)
+    seq_dir = _official_sequence_dir(official_interact_root, subset, seq_id)
+    marker_contact = _load_official_marker_contact_data(seq_dir, T, target_fps)
+    markers = _load_official_markers(seq_dir, T, target_fps)
+    if marker_contact is None or markers is None:
+        return None, None, None
+    marker_distances, marker_targets_local = marker_contact
+
+    extra = np.zeros((T, NUM_BODY_PARTS), dtype=np.float32)
+    anchors = joints[:, BODY_PART_INDICES, :].astype(np.float32, copy=True)
+    targets_local = np.full((T, NUM_BODY_PARTS, 3), np.nan, dtype=np.float32)
+    valid_part_indices: list[int] = []
+
+    for part_name in enabled_parts:
+        if part_name not in BODY_PART_NAMES:
+            raise ValueError(f"Unknown official marker body part: {part_name}")
+        bp_idx = BODY_PART_NAMES.index(part_name)
+        marker_idx = _official_marker_indices(
+            markers, joints, body_part=part_name, k=num_markers_per_part,
+        )
+        part_dist = marker_distances[:, marker_idx]
+        threshold = distance_thresholds_m[part_name]
+        binary = part_dist.min(axis=1) < threshold
+        extra[:, bp_idx] = binary.astype(np.float32)
+        valid_part_indices.append(bp_idx)
+
+        nearest_local = part_dist.argmin(axis=1)
+        nearest_marker_idx = marker_idx[nearest_local]
+        anchors[:, bp_idx, :] = markers[np.arange(T), nearest_marker_idx, :]
+        targets_local[:, bp_idx, :] = marker_targets_local[np.arange(T), nearest_marker_idx, :]
+
+    if valid_part_indices:
+        part_block = extra[:, valid_part_indices]
+        extra[:, valid_part_indices] = _postprocess_marker_binary(
+            part_block,
+            median_size=median_filter_size,
+            min_duration=min_contact_duration,
+        )
+    return extra, anchors, targets_local
+
+
+def _marker_thresholds(
+    *,
+    hand_m: float,
+    foot_m: float,
+    pelvis_m: float,
+) -> dict[str, float]:
+    thresholds = dict(DEFAULT_OFFICIAL_MARKER_THRESHOLDS_M)
+    thresholds["left_hand"] = hand_m
+    thresholds["right_hand"] = hand_m
+    thresholds["left_foot"] = foot_m
+    thresholds["right_foot"] = foot_m
+    thresholds["pelvis"] = pelvis_m
+    return thresholds
+
+
 def process_sequence(
     joints: np.ndarray,
     object_mesh: "trimesh.Trimesh | str | Path",
@@ -109,6 +326,10 @@ def process_sequence(
     use_hmm_refinement: bool = True,
     contact_version: str = "v11",
     strict_contact_config: StrictContactConfig | None = None,
+    contact_state_extra: np.ndarray | None = None,
+    contact_anchor_points_world: np.ndarray | None = None,
+    contact_state_override: np.ndarray | None = None,
+    contact_target_points_local: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Run the full pseudo-label extraction for one sequence.
 
@@ -143,7 +364,14 @@ def process_sequence(
     # contact_version selects v11 (legacy "approach within ~12 cm") vs
     # v12_strict (real-contact: tight distance OR engagement, with drift
     # filter). See analyses/2026-05-03_pseudo_label_v12_strict_design.md.
-    if contact_version == "v11":
+    if contact_state_override is not None:
+        if contact_state_override.shape != (len(joints), NUM_BODY_PARTS):
+            raise ValueError(
+                f"contact_state_override shape {contact_state_override.shape} "
+                f"does not match expected {(len(joints), NUM_BODY_PARTS)}"
+            )
+        contact_state = contact_state_override.astype(np.float32, copy=True)
+    elif contact_version == "v11":
         contact_state = extract_contact_state(
             joints, mesh,
             object_positions=object_positions,
@@ -163,6 +391,14 @@ def process_sequence(
             f"contact_version must be 'v11' or 'v12_strict', got {contact_version!r}"
         )
 
+    if contact_state_extra is not None:
+        if contact_state_extra.shape != contact_state.shape:
+            raise ValueError(
+                f"contact_state_extra shape {contact_state_extra.shape} does "
+                f"not match contact_state shape {contact_state.shape}"
+            )
+        contact_state = np.maximum(contact_state, contact_state_extra.astype(np.float32))
+
     # Step 2: Contact target. Now returns three arrays:
     # - contact_target_xyz_gt (T, 5, 3): closest-surface-point per body
     #   part in object-local frame — the v3 GT for the predictor's xyz
@@ -177,6 +413,8 @@ def process_sequence(
         object_rotations=object_rotations,
         config=target_config,
         patch_centers=patch_centers,
+        anchor_points_world=contact_anchor_points_world,
+        target_points_local_override=contact_target_points_local,
     )
 
     # Step 3: Interaction phase — rotation-aware so that rotation-only
@@ -234,6 +472,15 @@ def run_pipeline(
     mesh_suffixes: tuple[str, ...] = ("_cleaned_simplified", ""),
     fps: float | None = None,
     contact_version: str = "v11",
+    official_interact_root: Path | None = None,
+    official_marker_objects: tuple[str, ...] = DEFAULT_OFFICIAL_MARKER_OBJECTS,
+    official_marker_parts: tuple[str, ...] = DEFAULT_OFFICIAL_MARKER_PARTS,
+    official_marker_hand_distance_m: float = 0.05,
+    official_marker_foot_distance_m: float = 0.05,
+    official_marker_pelvis_distance_m: float = 0.20,
+    official_marker_k: int = 8,
+    target_query_contact_only: bool = False,
+    official_marker_contact_only: bool = False,
 ) -> None:
     """Batch pseudo-label extraction for all sequences.
 
@@ -269,7 +516,7 @@ def run_pipeline(
     resolved_fps = _resolve_fps(data_dir, fps)
     contact_cfg = ContactConfig(fps=resolved_fps)
     phase_cfg = PhaseConfig(fps=resolved_fps)
-    target_cfg = TargetConfig()
+    target_cfg = TargetConfig(query_all_frames=not target_query_contact_only)
     support_cfg = SupportConfig(fps=resolved_fps)
     # v12: use the strict definition (analyses/2026-05-03_pseudo_label_v12_strict_design.md)
     strict_cfg: StrictContactConfig | None = None
@@ -286,6 +533,12 @@ def run_pipeline(
             kin_window_sec=0.5,
             fps=resolved_fps,
         )
+    official_marker_object_set = {obj.lower() for obj in official_marker_objects}
+    official_marker_thresholds = _marker_thresholds(
+        hand_m=official_marker_hand_distance_m,
+        foot_m=official_marker_foot_distance_m,
+        pelvis_m=official_marker_pelvis_distance_m,
+    )
 
     print(f"Extracting pseudo-labels for {len(metadata)} sequences")
     print(f"  Data:   {data_dir}")
@@ -293,6 +546,14 @@ def run_pipeline(
     print(f"  Output: {output_dir}")
     print(f"  FPS:    {resolved_fps}  (used for velocity thresholds)")
     print(f"  Contact version: {contact_version}")
+    if official_interact_root is not None:
+        print(
+            "  Official marker contact prior: "
+            f"{official_interact_root} objects={sorted(official_marker_object_set)} "
+            f"parts={list(official_marker_parts)} thresholds={official_marker_thresholds}"
+        )
+    if official_marker_contact_only:
+        print("  Contact source: official surface markers only")
 
     # Cache LOADED meshes (not just paths) so each object is loaded once
     # and its trimesh spatial index is reused across all sequences using
@@ -306,6 +567,7 @@ def run_pipeline(
     n_ok = 0
     n_skip = 0
     n_resume = 0
+    n_marker_prior = 0
     skip_reasons: list[dict[str, str]] = []
     per_seq_stats = []
     for entry in tqdm(metadata, desc="Pseudo-labels"):
@@ -370,6 +632,35 @@ def run_pipeline(
         files = set(motion_data.files)
         object_positions = motion_data["object_positions"] if "object_positions" in files else None
         object_rotations = motion_data["object_rotations"] if "object_rotations" in files else None
+        contact_extra = None
+        contact_anchors = None
+        contact_targets_local = None
+        try:
+            contact_extra, contact_anchors, contact_targets_local = _official_marker_contact_prior(
+                official_interact_root=official_interact_root,
+                subset=data_dir.name,
+                seq_id=seq_id,
+                object_id=obj_id,
+                joints=joints,
+                target_fps=resolved_fps,
+                enabled_objects=official_marker_object_set,
+                enabled_parts=official_marker_parts,
+                distance_thresholds_m=official_marker_thresholds,
+                num_markers_per_part=official_marker_k,
+                median_filter_size=(strict_cfg or StrictContactConfig(fps=resolved_fps)).median_filter_size,
+                min_contact_duration=(strict_cfg or StrictContactConfig(fps=resolved_fps)).min_contact_duration,
+            )
+            if contact_extra is not None:
+                n_marker_prior += 1
+        except Exception as e:
+            print(f"  [warn] official marker contact prior failed for {seq_id}: {e}")
+        if official_marker_contact_only and contact_extra is None:
+            n_skip += 1
+            skip_reasons.append({
+                "seq_id": seq_id,
+                "reason": "official_marker_contact_unavailable",
+            })
+            continue
 
         try:
             labels = process_sequence(
@@ -386,6 +677,10 @@ def run_pipeline(
                 use_hmm_refinement=use_hmm,
                 contact_version=contact_version,
                 strict_contact_config=strict_cfg,
+                contact_state_extra=None if official_marker_contact_only else contact_extra,
+                contact_anchor_points_world=contact_anchors,
+                contact_state_override=contact_extra if official_marker_contact_only else None,
+                contact_target_points_local=contact_targets_local,
             )
         except Exception as e:
             print(f"  [warn] {seq_id}: {e}")
@@ -432,12 +727,23 @@ def run_pipeline(
         "use_hmm": use_hmm,
         "contact_version": contact_version,
         "mesh_suffixes": list(mesh_suffixes),
+        "official_marker_contact_prior": {
+            "official_interact_root": str(official_interact_root) if official_interact_root else None,
+            "enabled_objects": sorted(official_marker_object_set),
+            "enabled_parts": list(official_marker_parts),
+            "distance_thresholds_m": official_marker_thresholds,
+            "num_markers_per_part": official_marker_k,
+            "num_sequences_augmented": n_marker_prior,
+        },
+        "target_query_contact_only": target_query_contact_only,
+        "official_marker_contact_only": official_marker_contact_only,
         "num_objects_with_atlas": len([k for k, v in atlas_cache.items() if v is not None]),
         "counts": {
             "num_in_metadata": len(metadata),
             "num_labels_written": n_ok,
             "num_resumed": n_resume,
             "num_skipped": n_skip,
+            "num_official_marker_contact_prior": n_marker_prior,
         },
         "elapsed_sec": round(elapsed, 2),
         "throughput_seq_per_sec": round(n_ok / max(elapsed, 1e-6), 2),
@@ -468,6 +774,7 @@ def _find_mesh(
     """
     extensions = (".obj", ".ply", ".stl", ".off")
     candidate_dirs = (mesh_dir, mesh_dir / obj_id)
+    suffixes = tuple(dict.fromkeys((*suffixes, "")))
     for d in candidate_dirs:
         for suffix in suffixes:
             for ext in extensions:
@@ -530,6 +837,89 @@ def build_parser() -> argparse.ArgumentParser:
              "analyses/2026-05-03_pseudo_label_v12_strict_design.md for "
              "the design and rationale.",
     )
+    parser.add_argument(
+        "--official-interact-root",
+        type=Path,
+        default=None,
+        help="Optional official InterAct root. When provided, hand contact "
+             "for configured handheld objects can be augmented from official "
+             "sequences_canonical/<seq_id>/motion.npy marker-object distances.",
+    )
+    parser.add_argument(
+        "--official-marker-hand-objects",
+        nargs="+",
+        dest="official_marker_objects",
+        default=list(DEFAULT_OFFICIAL_MARKER_OBJECTS),
+        help="Deprecated alias for --official-marker-objects.",
+    )
+    parser.add_argument(
+        "--official-marker-objects",
+        nargs="+",
+        dest="official_marker_objects",
+        default=None,
+        help="Object ids allowed to use the official marker contact prior. "
+             "Use '*' for all objects. Default: '*'.",
+    )
+    parser.add_argument(
+        "--official-marker-parts",
+        nargs="+",
+        default=list(DEFAULT_OFFICIAL_MARKER_PARTS),
+        choices=list(DEFAULT_OFFICIAL_MARKER_PARTS),
+        help="Body parts to augment from official surface markers.",
+    )
+    parser.add_argument(
+        "--official-marker-hand-distance-m",
+        type=float,
+        default=0.05,
+        help="Surface-marker to object distance threshold for official hand "
+             "contact. Default: 5 cm.",
+    )
+    parser.add_argument(
+        "--official-marker-foot-distance-m",
+        type=float,
+        default=0.05,
+        help="Surface-marker to object distance threshold for official foot "
+             "contact. Default: 5 cm.",
+    )
+    parser.add_argument(
+        "--official-marker-pelvis-distance-m",
+        type=float,
+        default=0.20,
+        help="Surface-marker to object distance threshold for official pelvis "
+             "contact. Default: 20 cm.",
+    )
+    parser.add_argument(
+        "--official-marker-hand-k",
+        dest="official_marker_k",
+        type=int,
+        default=8,
+        help="Deprecated alias for --official-marker-k.",
+    )
+    parser.add_argument(
+        "--official-marker-k",
+        dest="official_marker_k",
+        type=int,
+        default=None,
+        help="Number of nearest official surface markers to use per body part. "
+             "Default: 8.",
+    )
+    parser.add_argument(
+        "--target-query-contact-only",
+        action="store_true",
+        help="Only compute contact_target_xyz_gt closest mesh points on "
+             "frame/body-part cells with contact_state >= threshold. Current "
+             "Stage A/B losses gate target supervision by contact; leaving "
+             "this off preserves dense legacy labels.",
+    )
+    parser.add_argument(
+        "--official-marker-contact-only",
+        action="store_true",
+        help="Use official InterAct surface-marker distances as the contact "
+             "state instead of running the joint-to-mesh contact extractor. "
+             "Requires --official-interact-root and marker data for every "
+             "sequence. The official nearest object point is also used as "
+             "contact_target_xyz_gt where available.",
+    )
     return parser
 
 
@@ -545,6 +935,15 @@ def main() -> None:
         mesh_suffixes=tuple(args.mesh_suffixes),
         fps=args.fps,
         contact_version=args.contact_version,
+        official_interact_root=args.official_interact_root,
+        official_marker_objects=tuple(args.official_marker_objects or DEFAULT_OFFICIAL_MARKER_OBJECTS),
+        official_marker_parts=tuple(args.official_marker_parts),
+        official_marker_hand_distance_m=args.official_marker_hand_distance_m,
+        official_marker_foot_distance_m=args.official_marker_foot_distance_m,
+        official_marker_pelvis_distance_m=args.official_marker_pelvis_distance_m,
+        official_marker_k=args.official_marker_k or 8,
+        target_query_contact_only=args.target_query_contact_only,
+        official_marker_contact_only=args.official_marker_contact_only,
     )
 
 
