@@ -259,6 +259,7 @@ def build_anchordiff_step_fn(
     motion_representation: str = "motion_263",
     world_joint_velocity_weight: float = 0.0,
     object_traj_dim: int = 9,
+    fk_consistency_weight: float = 0.0,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -343,7 +344,7 @@ def build_anchordiff_step_fn(
                 R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
                     joints, motion, seq_len,
                 )
-        elif motion_representation == "joints22_world":
+        elif motion_representation in {"joints22_world", "joints22_world_with_rot6d"}:
             R_y = T_xz_canon = T_y_canon = None
         else:
             raise ValueError(
@@ -421,8 +422,11 @@ def build_anchordiff_step_fn(
                 seq_mask=seq_mask.bool(),
             )
         else:
+            # v4 (joints22_world): full 66-D output is (B, T, 22, 3) jpos.
+            # v5 (joints22_world_with_rot6d): 198-D output, first 66 = jpos.
+            jpos_pred = x0_pred[..., :66].view(B, T, 22, 3)
             anchor = anchor_consistency_loss_world_joints(
-                joints_world_pred=x0_pred.view(B, T, 22, 3),
+                joints_world_pred=jpos_pred,
                 contact_state_gt=contact_state,
                 contact_target_xyz_local=contact_target_xyz,
                 object_positions=obj_pos_world,
@@ -437,10 +441,19 @@ def build_anchordiff_step_fn(
             seq_mask=seq_mask,
             cfg=geometric_cfg,
         )
-        if motion_representation == "joints22_world" and world_joint_velocity_weight > 0.0:
-            world_vel = feature_velocity_loss(
-                x0_pred.float(), x0_target.float(), seq_mask.float(),
-            )
+        # World-frame velocity: for v4 use full 66-D; for v5 use the
+        # jpos sub-vector only (rotations have their own continuous
+        # velocity that's not directly comparable).
+        if (
+            motion_representation in {"joints22_world", "joints22_world_with_rot6d"}
+            and world_joint_velocity_weight > 0.0
+        ):
+            if motion_representation == "joints22_world":
+                wv_pred, wv_target = x0_pred.float(), x0_target.float()
+            else:
+                wv_pred = x0_pred[..., :66].float()
+                wv_target = x0_target[..., :66].float()
+            world_vel = feature_velocity_loss(wv_pred, wv_target, seq_mask.float())
             geom = {
                 **geom,
                 "loss_geometric": geom["loss_geometric"]
@@ -448,7 +461,28 @@ def build_anchordiff_step_fn(
                 "loss_vel": world_vel,
             }
 
-        total = mse + anchor + geom["loss_geometric"]
+        # FK consistency (v5 only): re-derive jpos from predicted global
+        # rot_6d via SMPL-22 FK with per-clip rest_offsets, MSE vs the
+        # predicted jpos. Forces the redundant 198-D representation to be
+        # internally self-consistent — eliminates the v4 'arm stretches
+        # to satisfy anchor target' failure mode.
+        loss_fk = torch.zeros((), device=device, dtype=x0_pred.dtype)
+        if (
+            motion_representation == "joints22_world_with_rot6d"
+            and fk_consistency_weight > 0.0
+        ):
+            from piano.training.anchordiff_v5_losses import fk_consistency_loss
+            jpos_pred = x0_pred[..., :66].view(B, T, 22, 3).float()
+            rot_6d_pred = x0_pred[..., 66:].view(B, T, 22, 6).float()
+            rest_offsets = batch["rest_offsets"].to(device).float()        # (B, 22, 3)
+            loss_fk = fk_consistency_loss(
+                jpos_pred=jpos_pred,
+                rot_6d_pred=rot_6d_pred,
+                rest_offsets=rest_offsets,
+                seq_mask=seq_mask,
+            )
+
+        total = mse + anchor + geom["loss_geometric"] + fk_consistency_weight * loss_fk
         return {
             "loss": total,
             "mse_x0": mse.detach(),
@@ -458,6 +492,7 @@ def build_anchordiff_step_fn(
             "loss_pos": geom["loss_pos"].detach(),
             "loss_vel": geom["loss_vel"].detach(),
             "loss_foot": geom["loss_foot"].detach(),
+            "loss_fk": loss_fk.detach(),
         }
 
     return step_fn
@@ -635,11 +670,19 @@ def main() -> None:
     world_joint_velocity_weight = float(
         cfg.loss.get("world_joint_velocity_weight", 0.0)
     )
+    fk_consistency_weight = float(cfg.loss.get("fk_consistency_weight", 0.0))
     accelerator.print(
         "Motion representation: "
         f"{motion_representation} "
-        f"(world_joint_velocity_weight={world_joint_velocity_weight})",
+        f"(world_joint_velocity_weight={world_joint_velocity_weight} "
+        f"fk_consistency_weight={fk_consistency_weight})",
     )
+    if motion_representation == "joints22_world_with_rot6d":
+        if int(cfg.model.denoiser.motion_dim) != 198:
+            raise ValueError(
+                "joints22_world_with_rot6d requires model.denoiser.motion_dim=198 "
+                f"(got {int(cfg.model.denoiser.motion_dim)})"
+            )
 
     # --- Optimizer + scheduler ---
     accum = int(cfg.training.get("gradient_accumulation_steps", 1))
@@ -705,6 +748,7 @@ def main() -> None:
         motion_representation=motion_representation,
         world_joint_velocity_weight=world_joint_velocity_weight,
         object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
+        fk_consistency_weight=fk_consistency_weight,
     )
 
     # --- Smoke test: one batch through forward + backward ---
@@ -719,7 +763,8 @@ def main() -> None:
             f"geom={out['loss_geometric'].item():.4f}  "
             f"pos={out['loss_pos'].item():.4f}  "
             f"vel={out['loss_vel'].item():.4f}  "
-            f"foot={out['loss_foot'].item():.4f}"
+            f"foot={out['loss_foot'].item():.4f}  "
+            f"fk={out.get('loss_fk', torch.zeros(())).item():.4f}"
         )
         accelerator.backward(out["loss"])
         optimizer.step()

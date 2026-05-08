@@ -203,12 +203,30 @@ class HOIDataset(Dataset):
         # adapter (effect-size 9.3% mean / 21.2% peak), so this flag
         # tests the canonicalization choice in isolation.
         self.force_world_frame = force_world_frame
-        if motion_representation not in {"motion_263", "joints22_world"}:
+        if motion_representation not in {
+            "motion_263",
+            "joints22_world",
+            "joints22_world_with_rot6d",
+        }:
             raise ValueError(
-                "motion_representation must be 'motion_263' or 'joints22_world', "
-                f"got {motion_representation!r}"
+                "motion_representation must be 'motion_263', 'joints22_world', "
+                f"or 'joints22_world_with_rot6d', got {motion_representation!r}"
             )
         self.motion_representation = motion_representation
+        # The 198-D rep co-mixes joint positions (augment-friendly) with
+        # SMPL-22 global 6D rotations derived from raw smplx_poses. The
+        # current ``_apply_augmentation`` rotates joints / motion_263 /
+        # object pose but does NOT rotate smplx-derived global rotations,
+        # which would desynchronize the two halves of the motion vector.
+        # v5 configs must therefore disable mirror + Y-rotation augmentation.
+        if motion_representation == "joints22_world_with_rot6d":
+            aug = augment or AugmentConfig()
+            if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
+                raise ValueError(
+                    "motion_representation='joints22_world_with_rot6d' is not "
+                    "compatible with mirror_prob>0 or rotate_around_y_prob>0 — "
+                    "global rot 6D would desync. Set both probs to 0 in v5 configs."
+                )
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -365,12 +383,82 @@ class HOIDataset(Dataset):
         # so downstream code (eval_predictor per-object aggregation) can
         # group clips by object identity. The collate fn accumulates them
         # as parallel string lists alongside the tensor batches.
+        # Optionally extend motion with global per-joint 6D rotations for
+        # OMOMO/CHOIS-style 198-D representation (v5). The 6D rotations
+        # are derived from the GT SMPL-X axis-angle local pose by chaining
+        # through the SMPL-22 kinematic tree. ``rest_offsets`` is computed
+        # by reverse-FK so FK(rot, offsets, root_pos) reproduces the GT
+        # joints exactly (verified < 0.1 mm in scratch testing).
+        rest_offsets_np: np.ndarray | None = None
         if self.motion_representation == "motion_263":
             motion = motion_263
-        else:
+        elif self.motion_representation == "joints22_world":
             motion = joints.reshape(joints.shape[0], 22 * 3).astype(
                 np.float32,
                 copy=False,
+            )
+        elif self.motion_representation == "joints22_world_with_rot6d":
+            # We need un-augmented smplx_poses; augmentation is not yet
+            # propagated through to global rotations, so v5 configs must
+            # disable mirror + Y-rotation augmentation. The dataset class
+            # raises if augment.enabled and rep is joints22_world_with_rot6d
+            # in __init__-time check below.
+            if "smplx_poses" not in motion_data.files:
+                raise KeyError(
+                    f"smplx_poses missing in {motion_path}; v5 rep "
+                    "joints22_world_with_rot6d requires the npz to contain "
+                    "smplx_poses (T, 156) and joints_22 (T, 22, 3)."
+                )
+            smplx_poses_full = motion_data["smplx_poses"].astype(np.float32)
+            # First 66 dims of smplx_poses_full = SMPL-22 root_orient(3)
+            # + body_pose(63=21*3) axis-angle local. The remaining 90 dims
+            # are SMPL-X jaw/eyes/hands which we ignore here.
+            pose_22_aa = smplx_poses_full[:, :66].reshape(-1, 22, 3)
+            pose_22_aa = self._pad_or_truncate(
+                pose_22_aa, self.max_seq_length,
+            ).astype(np.float32)                                # (max_T, 22, 3)
+
+            # Compute global per-joint rotation matrices then 6D rep.
+            # Done in torch CPU because our smpl_kinematics utilities are
+            # torch-native (Rodrigues + chain through SMPL-22 parents).
+            from piano.training.smpl_kinematics import (
+                axis_angle_to_matrix as _aa2mat,
+                local2global_pose as _l2g,
+                matrix_to_rotation_6d as _mat2_6d,
+                SMPL22_PARENTS as _PARENTS,
+            )
+            aa_t = torch.from_numpy(pose_22_aa)                 # (max_T, 22, 3)
+            local_R = _aa2mat(aa_t)                             # (max_T, 22, 3, 3)
+            global_R = _l2g(local_R)                            # (max_T, 22, 3, 3)
+            global_rot_6d = _mat2_6d(global_R)                  # (max_T, 22, 6)
+
+            # Reverse FK on valid frames: rest_offset[j] is the bone vector
+            # from parent(j) to j in T-pose coordinates of the parent.
+            # Solve: jpos[t,j] - jpos[t,parent(j)] = R_global[t,parent(j)] @ rest_offset[j]
+            #     => rest_offset[j] = R_global[t,parent(j)].T @ bone[t,j]
+            # Average over valid frames for stability (verified < 0.03 mm
+            # standard deviation in scratch test on chairs Sub0001).
+            joints_v = torch.from_numpy(joints[:seq_len])       # (seq_len, 22, 3)
+            global_R_v = global_R[:seq_len]                     # (seq_len, 22, 3, 3)
+            rest_offsets_t = torch.zeros(22, 3, dtype=torch.float32)
+            for j in range(1, 22):
+                p = int(_PARENTS[j])
+                bone = joints_v[:, j, :] - joints_v[:, p, :]    # (seq_len, 3)
+                R_inv = global_R_v[:, p, :, :].transpose(-1, -2)
+                offset_t = torch.einsum("tij,tj->ti", R_inv, bone)
+                rest_offsets_t[j] = offset_t.mean(dim=0)
+            rest_offsets_np = rest_offsets_t.numpy()            # (22, 3)
+
+            motion = np.concatenate(
+                [
+                    joints.reshape(joints.shape[0], 22 * 3),
+                    global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
+                ],
+                axis=-1,
+            ).astype(np.float32, copy=False)                    # (max_T, 198)
+        else:                                                   # pragma: no cover
+            raise AssertionError(
+                f"motion_representation={self.motion_representation!r} not handled"
             )
 
         result: dict[str, torch.Tensor | str] = {
@@ -383,6 +471,8 @@ class HOIDataset(Dataset):
             "subset": self.root.name,
             "seq_id": str(seq_id),
         }
+        if rest_offsets_np is not None:
+            result["rest_offsets"] = torch.from_numpy(rest_offsets_np)
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
         if object_rotations is not None:
