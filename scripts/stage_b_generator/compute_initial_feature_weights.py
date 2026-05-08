@@ -25,17 +25,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from piano.data.dataset import HOIDataset, collate_hoi
+from piano.training.feature_groups import FEATURE_GROUPS as FEATURE_GROUP_DEFS
 
 
-GROUPS = [
-    ("root_rot_vel", 0, 1),
-    ("root_lin_vel", 1, 3),
-    ("root_height_y", 3, 4),
-    ("joint_pos_local", 4, 67),
-    ("joint_rot_6d", 67, 193),
-    ("joint_velocity", 193, 259),
-    ("foot_contact", 259, 263),
-]
+GROUPS = [(g.name, g.lo, g.hi) for g in FEATURE_GROUP_DEFS]
 
 
 def main() -> None:

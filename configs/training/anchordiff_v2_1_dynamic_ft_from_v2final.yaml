@@ -1,20 +1,11 @@
-# PIANO-AnchorDiff v3: dynamic group-level MSE weighting (M1.5).
+# PIANO-AnchorDiff v2.1 finetune from the converged v2-weighted run.
 #
-# Activate ONLY if v2 (anchordiff_v2_weighted) still shows root-rotation
-# drift / spinning. v3 replaces hand-tuned static weights with
-#
-#     weight_g(epoch) = max(geometry_prior_g, static_floor_g)
-#                       * residual_factor_g(epoch)
-#
-# Initial geometry_prior_g comes from offline finite-difference probes
-# through recover_from_ric on a fixed val-split calibration set
-# (analyses/2026-05-08_anchordiff_dynamic_metric/geometry_prior.json).
-# residual_factor_g(epoch) is recomputed every K epochs from the current
-# checkpoint on the SAME fixed calibration set, single-step denoising.
-# Weights are EMA-smoothed, clamped, and renormalised to preserve v2's
-# total MSE scale.
-#
-# Spec: PLAN.md M1.5 (sections "Step 1" through "Step 8").
+# Purpose:
+# - Use v2 final weights as the model/object-encoder initialization.
+# - Reset AdamW + cosine schedule instead of continuing v2's near-zero LR.
+# - Enable the dynamic group-level MSE metric from PLAN.md M1.5.
+# - Select best_val on stable unweighted x0 MSE because dynamic weighted
+#   val loss changes its scale as feature weights update.
 
 model:
   cfg_drop_prob: 0.15
@@ -78,33 +69,29 @@ data:
     pc_jitter_std: 0.005
 
 training:
+  init_checkpoint: "runs/training/stageB_anchordiff_v2_weighted/final.pt"
   batch_size: 16
-  num_epochs: 100
+  num_epochs: 30
   num_workers: 4
   seed: 42
   optimizer:
     name: "adamw"
-    lr: 1.0e-4
+    lr: 3.0e-5
     weight_decay: 0.01
     betas: [0.9, 0.999]
   scheduler:
     name: "cosine"
-    warmup_steps: 200
+    warmup_steps: 100
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   mixed_precision: "bf16"
   val_every_epochs: 5
-  # Dynamic weights make total val loss a moving target. Select best_val on
-  # a stable unweighted x0 MSE; contact/visual gates still decide shipping.
   val_best_key: "mse_x0_unweighted"
 
 loss:
   anchor_weight: 5.0
   contact_threshold: 0.5
 
-  # Static base/floor weights (also used as base_prior_floor for groups
-  # whose geometry_prior is ~0, e.g. joint_rot_6d / velocity / foot_contact
-  # don't affect recover_from_ric).
   motion_feature_weights:
     root_rot_vel: 100.0
     root_lin_vel: 30.0
@@ -114,7 +101,6 @@ loss:
     joint_velocity: 1.0
     foot_contact: 5.0
 
-  # v2.1 dynamic group metric
   dynamic_metric:
     enabled: true
     geometry_prior_path: "analyses/2026-05-08_anchordiff_dynamic_metric/geometry_prior.json"
@@ -124,13 +110,13 @@ loss:
     residual_alpha: 0.5
     clamp_min: 0.25
     clamp_max: 150.0
-    fixed_timestep: 200          # mid-noise level for single-step denoising
+    fixed_timestep: 200
     calibration_seed: 12345
 
 logging:
   project: "piano"
-  run_name: "stageB_anchordiff_v3_dynamic"
+  run_name: "stageB_anchordiff_v2_1_dynamic_ft_from_v2final"
   log_every_n_steps: 50
-  save_every_n_epochs: 10
+  save_every_n_epochs: 5
 
-output_dir: "runs/training/stageB_anchordiff_v3_dynamic"
+output_dir: "runs/training/stageB_anchordiff_v2_1_dynamic_ft_from_v2final"

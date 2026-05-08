@@ -153,6 +153,7 @@ def run_training_loop(
     val_report_keys: list[str] | tuple[str, ...] | None = None,
     contact_report_keys: list[str] | tuple[str, ...] | None = None,
     epoch_end_hook: Callable[..., None] | None = None,
+    extra_state_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """Generic training loop used by all stages.
 
@@ -205,6 +206,10 @@ def run_training_loop(
         still computed internally and validation/checkpoint decisions still
         use ``val_best_key`` / ``contact_best_key``. ``None`` preserves the
         historical "report everything" behaviour.
+    epoch_end_hook : optional callback invoked once after each epoch's
+        validation/contact eval and before periodic checkpointing.
+    extra_state_fn : optional callable returning non-module state to merge
+        into every checkpoint payload, e.g. dynamic loss-weight state.
     """
     output_dir = ensure_dir(output_dir)
     metrics_jsonl = Path(output_dir) / "metrics.jsonl"
@@ -401,6 +406,7 @@ def run_training_loop(
                 _save_checkpoint(
                     accelerator, model, optimizer, epoch, global_step, output_dir,
                     name="best_val", extra_modules=extra_modules,
+                    extra_state_fn=extra_state_fn,
                 )
                 if accelerator.is_main_process:
                     accelerator.print(
@@ -464,6 +470,7 @@ def run_training_loop(
                     _save_checkpoint(
                         accelerator, model, optimizer, epoch, global_step, output_dir,
                         name="best_contact", extra_modules=extra_modules,
+                        extra_state_fn=extra_state_fn,
                     )
                     if accelerator.is_main_process:
                         accelerator.print(
@@ -471,13 +478,6 @@ def run_training_loop(
                             f"{contact_best_key}={cur_contact:.4f} "
                             f"(epoch {epoch+1})",
                         )
-
-        # Save checkpoint
-        if (epoch + 1) % save_every_epochs == 0:
-            _save_checkpoint(
-                accelerator, model, optimizer, epoch, global_step, output_dir,
-                extra_modules=extra_modules,
-            )
 
         # User-supplied per-epoch hook (e.g. dynamic loss-weight update)
         if epoch_end_hook is not None:
@@ -491,10 +491,20 @@ def run_training_loop(
                 wandb_run=wandb_run,
             )
 
+        # Save checkpoint after epoch-end hooks so dynamic training state
+        # reflects the weights that will be used when resuming next epoch.
+        if (epoch + 1) % save_every_epochs == 0:
+            _save_checkpoint(
+                accelerator, model, optimizer, epoch, global_step, output_dir,
+                extra_modules=extra_modules,
+                extra_state_fn=extra_state_fn,
+            )
+
     # Final save
     _save_checkpoint(
         accelerator, model, optimizer, num_epochs - 1, global_step, output_dir,
         name="final", extra_modules=extra_modules,
+        extra_state_fn=extra_state_fn,
     )
     accelerator.print("Training complete.")
     _append_metrics("complete", {"global_step": global_step})
@@ -571,6 +581,7 @@ def _save_checkpoint(
     output_dir: Path,
     name: str | None = None,
     extra_modules: dict[str, torch.nn.Module] | None = None,
+    extra_state_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """Save model checkpoint (main process only).
 
@@ -596,6 +607,8 @@ def _save_checkpoint(
     if extra_modules:
         for mod_name, mod in extra_modules.items():
             payload[mod_name] = accelerator.unwrap_model(mod).state_dict()
+    if extra_state_fn is not None:
+        payload.update(extra_state_fn())
 
     torch.save(payload, ckpt_path)
     accelerator.print(f"  Saved checkpoint: {ckpt_path}")

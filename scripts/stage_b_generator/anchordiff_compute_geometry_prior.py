@@ -52,7 +52,10 @@ from omegaconf import OmegaConf
 
 from piano.data.dataset import HOIDataset
 from piano.training.anchor_consistency_loss import (
-    PART_TO_JOINT, lift_canonical_joints_to_world, lift_motion263_to_joints,
+    PART_TO_JOINT,
+    AnchorConsistencyConfig,
+    lift_canonical_joints_to_world,
+    lift_motion263_to_joints,
 )
 from piano.training.feature_groups import FEATURE_GROUPS, MOTION_DIM
 from piano.utils.canonical_frame import get_canonicalize_transform_from_clip
@@ -132,6 +135,9 @@ def main() -> None:
         probes_per_group[g.name] = v
 
     part_idx = torch.tensor(PART_TO_JOINT, device=device, dtype=torch.long)
+    part_weights = np.asarray(
+        AnchorConsistencyConfig().part_weights, dtype=np.float32,
+    )
 
     # Estimate per-clip per-group GT std (per-feature std over time, then
     # Frobenius across features in the group).
@@ -166,8 +172,13 @@ def main() -> None:
         seq_len = int(sample["seq_len"].item())
         motion = sample["motion"].numpy()[:seq_len]                # (T, 263)
         joints_world = sample["joints"].numpy()[:seq_len]          # (T, 22, 3)
+        contact_state = sample["contact_state"].numpy()[:seq_len]  # (T, 5)
 
         if seq_len < 5:
+            continue
+        contact_mask = (contact_state >= 0.5).astype(np.float32)
+        contact_mask = contact_mask * part_weights[None, :]
+        if float(contact_mask.sum()) < 1.0:
             continue
 
         # GT std per group (over time × dims in group, scalar per group)
@@ -206,7 +217,11 @@ def main() -> None:
                 world_p_t = lift_canonical_joints_to_world(canon_p_t, R_y_t, T_xz_t, T_y_t)
                 parts_p = world_p_t.index_select(2, part_idx).squeeze(0).cpu().numpy()
                 diff = parts_p - parts_gt
-                world_diff_sum_sq += float(np.mean(diff * diff))
+                part_l2_sq = np.sum(diff * diff, axis=-1)          # (T, 5)
+                world_diff_sum_sq += float(
+                    (part_l2_sq * contact_mask).sum()
+                    / max(float(contact_mask.sum()), 1.0)
+                )
                 probe_norms_sum_sq += float(np.mean(delta * delta))
             avg_world_mse = world_diff_sum_sq / args.num_probes
             avg_probe_mse = probe_norms_sum_sq / args.num_probes

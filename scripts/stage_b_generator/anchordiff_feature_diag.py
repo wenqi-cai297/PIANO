@@ -34,18 +34,11 @@ from piano.models.motion_anchordiff import (
     MotionAnchorDiff, ZIntDims, pack_z_int,
 )
 from piano.models.object_encoder import ObjectEncoder
+from piano.training.feature_groups import FEATURE_GROUPS as FEATURE_GROUP_DEFS
 from piano.utils.clip_utils import encode_text_per_token, load_clip_text_encoder
 
 
-FEATURE_GROUPS = [
-    ("root_rot_vel", 0, 1),
-    ("root_lin_vel", 1, 3),
-    ("root_height_y", 3, 4),
-    ("joint_pos_local", 4, 67),
-    ("joint_rot_6d", 67, 193),
-    ("joint_velocity", 193, 259),
-    ("foot_contact", 259, 263),
-]
+FEATURE_GROUPS = [(g.name, g.lo, g.hi) for g in FEATURE_GROUP_DEFS]
 
 
 def build_model(cfg, device):
