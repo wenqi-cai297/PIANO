@@ -31,6 +31,7 @@ import torch
 from omegaconf import OmegaConf
 
 from piano.data.dataset import HOIDataset, collate_hoi
+from piano.inference.anchor_postprocess import translate_world_joints_to_active_anchors
 from piano.inference.visualize_motion import render_motion_video
 from piano.models.motion_anchordiff import (
     AnchorDenoiserConfig, AnchorDiffConfig, DiffusionConfig,
@@ -38,7 +39,9 @@ from piano.models.motion_anchordiff import (
 )
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
-    lift_motion263_to_joints, lift_canonical_joints_to_world,
+    lift_motion263_to_joints,
+    lift_canonical_joints_to_world,
+    lift_object_local_to_world,
 )
 from piano.utils.canonical_frame import (
     get_canonicalize_transform_from_clip, y_rotation_matrix,
@@ -68,13 +71,24 @@ def main() -> None:
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--dpi", type=int, default=80)
+    parser.add_argument("--post-anchor-translate-strength", type=float, default=0.0)
+    parser.add_argument("--post-anchor-smooth-window", type=int, default=9)
+    parser.add_argument("--post-anchor-max-offset", type=float, default=0.75)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
+    motion_representation = str(cfg.data.get("motion_representation", "motion_263"))
+    object_traj_dim = int(cfg.model.denoiser.object_traj_dim)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.seed is not None:
+        np.random.seed(int(args.seed))
+        torch.manual_seed(int(args.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(args.seed))
 
     # Build model + load ckpt
     z_dims = ZIntDims(
@@ -142,6 +156,8 @@ def main() -> None:
             augment=None,
             support_collapse_hand_support=True,
             surface_obj_pose=True,
+            force_world_frame=bool(cfg.data.get("force_world_frame", False)),
+            motion_representation=motion_representation,
         )
         datasets[entry.name] = ds
 
@@ -188,7 +204,19 @@ def main() -> None:
         phase_soft = F.one_hot(phase.clamp_min(0).long(), num_classes=z_dims.phase_classes).float()
         support_soft = F.one_hot(support.clamp_min(0).long(), num_classes=z_dims.support_classes).float()
         z_int = pack_z_int(contact_state, contact_target_xyz, phase_soft, support_soft, z_dims)
-        object_traj = torch.cat([obj_com, obj_rot6d], dim=-1)
+        object_traj_parts = [obj_com, obj_rot6d]
+        if object_traj_dim == 24:
+            target_world = lift_object_local_to_world(
+                contact_target_xyz,
+                obj_pos_world,
+                obj_rot_world,
+            ).reshape(1, T_full, -1)
+            object_traj_parts.append(target_world)
+        object_traj = torch.cat(object_traj_parts, dim=-1)
+        if object_traj.shape[-1] != object_traj_dim:
+            raise ValueError(
+                f"object_traj_dim={object_traj_dim} but built {object_traj.shape[-1]}"
+            )
         init_pose = joints_world_gt[:, 0, :, :].reshape(1, -1)
 
         text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
@@ -206,18 +234,36 @@ def main() -> None:
         print(f"[{subset}/{seq_id}] T={seq_len}  sampling (1000 DDPM steps, cfg={args.cfg_scale})...")
         with torch.no_grad():
             x0_sample = model.sample(cond=cond, seq_length=T_full, cfg_scale=args.cfg_scale)
-        # Recover joints + lift to world
-        canon_pred = lift_motion263_to_joints(x0_sample)              # (1, T, 22, 3)
-        canon_gt = lift_motion263_to_joints(motion_gt)
-        # Compute (R_y, T_xz, T_y) from GT joints[0] + GT motion[0]
-        j0 = joints_world_gt[0].cpu().numpy()
-        m0 = motion_gt[0].cpu().numpy()
-        cn0 = canon_gt[0].cpu().numpy()
-        R_y_n, T_xz_n, T_y_n = get_canonicalize_transform_from_clip(j0, cn0)
-        R_y = torch.tensor([R_y_n], device=device)
-        T_xz = torch.tensor([[T_xz_n[0], T_xz_n[1]]], device=device)
-        T_y = torch.tensor([T_y_n], device=device)
-        joints_pred_world = lift_canonical_joints_to_world(canon_pred, R_y, T_xz, T_y).squeeze(0).cpu().numpy()
+        # Recover joints. v1-v3 output motion_263 and need recover/lift;
+        # v4 outputs flattened world-frame joints directly.
+        if motion_representation == "joints22_world":
+            joints_pred_world_t = x0_sample.view(1, T_full, 22, 3)
+        else:
+            canon_pred = lift_motion263_to_joints(x0_sample)          # (1, T, 22, 3)
+            canon_gt = lift_motion263_to_joints(motion_gt)
+            # Compute (R_y, T_xz, T_y) from GT joints[0] + GT motion[0]
+            j0 = joints_world_gt[0].cpu().numpy()
+            cn0 = canon_gt[0].cpu().numpy()
+            R_y_n, T_xz_n, T_y_n = get_canonicalize_transform_from_clip(j0, cn0)
+            R_y = torch.tensor([R_y_n], device=device)
+            T_xz = torch.tensor([[T_xz_n[0], T_xz_n[1]]], device=device)
+            T_y = torch.tensor([T_y_n], device=device)
+            joints_pred_world_t = lift_canonical_joints_to_world(canon_pred, R_y, T_xz, T_y)
+
+        if args.post_anchor_translate_strength > 0.0:
+            joints_pred_world_t, guide_stats = translate_world_joints_to_active_anchors(
+                joints_pred_world_t,
+                contact_state,
+                contact_target_xyz,
+                obj_pos_world,
+                obj_rot_world,
+                strength=float(args.post_anchor_translate_strength),
+                smooth_window=int(args.post_anchor_smooth_window),
+                max_offset_m=float(args.post_anchor_max_offset),
+            )
+            print(f"  post-anchor translation: {guide_stats}")
+
+        joints_pred_world = joints_pred_world_t.squeeze(0).cpu().numpy()
         # Truncate to seq_len for cleaner viz
         joints_pred_world = joints_pred_world[:seq_len]
         joints_world_gt_np = joints_world_gt.squeeze(0).cpu().numpy()[:seq_len]

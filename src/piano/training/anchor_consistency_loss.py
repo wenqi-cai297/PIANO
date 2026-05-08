@@ -157,6 +157,67 @@ def lift_canonical_joints_to_world(
     return rotated
 
 
+def _anchor_l2_from_world_joints(
+    joints_world_pred: Tensor,      # (B, T, J, 3)
+    contact_state_gt: Tensor,       # (B, T, P)
+    contact_target_xyz_local: Tensor,  # (B, T, P, 3)
+    object_positions: Tensor,       # (B, T, 3)
+    object_rotations: Tensor,       # (B, T, 3)
+    cfg: AnchorConsistencyConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """Core world-frame anchor loss once predicted joints are available."""
+    target_world = lift_object_local_to_world(
+        contact_target_xyz_local, object_positions, object_rotations,
+    )                                                              # (B, T, P, 3)
+
+    part_idx = torch.tensor(
+        PART_TO_JOINT, device=joints_world_pred.device, dtype=torch.long,
+    )                                                              # (P,)
+    pred_part = joints_world_pred.index_select(2, part_idx)        # (B, T, P, 3)
+
+    diff = pred_part - target_world                                # (B, T, P, 3)
+    sq = (diff * diff).sum(-1)                                    # (B, T, P)
+    l2 = torch.sqrt(sq + cfg.eps_l2).clamp(max=cfg.max_distance_m)
+
+    contact_mask = (contact_state_gt >= cfg.contact_threshold).float()
+    part_w = torch.tensor(
+        cfg.part_weights, device=l2.device, dtype=l2.dtype,
+    ).view(1, 1, -1)
+    contact_mask = contact_mask * part_w
+    if seq_mask is not None:
+        contact_mask = contact_mask * seq_mask.unsqueeze(-1).float()
+
+    denom = contact_mask.sum().clamp_min(1.0)
+    return cfg.weight * (l2 * contact_mask).sum() / denom
+
+
+def anchor_consistency_loss_world_joints(
+    joints_world_pred: Tensor,      # (B, T, 22, 3)
+    contact_state_gt: Tensor,       # (B, T, P)
+    contact_target_xyz_local: Tensor,  # (B, T, P, 3)
+    object_positions: Tensor,       # (B, T, 3)
+    object_rotations: Tensor,       # (B, T, 3)
+    cfg: AnchorConsistencyConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """Anchor consistency for HOI-native world-frame joint predictions.
+
+    AnchorDiff v4 predicts flattened world-frame SMPL-22 joints directly,
+    so the loss can skip ``recover_from_ric`` and the per-clip
+    canonical-to-world lift used by the ``motion_263`` branch.
+    """
+    return _anchor_l2_from_world_joints(
+        joints_world_pred=joints_world_pred,
+        contact_state_gt=contact_state_gt,
+        contact_target_xyz_local=contact_target_xyz_local,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        cfg=cfg,
+        seq_mask=seq_mask,
+    )
+
+
 def anchor_consistency_loss(
     x0_pred: Tensor,                # (B, T, 263) predicted clean motion
     contact_state_gt: Tensor,       # (B, T, P)   GT contact (or sigmoid)
@@ -179,29 +240,12 @@ def anchor_consistency_loss(
     joints_world_pred = lift_canonical_joints_to_world(
         joints_canon, R_y, T_xz, T_y,
     )                                                              # (B, T, J, 3)
-    target_world = lift_object_local_to_world(
-        contact_target_xyz_local, object_positions, object_rotations,
-    )                                                              # (B, T, P, 3)
-
-    # gather predicted joint per body part
-    part_idx = torch.tensor(
-        PART_TO_JOINT, device=joints_world_pred.device, dtype=torch.long,
-    )                                                              # (P,)
-    pred_part = joints_world_pred.index_select(2, part_idx)        # (B, T, P, 3)
-
-    diff = pred_part - target_world                                # (B, T, P, 3)
-    sq = (diff * diff).sum(-1)                                    # (B, T, P)
-    l2 = torch.sqrt(sq + cfg.eps_l2)                              # (B, T, P)
-    # Cap per-element to limit pathological-clip contribution.
-    l2 = l2.clamp(max=cfg.max_distance_m)
-
-    contact_mask = (contact_state_gt >= cfg.contact_threshold).float()
-    part_w = torch.tensor(
-        cfg.part_weights, device=l2.device, dtype=l2.dtype,
-    ).view(1, 1, -1)                                              # (1, 1, P)
-    contact_mask = contact_mask * part_w
-    if seq_mask is not None:
-        contact_mask = contact_mask * seq_mask.unsqueeze(-1).float()
-
-    denom = contact_mask.sum().clamp_min(1.0)
-    return cfg.weight * (l2 * contact_mask).sum() / denom
+    return _anchor_l2_from_world_joints(
+        joints_world_pred=joints_world_pred,
+        contact_state_gt=contact_state_gt,
+        contact_target_xyz_local=contact_target_xyz_local,
+        object_positions=object_positions,
+        object_rotations=object_rotations,
+        cfg=cfg,
+        seq_mask=seq_mask,
+    )

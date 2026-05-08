@@ -45,9 +45,16 @@ from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
     AnchorConsistencyConfig,
     anchor_consistency_loss,
+    anchor_consistency_loss_world_joints,
+    lift_object_local_to_world,
 )
 from piano.training.feature_groups import FEATURE_GROUPS
 from piano.training.feature_weight_state import FeatureWeightState
+from piano.training.anchordiff_geometric_losses import (
+    MotionGeometricLossConfig,
+    compute_motion_geometric_losses,
+    feature_velocity_loss,
+)
 from piano.training.trainer import (
     build_optimizer_with_decay_groups,
     build_scheduler,
@@ -131,9 +138,50 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
                 cfg.data.get("support_collapse_hand_support", True)
             ),
             surface_obj_pose=True,
+            force_world_frame=bool(cfg.data.get("force_world_frame", False)),
+            motion_representation=str(
+                cfg.data.get("motion_representation", "motion_263")
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
+
+
+def _load_state_dict_compatible(
+    module: torch.nn.Module,
+    incoming: dict[str, Tensor],
+) -> tuple[list[str], list[str]]:
+    """Load matching checkpoint tensors and partially copy resized tensors.
+
+    Used by v4b to warm-start from v4a while expanding the per-frame object
+    trajectory channel from 9 dims to 24 dims. Exact-shape parameters load
+    normally; same-rank shape mismatches copy the overlapping slice and keep
+    the freshly initialized values for new rows/columns.
+    """
+    current = module.state_dict()
+    loadable: dict[str, Tensor] = {}
+    partial: list[str] = []
+    skipped: list[str] = []
+
+    for name, src in incoming.items():
+        if name not in current:
+            skipped.append(name)
+            continue
+        dst = current[name]
+        if dst.shape == src.shape:
+            loadable[name] = src
+            continue
+        if dst.ndim == src.ndim and dst.ndim > 0:
+            merged = dst.clone()
+            slices = tuple(slice(0, min(a, b)) for a, b in zip(dst.shape, src.shape))
+            merged[slices] = src.to(dtype=dst.dtype)[slices]
+            loadable[name] = merged
+            partial.append(name)
+            continue
+        skipped.append(name)
+
+    module.load_state_dict(loadable, strict=False)
+    return partial, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +254,11 @@ def build_anchordiff_step_fn(
     anchor_cfg: AnchorConsistencyConfig,
     z_dims: ZIntDims,
     device: torch.device,
-    feature_weight_state: FeatureWeightState,
+    feature_weight_state: FeatureWeightState | None,
+    geometric_cfg: MotionGeometricLossConfig,
+    motion_representation: str = "motion_263",
+    world_joint_velocity_weight: float = 0.0,
+    object_traj_dim: int = 9,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -219,18 +271,56 @@ def build_anchordiff_step_fn(
 
     class _WeightCache:
         def __init__(self) -> None:
-            self._t = feature_weight_state.to_per_frame_tensor(device)
-            self._ver = feature_weight_state.last_update_epoch
+            self._t: Tensor | None = None
+            self._ver = -1
+            if feature_weight_state is not None:
+                self._t = feature_weight_state.to_per_frame_tensor(device)
+                self._ver = feature_weight_state.last_update_epoch
 
-        def get(self) -> Tensor:
+        def get(self, motion_dim: int) -> Tensor:
+            if feature_weight_state is None:
+                if self._t is None or self._t.shape[-1] != motion_dim:
+                    self._t = torch.ones(
+                        1, 1, motion_dim, device=device, dtype=torch.float32,
+                    )
+                return self._t
             if feature_weight_state.last_update_epoch != self._ver:
                 self._t = feature_weight_state.to_per_frame_tensor(device)
                 self._ver = feature_weight_state.last_update_epoch
+            if self._t is None or self._t.shape[-1] != motion_dim:
+                raise ValueError(
+                    "FeatureWeightState is only valid for motion_263; "
+                    f"got weight_dim={None if self._t is None else self._t.shape[-1]} "
+                    f"for motion_dim={motion_dim}"
+                )
             return self._t
 
     cache = _WeightCache()
+
+    def _build_object_traj(
+        obj_com: Tensor,
+        obj_rot6d: Tensor,
+        contact_target_xyz: Tensor,
+        obj_pos_world: Tensor,
+        obj_rot_world: Tensor,
+    ) -> Tensor:
+        components = [obj_com, obj_rot6d]
+        if object_traj_dim == 24:
+            target_world = lift_object_local_to_world(
+                contact_target_xyz,
+                obj_pos_world,
+                obj_rot_world,
+            ).reshape(obj_com.shape[0], obj_com.shape[1], -1)
+            components.append(target_world)
+        out = torch.cat(components, dim=-1)
+        if out.shape[-1] != object_traj_dim:
+            raise ValueError(
+                f"object_traj_dim={object_traj_dim} but built {out.shape[-1]} dims"
+            )
+        return out
+
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
-        motion = batch["motion"].to(device)                       # (B, T, 263)
+        motion = batch["motion"].to(device)                       # (B, T, D_motion)
         joints = batch["joints"].to(device)                       # (B, T, 22, 3)
         object_pc = batch["object_pc"].to(device)
         contact_state = batch["contact_state"].to(device)         # (B, T, 5)
@@ -243,14 +333,21 @@ def build_anchordiff_step_fn(
         obj_rot_world = batch["object_rotations"].to(device)      # (B, T, 3) axis-angle
         seq_len = batch["seq_len"].to(device)                     # (B,)
 
-        B, T, _ = motion.shape
+        B, T, motion_dim = motion.shape
         seq_idx = torch.arange(T, device=device).unsqueeze(0)
         seq_mask = (seq_idx < seq_len.unsqueeze(1)).float()        # (B, T)
 
         # Per-clip canonical→world transform (cheap; one frame-0 op per clip).
-        with torch.no_grad():
-            R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
-                joints, motion, seq_len,
+        if motion_representation == "motion_263":
+            with torch.no_grad():
+                R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
+                    joints, motion, seq_len,
+                )
+        elif motion_representation == "joints22_world":
+            R_y = T_xz_canon = T_y_canon = None
+        else:
+            raise ValueError(
+                f"Unsupported motion_representation={motion_representation!r}"
             )
 
         # --- Pack z_int (training: GT contact + GT target + GT phase/support) ---
@@ -260,9 +357,17 @@ def build_anchordiff_step_fn(
             contact_state, contact_target_xyz, phase_soft, support_soft, z_dims,
         )                                                          # (B, T, total)
 
-        # --- Object world trajectory channel: use canonical object pose
-        # (matches motion_263 frame), 3 (com) + 6 (rot6d) = 9 dims/frame.
-        object_traj = torch.cat([obj_com, obj_rot6d], dim=-1)      # (B, T, 9)
+        # --- Object trajectory channel. v1-v4a use object pose only
+        # (3 COM + 6 rot6d). v4b appends the five body-part anchor targets
+        # already transformed into world frame (5 * 3), so Stage A's
+        # predictor signal reaches the denoiser in task-space coordinates.
+        object_traj = _build_object_traj(
+            obj_com=obj_com,
+            obj_rot6d=obj_rot6d,
+            contact_target_xyz=contact_target_xyz,
+            obj_pos_world=obj_pos_world,
+            obj_rot_world=obj_rot_world,
+        )
 
         # --- Init pose: SMPL-22 frame 0 ---
         init_pose = joints[:, 0, :, :].reshape(B, -1)              # (B, 66)
@@ -292,8 +397,8 @@ def build_anchordiff_step_fn(
         # FeatureWeightState (static or dynamic). See feature_groups.py
         # for the per-group layout and feature_weight_state.py for the
         # update logic.
-        mse_per_dim = (x0_pred - x0_target).pow(2)                  # (B, T, 263)
-        weighted = (mse_per_dim * cache.get()).sum(-1)              # (B, T)
+        mse_per_dim = (x0_pred - x0_target).pow(2)                  # (B, T, D)
+        weighted = (mse_per_dim * cache.get(motion_dim)).sum(-1)    # (B, T)
         mse = (weighted * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
         mse_unweighted = (
             mse_per_dim.sum(-1) * seq_mask
@@ -302,25 +407,57 @@ def build_anchordiff_step_fn(
         # Anchor consistency in WORLD frame (uniform-skel canonical lifted
         # to world via per-clip (R_y, T_xz, T_y); see
         # analyses/2026-05-08_anchordiff_frame_bug_fix.md).
-        anchor = anchor_consistency_loss(
-            x0_pred=x0_pred,
-            contact_state_gt=contact_state,
-            contact_target_xyz_local=contact_target_xyz,
-            object_positions=obj_pos_world,
-            object_rotations=obj_rot_world,
-            R_y=R_y,
-            T_xz=T_xz_canon,
-            T_y=T_y_canon,
-            cfg=anchor_cfg,
-            seq_mask=seq_mask.bool(),
-        )
+        if motion_representation == "motion_263":
+            anchor = anchor_consistency_loss(
+                x0_pred=x0_pred,
+                contact_state_gt=contact_state,
+                contact_target_xyz_local=contact_target_xyz,
+                object_positions=obj_pos_world,
+                object_rotations=obj_rot_world,
+                R_y=R_y,
+                T_xz=T_xz_canon,
+                T_y=T_y_canon,
+                cfg=anchor_cfg,
+                seq_mask=seq_mask.bool(),
+            )
+        else:
+            anchor = anchor_consistency_loss_world_joints(
+                joints_world_pred=x0_pred.view(B, T, 22, 3),
+                contact_state_gt=contact_state,
+                contact_target_xyz_local=contact_target_xyz,
+                object_positions=obj_pos_world,
+                object_rotations=obj_rot_world,
+                cfg=anchor_cfg,
+                seq_mask=seq_mask.bool(),
+            )
 
-        total = mse + anchor
+        geom = compute_motion_geometric_losses(
+            x0_pred=x0_pred,
+            x0_target=x0_target,
+            seq_mask=seq_mask,
+            cfg=geometric_cfg,
+        )
+        if motion_representation == "joints22_world" and world_joint_velocity_weight > 0.0:
+            world_vel = feature_velocity_loss(
+                x0_pred.float(), x0_target.float(), seq_mask.float(),
+            )
+            geom = {
+                **geom,
+                "loss_geometric": geom["loss_geometric"]
+                + world_joint_velocity_weight * world_vel,
+                "loss_vel": world_vel,
+            }
+
+        total = mse + anchor + geom["loss_geometric"]
         return {
             "loss": total,
             "mse_x0": mse.detach(),
             "mse_x0_unweighted": mse_unweighted.detach(),
             "anchor_l2": anchor.detach(),
+            "loss_geometric": geom["loss_geometric"].detach(),
+            "loss_pos": geom["loss_pos"].detach(),
+            "loss_vel": geom["loss_vel"].detach(),
+            "loss_foot": geom["loss_foot"].detach(),
         }
 
     return step_fn
@@ -426,7 +563,19 @@ def main() -> None:
         accelerator.print(f"Loading model init checkpoint: {init_path}")
         state = torch.load(init_path, map_location="cpu", weights_only=False)
         model_state = state.get("model", state)
-        model.load_state_dict(model_state)
+        partial_init = bool(
+            cfg.training.get("partial_init_allow_shape_mismatch", False)
+        )
+        if partial_init:
+            partial, skipped = _load_state_dict_compatible(model, model_state)
+            accelerator.print(
+                f"Partial model init: {len(partial)} resized tensors, "
+                f"{len(skipped)} skipped tensors"
+            )
+            if partial:
+                accelerator.print("  resized: " + ", ".join(partial[:8]))
+        else:
+            model.load_state_dict(model_state)
         if "object_encoder" in state:
             object_encoder.load_state_dict(state["object_encoder"])
         elif "extra_modules" in state and "object_encoder" in state["extra_modules"]:
@@ -448,6 +597,48 @@ def main() -> None:
     anchor_cfg = AnchorConsistencyConfig(
         weight=float(cfg.loss.anchor_weight),
         contact_threshold=float(cfg.loss.contact_threshold),
+    )
+    geom_cfg_raw = cfg.loss.get("motion_geometric", None)
+    if geom_cfg_raw is None:
+        geometric_cfg = MotionGeometricLossConfig()
+    else:
+        foot_indices = tuple(
+            int(v)
+            for v in geom_cfg_raw.get(
+                "foot_joint_indices",
+                MotionGeometricLossConfig().foot_joint_indices,
+            )
+        )
+        if len(foot_indices) != 4:
+            raise ValueError("loss.motion_geometric.foot_joint_indices must have 4 entries")
+        geometric_cfg = MotionGeometricLossConfig(
+            enabled=bool(geom_cfg_raw.get("enabled", False)),
+            pos_weight=float(geom_cfg_raw.get("pos_weight", 0.0)),
+            vel_weight=float(geom_cfg_raw.get("vel_weight", 0.0)),
+            foot_weight=float(geom_cfg_raw.get("foot_weight", 0.0)),
+            foot_contact_threshold=float(
+                geom_cfg_raw.get("foot_contact_threshold", 0.5)
+            ),
+            foot_velocity_threshold=float(
+                geom_cfg_raw.get("foot_velocity_threshold", 0.01)
+            ),
+            foot_joint_indices=foot_indices,
+        )
+    accelerator.print(
+        "Motion geometric losses: "
+        f"enabled={geometric_cfg.enabled} "
+        f"pos={geometric_cfg.pos_weight} "
+        f"vel={geometric_cfg.vel_weight} "
+        f"foot={geometric_cfg.foot_weight}",
+    )
+    motion_representation = str(cfg.data.get("motion_representation", "motion_263"))
+    world_joint_velocity_weight = float(
+        cfg.loss.get("world_joint_velocity_weight", 0.0)
+    )
+    accelerator.print(
+        "Motion representation: "
+        f"{motion_representation} "
+        f"(world_joint_velocity_weight={world_joint_velocity_weight})",
     )
 
     # --- Optimizer + scheduler ---
@@ -478,7 +669,12 @@ def main() -> None:
         if "motion_feature_weights" in cfg.loss else None
     )
     dyn_cfg = cfg.loss.get("dynamic_metric", None)
-    if dyn_cfg is not None and dyn_cfg.get("enabled", False):
+    if motion_representation != "motion_263" or int(cfg.model.denoiser.motion_dim) != 263:
+        if dyn_cfg is not None and dyn_cfg.get("enabled", False):
+            raise ValueError("dynamic_metric is only supported for motion_263")
+        feature_weight_state = None
+        accelerator.print("FeatureWeightState disabled for non-motion_263 representation")
+    elif dyn_cfg is not None and dyn_cfg.get("enabled", False):
         feature_weight_state = FeatureWeightState.dynamic_from_config(
             static_weights_cfg=static_w_cfg,
             geometry_prior_path=str(dyn_cfg.geometry_prior_path),
@@ -505,6 +701,10 @@ def main() -> None:
         z_dims=z_dims,
         device=device,
         feature_weight_state=feature_weight_state,
+        geometric_cfg=geometric_cfg,
+        motion_representation=motion_representation,
+        world_joint_velocity_weight=world_joint_velocity_weight,
+        object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
     )
 
     # --- Smoke test: one batch through forward + backward ---
@@ -515,7 +715,11 @@ def main() -> None:
         accelerator.print(
             f"  loss={out['loss'].item():.4f}  "
             f"mse_x0={out['mse_x0'].item():.4f}  "
-            f"anchor_l2={out['anchor_l2'].item():.4f}"
+            f"anchor_l2={out['anchor_l2'].item():.4f}  "
+            f"geom={out['loss_geometric'].item():.4f}  "
+            f"pos={out['loss_pos'].item():.4f}  "
+            f"vel={out['loss_vel'].item():.4f}  "
+            f"foot={out['loss_foot'].item():.4f}"
         )
         accelerator.backward(out["loss"])
         optimizer.step()
@@ -535,7 +739,7 @@ def main() -> None:
 
     # --- Calibration data + dynamic-weight update hook (v2.1 only) ---
     epoch_end_hook = None
-    if feature_weight_state.enable_dynamic:
+    if feature_weight_state is not None and feature_weight_state.enable_dynamic:
         from piano.data.dataset import HOIDataset
         from piano.training.feature_groups import FEATURE_GROUPS as _FG
         from piano.utils.io_utils import load_json as _load_json
@@ -740,9 +944,10 @@ def main() -> None:
         wandb_run=wandb_run,
         extra_modules={"object_encoder": object_encoder},
         epoch_end_hook=epoch_end_hook,
-        extra_state_fn=lambda: {
-            "feature_weight_state": feature_weight_state.state_dict(),
-        },
+        extra_state_fn=(
+            (lambda: {"feature_weight_state": feature_weight_state.state_dict()})
+            if feature_weight_state is not None else None
+        ),
         val_dataloader=val_loader,
         val_every_epochs=int(cfg.training.get("val_every_epochs", 0)),
         val_best_key=str(cfg.training.get("val_best_key", "loss")),

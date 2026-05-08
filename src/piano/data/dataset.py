@@ -145,6 +145,12 @@ class HOIDataset(Dataset):
         each __getitem__ randomly applies (mirror, rotate around Y, pc
         jitter) per the config probabilities. Disabled by default so
         the dataset class is reusable for eval / inference.
+    motion_representation : {"motion_263", "joints22_world"}
+        Which per-frame body representation to return under the ``motion``
+        key. ``motion_263`` preserves the MoMask/HumanML3D path. The
+        ``joints22_world`` branch returns flattened world-frame SMPL-22
+        joint positions and is used by AnchorDiff v4 to train in HOI task
+        space rather than through HumanML3D's cumulative root-yaw decoder.
     """
 
     def __init__(
@@ -159,6 +165,7 @@ class HOIDataset(Dataset):
         augment: AugmentConfig | None = None,
         surface_obj_pose: bool = False,
         force_world_frame: bool = False,
+        motion_representation: str = "motion_263",
         # v9.1 (2026-05-03): collapse hand_support (id=3) into both_feet
         # (id=0) at load time. The compound class hand_support
         # = (hand_contact ∧ pelvis_static ∧ phase_stable) is essentially
@@ -196,6 +203,12 @@ class HOIDataset(Dataset):
         # adapter (effect-size 9.3% mean / 21.2% peak), so this flag
         # tests the canonicalization choice in isolation.
         self.force_world_frame = force_world_frame
+        if motion_representation not in {"motion_263", "joints22_world"}:
+            raise ValueError(
+                "motion_representation must be 'motion_263' or 'joints22_world', "
+                f"got {motion_representation!r}"
+            )
+        self.motion_representation = motion_representation
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -262,9 +275,9 @@ class HOIDataset(Dataset):
         # --- Load motion ---
         motion_path = self.root / "motions" / f"{seq_id}.npz"
         motion_data = np.load(motion_path, allow_pickle=False)
-        motion = motion_data["motion_263"].astype(np.float32)    # (T, 263)
+        motion_263 = motion_data["motion_263"].astype(np.float32)    # (T, 263)
         joints = motion_data["joints_22"].astype(np.float32)     # (T, 22, 3)
-        seq_len = min(len(motion), self.max_seq_length)
+        seq_len = min(len(motion_263), self.max_seq_length)
 
         # Object trajectory in world frame (per-frame object center position
         # + per-frame axis-angle rotation). Used for pseudo-label extraction
@@ -287,7 +300,7 @@ class HOIDataset(Dataset):
         labels = self._load_pseudo_labels(label_path, seq_len)
 
         # --- Pad or truncate to max_seq_length ---
-        motion = self._pad_or_truncate(motion, self.max_seq_length)
+        motion_263 = self._pad_or_truncate(motion_263, self.max_seq_length)
         joints = self._pad_or_truncate(joints, self.max_seq_length)
         if object_positions is not None:
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
@@ -312,12 +325,13 @@ class HOIDataset(Dataset):
             joints, object_pc, text, padded_labels, motion, object_positions, object_rotations = (
                 self._apply_augmentation(
                     joints, object_pc, text, padded_labels,
-                    motion=motion,
+                    motion=motion_263,
                     object_positions=object_positions,
                     object_rotations=object_rotations,
                     force_mirror=force_mirror,
                 )
             )
+            motion_263 = motion
 
         # --- Body-canonical object pose (Stage B; v0.2+) ---
         # Computed AFTER augmentation so mirror flips through. The
@@ -333,10 +347,10 @@ class HOIDataset(Dataset):
             and object_positions is not None
             and object_rotations is not None
         ):
-            valid = min(seq_len, len(joints), len(motion))
+            valid = min(seq_len, len(joints), len(motion_263))
             obj_com_canonical, obj_rot6d_canonical = (
                 self._compute_canonical_object_pose(
-                    motion[:valid],
+                    motion_263[:valid],
                     joints[:valid],
                     object_positions[:valid],
                     object_rotations[:valid],
@@ -351,6 +365,14 @@ class HOIDataset(Dataset):
         # so downstream code (eval_predictor per-object aggregation) can
         # group clips by object identity. The collate fn accumulates them
         # as parallel string lists alongside the tensor batches.
+        if self.motion_representation == "motion_263":
+            motion = motion_263
+        else:
+            motion = joints.reshape(joints.shape[0], 22 * 3).astype(
+                np.float32,
+                copy=False,
+            )
+
         result: dict[str, torch.Tensor | str] = {
             "motion": torch.from_numpy(motion),
             "joints": torch.from_numpy(joints),
