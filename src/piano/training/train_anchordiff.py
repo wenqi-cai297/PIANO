@@ -344,7 +344,11 @@ def build_anchordiff_step_fn(
                 R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
                     joints, motion, seq_len,
                 )
-        elif motion_representation in {"joints22_world", "joints22_world_with_rot6d"}:
+        elif motion_representation in {
+            "joints22_world",
+            "joints22_world_with_rot6d",
+            "smpl_pose_135",
+        }:
             R_y = T_xz_canon = T_y_canon = None
         else:
             raise ValueError(
@@ -424,7 +428,24 @@ def build_anchordiff_step_fn(
         else:
             # v4 (joints22_world): full 66-D output is (B, T, 22, 3) jpos.
             # v5 (joints22_world_with_rot6d): 198-D output, first 66 = jpos.
-            jpos_pred = x0_pred[..., :66].view(B, T, 22, 3)
+            # v6 (smpl_pose_135): 135-D output, first 132 = global_rot_6d,
+            #   last 3 = root world translation. jpos derived by FK from
+            #   rot_6d + per-clip rest_offsets + root_world.
+            if motion_representation == "smpl_pose_135":
+                from piano.training.smpl_kinematics import (
+                    rotation_6d_to_matrix as _rot6d_to_mat,
+                    fk_from_global_rotations as _fk_from_global,
+                )
+                rot_6d = x0_pred[..., :132].view(B, T, 22, 6).float()
+                root_world_pred = x0_pred[..., 132:135].float()        # (B, T, 3)
+                rot_mat_global = _rot6d_to_mat(rot_6d)                 # (B, T, 22, 3, 3)
+                rest_offsets = batch["rest_offsets"].to(device).float() # (B, 22, 3)
+                rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3)
+                jpos_pred = _fk_from_global(
+                    rot_mat_global, rest_per_frame, root_world_pred,
+                )                                                       # (B, T, 22, 3)
+            else:
+                jpos_pred = x0_pred[..., :66].view(B, T, 22, 3)
             anchor = anchor_consistency_loss_world_joints(
                 joints_world_pred=jpos_pred,
                 contact_state_gt=contact_state,
@@ -441,18 +462,22 @@ def build_anchordiff_step_fn(
             seq_mask=seq_mask,
             cfg=geometric_cfg,
         )
-        # World-frame velocity: for v4 use full 66-D; for v5 use the
-        # jpos sub-vector only (rotations have their own continuous
-        # velocity that's not directly comparable).
+        # World-frame velocity loss source:
+        # v4 (joints22_world): full 66-D motion vector (jpos).
+        # v5 (198-D): jpos sub-vector [:66] only (rotations have own continuity).
+        # v6 (smpl_pose_135): full 135-D rep — frame-difference on global rot_6d
+        #   penalises angular jitter, frame-difference on root_world penalises
+        #   root jitter. Both are valid temporal smoothness terms.
         if (
-            motion_representation in {"joints22_world", "joints22_world_with_rot6d"}
+            motion_representation
+            in {"joints22_world", "joints22_world_with_rot6d", "smpl_pose_135"}
             and world_joint_velocity_weight > 0.0
         ):
-            if motion_representation == "joints22_world":
-                wv_pred, wv_target = x0_pred.float(), x0_target.float()
-            else:
+            if motion_representation == "joints22_world_with_rot6d":
                 wv_pred = x0_pred[..., :66].float()
                 wv_target = x0_target[..., :66].float()
+            else:
+                wv_pred, wv_target = x0_pred.float(), x0_target.float()
             world_vel = feature_velocity_loss(wv_pred, wv_target, seq_mask.float())
             geom = {
                 **geom,
@@ -681,6 +706,12 @@ def main() -> None:
         if int(cfg.model.denoiser.motion_dim) != 198:
             raise ValueError(
                 "joints22_world_with_rot6d requires model.denoiser.motion_dim=198 "
+                f"(got {int(cfg.model.denoiser.motion_dim)})"
+            )
+    if motion_representation == "smpl_pose_135":
+        if int(cfg.model.denoiser.motion_dim) != 135:
+            raise ValueError(
+                "smpl_pose_135 requires model.denoiser.motion_dim=135 "
                 f"(got {int(cfg.model.denoiser.motion_dim)})"
             )
 

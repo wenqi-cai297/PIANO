@@ -377,6 +377,7 @@ def process_sequence(
             object_positions=object_positions,
             object_rotations=object_rotations,
             config=contact_config,
+            object_id=object_id,
         )
     elif contact_version == "v12_strict":
         contact_state = extract_strict_contact_state(
@@ -398,6 +399,44 @@ def process_sequence(
                 f"not match contact_state shape {contact_state.shape}"
             )
         contact_state = np.maximum(contact_state, contact_state_extra.astype(np.float32))
+
+    # v19 (2026-05-09): directional gate for pelvis contact, applied after
+    # max-combining mesh-distance and official-marker signals. Filters the
+    # frequent false positives during bat-swing / lift / carry motions
+    # where an object passes within 20 cm of pelvis at the side or above.
+    # Reuses the cylinder + upward-facing-normal helper from sitting
+    # detection — same per-mesh seat-points cache, no extra surface
+    # sampling. Only fires when contact_config.use_directional_pelvis_gate.
+    if (
+        contact_config is not None
+        and contact_config.use_directional_pelvis_gate
+        and object_positions is not None
+    ):
+        from piano.data.pseudo_labels.extract_contact import _PELVIS_BP_IDX
+        from piano.data.pseudo_labels.extract_support import (
+            SupportConfig as _SupportConfig,
+            _pelvis_object_below_mask,
+        )
+        _gate_support_cfg = _SupportConfig(
+            sitting_below_horz_radius=contact_config.pelvis_below_horz_radius,
+            sitting_below_vert_gate=contact_config.pelvis_below_vert_gate,
+            sitting_below_upward_normal_threshold=
+                contact_config.pelvis_below_upward_normal_threshold,
+            fps=contact_config.fps,
+        )
+        T_gate = len(joints)
+        below_mask = _pelvis_object_below_mask(
+            joints=joints,
+            object_mesh=mesh,
+            object_positions=object_positions,
+            object_rotations=object_rotations,
+            config=_gate_support_cfg,
+            T=T_gate,
+            object_id=object_id,
+        ).astype(np.float32)
+        contact_state[:, _PELVIS_BP_IDX] = (
+            contact_state[:, _PELVIS_BP_IDX] * below_mask
+        )
 
     # Step 2: Contact target. Now returns three arrays:
     # - contact_target_xyz_gt (T, 5, 3): closest-surface-point per body
@@ -481,6 +520,7 @@ def run_pipeline(
     official_marker_k: int = 8,
     target_query_contact_only: bool = False,
     official_marker_contact_only: bool = False,
+    use_directional_pelvis_gate: bool = False,
 ) -> None:
     """Batch pseudo-label extraction for all sequences.
 
@@ -514,7 +554,10 @@ def run_pipeline(
     metadata = load_json(metadata_path)
 
     resolved_fps = _resolve_fps(data_dir, fps)
-    contact_cfg = ContactConfig(fps=resolved_fps)
+    contact_cfg = ContactConfig(
+        fps=resolved_fps,
+        use_directional_pelvis_gate=use_directional_pelvis_gate,
+    )
     phase_cfg = PhaseConfig(fps=resolved_fps)
     target_cfg = TargetConfig(query_all_frames=not target_query_contact_only)
     support_cfg = SupportConfig(fps=resolved_fps)
@@ -532,6 +575,7 @@ def run_pipeline(
             kin_radius_proxy=0.3,
             kin_window_sec=0.5,
             fps=resolved_fps,
+            use_directional_pelvis_gate=use_directional_pelvis_gate,
         )
     official_marker_object_set = {obj.lower() for obj in official_marker_objects}
     official_marker_thresholds = _marker_thresholds(
@@ -920,6 +964,15 @@ def build_parser() -> argparse.ArgumentParser:
              "sequence. The official nearest object point is also used as "
              "contact_target_xyz_gt where available.",
     )
+    parser.add_argument(
+        "--use-directional-pelvis-gate",
+        action="store_true",
+        help="v19: gate pelvis contact by 'object below pelvis in cylinder + "
+             "upward-facing normal' check (mirroring sitting detector). "
+             "Eliminates false-positive pelvis contacts during dynamic "
+             "motions like bat-swing where an object passes 15-20cm to the "
+             "side of the pelvis. Off by default (v18 behavior).",
+    )
     return parser
 
 
@@ -944,6 +997,7 @@ def main() -> None:
         official_marker_k=args.official_marker_k or 8,
         target_query_contact_only=args.target_query_contact_only,
         official_marker_contact_only=args.official_marker_contact_only,
+        use_directional_pelvis_gate=args.use_directional_pelvis_gate,
     )
 
 

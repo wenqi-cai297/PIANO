@@ -57,6 +57,10 @@ from piano.utils.smpl_utils import (
     compute_joint_velocities,
 )
 
+# Index of pelvis in BODY_PART_NAMES (= 4 in current layout); exported
+# for v19 directional gating in run_all.py:process_sequence.
+_PELVIS_BP_IDX: int = BODY_PART_NAMES.index("pelvis")
+
 
 # Per-body-part joint-to-contact-surface offsets (meters), used as the
 # distance-threshold midpoints in the soft sigmoid. Derived from anatomy
@@ -111,6 +115,29 @@ class ContactConfig:
     use_velocity_gating: bool = False       # disabled by default; see module docstring
     velocity_threshold: float = 0.5         # m/s — only used when gating is on
     velocity_sigma: float = 0.2             # m/s
+
+    # --- v19 directional gate for pelvis (2026-05-09) ---
+    # The default v18 pelvis contact uses pure 3D Euclidean distance,
+    # which gives false positives during dynamic motions where an object
+    # passes near pelvis (e.g. bat handle 15-20 cm to the side during
+    # a swing). Sitting / lying are the only physical situations where
+    # pelvis contact is real, and they all share the same geometric
+    # signature: an upward-facing surface is below the pelvis.
+    #
+    # When ``use_directional_pelvis_gate`` is True, the pelvis contact
+    # score (both distance- and kinematic-coupling-based) is multiplied
+    # by ``_pelvis_object_below_mask`` from extract_support.py — the
+    # exact same cylinder + upward-normal helper used to disambiguate
+    # the "sitting" support label. Reusing the helper means v19
+    # automatically inherits sitting's tested gate parameters and its
+    # per-mesh seat-points cache.
+    use_directional_pelvis_gate: bool = False  # opt-in (False = v18 behavior)
+    pelvis_below_horz_radius: float = 0.15     # cylinder XZ radius (m)
+    pelvis_below_vert_gate: float = 0.30       # cylinder height below pelvis (m)
+    pelvis_below_upward_normal_threshold: float = 0.5
+                                                # face-normal · up_axis threshold
+                                                # (0.5 ≈ 60° from vertical, matches
+                                                #  extract_support.py:109 default)
     # Temporal median filter window, in frames. v1-v7 used 5 (0.25s at
     # 20fps). v7 vis surfaced heavy frame-to-frame contact flicker that
     # drove phase transitions every 10 frames on some imhd clips. v8
@@ -243,6 +270,7 @@ def extract_contact_state(
     object_positions: np.ndarray | None = None,
     object_rotations: np.ndarray | None = None,
     config: ContactConfig | None = None,
+    object_id: str | None = None,
 ) -> np.ndarray:
     """Extract per-frame, per-body-part contact state.
 
@@ -281,6 +309,11 @@ def extract_contact_state(
         if config.use_velocity_gating else None
     )
 
+    # v19 directional gate is applied at the process_sequence level
+    # (after extract_contact_state's mesh-distance signal is max-combined
+    # with the official semantic-marker contact prior), so it filters
+    # both signal sources at once. See run_all.py:process_sequence.
+
     for bp_idx, joint_idx in enumerate(BODY_PART_INDICES):
         bp_name = BODY_PART_NAMES[bp_idx]
         bp_positions_world = joints[:, joint_idx, :]      # (T, 3)
@@ -311,6 +344,7 @@ def extract_contact_state(
             bp_positions_world, object_positions, object_rotations, config,
         )
         score = np.maximum(dist_score, kin_score)
+
 
         if joint_vel is not None:
             bp_velocities = joint_vel[:, joint_idx, :]

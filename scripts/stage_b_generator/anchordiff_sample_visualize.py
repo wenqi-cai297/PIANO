@@ -237,12 +237,24 @@ def main() -> None:
         # Recover joints. v1-v3 output motion_263 and need recover/lift;
         # v4 outputs flattened world-frame joints directly;
         # v5 (joints22_world_with_rot6d) outputs 198-D = (jpos: 66, rot_6d: 132),
-        # we just take the jpos sub-vector for visualization (rot_6d would need
-        # FK + bone_offsets to render; jpos is already world XYZ).
+        # we just take the jpos sub-vector for visualization;
+        # v6 (smpl_pose_135) outputs 135-D = (rot_6d: 132, root_world: 3) and
+        # we MUST run FK + per-clip rest_offsets to recover jpos.
         if motion_representation == "joints22_world":
             joints_pred_world_t = x0_sample.view(1, T_full, 22, 3)
         elif motion_representation == "joints22_world_with_rot6d":
             joints_pred_world_t = x0_sample[..., :66].view(1, T_full, 22, 3)
+        elif motion_representation == "smpl_pose_135":
+            from piano.training.smpl_kinematics import (
+                rotation_6d_to_matrix as _rot6d_to_mat,
+                fk_from_global_rotations as _fk_from_global,
+            )
+            rot_6d = x0_sample[..., :132].view(1, T_full, 22, 6).float()
+            root_world = x0_sample[..., 132:135].view(1, T_full, 3).float()
+            rot_mat_global = _rot6d_to_mat(rot_6d)
+            rest_offsets = batch["rest_offsets"].to(device).float()  # (1, 22, 3)
+            rest_per_frame = rest_offsets.unsqueeze(1).expand(1, T_full, 22, 3)
+            joints_pred_world_t = _fk_from_global(rot_mat_global, rest_per_frame, root_world)
         else:
             canon_pred = lift_motion263_to_joints(x0_sample)          # (1, T, 22, 3)
             canon_gt = lift_motion263_to_joints(motion_gt)

@@ -207,25 +207,27 @@ class HOIDataset(Dataset):
             "motion_263",
             "joints22_world",
             "joints22_world_with_rot6d",
+            "smpl_pose_135",
         }:
             raise ValueError(
-                "motion_representation must be 'motion_263', 'joints22_world', "
-                f"or 'joints22_world_with_rot6d', got {motion_representation!r}"
+                "motion_representation must be one of "
+                "{motion_263, joints22_world, joints22_world_with_rot6d, "
+                f"smpl_pose_135}}, got {motion_representation!r}"
             )
         self.motion_representation = motion_representation
-        # The 198-D rep co-mixes joint positions (augment-friendly) with
+        # The 198-D (jpos+rot_6d) and 135-D (rot_6d+root) reps both contain
         # SMPL-22 global 6D rotations derived from raw smplx_poses. The
         # current ``_apply_augmentation`` rotates joints / motion_263 /
         # object pose but does NOT rotate smplx-derived global rotations,
-        # which would desynchronize the two halves of the motion vector.
-        # v5 configs must therefore disable mirror + Y-rotation augmentation.
-        if motion_representation == "joints22_world_with_rot6d":
+        # which would desync the rep. v5 / v6 configs must therefore disable
+        # mirror + Y-rotation augmentation.
+        if motion_representation in {"joints22_world_with_rot6d", "smpl_pose_135"}:
             aug = augment or AugmentConfig()
             if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
                 raise ValueError(
-                    "motion_representation='joints22_world_with_rot6d' is not "
+                    f"motion_representation={motion_representation!r} is not "
                     "compatible with mirror_prob>0 or rotate_around_y_prob>0 — "
-                    "global rot 6D would desync. Set both probs to 0 in v5 configs."
+                    "global rot 6D would desync. Set both probs to 0 in the config."
                 )
 
         # Load metadata — prefer metadata_clean.json when it exists so
@@ -397,17 +399,16 @@ class HOIDataset(Dataset):
                 np.float32,
                 copy=False,
             )
-        elif self.motion_representation == "joints22_world_with_rot6d":
-            # We need un-augmented smplx_poses; augmentation is not yet
-            # propagated through to global rotations, so v5 configs must
-            # disable mirror + Y-rotation augmentation. The dataset class
-            # raises if augment.enabled and rep is joints22_world_with_rot6d
-            # in __init__-time check below.
+        elif self.motion_representation in {"joints22_world_with_rot6d", "smpl_pose_135"}:
+            # v5 (joints22_world_with_rot6d) / v6 (smpl_pose_135) both need
+            # un-augmented smplx_poses to compute global 6D rotations. Augment
+            # rotation propagation is not implemented, so configs must disable
+            # mirror + Y-rotation augmentation (enforced in __init__).
             if "smplx_poses" not in motion_data.files:
                 raise KeyError(
-                    f"smplx_poses missing in {motion_path}; v5 rep "
-                    "joints22_world_with_rot6d requires the npz to contain "
-                    "smplx_poses (T, 156) and joints_22 (T, 22, 3)."
+                    f"smplx_poses missing in {motion_path}; "
+                    f"motion_representation={self.motion_representation!r} requires "
+                    "smplx_poses (T, 156) and joints_22 (T, 22, 3) in the npz."
                 )
             smplx_poses_full = motion_data["smplx_poses"].astype(np.float32)
             # First 66 dims of smplx_poses_full = SMPL-22 root_orient(3)
@@ -449,13 +450,28 @@ class HOIDataset(Dataset):
                 rest_offsets_t[j] = offset_t.mean(dim=0)
             rest_offsets_np = rest_offsets_t.numpy()            # (22, 3)
 
-            motion = np.concatenate(
-                [
-                    joints.reshape(joints.shape[0], 22 * 3),
-                    global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
-                ],
-                axis=-1,
-            ).astype(np.float32, copy=False)                    # (max_T, 198)
+            if self.motion_representation == "joints22_world_with_rot6d":
+                # v5: cat(jpos: 66, global_rot_6d: 132) = 198-D
+                motion = np.concatenate(
+                    [
+                        joints.reshape(joints.shape[0], 22 * 3),
+                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
+                    ],
+                    axis=-1,
+                ).astype(np.float32, copy=False)                # (max_T, 198)
+            else:
+                # v6 (smpl_pose_135): cat(global_rot_6d: 132, root_world_pos: 3) = 135-D
+                # joints[:, 0, :] is root world pos already in our preprocessing
+                # (it equals smplx_trans + trans2joint). We use joints[:, 0, :]
+                # directly for consistency with the FK chain target.
+                root_world_pos = joints[:, 0, :].astype(np.float32)   # (max_T, 3)
+                motion = np.concatenate(
+                    [
+                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
+                        root_world_pos,
+                    ],
+                    axis=-1,
+                ).astype(np.float32, copy=False)                # (max_T, 135)
         else:                                                   # pragma: no cover
             raise AssertionError(
                 f"motion_representation={self.motion_representation!r} not handled"
