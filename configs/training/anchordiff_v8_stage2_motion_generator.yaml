@@ -1,0 +1,132 @@
+# V8 Stage 2: Motion generator — diffusion conditioned on sparse
+# keyframes + object trajectory + semantic z_int (no per-frame spatial
+# anchor conditioning, mode-averaging fix from v7).
+#
+# Stage 2 conditioning changes vs v7:
+#   - contact_target_xyz inside z_int is ZEROED at non-keyframe frames
+#     (= no per-frame spatial anchor pulling each frame to a "plausible
+#       pose for current contact target")
+#   - object_traj is extended from 24-D to 43-D = 24 + 18 (6 keyjoint
+#     positions, only at keyframe frames) + 1 (keyframe indicator).
+#   - Anchor loss applies ONLY at keyframe frames (sparse, K=5-12)
+#
+# Stage 2 inherits v7's architecture + L_pos full-body (dense temporal
+# supervision via GT joints, NOT via per-frame spatial conditioning).
+# Trained from scratch (cannot warm-start v7 — conditioning shape changes).
+#
+# Training uses GT keyframes (from offline pass). Inference uses Stage 1
+# predicted keyframes (separate script).
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  denoiser:
+    motion_dim: 135               # 22*6 (global rot 6D) + 3 (root world)
+    object_traj_dim: 43           # 24 + 18 keyjoint pos + 1 indicator
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_keyframed"
+  force_world_frame: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: true
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null           # from scratch
+  batch_size: 16
+  num_epochs: 80
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 5
+  val_best_key: "anchor_l2"
+
+loss:
+  # Anchor only at keyframe frames (sparse). λ matches v7 (1.0).
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0            # MDM L_pos full-body, dense temporal supervision
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v8_stage2_motion_generator"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+
+output_dir: "runs/training/stageB_anchordiff_v8_stage2_motion_generator"

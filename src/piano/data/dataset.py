@@ -166,6 +166,8 @@ class HOIDataset(Dataset):
         surface_obj_pose: bool = False,
         force_world_frame: bool = False,
         motion_representation: str = "motion_263",
+        keyframe_subdir: str = "keyframes/v8_default",
+        keyframe_max_k: int = 12,
         # v9.1 (2026-05-03): collapse hand_support (id=3) into both_feet
         # (id=0) at load time. The compound class hand_support
         # = (hand_contact ∧ pelvis_static ∧ phase_stable) is essentially
@@ -208,20 +210,28 @@ class HOIDataset(Dataset):
             "joints22_world",
             "joints22_world_with_rot6d",
             "smpl_pose_135",
+            "smpl_pose_135_keyframed",
         }:
             raise ValueError(
                 "motion_representation must be one of "
                 "{motion_263, joints22_world, joints22_world_with_rot6d, "
-                f"smpl_pose_135}}, got {motion_representation!r}"
+                "smpl_pose_135, smpl_pose_135_keyframed}, "
+                f"got {motion_representation!r}"
             )
         self.motion_representation = motion_representation
+        self.keyframe_subdir = str(keyframe_subdir)
+        self.keyframe_max_k = int(keyframe_max_k)
         # The 198-D (jpos+rot_6d) and 135-D (rot_6d+root) reps both contain
         # SMPL-22 global 6D rotations derived from raw smplx_poses. The
         # current ``_apply_augmentation`` rotates joints / motion_263 /
         # object pose but does NOT rotate smplx-derived global rotations,
         # which would desync the rep. v5 / v6 configs must therefore disable
         # mirror + Y-rotation augmentation.
-        if motion_representation in {"joints22_world_with_rot6d", "smpl_pose_135"}:
+        if motion_representation in {
+            "joints22_world_with_rot6d",
+            "smpl_pose_135",
+            "smpl_pose_135_keyframed",
+        }:
             aug = augment or AugmentConfig()
             if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
                 raise ValueError(
@@ -399,7 +409,11 @@ class HOIDataset(Dataset):
                 np.float32,
                 copy=False,
             )
-        elif self.motion_representation in {"joints22_world_with_rot6d", "smpl_pose_135"}:
+        elif self.motion_representation in {
+            "joints22_world_with_rot6d",
+            "smpl_pose_135",
+            "smpl_pose_135_keyframed",
+        }:
             # v5 (joints22_world_with_rot6d) / v6 (smpl_pose_135) both need
             # un-augmented smplx_poses to compute global 6D rotations. Augment
             # rotation propagation is not implemented, so configs must disable
@@ -489,6 +503,45 @@ class HOIDataset(Dataset):
         }
         if rest_offsets_np is not None:
             result["rest_offsets"] = torch.from_numpy(rest_offsets_np)
+        # v8 hierarchical: load offline-precomputed keyframes for the
+        # keyframed motion representation. Stage 1 uses these as
+        # supervision targets; Stage 2 uses them as sparse condition.
+        # Output schema: padded to keyframe_max_k with mask. Variable-K
+        # per clip handled via collate_fn default behavior.
+        if self.motion_representation == "smpl_pose_135_keyframed":
+            kf_path = self.root / self.keyframe_subdir / f"{seq_id}.npz"
+            if not kf_path.exists():
+                raise FileNotFoundError(
+                    f"v8 keyframe file missing: {kf_path}. Run "
+                    "scripts/stage_b_generator/extract_v8_keyframes.sh first."
+                )
+            kf_data = np.load(kf_path, allow_pickle=False)
+            indices = kf_data["indices"].astype(np.int64)         # (K,)
+            targets = kf_data["targets"].astype(np.float32)       # (K, 6, 3)
+            K = int(kf_data["num_keyframes"])
+            K_max = self.keyframe_max_k
+
+            # Drop keyframes that fall outside the truncated [0, seq_len)
+            # window (offline pass used original T which may exceed
+            # self.max_seq_length). Maintain alignment between indices
+            # and targets.
+            in_window = indices < seq_len
+            indices = indices[in_window]
+            targets = targets[in_window]
+            K = len(indices)
+
+            # Pad to K_max
+            kf_indices_padded = np.zeros(K_max, dtype=np.int64)
+            kf_targets_padded = np.zeros((K_max, 6, 3), dtype=np.float32)
+            kf_mask = np.zeros(K_max, dtype=np.float32)
+            n = min(K, K_max)
+            kf_indices_padded[:n] = indices[:n]
+            kf_targets_padded[:n] = targets[:n]
+            kf_mask[:n] = 1.0
+
+            result["keyframe_indices"] = torch.from_numpy(kf_indices_padded)
+            result["keyframe_targets"] = torch.from_numpy(kf_targets_padded)
+            result["keyframe_mask"] = torch.from_numpy(kf_mask)
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
         if object_rotations is not None:

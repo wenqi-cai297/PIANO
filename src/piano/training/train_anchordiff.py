@@ -306,8 +306,14 @@ def build_anchordiff_step_fn(
         obj_pos_world: Tensor,
         obj_rot_world: Tensor,
     ) -> Tensor:
+        # Base components (COM 3 + rot6d 6 = 9). Append 5 anchor world
+        # coords (15) when object_traj_dim>=24 (v4b+ models). Final size
+        # check is permissive for v8 path which adds 19 more dims (18
+        # keyjoint pos + 1 indicator) externally.
         components = [obj_com, obj_rot6d]
-        if object_traj_dim == 24:
+        # v8 (object_traj_dim=43) and v4b-v7 (24) both want anchor_world.
+        # v1-v3 (object_traj_dim=9) skip it.
+        if object_traj_dim >= 24:
             target_world = lift_object_local_to_world(
                 contact_target_xyz,
                 obj_pos_world,
@@ -315,10 +321,13 @@ def build_anchordiff_step_fn(
             ).reshape(obj_com.shape[0], obj_com.shape[1], -1)
             components.append(target_world)
         out = torch.cat(components, dim=-1)
-        if out.shape[-1] != object_traj_dim:
-            raise ValueError(
-                f"object_traj_dim={object_traj_dim} but built {out.shape[-1]} dims"
-            )
+        # Strict equality only for non-keyframed reps; v8 adds 19 more
+        # dims externally so its base build returns 24, not 43.
+        if motion_representation != "smpl_pose_135_keyframed":
+            if out.shape[-1] != object_traj_dim:
+                raise ValueError(
+                    f"object_traj_dim={object_traj_dim} but built {out.shape[-1]} dims"
+                )
         return out
 
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
@@ -349,6 +358,7 @@ def build_anchordiff_step_fn(
             "joints22_world",
             "joints22_world_with_rot6d",
             "smpl_pose_135",
+            "smpl_pose_135_keyframed",
         }:
             R_y = T_xz_canon = T_y_canon = None
         else:
@@ -356,24 +366,55 @@ def build_anchordiff_step_fn(
                 f"Unsupported motion_representation={motion_representation!r}"
             )
 
+        # --- v8 keyframed: zero contact_target_xyz at non-keyframe frames
+        # to drop per-frame spatial conditioning. Semantic z_int channels
+        # (contact_state, phase, support) stay; spatial keyframe info is
+        # appended to object_traj only at keyframe frames below.
+        contact_target_xyz_for_z = contact_target_xyz
+        if motion_representation == "smpl_pose_135_keyframed":
+            kf_indices_z = batch["keyframe_indices"].to(device)        # (B, K_MAX)
+            kf_mask_z = batch["keyframe_mask"].to(device).bool()       # (B, K_MAX)
+            kf_frame_mask_z = torch.zeros(B, T, dtype=torch.bool, device=device)
+            valid_kf_z = kf_indices_z.clamp(min=0, max=T-1)
+            kf_frame_mask_z.scatter_(1, valid_kf_z, torch.ones_like(valid_kf_z, dtype=torch.bool) & kf_mask_z)
+            # Zero contact_target_xyz at non-keyframe frames
+            contact_target_xyz_for_z = contact_target_xyz * kf_frame_mask_z.unsqueeze(-1).unsqueeze(-1).float()
+
         # --- Pack z_int (training: GT contact + GT target + GT phase/support) ---
         phase_soft = _phase_to_softmax(phase, z_dims.phase_classes)
         support_soft = _support_to_softmax(support, z_dims.support_classes)
         z_int = pack_z_int(
-            contact_state, contact_target_xyz, phase_soft, support_soft, z_dims,
+            contact_state, contact_target_xyz_for_z, phase_soft, support_soft, z_dims,
         )                                                          # (B, T, total)
 
         # --- Object trajectory channel. v1-v4a use object pose only
         # (3 COM + 6 rot6d). v4b appends the five body-part anchor targets
         # already transformed into world frame (5 * 3), so Stage A's
         # predictor signal reaches the denoiser in task-space coordinates.
+        # v8 keyframed: appends 6-keyjoint positions only at keyframe
+        # frames + 1-D keyframe indicator (zero elsewhere).
         object_traj = _build_object_traj(
             obj_com=obj_com,
             obj_rot6d=obj_rot6d,
-            contact_target_xyz=contact_target_xyz,
+            contact_target_xyz=contact_target_xyz_for_z,
             obj_pos_world=obj_pos_world,
             obj_rot_world=obj_rot_world,
         )
+
+        if motion_representation == "smpl_pose_135_keyframed":
+            kf_targets_t = batch["keyframe_targets"].to(device).float() # (B, K_MAX, 6, 3)
+            # Build per-frame keyframe positions: (B, T, 6, 3), zero at
+            # non-keyframe frames, GT keyjoint positions at keyframe frames.
+            kf_per_frame = torch.zeros(B, T, 6, 3, device=device, dtype=kf_targets_t.dtype)
+            # scatter keyframe targets into the right frame indices
+            for b in range(B):
+                for k in range(kf_indices_z.shape[1]):
+                    if kf_mask_z[b, k]:
+                        kf_per_frame[b, kf_indices_z[b, k]] = kf_targets_t[b, k]
+            kf_per_frame_flat = kf_per_frame.view(B, T, 18)             # (B, T, 18)
+            kf_indicator = kf_frame_mask_z.float().unsqueeze(-1)        # (B, T, 1)
+            object_traj = torch.cat([object_traj, kf_per_frame_flat, kf_indicator], dim=-1)
+            # New object_traj dim = 24 + 18 + 1 = 43
 
         # --- Init pose: SMPL-22 frame 0 ---
         init_pose = joints[:, 0, :, :].reshape(B, -1)              # (B, 66)
@@ -432,7 +473,7 @@ def build_anchordiff_step_fn(
             # v6 (smpl_pose_135): 135-D output, first 132 = global_rot_6d,
             #   last 3 = root world translation. jpos derived by FK from
             #   rot_6d + per-clip rest_offsets + root_world.
-            if motion_representation == "smpl_pose_135":
+            if motion_representation in {"smpl_pose_135", "smpl_pose_135_keyframed"}:
                 from piano.training.smpl_kinematics import (
                     rotation_6d_to_matrix as _rot6d_to_mat,
                     fk_from_global_rotations as _fk_from_global,
@@ -447,6 +488,25 @@ def build_anchordiff_step_fn(
                 )                                                       # (B, T, 22, 3)
             else:
                 jpos_pred = x0_pred[..., :66].view(B, T, 22, 3)
+
+            # v8: anchor loss only at keyframe frames (sparse). Mask
+            # contact_state to 0 outside keyframe set so anchor sums
+            # only at those frames.
+            if motion_representation == "smpl_pose_135_keyframed":
+                kf_indices = batch["keyframe_indices"].to(device)      # (B, K_MAX)
+                kf_mask = batch["keyframe_mask"].to(device).bool()     # (B, K_MAX)
+                # Build (B, T) bool: True at keyframe frame indices
+                kf_frame_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+                # scatter kf_indices into the frame-mask wherever kf_mask is valid
+                valid_kf = kf_indices.clamp(min=0, max=T-1)
+                ones = torch.ones_like(valid_kf, dtype=torch.bool)
+                # For each batch element, mark valid keyframe positions
+                kf_frame_mask.scatter_(1, valid_kf, ones & kf_mask)
+                # Combine with seq_mask: only valid keyframes within valid frames
+                anchor_seq_mask = kf_frame_mask & seq_mask.bool()
+            else:
+                anchor_seq_mask = seq_mask.bool()
+
             anchor = anchor_consistency_loss_world_joints(
                 joints_world_pred=jpos_pred,
                 contact_state_gt=contact_state,
@@ -454,7 +514,7 @@ def build_anchordiff_step_fn(
                 object_positions=obj_pos_world,
                 object_rotations=obj_rot_world,
                 cfg=anchor_cfg,
-                seq_mask=seq_mask.bool(),
+                seq_mask=anchor_seq_mask,
             )
 
         geom = compute_motion_geometric_losses(
@@ -471,7 +531,12 @@ def build_anchordiff_step_fn(
         #   root jitter. Both are valid temporal smoothness terms.
         if (
             motion_representation
-            in {"joints22_world", "joints22_world_with_rot6d", "smpl_pose_135"}
+            in {
+                "joints22_world",
+                "joints22_world_with_rot6d",
+                "smpl_pose_135",
+                "smpl_pose_135_keyframed",
+            }
             and world_joint_velocity_weight > 0.0
         ):
             if motion_representation == "joints22_world_with_rot6d":
@@ -508,18 +573,13 @@ def build_anchordiff_step_fn(
                 seq_mask=seq_mask,
             )
 
-        # Full-body L_pos (v7): MSE between FK-derived predicted joints
-        # and GT joints_22, all 22 joints × all valid frames. This is
-        # the dense temporal supervision that forces the model to track
-        # GT cyclic dynamics (gait, arm-swing) rather than collapsing to
-        # the trivial 'frozen pose + root translation' attractor.
-        # Mirrors MDM Eq. 3 (Tevet et al. ICLR 2023) — the loss the
-        # released MDM HumanML3D config disables but HumanAct12/Babel
-        # configs use at lambda=1.0. We apply only on smpl_pose_135 path
-        # (v7) where 'jpos_pred' is already FK-derived above (line 444).
+        # Full-body L_pos (v7+): MSE between FK-derived predicted joints
+        # and GT joints_22, all 22 joints × all valid frames. Dense
+        # temporal supervision (MDM Eq. 3, Tevet et al. ICLR 2023).
+        # Active for v7 (smpl_pose_135) and v8 (smpl_pose_135_keyframed).
         loss_pos_full = torch.zeros((), device=device, dtype=x0_pred.dtype)
         if (
-            motion_representation == "smpl_pose_135"
+            motion_representation in {"smpl_pose_135", "smpl_pose_135_keyframed"}
             and pos_loss_weight > 0.0
         ):
             joints_gt = joints.float()                                    # (B, T, 22, 3)
