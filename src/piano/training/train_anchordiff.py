@@ -492,6 +492,7 @@ def build_anchordiff_step_fn(
             # v8: anchor loss only at keyframe frames (sparse). Mask
             # contact_state to 0 outside keyframe set so anchor sums
             # only at those frames.
+            stability_mask_v8 = None
             if motion_representation == "smpl_pose_135_keyframed":
                 kf_indices = batch["keyframe_indices"].to(device)      # (B, K_MAX)
                 kf_mask = batch["keyframe_mask"].to(device).bool()     # (B, K_MAX)
@@ -504,6 +505,17 @@ def build_anchordiff_step_fn(
                 kf_frame_mask.scatter_(1, valid_kf, ones & kf_mask)
                 # Combine with seq_mask: only valid keyframes within valid frames
                 anchor_seq_mask = kf_frame_mask & seq_mask.bool()
+
+                # v8 rule B: per-frame per-bodypart contact stability
+                # factor in [0,1]. Frames where contact_state is
+                # ambiguous (rolling-mean ≈ 0.5) get factor → 0,
+                # downweighting the anchor pull on flickering hands.
+                from piano.data.contact_postprocess import (
+                    compute_contact_stability_mask_torch,
+                )
+                stability_mask_v8 = compute_contact_stability_mask_torch(
+                    contact_state, window=15,
+                )                                                       # (B, T, P)
             else:
                 anchor_seq_mask = seq_mask.bool()
 
@@ -515,6 +527,7 @@ def build_anchordiff_step_fn(
                 object_rotations=obj_rot_world,
                 cfg=anchor_cfg,
                 seq_mask=anchor_seq_mask,
+                stability_mask=stability_mask_v8,
             )
 
         geom = compute_motion_geometric_losses(

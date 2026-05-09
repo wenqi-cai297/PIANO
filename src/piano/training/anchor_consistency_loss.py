@@ -165,8 +165,14 @@ def _anchor_l2_from_world_joints(
     object_rotations: Tensor,       # (B, T, 3)
     cfg: AnchorConsistencyConfig,
     seq_mask: Tensor | None = None,
+    stability_mask: Tensor | None = None,   # (B, T, P) v8 rule B
 ) -> Tensor:
-    """Core world-frame anchor loss once predicted joints are available."""
+    """Core world-frame anchor loss once predicted joints are available.
+
+    v8 rule B: ``stability_mask`` (B, T, P) downweights anchor at frames
+    where contact_state is ambiguous (rolling-mean of contact_state ≈ 0.5).
+    Computed via ``contact_postprocess.compute_contact_stability_mask_torch``.
+    """
     target_world = lift_object_local_to_world(
         contact_target_xyz_local, object_positions, object_rotations,
     )                                                              # (B, T, P, 3)
@@ -187,6 +193,8 @@ def _anchor_l2_from_world_joints(
     contact_mask = contact_mask * part_w
     if seq_mask is not None:
         contact_mask = contact_mask * seq_mask.unsqueeze(-1).float()
+    if stability_mask is not None:
+        contact_mask = contact_mask * stability_mask.to(contact_mask.dtype)
 
     denom = contact_mask.sum().clamp_min(1.0)
     return cfg.weight * (l2 * contact_mask).sum() / denom
@@ -200,12 +208,16 @@ def anchor_consistency_loss_world_joints(
     object_rotations: Tensor,       # (B, T, 3)
     cfg: AnchorConsistencyConfig,
     seq_mask: Tensor | None = None,
+    stability_mask: Tensor | None = None,
 ) -> Tensor:
     """Anchor consistency for HOI-native world-frame joint predictions.
 
     AnchorDiff v4 predicts flattened world-frame SMPL-22 joints directly,
     so the loss can skip ``recover_from_ric`` and the per-clip
     canonical-to-world lift used by the ``motion_263`` branch.
+
+    v8 rule B: ``stability_mask`` (B, T, P) optionally downweights
+    anchor at frames where contact_state is ambiguous (flickering).
     """
     return _anchor_l2_from_world_joints(
         joints_world_pred=joints_world_pred,
@@ -215,6 +227,7 @@ def anchor_consistency_loss_world_joints(
         object_rotations=object_rotations,
         cfg=cfg,
         seq_mask=seq_mask,
+        stability_mask=stability_mask,
     )
 
 

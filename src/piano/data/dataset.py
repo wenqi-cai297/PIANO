@@ -329,6 +329,21 @@ class HOIDataset(Dataset):
         label_path = self.pseudo_label_dir / f"{seq_id}.npz"
         labels = self._load_pseudo_labels(label_path, seq_len)
 
+        # v8 Rule C: zero hand contact when support==sitting + pelvis
+        # has stable contact (sofa-sit incidental armrest contact that
+        # would otherwise flicker as hands raise/lower). Applied to
+        # contact_state before any downstream use (z_int packing,
+        # anchor loss). Identical logic to keyframe_extraction so
+        # offline keyframes and online conditioning stay consistent.
+        if (
+            labels.get("contact_state") is not None
+            and labels.get("support") is not None
+        ):
+            from piano.data.contact_postprocess import suppress_sitting_hand_contact
+            labels["contact_state"] = suppress_sitting_hand_contact(
+                labels["contact_state"], labels["support"],
+            )
+
         # --- Pad or truncate to max_seq_length ---
         motion_263 = self._pad_or_truncate(motion_263, self.max_seq_length)
         joints = self._pad_or_truncate(joints, self.max_seq_length)

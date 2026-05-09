@@ -32,6 +32,8 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
+from piano.data.contact_postprocess import suppress_sitting_hand_contact
+
 
 # Body parts: SMPL-22 indices for the 6 keyjoints we track in v8.
 # Order: root, L_hand, R_hand, L_foot, R_foot, head.
@@ -44,6 +46,13 @@ K_MAX: int = 12
 CONTACT_THRESHOLD: float = 0.5
 POSE_PEAK_MIN_DISTANCE: int = 15
 POSE_DIFF_SMOOTH_WIN: int = 5
+
+# Rule A: contact-state stability gate window (frames). Transitions
+# are detected on the rolling-mean smoothed contact_state instead of
+# the raw value, so single-frame flickers (and short repeated
+# raise/lower cycles) don't generate keyframes.
+CONTACT_STABILITY_WINDOW: int = 15
+CONTACT_STABILITY_THRESHOLD: float = 0.7
 
 
 def select_keyframes(
@@ -64,17 +73,22 @@ def select_keyframes(
 
     last_frame = T_eff - 1
 
-    # Step 1: contact-change frames (any of 5 body parts crossing threshold).
+    # Step 1: contact-change frames (rule A — stability gate).
+    # Use rolling-mean smoothed contact_state (window=15 frames) and
+    # require >70% in-window to count as "stable contact". This filters
+    # out single-frame flickers and short repeated raise/lower cycles
+    # that would otherwise produce many spurious keyframe boundaries.
     boundary_set: set[int] = set()
-    for bp_idx in range(contact_state.shape[1]):
-        cs = contact_state[:T_eff, bp_idx] >= CONTACT_THRESHOLD
-        # transitions: indices where cs[t] != cs[t-1]; use diff
-        if T_eff < 2:
-            continue
-        cs_int = cs.astype(np.int8)
-        diff = np.diff(cs_int)
-        for t in np.nonzero(diff != 0)[0]:
-            boundary_set.add(int(t + 1))   # change happens at frame t+1
+    if T_eff >= 2:
+        for bp_idx in range(contact_state.shape[1]):
+            cs_raw = (contact_state[:T_eff, bp_idx] >= CONTACT_THRESHOLD).astype(np.float32)
+            cs_smooth = uniform_filter1d(
+                cs_raw, size=CONTACT_STABILITY_WINDOW, mode="nearest",
+            )
+            cs_stable = (cs_smooth >= CONTACT_STABILITY_THRESHOLD).astype(np.int8)
+            diff = np.diff(cs_stable)
+            for t in np.nonzero(diff != 0)[0]:
+                boundary_set.add(int(t + 1))   # change happens at frame t+1
 
     # Step 2: pose-change-rate peaks
     diffs = np.linalg.norm(
@@ -163,7 +177,16 @@ def extract_for_subset(
             joints = md["joints_22"]                     # (T, 22, 3)
             ld = np.load(label_path, allow_pickle=False)
             contact_state = ld["contact_state"]          # (T, 5)
+            support = ld["support"] if "support" in ld.files else None
             seq_len = min(len(joints), len(contact_state))
+
+            # Rule C: zero hand contact when support==sitting + pelvis
+            # has stable contact. Applied BEFORE keyframe selection so
+            # rule A's stability gate sees the corrected contact_state.
+            contact_state = suppress_sitting_hand_contact(
+                contact_state[:seq_len], support[:seq_len] if support is not None else None,
+            )
+
             indices, targets = select_keyframes(
                 joints, contact_state, seq_len=seq_len,
             )
