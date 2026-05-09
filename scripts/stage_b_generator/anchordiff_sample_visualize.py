@@ -235,9 +235,14 @@ def main() -> None:
         with torch.no_grad():
             x0_sample = model.sample(cond=cond, seq_length=T_full, cfg_scale=args.cfg_scale)
         # Recover joints. v1-v3 output motion_263 and need recover/lift;
-        # v4 outputs flattened world-frame joints directly.
+        # v4 outputs flattened world-frame joints directly;
+        # v5 (joints22_world_with_rot6d) outputs 198-D = (jpos: 66, rot_6d: 132),
+        # we just take the jpos sub-vector for visualization (rot_6d would need
+        # FK + bone_offsets to render; jpos is already world XYZ).
         if motion_representation == "joints22_world":
             joints_pred_world_t = x0_sample.view(1, T_full, 22, 3)
+        elif motion_representation == "joints22_world_with_rot6d":
+            joints_pred_world_t = x0_sample[..., :66].view(1, T_full, 22, 3)
         else:
             canon_pred = lift_motion263_to_joints(x0_sample)          # (1, T, 22, 3)
             canon_gt = lift_motion263_to_joints(motion_gt)
