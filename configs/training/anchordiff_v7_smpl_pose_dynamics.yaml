@@ -1,0 +1,148 @@
+# PIANO-AnchorDiff v7: v6 SMPL pose-space + MDM-style L_pos full-body
+# (per-frame all-22-joint MSE between FK output and GT joints).
+#
+# v6 design (rep change to 135-D = global rot 6D + root) successfully
+# enforces skeletal geometry. But visual review shows v6 generates
+# 'frozen pose + root translation' — the body moves to contact targets
+# but inner joints (legs, arms) don't cycle (no gait, no arm-swing).
+#
+# Diagnosis: anchor loss is sparse (contact joints × contact frames),
+# L_simple's per-dim MSE on 132 rotation channels gets diluted, so the
+# trivial 'frozen + translate' solution is a low-loss attractor for the
+# absolute-rep motion vector.
+#
+# Fix: MDM Eq. 3 (Tevet et al. ICLR 2023) full-body L_pos on FK output
+# vs GT joints_22. Forces the model to track GT joint trajectories at
+# every joint, every frame — the dense temporal supervision missing in
+# v6. Lambda chosen so L_pos dominates the gradient budget over anchor.
+#
+# Design doc:
+#   analyses/2026-05-09_anchordiff_v6_smpl_pose_design.md (rep)
+#   chat 2026-05-09 turn re: 'dynamics absent' (this loss config)
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  denoiser:
+    motion_dim: 135               # = 22*6 (global rot 6D) + 3 (root world)
+    object_traj_dim: 24           # COM 3 + rot6d 6 + 5 anchors * 3
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  # v7 first run uses v18 labels (matches v6 baseline for direct
+  # comparison of the L_pos effect). v19 labels can be plugged in later
+  # via config override once v19 extraction completes for all 4 subsets.
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135"
+  force_world_frame: true
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  # mirror_prob/rotate_around_y_prob must stay 0 for smpl_pose_135 rep
+  # (global rot 6D doesn't sync through current augment pipeline).
+  augmentation:
+    enabled: true
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null           # from scratch per user instruction
+  batch_size: 16
+  num_epochs: 80
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 5
+  val_best_key: "anchor_l2"
+
+loss:
+  # anchor_weight 5 -> 1: in v6, anchor=5 made 'satisfy contact' the
+  # primary objective and frozen-translate became a viable trivial
+  # solution. v7 puts dense full-body GT supervision at the helm; anchor
+  # is now a re-emphasis of contact joints but no longer dominates.
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false              # motion_263-only; v7 uses pos_loss_weight instead
+
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0    # not needed (FK is deterministic in 135-D rep)
+
+  # v7 NEW: MDM-style full-body L_pos (per-frame, all 22 joints).
+  # FK output 22 joints world XYZ vs GT joints_22, squared-L2 averaged.
+  # lambda=5 makes this loss dominate gradient over anchor (=1) and
+  # L_simple (=1) — dense temporal supervision is the primary task in v7.
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v7_smpl_pose_dynamics"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+
+output_dir: "runs/training/stageB_anchordiff_v7_smpl_pose_dynamics"

@@ -260,6 +260,7 @@ def build_anchordiff_step_fn(
     world_joint_velocity_weight: float = 0.0,
     object_traj_dim: int = 9,
     fk_consistency_weight: float = 0.0,
+    pos_loss_weight: float = 0.0,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -497,17 +498,42 @@ def build_anchordiff_step_fn(
             and fk_consistency_weight > 0.0
         ):
             from piano.training.anchordiff_v5_losses import fk_consistency_loss
-            jpos_pred = x0_pred[..., :66].view(B, T, 22, 3).float()
+            jpos_pred_v5 = x0_pred[..., :66].view(B, T, 22, 3).float()
             rot_6d_pred = x0_pred[..., 66:].view(B, T, 22, 6).float()
             rest_offsets = batch["rest_offsets"].to(device).float()        # (B, 22, 3)
             loss_fk = fk_consistency_loss(
-                jpos_pred=jpos_pred,
+                jpos_pred=jpos_pred_v5,
                 rot_6d_pred=rot_6d_pred,
                 rest_offsets=rest_offsets,
                 seq_mask=seq_mask,
             )
 
-        total = mse + anchor + geom["loss_geometric"] + fk_consistency_weight * loss_fk
+        # Full-body L_pos (v7): MSE between FK-derived predicted joints
+        # and GT joints_22, all 22 joints × all valid frames. This is
+        # the dense temporal supervision that forces the model to track
+        # GT cyclic dynamics (gait, arm-swing) rather than collapsing to
+        # the trivial 'frozen pose + root translation' attractor.
+        # Mirrors MDM Eq. 3 (Tevet et al. ICLR 2023) — the loss the
+        # released MDM HumanML3D config disables but HumanAct12/Babel
+        # configs use at lambda=1.0. We apply only on smpl_pose_135 path
+        # (v7) where 'jpos_pred' is already FK-derived above (line 444).
+        loss_pos_full = torch.zeros((), device=device, dtype=x0_pred.dtype)
+        if (
+            motion_representation == "smpl_pose_135"
+            and pos_loss_weight > 0.0
+        ):
+            joints_gt = joints.float()                                    # (B, T, 22, 3)
+            err = (jpos_pred.float() - joints_gt).pow(2).sum(-1)          # (B, T, 22)
+            denom = (seq_mask.sum() * 22).clamp_min(1.0)
+            loss_pos_full = (err * seq_mask.unsqueeze(-1).float()).sum() / denom
+
+        total = (
+            mse
+            + anchor
+            + geom["loss_geometric"]
+            + fk_consistency_weight * loss_fk
+            + pos_loss_weight * loss_pos_full
+        )
         return {
             "loss": total,
             "mse_x0": mse.detach(),
@@ -518,6 +544,7 @@ def build_anchordiff_step_fn(
             "loss_vel": geom["loss_vel"].detach(),
             "loss_foot": geom["loss_foot"].detach(),
             "loss_fk": loss_fk.detach(),
+            "loss_pos_full": loss_pos_full.detach(),
         }
 
     return step_fn
@@ -696,11 +723,13 @@ def main() -> None:
         cfg.loss.get("world_joint_velocity_weight", 0.0)
     )
     fk_consistency_weight = float(cfg.loss.get("fk_consistency_weight", 0.0))
+    pos_loss_weight = float(cfg.loss.get("pos_loss_weight", 0.0))
     accelerator.print(
         "Motion representation: "
         f"{motion_representation} "
         f"(world_joint_velocity_weight={world_joint_velocity_weight} "
-        f"fk_consistency_weight={fk_consistency_weight})",
+        f"fk_consistency_weight={fk_consistency_weight} "
+        f"pos_loss_weight={pos_loss_weight})",
     )
     if motion_representation == "joints22_world_with_rot6d":
         if int(cfg.model.denoiser.motion_dim) != 198:
@@ -780,6 +809,7 @@ def main() -> None:
         world_joint_velocity_weight=world_joint_velocity_weight,
         object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
         fk_consistency_weight=fk_consistency_weight,
+        pos_loss_weight=pos_loss_weight,
     )
 
     # --- Smoke test: one batch through forward + backward ---
@@ -795,7 +825,8 @@ def main() -> None:
             f"pos={out['loss_pos'].item():.4f}  "
             f"vel={out['loss_vel'].item():.4f}  "
             f"foot={out['loss_foot'].item():.4f}  "
-            f"fk={out.get('loss_fk', torch.zeros(())).item():.4f}"
+            f"fk={out.get('loss_fk', torch.zeros(())).item():.4f}  "
+            f"pos_full={out.get('loss_pos_full', torch.zeros(())).item():.4f}"
         )
         accelerator.backward(out["loss"])
         optimizer.step()
