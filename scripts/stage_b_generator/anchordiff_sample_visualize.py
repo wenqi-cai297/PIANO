@@ -69,6 +69,16 @@ def main() -> None:
     parser.add_argument("--clips", type=str, nargs="+", required=True,
                         help="subset:index_or_seq_id, e.g. chairs:0")
     parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--replacement", type=str, default="none",
+                        choices=["none", "x0", "x_t"],
+                        help="legacy v9_3 sampler replacement ablation")
+    parser.add_argument("--output-skip", type=str, default="auto",
+                        choices=["auto", "true", "false"],
+                        help="v9_4 hard-observation output skip override")
+    parser.add_argument("--v9-keyframes", type=int, default=8,
+                        help="v9 (smpl_pose_135_condmdi) only: number of "
+                             "evenly-spaced GT keyframes used as inpainting "
+                             "anchors at inference. Set to <=0 to disable.")
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--dpi", type=int, default=80)
     parser.add_argument("--post-anchor-translate-strength", type=float, default=0.0)
@@ -104,6 +114,22 @@ def main() -> None:
         text_dim=int(cfg.model.denoiser.text_dim),
         object_token_dim=int(cfg.model.denoiser.object_token_dim),
         object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
+        cond_motion_dim=int(cfg.model.denoiser.get("cond_motion_dim", 0)),
+        cond_motion_output_skip=bool(cfg.model.denoiser.get("cond_motion_output_skip", False)),
+        cfg_drop_cond_motion=bool(cfg.model.denoiser.get("cfg_drop_cond_motion", False)),
+        cond_motion_xt_inject=bool(cfg.model.denoiser.get("cond_motion_xt_inject", False)),
+        use_interaction_plan=bool(cfg.model.denoiser.get("use_interaction_plan", False)),
+        plan_k_max=int(cfg.model.denoiser.get("plan_k_max", 12)),
+        plan_s_max=int(cfg.model.denoiser.get("plan_s_max", 12)),
+        plan_num_anchor_types=int(cfg.model.denoiser.get("plan_num_anchor_types", 5)),
+        plan_num_parts=int(cfg.model.denoiser.get("plan_num_parts", 5)),
+        plan_use_segment_tokens=bool(cfg.model.denoiser.get("plan_use_segment_tokens", False)),
+        plan_use_context_hint=bool(cfg.model.denoiser.get("plan_use_context_hint", True)),
+        plan_d_hint=int(cfg.model.denoiser.get("plan_d_hint", 32)),
+        plan_d_time_embed=int(cfg.model.denoiser.get("plan_d_time_embed", 64)),
+        cfg_drop_plan=bool(cfg.model.denoiser.get("cfg_drop_plan", False)),
+        plan_per_part_tokens=bool(cfg.model.denoiser.get("plan_per_part_tokens", False)),
+        plan_context_hint_mode=str(cfg.model.denoiser.get("plan_context_hint_mode", "time_only")),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -114,6 +140,7 @@ def main() -> None:
     diff_cfg = DiffusionConfig(
         num_steps=int(cfg.model.diffusion.num_steps),
         schedule=str(cfg.model.diffusion.schedule),
+        prediction_target=str(cfg.model.diffusion.get("prediction_target", "x0")),
     )
     model = MotionAnchorDiff(AnchorDiffConfig(
         diffusion=diff_cfg, denoiser=denoiser_cfg,
@@ -199,20 +226,45 @@ def main() -> None:
 
         T_full = motion_gt.shape[1]
 
-        # Pack GT z_int
+        # v8 keyframed: zero contact_target_xyz at non-keyframe frames
+        # and append per-frame keyframe-positions + indicator to
+        # object_traj. Mirror of train_anchordiff Stage 2 conditioning.
+        contact_target_xyz_for_z = contact_target_xyz
+        kf_frame_mask_b = None
+        if motion_representation == "smpl_pose_135_keyframed":
+            kf_indices_b = batch["keyframe_indices"].to(device)        # (1, K_MAX)
+            kf_mask_b = batch["keyframe_mask"].to(device).bool()       # (1, K_MAX)
+            kf_targets_b = batch["keyframe_targets"].to(device).float() # (1, K_MAX, 6, 3)
+            kf_frame_mask_b = torch.zeros(1, T_full, dtype=torch.bool, device=device)
+            valid_kf_b = kf_indices_b.clamp(min=0, max=T_full-1)
+            kf_frame_mask_b.scatter_(1, valid_kf_b, torch.ones_like(valid_kf_b, dtype=torch.bool) & kf_mask_b)
+            contact_target_xyz_for_z = contact_target_xyz * kf_frame_mask_b.unsqueeze(-1).unsqueeze(-1).float()
+
+        # Pack GT z_int (v8 path uses the keyframe-zeroed contact_target_xyz)
         import torch.nn.functional as F
         phase_soft = F.one_hot(phase.clamp_min(0).long(), num_classes=z_dims.phase_classes).float()
         support_soft = F.one_hot(support.clamp_min(0).long(), num_classes=z_dims.support_classes).float()
-        z_int = pack_z_int(contact_state, contact_target_xyz, phase_soft, support_soft, z_dims)
+        z_int = pack_z_int(contact_state, contact_target_xyz_for_z, phase_soft, support_soft, z_dims)
         object_traj_parts = [obj_com, obj_rot6d]
-        if object_traj_dim == 24:
+        if object_traj_dim >= 24:
             target_world = lift_object_local_to_world(
-                contact_target_xyz,
+                contact_target_xyz_for_z,
                 obj_pos_world,
                 obj_rot_world,
             ).reshape(1, T_full, -1)
             object_traj_parts.append(target_world)
         object_traj = torch.cat(object_traj_parts, dim=-1)
+
+        if motion_representation == "smpl_pose_135_keyframed":
+            # Append (per-frame keyjoint positions: 18) + (indicator: 1) = 19
+            kf_per_frame = torch.zeros(1, T_full, 6, 3, device=device, dtype=kf_targets_b.dtype)
+            for k in range(kf_indices_b.shape[1]):
+                if kf_mask_b[0, k]:
+                    kf_per_frame[0, kf_indices_b[0, k]] = kf_targets_b[0, k]
+            kf_per_frame_flat = kf_per_frame.view(1, T_full, 18)
+            kf_indicator = kf_frame_mask_b.float().unsqueeze(-1)
+            object_traj = torch.cat([object_traj, kf_per_frame_flat, kf_indicator], dim=-1)
+
         if object_traj.shape[-1] != object_traj_dim:
             raise ValueError(
                 f"object_traj_dim={object_traj_dim} but built {object_traj.shape[-1]}"
@@ -230,10 +282,54 @@ def main() -> None:
             "object_tokens": obj_tokens,
         }
 
+        # v10 plan-tokens: thread the GT-compiled InteractionPlan through
+        # cond. The dataset has already compiled it in __getitem__ for
+        # smpl_pose_135_plan (per piano_interaction_plan_pipeline_reframe).
+        if motion_representation == "smpl_pose_135_plan":
+            plan_keys = [
+                "anchor_time", "anchor_part", "anchor_target_local",
+                "anchor_target_world", "anchor_type", "anchor_phase",
+                "anchor_support", "anchor_conf", "anchor_mask",
+                "segment_start", "segment_end", "segment_part",
+                "segment_target_summary_local", "segment_phase",
+                "segment_support", "segment_conf", "segment_mask",
+            ]
+            cond["interaction_plan"] = {
+                k: batch[f"plan_{k}"].to(device) for k in plan_keys
+            }
+
+        # v9 CondMDI: provide clean GT motion at evenly-spaced keyframes
+        # as the inpainting condition. At inference proper this would be
+        # replaced by Stage-1 predicted keyframes; for the visual sanity
+        # check we use GT keyframes to validate the inpainting path itself.
+        if motion_representation == "smpl_pose_135_condmdi":
+            K_inf = max(0, int(args.v9_keyframes))
+            kf_obs_mask = torch.zeros(1, T_full, device=device, dtype=motion_gt.dtype)
+            if K_inf > 0 and seq_len > 0:
+                K_eff = min(K_inf, seq_len)
+                # Evenly-spaced indices including frame 0 and frame seq_len-1
+                # so the model sees a clean start + end pose.
+                idx = torch.linspace(0, seq_len - 1, K_eff, device=device).round().long()
+                idx = torch.unique(idx)
+                kf_obs_mask[0, idx] = 1.0
+            cond_motion_inf = motion_gt * kf_obs_mask.unsqueeze(-1)
+            cond["cond_motion_input"] = torch.cat(
+                [cond_motion_inf, kf_obs_mask.unsqueeze(-1)], dim=-1,
+            )
+
         # Sample
         print(f"[{subset}/{seq_id}] T={seq_len}  sampling (1000 DDPM steps, cfg={args.cfg_scale})...")
         with torch.no_grad():
-            x0_sample = model.sample(cond=cond, seq_length=T_full, cfg_scale=args.cfg_scale)
+            output_skip_arg = (
+                None if args.output_skip == "auto"
+                else (args.output_skip == "true")
+            )
+            x0_sample = model.sample(
+                cond=cond, seq_length=T_full,
+                cfg_scale=args.cfg_scale,
+                replacement=args.replacement,
+                output_skip=output_skip_arg,
+            )
         # Recover joints. v1-v3 output motion_263 and need recover/lift;
         # v4 outputs flattened world-frame joints directly;
         # v5 (joints22_world_with_rot6d) outputs 198-D = (jpos: 66, rot_6d: 132),
@@ -244,7 +340,15 @@ def main() -> None:
             joints_pred_world_t = x0_sample.view(1, T_full, 22, 3)
         elif motion_representation == "joints22_world_with_rot6d":
             joints_pred_world_t = x0_sample[..., :66].view(1, T_full, 22, 3)
-        elif motion_representation == "smpl_pose_135":
+        elif motion_representation in (
+            "smpl_pose_135",
+            "smpl_pose_135_keyframed",
+            "smpl_pose_135_condmdi",
+            "smpl_pose_135_plan",
+        ):
+            # v6 / v8 / v9: 135-D = (rot_6d 132, root_world 3) — same FK decode.
+            # Conditioning differs (none / sparse keyframes / CondMDI inpainting)
+            # but the output rep is identical so we use the same FK path.
             from piano.training.smpl_kinematics import (
                 rotation_6d_to_matrix as _rot6d_to_mat,
                 fk_from_global_rotations as _fk_from_global,

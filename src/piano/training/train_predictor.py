@@ -226,6 +226,8 @@ def _build_dataset(
             max_seq_length=cfg.data.max_seq_length,
             object_id_filter=split_info["object_id_filter"],
             subject_id_filter=split_info["subject_id_filter"],
+            subsample_n_per_object=cfg.data.get("subsample_n_per_object", None),
+            subsample_seed=int(cfg.data.get("subsample_seed", 42)),
             augment=augment,
             # v9.1: collapse hand_support → both_feet at dataloader.
             support_collapse_hand_support=bool(

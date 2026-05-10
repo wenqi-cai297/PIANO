@@ -1,0 +1,136 @@
+# V9.2_obs_loss (one-clip overfit, λ_obs=5.0).
+#
+# Per claude_code_v9_condmdi_diagnostic_next_steps.md §7:
+# > Make observed-frame supervision explicit. Current v9 uses one MSE
+# > over all valid frames. This gives gradients everywhere, but it does
+# > not create a strong, separate copy/reconstruction pressure on
+# > observed frames. Observed frames are sparse and can be diluted by
+# > unobserved frames.
+#
+# Single-variable change vs v9_1_clean_x0_overfit:
+#   loss.cond_motion_keyframe_weight: 0.0 → 5.0
+#
+# v9_1 diagnostic on 2026-05-10 confirmed: model ignores cond_motion.
+# Output deltas across {GT, zeros, shuffled, wrong_clip, reversed} are
+# all < 0.01 in motion-135 L2 — variant choice has no effect on output.
+# Adding the keyframe MSE term gives the model an explicit copy-gradient
+# at observed frames; condition sensitivity test on the resulting ckpt
+# is the success metric, not training loss.
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  denoiser:
+    motion_dim: 135
+    object_traj_dim: 24
+    cond_motion_dim: 136
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_condmdi"
+  force_world_frame: true
+  subsample_n_per_object: 10
+  subsample_seed: 42
+  overfit_n_clips: 1
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  init_checkpoint: null
+  batch_size: 1
+  num_epochs: 200
+  num_workers: 0
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 50
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 0
+  val_best_key: "anchor_l2"
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+  # v9_2 ADDITION: explicit observed-frame copy-gradient.
+  # 0.0 = single-MSE behavior (v9_1). 5.0 = middle of spec's recommended
+  # sweep {1, 5, 10}. Only active when motion_representation is
+  # 'smpl_pose_135_condmdi' AND value > 0.
+  cond_motion_keyframe_weight: 5.0      # ← THE ONLY DIFF VS V9_1
+
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v9_2_obs_loss_overfit"
+  log_every_n_steps: 10
+  save_every_n_epochs: 50
+
+output_dir: "runs/training/stageB_anchordiff_v9_2_obs_loss_overfit"

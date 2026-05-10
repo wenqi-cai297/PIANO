@@ -53,6 +53,9 @@ data:
   max_seq_length: 196
   support_collapse_hand_support: true
   motion_representation: "smpl_pose_135_keyframed"
+  # Method-validation subsampling: shared seed with Stage A v11 + Stage 2.
+  subsample_n_per_object: 10
+  subsample_seed: 42
 
   subject_split:
     enabled: true

@@ -162,6 +162,8 @@ class HOIDataset(Dataset):
         use_clean_metadata: bool = True,
         object_id_filter: set[str] | None = None,
         subject_id_filter: set[str] | None = None,
+        subsample_n_per_object: int | None = None,
+        subsample_seed: int = 42,
         augment: AugmentConfig | None = None,
         surface_obj_pose: bool = False,
         force_world_frame: bool = False,
@@ -211,16 +213,25 @@ class HOIDataset(Dataset):
             "joints22_world_with_rot6d",
             "smpl_pose_135",
             "smpl_pose_135_keyframed",
+            "smpl_pose_135_condmdi",
+            "smpl_pose_135_plan",
         }:
             raise ValueError(
                 "motion_representation must be one of "
                 "{motion_263, joints22_world, joints22_world_with_rot6d, "
-                "smpl_pose_135, smpl_pose_135_keyframed}, "
+                "smpl_pose_135, smpl_pose_135_keyframed, smpl_pose_135_condmdi, "
+                "smpl_pose_135_plan}, "
                 f"got {motion_representation!r}"
             )
         self.motion_representation = motion_representation
         self.keyframe_subdir = str(keyframe_subdir)
         self.keyframe_max_k = int(keyframe_max_k)
+        # InteractionPlan compiler config (lazily built in __getitem__ for
+        # the smpl_pose_135_plan branch). Attribute is None when not in
+        # plan mode so the lazy import + construction is paid only by the
+        # v10 plan-tokens path. See
+        # analyses/piano_interaction_plan_pipeline_reframe_for_claude_code.md.
+        self._interaction_plan_compiler_cfg = None
         # The 198-D (jpos+rot_6d) and 135-D (rot_6d+root) reps both contain
         # SMPL-22 global 6D rotations derived from raw smplx_poses. The
         # current ``_apply_augmentation`` rotates joints / motion_263 /
@@ -231,6 +242,8 @@ class HOIDataset(Dataset):
             "joints22_world_with_rot6d",
             "smpl_pose_135",
             "smpl_pose_135_keyframed",
+            "smpl_pose_135_condmdi",
+            "smpl_pose_135_plan",
         }:
             aug = augment or AugmentConfig()
             if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
@@ -255,6 +268,38 @@ class HOIDataset(Dataset):
         if not meta_path.exists():
             raise FileNotFoundError(f"metadata not found in {self.root}")
         metadata: list[dict] = load_json(meta_path)
+
+        # Method-validation subsampling (2026-05-09): randomly keep at
+        # most ``subsample_n_per_object`` clips per object_id from the
+        # full metadata. Applied BEFORE any train/val split so the same
+        # global subset is used by all dataset instances sharing the
+        # same ``subsample_seed``. Trims a 8.5K-clip pipeline to ~3K
+        # for fast iteration; switch off (set to None) for full-data
+        # production training.
+        if subsample_n_per_object is not None:
+            import numpy as _np
+            rng = _np.random.default_rng(int(subsample_seed))
+            by_obj: dict[str, list[dict]] = {}
+            for m in metadata:
+                by_obj.setdefault(str(m.get("object_id", "_unknown")), []).append(m)
+            sampled: list[dict] = []
+            for obj_id in sorted(by_obj.keys()):
+                entries = by_obj[obj_id]
+                if len(entries) <= subsample_n_per_object:
+                    sampled.extend(entries)
+                else:
+                    picked_idx = rng.choice(
+                        len(entries),
+                        size=int(subsample_n_per_object),
+                        replace=False,
+                    )
+                    sampled.extend(entries[i] for i in picked_idx)
+            print(
+                f"[HOIDataset] Subsampled {self.root.name}: "
+                f"{len(metadata)} -> {len(sampled)} clips "
+                f"({subsample_n_per_object} per object, seed={subsample_seed})"
+            )
+            metadata = sampled
 
         # Object-id split filter (legacy primary, now secondary —
         # used only by the novel-object ablation eval). Drops metadata
@@ -428,6 +473,8 @@ class HOIDataset(Dataset):
             "joints22_world_with_rot6d",
             "smpl_pose_135",
             "smpl_pose_135_keyframed",
+            "smpl_pose_135_condmdi",
+            "smpl_pose_135_plan",
         }:
             # v5 (joints22_world_with_rot6d) / v6 (smpl_pose_135) both need
             # un-augmented smplx_poses to compute global 6D rotations. Augment
@@ -488,6 +535,17 @@ class HOIDataset(Dataset):
                     ],
                     axis=-1,
                 ).astype(np.float32, copy=False)                # (max_T, 198)
+            elif self.motion_representation == "smpl_pose_135_plan":
+                # v10: same 135-D base as smpl_pose_135. The
+                # InteractionPlan is added below as separate batch fields.
+                root_world_pos = joints[:, 0, :].astype(np.float32)
+                motion = np.concatenate(
+                    [
+                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
+                        root_world_pos,
+                    ],
+                    axis=-1,
+                ).astype(np.float32, copy=False)                # (max_T, 135)
             else:
                 # v6 (smpl_pose_135): cat(global_rot_6d: 132, root_world_pos: 3) = 135-D
                 # joints[:, 0, :] is root world pos already in our preprocessing
@@ -518,6 +576,73 @@ class HOIDataset(Dataset):
         }
         if rest_offsets_np is not None:
             result["rest_offsets"] = torch.from_numpy(rest_offsets_np)
+
+        # ---------------------------------------------------------------
+        # InteractionPlan (v10 plan-tokens path)
+        # ---------------------------------------------------------------
+        # Compile a sparse interaction program from the dense
+        # pseudo-labels and surface as ``plan_*`` tensors. The compiler
+        # is deterministic given inputs + config (test_determinism in
+        # tests/test_interaction_plan_compiler.py), so caching on disk is
+        # not required for now — it adds < 1 ms per __getitem__ call on
+        # 196-frame clips.
+        if (
+            self.motion_representation == "smpl_pose_135_plan"
+            and padded_labels.get("contact_state") is not None
+            and padded_labels.get("contact_target_xyz") is not None
+            and padded_labels.get("phase") is not None
+            and padded_labels.get("support") is not None
+            and object_positions is not None
+            and object_rotations is not None
+        ):
+            from piano.data.interaction_plan_compiler import (
+                InteractionPlanCompilerConfig,
+                compile_interaction_plan,
+            )
+            if self._interaction_plan_compiler_cfg is None:
+                # Tied to default compiler hyperparameters (audited in
+                # analyses/2026-05-10_interaction_plan_compiler_audit.md).
+                # Number of phase / support classes derives from the
+                # pseudo-label set the dataset was constructed against.
+                num_phase = int(padded_labels["phase"].max()) + 1
+                num_phase = max(num_phase, 3)
+                # Support is collapsed to 3 in our v18+ ship label set.
+                num_support = 3
+                self._interaction_plan_compiler_cfg = InteractionPlanCompilerConfig(
+                    num_parts=int(padded_labels["contact_state"].shape[1]),
+                    num_phase_classes=num_phase,
+                    num_support_classes=num_support,
+                )
+
+            cfg_compile = self._interaction_plan_compiler_cfg
+
+            # Convert phase / support GT integer arrays to one-hot softmax
+            # of the same shape the compiler expects.
+            phase_int = padded_labels["phase"].astype(np.int64)
+            support_int = padded_labels["support"].astype(np.int64)
+            phase_softmax = np.zeros(
+                (len(phase_int), cfg_compile.num_phase_classes), dtype=np.float32,
+            )
+            support_softmax = np.zeros(
+                (len(support_int), cfg_compile.num_support_classes), dtype=np.float32,
+            )
+            phase_safe = np.clip(phase_int, 0, cfg_compile.num_phase_classes - 1)
+            support_safe = np.clip(support_int, 0, cfg_compile.num_support_classes - 1)
+            phase_softmax[np.arange(len(phase_int)), phase_safe] = 1.0
+            support_softmax[np.arange(len(support_int)), support_safe] = 1.0
+
+            plan = compile_interaction_plan(
+                contact_prob=padded_labels["contact_state"][:seq_len].astype(np.float32),
+                target_local=padded_labels["contact_target_xyz"][:seq_len].astype(np.float32),
+                phase_softmax=phase_softmax[:seq_len],
+                support_softmax=support_softmax[:seq_len],
+                object_pos_world=object_positions[:seq_len].astype(np.float32),
+                object_rot_world_aa=object_rotations[:seq_len].astype(np.float32),
+                seq_len=seq_len,
+                cfg=cfg_compile,
+            )
+            for k, v in plan.items():
+                result[f"plan_{k}"] = torch.from_numpy(v)
         # v8 hierarchical: load offline-precomputed keyframes for the
         # keyframed motion representation. Stage 1 uses these as
         # supervision targets; Stage 2 uses them as sparse condition.

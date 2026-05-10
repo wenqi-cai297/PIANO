@@ -1,21 +1,33 @@
-# V8 Stage 2: Motion generator — diffusion conditioned on sparse
-# keyframes + object trajectory + semantic z_int (no per-frame spatial
-# anchor conditioning, mode-averaging fix from v7).
+# V9.2: CondMDI two-term loss + x_0-prediction.
 #
-# Stage 2 conditioning changes vs v7:
-#   - contact_target_xyz inside z_int is ZEROED at non-keyframe frames
-#     (= no per-frame spatial anchor pulling each frame to a "plausible
-#       pose for current contact target")
-#   - object_traj is extended from 24-D to 43-D = 24 + 18 (6 keyjoint
-#     positions, only at keyframe frames) + 1 (keyframe indicator).
-#   - Anchor loss applies ONLY at keyframe frames (sparse, K=5-12)
+# Addresses the two root causes localised by the 2026-05-10 sanity
+# battery (analyses/2026-05-10_v9_sanity_check_results.md):
 #
-# Stage 2 inherits v7's architecture + L_pos full-body (dense temporal
-# supervision via GT joints, NOT via per-frame spatial conditioning).
-# Trained from scratch (cannot warm-start v7 — conditioning shape changes).
+# 1. v-prediction was making inference reconstruction brittle on small
+#    data. Step 3 (one-clip overfit, 200 ep) showed training loss
+#    oscillating 8-140 across consecutive epochs with no convergence,
+#    and inference err 161 cm on the training clip. Fix: switch back
+#    to x_0-pred (the field-standard for motion diffusion).
 #
-# Training uses GT keyframes (from offline pass). Inference uses Stage 1
-# predicted keyframes (separate script).
+# 2. Single MSE over all valid frames gave the model no explicit
+#    gradient to *copy* cond_motion at observed frames. Step 4
+#    (all-observed test) showed 80-160 cm joint err even when the
+#    model was given GT motion as full cond_motion + obs_mask=1
+#    everywhere. Fix: split the MSE into two terms matching the
+#    CondMDI reference impl (`setarehc/diffusion-motion-inbetweening`):
+#      L_main = MSE over (obs_mask == 0) frames     # generation
+#      L_kf   = MSE over (obs_mask == 1) frames     # copy gradient
+#      L      = L_main + λ_kf · L_kf
+#
+# All other v9 changes preserved:
+#   - smpl_pose_135_condmdi rep
+#   - cond_motion_dim = 136 (motion 135 + obs_mask 1)
+#   - random K∈[3,12] keyframes per training step
+#   - object_traj_dim = 24
+#   - anchor loss on all valid frames
+#
+# Trained from scratch (loss-shape change + prediction_target change
+# both invalidate v9 ckpt warmstart).
 
 model:
   cfg_drop_prob: 0.15
@@ -23,6 +35,7 @@ model:
   diffusion:
     num_steps: 1000
     schedule: "cosine"
+    prediction_target: "x0"          # ← change vs v9
 
   z_int:
     num_parts: 5
@@ -30,8 +43,9 @@ model:
     support_classes: 3
 
   denoiser:
-    motion_dim: 135               # 22*6 (global rot 6D) + 3 (root world)
-    object_traj_dim: 43           # 24 + 18 keyjoint pos + 1 indicator
+    motion_dim: 135
+    object_traj_dim: 24
+    cond_motion_dim: 136
     init_pose_dim: 66
     text_dim: 512
     object_token_dim: 256
@@ -65,9 +79,8 @@ data:
   pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
   max_seq_length: 196
   support_collapse_hand_support: true
-  motion_representation: "smpl_pose_135_keyframed"
+  motion_representation: "smpl_pose_135_condmdi"
   force_world_frame: true
-  # Method-validation subsampling: shared seed with Stage A v11 + Stage 1.
   subsample_n_per_object: 10
   subsample_seed: 42
 
@@ -84,7 +97,7 @@ data:
     pc_jitter_std: 0.005
 
 training:
-  init_checkpoint: null           # from scratch
+  init_checkpoint: null
   batch_size: 16
   num_epochs: 80
   num_workers: 4
@@ -104,9 +117,14 @@ training:
   val_best_key: "anchor_l2"
 
 loss:
-  # Anchor only at keyframe frames (sparse). λ matches v7 (1.0).
   anchor_weight: 1.0
   contact_threshold: 0.5
+
+  # CondMDI two-term loss (v9.2 ADDITION):
+  # Train-time only, only when cond_motion_dim > 0 in the model. The
+  # train_anchordiff step_fn splits the diffusion MSE on the obs_mask:
+  # main term over (mask==0), keyframes term over (mask==1).
+  cond_motion_keyframe_weight: 1.0   # ← new; λ_kf
 
   motion_feature_weights:
     root_rot_vel: 1.0
@@ -124,12 +142,12 @@ loss:
 
   world_joint_velocity_weight: 1.0
   fk_consistency_weight: 0.0
-  pos_loss_weight: 5.0            # MDM L_pos full-body, dense temporal supervision
+  pos_loss_weight: 5.0
 
 logging:
   project: "piano"
-  run_name: "stageB_anchordiff_v8_stage2_motion_generator"
+  run_name: "stageB_anchordiff_v9_2_condmdi_two_term"
   log_every_n_steps: 50
   save_every_n_epochs: 5
 
-output_dir: "runs/training/stageB_anchordiff_v8_stage2_motion_generator"
+output_dir: "runs/training/stageB_anchordiff_v9_2_condmdi_two_term"

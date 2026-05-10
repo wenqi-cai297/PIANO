@@ -89,6 +89,8 @@ def main() -> None:
                 cfg.data.get("support_collapse_hand_support", True)
             ),
             motion_representation="smpl_pose_135_keyframed",
+            subsample_n_per_object=cfg.data.get("subsample_n_per_object", None),
+            subsample_seed=int(cfg.data.get("subsample_seed", 42)),
         )
         train_datasets.append(HOIDataset(subject_id_filter=train_subj, **common))
         val_datasets.append(HOIDataset(subject_id_filter=val_subj, **common))

@@ -1,21 +1,31 @@
-# V8 Stage 2: Motion generator — diffusion conditioned on sparse
-# keyframes + object trajectory + semantic z_int (no per-frame spatial
-# anchor conditioning, mode-averaging fix from v7).
+# V9.1: CondMDI keyframe-inpainting + **x_0-prediction** (v-pred isolation).
 #
-# Stage 2 conditioning changes vs v7:
-#   - contact_target_xyz inside z_int is ZEROED at non-keyframe frames
-#     (= no per-frame spatial anchor pulling each frame to a "plausible
-#       pose for current contact target")
-#   - object_traj is extended from 24-D to 43-D = 24 + 18 (6 keyjoint
-#     positions, only at keyframe frames) + 1 (keyframe indicator).
-#   - Anchor loss applies ONLY at keyframe frames (sparse, K=5-12)
+# Diagnostic for the v9 visual failure (frantic spinning + clumped joints).
+# Per design doc 2026-05-09_v9_condmdi_design.md §6 decision tree:
+#   "v9 worse than v8 on both → isolate. Try CondMDI-only (keep x_0 pred)
+#    or v-pred-only (keep v8 conditioning) to identify which fix hurt."
 #
-# Stage 2 inherits v7's architecture + L_pos full-body (dense temporal
-# supervision via GT joints, NOT via per-frame spatial conditioning).
-# Trained from scratch (cannot warm-start v7 — conditioning shape changes).
+# v9.1 keeps every v9 change EXCEPT prediction_target = "x0":
+#   - cond_motion_dim = 136 (CondMDI inpainting channel)
+#   - smpl_pose_135_condmdi rep + random K∈[3,12] keyframes at training
+#   - object_traj_dim = 24 (no v8 keyframe-channel append)
+#   - prediction_target = "x0" ← THIS IS THE ONLY DIFF FROM v9
 #
-# Training uses GT keyframes (from offline pass). Inference uses Stage 1
-# predicted keyframes (separate script).
+# Hypothesis: v-prediction was undertrained on N=10 subsample. Salimans &
+# Ho 2022 §3 explicitly note v-pred is slower to converge from scratch
+# than x_0-pred. The "joints clumping" in v9 is consistent with the model
+# outputting near-zero v at high-t timesteps (recovered x_0 → 0 → all
+# rotations collapse to identity → all joints stack at the root). x_0-pred
+# avoids this failure mode by directly regressing the clean motion.
+#
+# If v9.1 visual looks like v8 (frozen body but skeleton intact, no
+# spinning) → v-pred was the regression source. Fix: longer training
+# OR drop v-pred; address frozen-body via raised pos_loss_weight + EDGE-
+# style vel_weight=2.96 instead.
+#
+# If v9.1 visual is also broken → CondMDI inpainting itself is the
+# regression. Fix: revert cond_motion_input wiring; v8 keyjoint-channel
+# was actually the better mechanism for our HOI setting.
 
 model:
   cfg_drop_prob: 0.15
@@ -23,6 +33,7 @@ model:
   diffusion:
     num_steps: 1000
     schedule: "cosine"
+    prediction_target: "x0"        # ← v9.1 change vs v9
 
   z_int:
     num_parts: 5
@@ -30,8 +41,9 @@ model:
     support_classes: 3
 
   denoiser:
-    motion_dim: 135               # 22*6 (global rot 6D) + 3 (root world)
-    object_traj_dim: 43           # 24 + 18 keyjoint pos + 1 indicator
+    motion_dim: 135
+    object_traj_dim: 24
+    cond_motion_dim: 136
     init_pose_dim: 66
     text_dim: 512
     object_token_dim: 256
@@ -65,9 +77,8 @@ data:
   pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
   max_seq_length: 196
   support_collapse_hand_support: true
-  motion_representation: "smpl_pose_135_keyframed"
+  motion_representation: "smpl_pose_135_condmdi"
   force_world_frame: true
-  # Method-validation subsampling: shared seed with Stage A v11 + Stage 1.
   subsample_n_per_object: 10
   subsample_seed: 42
 
@@ -84,7 +95,7 @@ data:
     pc_jitter_std: 0.005
 
 training:
-  init_checkpoint: null           # from scratch
+  init_checkpoint: null
   batch_size: 16
   num_epochs: 80
   num_workers: 4
@@ -104,7 +115,6 @@ training:
   val_best_key: "anchor_l2"
 
 loss:
-  # Anchor only at keyframe frames (sparse). λ matches v7 (1.0).
   anchor_weight: 1.0
   contact_threshold: 0.5
 
@@ -124,12 +134,12 @@ loss:
 
   world_joint_velocity_weight: 1.0
   fk_consistency_weight: 0.0
-  pos_loss_weight: 5.0            # MDM L_pos full-body, dense temporal supervision
+  pos_loss_weight: 5.0
 
 logging:
   project: "piano"
-  run_name: "stageB_anchordiff_v8_stage2_motion_generator"
+  run_name: "stageB_anchordiff_v9_1_condmdi_x0pred"
   log_every_n_steps: 50
   save_every_n_epochs: 5
 
-output_dir: "runs/training/stageB_anchordiff_v8_stage2_motion_generator"
+output_dir: "runs/training/stageB_anchordiff_v9_1_condmdi_x0pred"
