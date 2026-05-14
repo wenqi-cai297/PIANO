@@ -1,0 +1,181 @@
+# V11 FULL N=10 + LOCAL-DYNAMICS-v2 — corrected local-dynamics supervision.
+#
+# Per claude_code_v11_next_localdyn_target_routing.md Part A + B.
+#
+# Carries over the prior FULL N=10 baseline (far_unobs 21.53 cm, body
+# ~×0.57 GT local velocity = rigid). Replaces the previous ineffective
+# m²-space MSE local-vel loss (`stable_local_vel_weight=0.1` contributed
+# only 10⁻⁴ of total loss — see 2026-05-11_v11_FULL_N10_localvel_report_for_chatgpt.md)
+# with cm-scale SmoothL1 + cm-scale speed-moment loss that produce usable
+# gradient signals at low weights.
+#
+# Single-variable changes vs FULL N=10 baseline:
+#   loss.stable_local_vel_cm_weight: 0.0 → 0.05
+#   loss.stable_local_speed_moment_weight: 0.0 → 0.02
+#   loss.stable_local_acc_cm_weight: 0.0 → 0.0   (deferred per spec §A.4)
+#   (legacy m²-MSE weights stay at 0.0 — the new cm-scale losses fully supersede them)
+#
+# Pass criteria (spec §B.2):
+#   * far_unobs remains close to FULL baseline: target 21–25 cm
+#   * stable_local_vel improves: target > 0.6 × GT (≈ 0.97 cm/fr), preferred 0.7–0.9 × GT
+#   * stable_root_vel remains: target ≤ ~1.4 × GT
+#   * visual motion not frozen and not jittery
+#   * wrong_clip / part_target / target_perturbed remain nontrivial
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  zero_z_int_for_stageB: false
+  zero_dense_contact_target_for_stageB: false
+  # New plan-target flag — default off for FULL (plan target ON).
+  zero_plan_target_for_stageB: false
+
+  denoiser:
+    motion_dim: 135
+    object_traj_dim: 24
+    cond_motion_dim: 0
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+
+    use_interaction_plan: true
+    plan_k_max: 12
+    plan_s_max: 12
+    plan_num_anchor_types: 5
+    plan_num_parts: 5
+    plan_use_segment_tokens: false
+    plan_use_context_hint: true
+    plan_d_hint: 32
+    plan_d_time_embed: 64
+    cfg_drop_plan: false
+
+    plan_per_part_tokens: true
+    plan_context_hint_mode: "target_aware"
+
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_plan"
+  force_world_frame: true
+  subsample_n_per_object: 10
+  subsample_seed: 42
+  overfit_n_clips: 0
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null
+  batch_size: 16
+  num_epochs: 80
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 5
+  val_best_key: "anchor_l2"
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+  plan_anchor_weight: 1.0
+  plan_segment_weight: 0.0
+  plan_transition_vel_weight: 1.0
+  plan_transition_acc_weight: 1.0
+  plan_transition_window: 3
+
+  # Root-stability (unchanged — works well at ×1.36 GT).
+  stable_root_vel_weight: 0.5
+  stable_root_acc_weight: 0.25
+  stable_support_erode: 4
+
+  # Legacy m²-MSE local losses OFF (they were ineffective).
+  stable_local_vel_weight: 0.0
+  stable_local_acc_weight: 0.0
+
+  # NEW cm-scale local-dynamics losses (per spec §A.2-A.3).
+  stable_local_vel_cm_weight: 0.05
+  stable_local_speed_moment_weight: 0.02
+  stable_local_acc_cm_weight: 0.0
+
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v11_per_part_tokens_FULL_N10_localdyn_v2"
+  log_every_n_steps: 10
+  save_every_n_epochs: 50
+
+output_dir: "runs/training/stageB_anchordiff_v11_per_part_tokens_FULL_N10_localdyn_v2"

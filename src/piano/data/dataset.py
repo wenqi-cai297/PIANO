@@ -93,6 +93,8 @@ class AugmentConfig:
     mirror_duplicate: bool = False
     rotate_around_y_prob: float = 0.0
     pc_jitter_std: float = 0.0
+    timewarp_scales: tuple[float, ...] = ()
+    timewarp_mode: str = "online"
 
 
 # ---------------------------------------------------------------------------
@@ -333,15 +335,35 @@ class HOIDataset(Dataset):
             self.pseudo_label_dir = self.root / "pseudo_labels"
 
     def __len__(self) -> int:
+        n = len(self.metadata)
+        if self.augment.enabled and self.augment.timewarp_mode == "duplicate":
+            scales = self._timewarp_scales()
+            if scales:
+                n *= len(scales)
         if self.augment.enabled and self.augment.mirror_duplicate:
-            return len(self.metadata) * 2
-        return len(self.metadata)
+            n *= 2
+        return n
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         force_mirror = False
+        timewarp_scale = 1.0
+        mirror_factor = 2 if self.augment.enabled and self.augment.mirror_duplicate else 1
+        timewarp_scales = self._timewarp_scales()
+        timewarp_factor = (
+            len(timewarp_scales)
+            if self.augment.enabled and self.augment.timewarp_mode == "duplicate" and timewarp_scales
+            else 1
+        )
         if self.augment.enabled and self.augment.mirror_duplicate:
-            base_idx = idx // 2
-            force_mirror = bool(idx % 2)
+            force_mirror = bool(idx % mirror_factor)
+        if timewarp_factor > 1:
+            timewarp_idx = (idx // mirror_factor) % timewarp_factor
+            timewarp_scale = float(timewarp_scales[timewarp_idx])
+        elif self.augment.enabled and timewarp_scales:
+            timewarp_scale = float(random.choice(timewarp_scales))
+
+        if self.augment.enabled and (self.augment.mirror_duplicate or timewarp_factor > 1):
+            base_idx = idx // (mirror_factor * timewarp_factor)
         else:
             base_idx = idx
         meta = self.metadata[base_idx]
@@ -363,6 +385,9 @@ class HOIDataset(Dataset):
         object_rotations = None
         if "object_rotations" in motion_data.files:
             object_rotations = motion_data["object_rotations"].astype(np.float32)
+        smplx_poses = None
+        if "smplx_poses" in motion_data.files:
+            smplx_poses = motion_data["smplx_poses"].astype(np.float32)
 
         # --- Load object point cloud ---
         obj_id = meta["object_id"]
@@ -396,6 +421,8 @@ class HOIDataset(Dataset):
             object_positions = self._pad_or_truncate(object_positions, self.max_seq_length)
         if object_rotations is not None:
             object_rotations = self._pad_or_truncate(object_rotations, self.max_seq_length)
+        if smplx_poses is not None:
+            smplx_poses = self._pad_or_truncate(smplx_poses, self.max_seq_length)
 
         padded_labels: dict[str, np.ndarray] = {}
         for key in ("contact_state", "contact_target", "contact_target_xyz", "phase", "support"):
@@ -403,6 +430,26 @@ class HOIDataset(Dataset):
                 padded_labels[key] = self._pad_or_truncate(labels[key], self.max_seq_length)
 
         text = meta.get("text", "")
+
+        if self.augment.enabled and abs(float(timewarp_scale) - 1.0) > 1e-6:
+            (
+                motion_263,
+                joints,
+                object_positions,
+                object_rotations,
+                smplx_poses,
+                padded_labels,
+                seq_len,
+            ) = self._apply_timewarp(
+                motion_263=motion_263,
+                joints=joints,
+                object_positions=object_positions,
+                object_rotations=object_rotations,
+                smplx_poses=smplx_poses,
+                labels=padded_labels,
+                seq_len=seq_len,
+                scale=float(timewarp_scale),
+            )
 
         # --- Augment (training only; disabled by default) ---
         # Runs BEFORE canonical-frame computation so that the canonical
@@ -480,20 +527,16 @@ class HOIDataset(Dataset):
             # un-augmented smplx_poses to compute global 6D rotations. Augment
             # rotation propagation is not implemented, so configs must disable
             # mirror + Y-rotation augmentation (enforced in __init__).
-            if "smplx_poses" not in motion_data.files:
+            if smplx_poses is None:
                 raise KeyError(
                     f"smplx_poses missing in {motion_path}; "
                     f"motion_representation={self.motion_representation!r} requires "
                     "smplx_poses (T, 156) and joints_22 (T, 22, 3) in the npz."
                 )
-            smplx_poses_full = motion_data["smplx_poses"].astype(np.float32)
-            # First 66 dims of smplx_poses_full = SMPL-22 root_orient(3)
+            # First 66 dims of smplx_poses = SMPL-22 root_orient(3)
             # + body_pose(63=21*3) axis-angle local. The remaining 90 dims
             # are SMPL-X jaw/eyes/hands which we ignore here.
-            pose_22_aa = smplx_poses_full[:, :66].reshape(-1, 22, 3)
-            pose_22_aa = self._pad_or_truncate(
-                pose_22_aa, self.max_seq_length,
-            ).astype(np.float32)                                # (max_T, 22, 3)
+            pose_22_aa = smplx_poses[:, :66].reshape(-1, 22, 3)
 
             # Compute global per-joint rotation matrices then 6D rep.
             # Done in torch CPU because our smpl_kinematics utilities are
@@ -848,6 +891,150 @@ class HOIDataset(Dataset):
             ).astype(np.float32)
 
         return result
+
+    def _timewarp_scales(self) -> tuple[float, ...]:
+        if not self.augment.enabled:
+            return ()
+        scales = tuple(float(s) for s in self.augment.timewarp_scales)
+        return tuple(s for s in scales if s > 0.0 and np.isfinite(s))
+
+    @staticmethod
+    def _resample_linear(
+        arr: np.ndarray | None,
+        seq_len: int,
+        coords: np.ndarray,
+    ) -> np.ndarray | None:
+        if arr is None:
+            return None
+        out = np.zeros_like(arr)
+        if seq_len <= 0 or coords.size == 0:
+            return out
+        valid = arr[:seq_len].astype(np.float32, copy=False)
+        if seq_len == 1:
+            out[: len(coords)] = valid[0]
+            return out
+        left = np.floor(coords).astype(np.int64)
+        right = np.minimum(left + 1, seq_len - 1)
+        alpha = (coords - left).astype(np.float32)
+        view_shape = (len(coords),) + (1,) * (arr.ndim - 1)
+        out[: len(coords)] = (
+            valid[left] * (1.0 - alpha.reshape(view_shape))
+            + valid[right] * alpha.reshape(view_shape)
+        ).astype(arr.dtype, copy=False)
+        return out
+
+    @staticmethod
+    def _resample_nearest(
+        arr: np.ndarray | None,
+        seq_len: int,
+        coords: np.ndarray,
+    ) -> np.ndarray | None:
+        if arr is None:
+            return None
+        out = np.zeros_like(arr)
+        if seq_len <= 0 or coords.size == 0:
+            return out
+        nearest = np.rint(coords).astype(np.int64)
+        nearest = np.clip(nearest, 0, max(seq_len - 1, 0))
+        out[: len(coords)] = arr[:seq_len][nearest].astype(arr.dtype, copy=False)
+        return out
+
+    @staticmethod
+    def _resample_axis_angle(
+        arr: np.ndarray | None,
+        seq_len: int,
+        coords: np.ndarray,
+    ) -> np.ndarray | None:
+        if arr is None:
+            return None
+        out = np.zeros_like(arr)
+        if seq_len <= 0 or coords.size == 0:
+            return out
+        if arr.shape[-1] % 3 != 0:
+            return HOIDataset._resample_linear(arr, seq_len, coords)
+        if seq_len == 1:
+            out[: len(coords)] = arr[0]
+            return out
+
+        try:
+            from scipy.spatial.transform import Rotation, Slerp
+        except Exception:
+            return HOIDataset._resample_linear(arr, seq_len, coords)
+
+        valid = arr[:seq_len].astype(np.float64, copy=False).reshape(seq_len, -1, 3)
+        warped = np.empty((len(coords), valid.shape[1], 3), dtype=np.float32)
+        key_times = np.arange(seq_len, dtype=np.float64)
+        for j in range(valid.shape[1]):
+            slerp = Slerp(key_times, Rotation.from_rotvec(valid[:, j, :]))
+            warped[:, j, :] = slerp(coords).as_rotvec().astype(np.float32)
+        out[: len(coords)] = warped.reshape((len(coords),) + arr.shape[1:]).astype(
+            arr.dtype, copy=False,
+        )
+        return out
+
+    def _apply_timewarp(
+        self,
+        *,
+        motion_263: np.ndarray,
+        joints: np.ndarray,
+        object_positions: np.ndarray | None,
+        object_rotations: np.ndarray | None,
+        smplx_poses: np.ndarray | None,
+        labels: dict[str, np.ndarray],
+        seq_len: int,
+        scale: float,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        dict[str, np.ndarray],
+        int,
+    ]:
+        """Synchronized Stage-B time scaling before plan compilation.
+
+        ``scale`` changes the valid duration, then every per-frame signal is
+        resampled back into the fixed padded tensor shape. Continuous fields
+        use linear interpolation; categorical phase/support use nearest
+        frames; axis-angle rotations use SciPy Slerp when available.
+        """
+        seq_len = int(max(0, min(seq_len, self.max_seq_length)))
+        if seq_len <= 1:
+            return (
+                motion_263,
+                joints,
+                object_positions,
+                object_rotations,
+                smplx_poses,
+                labels,
+                seq_len,
+            )
+
+        new_len = int(round(seq_len * float(scale)))
+        new_len = max(2, min(self.max_seq_length, new_len))
+        coords = np.linspace(0.0, float(seq_len - 1), new_len, dtype=np.float64)
+
+        warped_labels: dict[str, np.ndarray] = {}
+        for key, arr in labels.items():
+            if key in {"phase", "support"}:
+                warped = self._resample_nearest(arr, seq_len, coords)
+            else:
+                warped = self._resample_linear(arr, seq_len, coords)
+                if key == "contact_state" and warped is not None:
+                    warped = np.clip(warped, 0.0, 1.0).astype(arr.dtype, copy=False)
+            if warped is not None:
+                warped_labels[key] = warped
+
+        return (
+            self._resample_linear(motion_263, seq_len, coords),
+            self._resample_linear(joints, seq_len, coords),
+            self._resample_linear(object_positions, seq_len, coords),
+            self._resample_axis_angle(object_rotations, seq_len, coords),
+            self._resample_axis_angle(smplx_poses, seq_len, coords),
+            warped_labels,
+            new_len,
+        )
 
     # -------------------------------------------------------------------
     # Augmentation

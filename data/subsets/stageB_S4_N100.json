@@ -1,0 +1,978 @@
+{
+  "subset_name": "S4",
+  "target_n": 100,
+  "actual_n": 100,
+  "anchor_object_cluster": [
+    "whitechair",
+    "woodchair"
+  ],
+  "anchor_action": "lift",
+  "seed": 42,
+  "indices": [
+    5984,
+    6417,
+    4552,
+    5422,
+    5885,
+    3986,
+    1268,
+    1555,
+    2430,
+    1783,
+    479,
+    4744,
+    6027,
+    4441,
+    499,
+    6127,
+    2569,
+    468,
+    410,
+    4785,
+    3905,
+    4119,
+    4350,
+    1289,
+    465,
+    4160,
+    656,
+    1522,
+    561,
+    4874,
+    556,
+    5531,
+    1926,
+    3307,
+    982,
+    4666,
+    2016,
+    4742,
+    4870,
+    325,
+    5073,
+    671,
+    3434,
+    5385,
+    4781,
+    4630,
+    4282,
+    2591,
+    2136,
+    1673,
+    5486,
+    5867,
+    2573,
+    1955,
+    2175,
+    3242,
+    1072,
+    5502,
+    5287,
+    2457,
+    3745,
+    2590,
+    6159,
+    594,
+    76,
+    3754,
+    5088,
+    4612,
+    819,
+    600,
+    4404,
+    1746,
+    4144,
+    2172,
+    1085,
+    2859,
+    563,
+    2001,
+    3027,
+    2334,
+    1292,
+    3589,
+    6830,
+    4450,
+    5763,
+    2478,
+    5010,
+    6611,
+    5357,
+    4333,
+    64,
+    5471,
+    6693,
+    4543,
+    2452,
+    5434,
+    848,
+    1100,
+    2166,
+    945
+  ],
+  "clips": [
+    {
+      "global_idx": 5984,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_tripod_021",
+      "object_id": "tripod",
+      "action": "put",
+      "text": "Put the tripod horizontally down, then pick up the fallen tripod."
+    },
+    {
+      "global_idx": 6417,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_072",
+      "object_id": "whitechair",
+      "action": "hold",
+      "text": "Hold the whitechair and turn it around to face a diffferent orientation."
+    },
+    {
+      "global_idx": 4552,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_plasticbox_048",
+      "object_id": "plasticbox",
+      "action": "push",
+      "text": "Push the plasticbox, release the hands, then pull the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 5422,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_suitcase_013",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 5885,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_trashcan_020",
+      "object_id": "trashcan",
+      "action": "kick",
+      "text": "Kick the trashcan, lift the trashcan, move the trashcan, and put down the trashcan."
+    },
+    {
+      "global_idx": 3986,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_largetable_072",
+      "object_id": "largetable",
+      "action": "push",
+      "text": "Push the largetable, release the hands, then drag the largetable, and set it back down."
+    },
+    {
+      "global_idx": 1268,
+      "subset": "imhd",
+      "seq_id": "20230825_songzn_bat_bat_pickup_putdown_0_0_6",
+      "object_id": "baseball",
+      "action": "set",
+      "text": "A person sets down a baseball, picks it up, and does this repeatedly. They then walk around the baseball bat, pick it cr"
+    },
+    {
+      "global_idx": 1555,
+      "subset": "imhd",
+      "seq_id": "20231015_wangjy_chair_freestyle1_0_488",
+      "object_id": "chair",
+      "action": "sit",
+      "text": "A person sits on a chair and rocks it."
+    },
+    {
+      "global_idx": 2430,
+      "subset": "neuraldome",
+      "seq_id": "subject06_pingpong_1172_1",
+      "object_id": "pingpong",
+      "action": "swing",
+      "text": "A person swings a ping pong with their right hand."
+    },
+    {
+      "global_idx": 1783,
+      "subset": "neuraldome",
+      "seq_id": "subject06_bigsofa_1378",
+      "object_id": "bigsofa",
+      "action": "bend",
+      "text": "A person bends their body, lifts a big sofa with their right hand."
+    },
+    {
+      "global_idx": 479,
+      "subset": "chairs",
+      "seq_id": "Sub1434_Obj162_Seg0_495",
+      "object_id": "162",
+      "action": "half",
+      "text": "A person half stands up from a chair with their hands holding the armrest of the chair, moves it backward and sits back "
+    },
+    {
+      "global_idx": 4744,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_plasticbox_048",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, move the plasticbox, and put down the plasticbox."
+    },
+    {
+      "global_idx": 6027,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_tripod_013",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 4441,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_plasticbox_001",
+      "object_id": "plasticbox",
+      "action": "push",
+      "text": "Push the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 499,
+      "subset": "chairs",
+      "seq_id": "Sub1659_Obj17_Seg0_0_1",
+      "object_id": "17",
+      "action": "sit",
+      "text": "A person sits on a chair, shifts around in different positions, then extends their right leg, retracts the leg and bends"
+    },
+    {
+      "global_idx": 6127,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_038",
+      "object_id": "tripod",
+      "action": "hold",
+      "text": "Hold and turn the tripod around to a different orientation."
+    },
+    {
+      "global_idx": 2569,
+      "subset": "neuraldome",
+      "seq_id": "subject01_table_292_1",
+      "object_id": "table",
+      "action": "stand",
+      "text": "A person stands next to a table and puts the table back down for four times."
+    },
+    {
+      "global_idx": 468,
+      "subset": "chairs",
+      "seq_id": "Sub1430_Obj162_Seg0_0_1",
+      "object_id": "162",
+      "action": "sit",
+      "text": "A person sits on a chair, then moves their position backward, and then stands up from the chair."
+    },
+    {
+      "global_idx": 410,
+      "subset": "chairs",
+      "seq_id": "Sub0356_Obj157_Seg0_312",
+      "object_id": "157",
+      "action": "sit",
+      "text": "A person sits on a chair, rests their chin on their right hand, removes their right hand, stretches their shoulders, and"
+    },
+    {
+      "global_idx": 4785,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_038",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, rotate the smallbox, and set it back down."
+    },
+    {
+      "global_idx": 3905,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_largetable_031",
+      "object_id": "largetable",
+      "action": "push",
+      "text": "Push the largetable, release the hands, then drag the largetable, and set it back down."
+    },
+    {
+      "global_idx": 4119,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_006",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 4350,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_monitor_009",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 1289,
+      "subset": "imhd",
+      "seq_id": "20230825_songzn_bat_bat_twoends_rotate_0_1365_2",
+      "object_id": "baseball",
+      "action": "hold",
+      "text": "A person holds the two ends of a baseball bat with their hands respectively, rotates the bat back and forth while walkin"
+    },
+    {
+      "global_idx": 465,
+      "subset": "chairs",
+      "seq_id": "Sub1425_Obj162_Seg0_0_3",
+      "object_id": "162",
+      "action": "sit",
+      "text": "A person sits on a chair, crosses their legs and leans back, then stands up from the chair and clasps their hands."
+    },
+    {
+      "global_idx": 4160,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_047",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 656,
+      "subset": "chairs",
+      "seq_id": "Sub0076_Obj24_Seg0_549",
+      "object_id": "24",
+      "action": "sit",
+      "text": "A person sits on a chair, rotates counterclockwise to the left, then rotates back and pulls the chair forward a bit, and"
+    },
+    {
+      "global_idx": 1522,
+      "subset": "imhd",
+      "seq_id": "20230827_zhaochf_bat_bat_twohands_swing3_3_221_1",
+      "object_id": "baseball",
+      "action": "hold",
+      "text": "A person holds a bat with their right hand, places the head of the formal bat on the ground, then lifts the bat up and s"
+    },
+    {
+      "global_idx": 561,
+      "subset": "chairs",
+      "seq_id": "Sub1715_Obj173_Seg0_639",
+      "object_id": "173",
+      "action": "sit",
+      "text": "A person sits on a chair, tilts their head back, and then brings their head back down and stands up."
+    },
+    {
+      "global_idx": 4874,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_smallbox_041",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 556,
+      "subset": "chairs",
+      "seq_id": "Sub1714_Obj173_Seg0_417",
+      "object_id": "173",
+      "action": "i",
+      "text": "The person is sitting on the chair while using the hands to move the chair forward and backward."
+    },
+    {
+      "global_idx": 5531,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_045",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, rotate the suitcase, and set it back down."
+    },
+    {
+      "global_idx": 1926,
+      "subset": "neuraldome",
+      "seq_id": "subject09_box_460_3",
+      "object_id": "box",
+      "action": "hold",
+      "text": "A person holds a box in their hands, then rotates it in their hands."
+    },
+    {
+      "global_idx": 3307,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_floorlamp_016",
+      "object_id": "floorlamp",
+      "action": "pull",
+      "text": "Pull the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 982,
+      "subset": "chairs",
+      "seq_id": "Sub0824_Obj81_Seg0_243_1",
+      "object_id": "81",
+      "action": "sit",
+      "text": "A person sits on a chair, leans back to lie on the chair, then bends their body forward, and finally stands up from the "
+    },
+    {
+      "global_idx": 4666,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_plasticbox_059",
+      "object_id": "plasticbox",
+      "action": "kick",
+      "text": "Kick the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 2016,
+      "subset": "neuraldome",
+      "seq_id": "subject06_chair_1399",
+      "object_id": "chair",
+      "action": "shack",
+      "text": "A person shacks the chair with their right hand, walks around the chair clockwise, and shacks the chair with their right"
+    },
+    {
+      "global_idx": 4742,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_plasticbox_046",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, move the plasticbox, and put down the plasticbox."
+    },
+    {
+      "global_idx": 4870,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_smallbox_037",
+      "object_id": "smallbox",
+      "action": "pull",
+      "text": "Pull the smallbox, and set it back down."
+    },
+    {
+      "global_idx": 325,
+      "subset": "chairs",
+      "seq_id": "Sub0283_Obj141_Seg0_255_1",
+      "object_id": "141",
+      "action": "lie",
+      "text": "A person lies their body on the left chair arm, bends their body forward and stands a up from the chair."
+    },
+    {
+      "global_idx": 5073,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_smalltable_045",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable by one of the edges, rotate it, drag the smalltable and place the legs back down."
+    },
+    {
+      "global_idx": 671,
+      "subset": "chairs",
+      "seq_id": "Sub0080_Obj24_Seg0_0",
+      "object_id": "24",
+      "action": "sit",
+      "text": "A person sits on a chair, stands up, walks around, sits back down, shifts around, stands up again, walks around, sits ba"
+    },
+    {
+      "global_idx": 3434,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_floorlamp_062",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 5385,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_suitcase_002",
+      "object_id": "suitcase",
+      "action": "push",
+      "text": "Push the suitcase, and set it back down."
+    },
+    {
+      "global_idx": 4781,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_030",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 4630,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_plasticbox_021",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, rotate the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 4282,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_006",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 2591,
+      "subset": "neuraldome",
+      "seq_id": "subject07_table_621",
+      "object_id": "table",
+      "action": "stand",
+      "text": "The person stands up, puts the right leg on the table and seems like sitting on it, and then stands again."
+    },
+    {
+      "global_idx": 2136,
+      "subset": "neuraldome",
+      "seq_id": "subject07_flower_330",
+      "object_id": "flower",
+      "action": "hold",
+      "text": "A person holds a flower with both hands, lifts it up, and then lowers it back to the original position."
+    },
+    {
+      "global_idx": 1673,
+      "subset": "imhd",
+      "seq_id": "20230901_songzn_suitcase_suitcase_lefthand_carry_0_1700",
+      "object_id": "suitcase",
+      "action": "carrie",
+      "text": "A person carries up a suitcase with their left hand and walks clockwise."
+    },
+    {
+      "global_idx": 5486,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_000",
+      "object_id": "suitcase",
+      "action": "push",
+      "text": "Push the suitcase, and set it back down."
+    },
+    {
+      "global_idx": 5867,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_trashcan_000",
+      "object_id": "trashcan",
+      "action": "push",
+      "text": "Push the trashcan, and set it back down."
+    },
+    {
+      "global_idx": 2573,
+      "subset": "neuraldome",
+      "seq_id": "subject02_table_275",
+      "object_id": "table",
+      "action": "lift",
+      "text": "A person lifts a table with both hands, carries the table with right hand, and walks counterclockwise."
+    },
+    {
+      "global_idx": 1955,
+      "subset": "neuraldome",
+      "seq_id": "subject06_case_0_0",
+      "object_id": "case",
+      "action": "walk",
+      "text": "A person walks toward a case, bends their body, picks up the case with their right hand, walks around."
+    },
+    {
+      "global_idx": 2175,
+      "subset": "neuraldome",
+      "seq_id": "subject02_keyboard_603",
+      "object_id": "keyboard",
+      "action": "walk",
+      "text": "The person walks forward with the keyboard, circling it with their right hand, and then walks backward."
+    },
+    {
+      "global_idx": 3242,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_floorlamp_029",
+      "object_id": "floorlamp",
+      "action": "pull",
+      "text": "Pull the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 1072,
+      "subset": "chairs",
+      "seq_id": "Sub1770_Obj85_Seg0_0",
+      "object_id": "85",
+      "action": "sit",
+      "text": "A person sits down on a chair, stretches their both legs to the front, stretches their both arms, lies their body on the"
+    },
+    {
+      "global_idx": 5502,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_016",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 5287,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_smalltable_040",
+      "object_id": "smalltable",
+      "action": "kick",
+      "text": "Kick the smalltable, and set it back down."
+    },
+    {
+      "global_idx": 2457,
+      "subset": "neuraldome",
+      "seq_id": "subject10_pingpong_900",
+      "object_id": "pingpong",
+      "action": "hold",
+      "text": "A person holds the ping pong with their right hand, swings the ping pong, and then holds the ping pong with both hands."
+    },
+    {
+      "global_idx": 3745,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_largebox_009",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 2590,
+      "subset": "neuraldome",
+      "seq_id": "subject07_table_570",
+      "object_id": "table",
+      "action": "i",
+      "text": "The person is examining the bottom surface of the table, trying to find something."
+    },
+    {
+      "global_idx": 6159,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_tripod_019",
+      "object_id": "tripod",
+      "action": "hold",
+      "text": "Hold and turn the tripod around to a different orientation."
+    },
+    {
+      "global_idx": 594,
+      "subset": "chairs",
+      "seq_id": "Sub1727_Obj173_Seg0_0",
+      "object_id": "173",
+      "action": "sit",
+      "text": "A person sits down on a chair, turns their head to the left, turns it back, extends their left leg, and then brings it b"
+    },
+    {
+      "global_idx": 76,
+      "subset": "chairs",
+      "seq_id": "Sub1895_Obj110_Seg0_0_2",
+      "object_id": "110",
+      "action": "sit",
+      "text": "A person sits on the chair, moves the chair to their right with their right arm, then stands up, walks around the chair "
+    },
+    {
+      "global_idx": 3754,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_largebox_018",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, rotate the largebox, and set it back down."
+    },
+    {
+      "global_idx": 5088,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_smalltable_063",
+      "object_id": "smalltable",
+      "action": "kick",
+      "text": "Kick the smalltable, and set it back down."
+    },
+    {
+      "global_idx": 4612,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_plasticbox_002",
+      "object_id": "plasticbox",
+      "action": "push",
+      "text": "Push the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 819,
+      "subset": "chairs",
+      "seq_id": "Sub0748_Obj46_Seg0_0_2",
+      "object_id": "46",
+      "action": "sit",
+      "text": "A person sits on a chair, leans back to the chair, and swings the chair, then stands up from the chair."
+    },
+    {
+      "global_idx": 600,
+      "subset": "chairs",
+      "seq_id": "Sub0559_Obj176_Seg0_0",
+      "object_id": "176",
+      "action": "sit",
+      "text": "A person sits down on a chair, swivels around, stands up and stretches their back, sits back down, scoots the chair, and"
+    },
+    {
+      "global_idx": 4404,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_028",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 1746,
+      "subset": "neuraldome",
+      "seq_id": "subject09_baseball_1234",
+      "object_id": "baseball",
+      "action": "walk",
+      "text": "A person walks around and swings a baseball with their right hand, and then points the baseball towards front."
+    },
+    {
+      "global_idx": 4144,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_031",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor, and then rotate the monitor to adjust its orientation.."
+    },
+    {
+      "global_idx": 2172,
+      "subset": "neuraldome",
+      "seq_id": "subject02_keyboard_1558",
+      "object_id": "keyboard",
+      "action": "the",
+      "text": "The individual walks with the keyboard forward and then walks backward."
+    },
+    {
+      "global_idx": 1085,
+      "subset": "chairs",
+      "seq_id": "Sub1729_Obj87_Seg0_420",
+      "object_id": "87",
+      "action": "sit",
+      "text": "A person sits on a chair, leans their change, crosses their right leg on their left leg and stands up from the chair."
+    },
+    {
+      "global_idx": 2859,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_clothesstand_008",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 563,
+      "subset": "chairs",
+      "seq_id": "Sub1717_Obj173_Seg0_0_0",
+      "object_id": "173",
+      "action": "sit",
+      "text": "A person sits down onto a chair, places both hands on it and stretches their legs, then moves it with both hands, places"
+    },
+    {
+      "global_idx": 2001,
+      "subset": "neuraldome",
+      "seq_id": "subject01_chair_499",
+      "object_id": "chair",
+      "action": "turn",
+      "text": "The person turns the chair around and then keeps to push and pull the chair for many times while looking at the left sid"
+    },
+    {
+      "global_idx": 3027,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_clothesstand_021",
+      "object_id": "clothesstand",
+      "action": "hold",
+      "text": "Hold and turn the clothesstand around to a different orientation."
+    },
+    {
+      "global_idx": 2334,
+      "subset": "neuraldome",
+      "seq_id": "subject09_pan_230_2",
+      "object_id": "pan",
+      "action": "hold",
+      "text": "A person holds the handle of a pan in their right hand, lifts the pan up and down with their right hand and walks around"
+    },
+    {
+      "global_idx": 1292,
+      "subset": "imhd",
+      "seq_id": "20230825_songzn_bat_bat_twoends_rotate_0_408_0",
+      "object_id": "baseball",
+      "action": "hold",
+      "text": "A person holds the two ends of a baseball bat with their hands respectively, rotates the bat back and forth while walkin"
+    },
+    {
+      "global_idx": 3589,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_largebox_089",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 6830,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_030",
+      "object_id": "woodchair",
+      "action": "use",
+      "text": "Use the foot to scoot the woodchair to change its orientation."
+    },
+    {
+      "global_idx": 4450,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_plasticbox_010",
+      "object_id": "plasticbox",
+      "action": "push",
+      "text": "Push the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 5763,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_trashcan_015",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, rotate the trashcan, and set it back down."
+    },
+    {
+      "global_idx": 2478,
+      "subset": "neuraldome",
+      "seq_id": "subject07_pink_1301_1",
+      "object_id": "pink",
+      "action": "swing",
+      "text": "A person swings a bucket back and forth with both, then raises it to the level of their head."
+    },
+    {
+      "global_idx": 5010,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_smallbox_034",
+      "object_id": "smallbox",
+      "action": "kick",
+      "text": "Kick the smallbox, and set it back down."
+    },
+    {
+      "global_idx": 6611,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_047",
+      "object_id": "whitechair",
+      "action": "hold",
+      "text": "Hold the whitechair and turn it around to face a diffferent orientation."
+    },
+    {
+      "global_idx": 5357,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_smalltable_061",
+      "object_id": "smalltable",
+      "action": "kick",
+      "text": "Kick the smalltable, and set it back down."
+    },
+    {
+      "global_idx": 4333,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_monitor_019",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 64,
+      "subset": "chairs",
+      "seq_id": "Sub1891_Obj110_Seg0_0_0",
+      "object_id": "110",
+      "action": "sit",
+      "text": "A person sits down on a chair, turns their body to the left, then turns back, bends their body forward and puts their bo"
+    },
+    {
+      "global_idx": 5471,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_suitcase_010",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 6693,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_027",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 4543,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_plasticbox_039",
+      "object_id": "plasticbox",
+      "action": "kick",
+      "text": "Kick the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 2452,
+      "subset": "neuraldome",
+      "seq_id": "subject08_pingpong_900",
+      "object_id": "pingpong",
+      "action": "grab",
+      "text": "A person grabs a ping pong bat handle in right hand and swings the ping pong bat."
+    },
+    {
+      "global_idx": 5434,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_suitcase_026",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, rotate the suitcase, and set it back down."
+    },
+    {
+      "global_idx": 848,
+      "subset": "chairs",
+      "seq_id": "Sub1461_Obj48_Seg0_0_1",
+      "object_id": "48",
+      "action": "sit",
+      "text": "A person sits on a chair, bends over, then straightens up."
+    },
+    {
+      "global_idx": 1100,
+      "subset": "chairs",
+      "seq_id": "Sub1737_Obj87_Seg0_135",
+      "object_id": "87",
+      "action": "stand",
+      "text": "The person stands up a little bit and then moves the chair for a little bit for two times, and then modifies the sitting"
+    },
+    {
+      "global_idx": 2166,
+      "subset": "neuraldome",
+      "seq_id": "subject01_keyboard_487_1",
+      "object_id": "keyboard",
+      "action": "i",
+      "text": "The person is walking around while using both of the two hands to hold the keyboard and uses the right hand to do some o"
+    },
+    {
+      "global_idx": 945,
+      "subset": "chairs",
+      "seq_id": "Sub0305_Obj64_Seg0_0",
+      "object_id": "64",
+      "action": "sit",
+      "text": "A person sits down on a chair, turns left, leans backward on the back of the chair, then stands up from the chair, steps"
+    }
+  ],
+  "unique_objects": [
+    "110",
+    "141",
+    "157",
+    "162",
+    "17",
+    "173",
+    "176",
+    "24",
+    "46",
+    "48",
+    "64",
+    "81",
+    "85",
+    "87",
+    "baseball",
+    "bigsofa",
+    "box",
+    "case",
+    "chair",
+    "clothesstand",
+    "floorlamp",
+    "flower",
+    "keyboard",
+    "largebox",
+    "largetable",
+    "monitor",
+    "pan",
+    "pingpong",
+    "pink",
+    "plasticbox",
+    "smallbox",
+    "smalltable",
+    "suitcase",
+    "table",
+    "trashcan",
+    "tripod",
+    "whitechair",
+    "woodchair"
+  ],
+  "unique_actions": [
+    "bend",
+    "carrie",
+    "grab",
+    "half",
+    "hold",
+    "i",
+    "kick",
+    "lie",
+    "lift",
+    "pull",
+    "push",
+    "put",
+    "set",
+    "shack",
+    "sit",
+    "stand",
+    "swing",
+    "the",
+    "turn",
+    "use",
+    "walk"
+  ]
+}

@@ -51,12 +51,25 @@ def _extract(a: Tensor, t: Tensor, x_shape: torch.Size) -> Tensor:
 class DiffusionConfig:
     num_steps: int = 1000
     schedule: str = "cosine"
+    objective: str = "ddpm"  # "ddpm" | "rectified_flow"
     # "x0" = denoiser predicts clean x_0 (MDM/OMOMO style).
     # "v"  = denoiser predicts v = sqrt(ᾱ)·ε - sqrt(1-ᾱ)·x_0 (Salimans & Ho 2022).
     #        Hybrid noise+clean target; recommended by Back-to-Basics for
     #        better dynamics under rotation reps. x_0 is recovered via
     #        x_0 = sqrt(ᾱ)·x_t - sqrt(1-ᾱ)·v inside the sampler / training.
     prediction_target: str = "x0"
+    # Rectified-flow / flow-matching ablation. Time convention follows ELF:
+    # rf_t=0 is pure noise, rf_t=1 is clean data. We map RF time to the
+    # existing DDPM-style timestep embedding as noisedness:
+    # rf_t=0 -> num_steps-1, rf_t=1 -> 0.
+    rf_eps_time: float = 0.05
+    rf_time_schedule: str = "uniform"  # "uniform" | "logit_normal"
+    rf_denoiser_p_mean: float = -1.5
+    rf_denoiser_p_std: float = 0.8
+    rf_denoiser_noise_scale: float = 1.0
+    rf_num_sampling_steps: int = 100
+    rf_sampler_type: str = "rectified_flow_ode"  # "rectified_flow_ode" | "rectified_flow_sde"
+    rf_sde_gamma: float = 0.0
 
 
 class GaussianDiffusion(nn.Module):
@@ -69,9 +82,22 @@ class GaussianDiffusion(nn.Module):
     def __init__(self, cfg: DiffusionConfig) -> None:
         super().__init__()
         self.num_steps = cfg.num_steps
+        self.objective = cfg.objective
+        if cfg.objective not in ("ddpm", "rectified_flow"):
+            raise ValueError(
+                f"objective must be 'ddpm' or 'rectified_flow', got {cfg.objective!r}"
+            )
         self.prediction_target = cfg.prediction_target
         if cfg.prediction_target not in ("x0", "v"):
             raise ValueError(f"prediction_target must be 'x0' or 'v', got {cfg.prediction_target!r}")
+        self.rf_eps_time = float(cfg.rf_eps_time)
+        self.rf_time_schedule = str(cfg.rf_time_schedule)
+        self.rf_denoiser_p_mean = float(cfg.rf_denoiser_p_mean)
+        self.rf_denoiser_p_std = float(cfg.rf_denoiser_p_std)
+        self.rf_denoiser_noise_scale = float(cfg.rf_denoiser_noise_scale)
+        self.rf_num_sampling_steps = int(cfg.rf_num_sampling_steps)
+        self.rf_sampler_type = str(cfg.rf_sampler_type)
+        self.rf_sde_gamma = float(cfg.rf_sde_gamma)
         if cfg.schedule == "cosine":
             betas = cosine_beta_schedule(cfg.num_steps)
         else:
@@ -121,6 +147,31 @@ class GaussianDiffusion(nn.Module):
             _extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise
             - _extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
         )
+
+    def sample_rf_t(self, batch_size: int, device: torch.device) -> Tensor:
+        """Sample rectified-flow times in (0, 1), where 0=noise and 1=data."""
+        eps = float(self.rf_eps_time)
+        if self.rf_time_schedule == "uniform":
+            t = torch.rand(batch_size, device=device)
+        elif self.rf_time_schedule == "logit_normal":
+            z = (
+                torch.randn(batch_size, device=device) * float(self.rf_denoiser_p_std)
+                + float(self.rf_denoiser_p_mean)
+            )
+            t = torch.sigmoid(z)
+        else:
+            raise ValueError(f"Unknown rf_time_schedule={self.rf_time_schedule!r}")
+        return t.clamp(min=eps, max=1.0 - eps)
+
+    def rf_time_to_index(self, t_rf: Tensor) -> Tensor:
+        """Map RF time (0=noise, 1=data) to existing DDPM noisedness index."""
+        t_idx = torch.round((1.0 - t_rf) * float(self.num_steps - 1))
+        return t_idx.clamp(0, self.num_steps - 1).long()
+
+    def rf_interpolate(self, x_start: Tensor, t_rf: Tensor, noise: Tensor) -> Tensor:
+        """Rectified-flow path z_t = t*x0 + (1-t)*noise."""
+        t = t_rf.reshape(t_rf.shape[0], *((1,) * (x_start.ndim - 1)))
+        return t * x_start + (1.0 - t) * noise
 
     def posterior_mean_from_x0(
         self, x_start: Tensor, x_t: Tensor, t: Tensor,
@@ -186,6 +237,11 @@ class GaussianDiffusion(nn.Module):
         """
         device = device or self.betas.device
         x = torch.randn(shape, device=device)
+        denoiser_cfg = getattr(denoiser, "cfg", None)
+        use_self_cond = bool(getattr(denoiser_cfg, "use_self_conditioning", False))
+        self_cond_mode = str(getattr(denoiser_cfg, "self_conditioning_mode", "standard"))
+        self_cond_t_max = int(getattr(denoiser_cfg, "self_conditioning_t_max", 700))
+        self_cond: Tensor | None = None
 
         # If replacement OR output_skip is enabled, extract cond_motion
         # and obs_mask from the CondMDI cond_motion_input.
@@ -204,6 +260,17 @@ class GaussianDiffusion(nn.Module):
 
         for t_int in reversed(range(self.num_steps)):
             t = torch.full((shape[0],), t_int, device=device, dtype=torch.long)
+            if not use_self_cond:
+                curr_self_cond = None
+            elif self_cond_mode == "standard":
+                curr_self_cond = self_cond
+            elif self_cond_mode == "late_start":
+                curr_self_cond = self_cond if t_int <= self_cond_t_max else None
+            else:
+                raise ValueError(
+                    "self_conditioning_mode must be 'standard' or 'late_start', "
+                    f"got {self_cond_mode!r}"
+                )
 
             # x_t replacement: BEFORE the network call at each step. Forces
             # the trajectory's noisy state at observed frames to match the
@@ -217,10 +284,14 @@ class GaussianDiffusion(nn.Module):
                 )
                 x = obs_mask * x_obs + (1.0 - obs_mask) * x
 
-            pred_cond = denoiser(x, t, cond, cond_drop_mask=None)
+            pred_cond = denoiser(
+                x, t, cond, cond_drop_mask=None, self_cond=curr_self_cond,
+            )
             if cfg_scale != 1.0:
                 drop = torch.ones(shape[0], dtype=torch.bool, device=device)
-                pred_uncond = denoiser(x, t, cond, cond_drop_mask=drop)
+                pred_uncond = denoiser(
+                    x, t, cond, cond_drop_mask=drop, self_cond=curr_self_cond,
+                )
             else:
                 pred_uncond = None
 
@@ -252,6 +323,9 @@ class GaussianDiffusion(nn.Module):
             # because x0 already matches cond_motion at observed frames.
             if replacement == "x0" and cond_motion is not None:
                 x0 = obs_mask * cond_motion + (1.0 - obs_mask) * x0
+
+            if use_self_cond:
+                self_cond = x0.detach()
 
             if sampler == "ddim_eta0":
                 # DDIM update with η = 0 (deterministic) — Song et al.,
@@ -286,6 +360,102 @@ class GaussianDiffusion(nn.Module):
                     )
                     x = mean + (0.5 * log_var).exp() * noise
         return x
+
+    @torch.no_grad()
+    def rf_sample_loop(
+        self,
+        denoiser: "AnchorDenoiser",
+        shape: tuple[int, ...],
+        cond: dict,
+        cfg_scale: float = 1.0,
+        device: torch.device | None = None,
+        output_skip: bool = False,
+        num_steps: int | None = None,
+        sampler_type: str | None = None,
+        time_schedule: str | None = None,
+        sde_gamma: float | None = None,
+        return_intermediates: tuple[float, ...] | None = None,
+    ) -> Tensor | tuple[Tensor, dict[float, Tensor]]:
+        """Rectified-flow ODE/SDE sampler adapted from ELF's continuous flow."""
+        device = device or self.betas.device
+        steps = int(num_steps or self.rf_num_sampling_steps)
+        sampler = str(sampler_type or self.rf_sampler_type)
+        schedule = str(time_schedule or self.rf_time_schedule)
+        gamma = float(self.rf_sde_gamma if sde_gamma is None else sde_gamma)
+        eps_time = float(self.rf_eps_time)
+        if steps <= 0:
+            raise ValueError(f"rf num_steps must be positive, got {steps}")
+        if sampler not in ("rectified_flow_ode", "rectified_flow_sde"):
+            raise ValueError(f"Unknown RF sampler_type={sampler!r}")
+
+        if schedule == "uniform":
+            times = torch.linspace(0.0, 1.0, steps + 1, device=device)
+        elif schedule == "logit_normal":
+            inner = torch.sigmoid(
+                torch.randn(steps - 1, device=device) * float(self.rf_denoiser_p_std)
+                + float(self.rf_denoiser_p_mean)
+            )
+            times = torch.cat([
+                torch.zeros(1, device=device),
+                inner.sort().values,
+                torch.ones(1, device=device),
+            ])
+        else:
+            raise ValueError(f"Unknown RF sampling schedule={schedule!r}")
+
+        z = torch.randn(shape, device=device) * float(self.rf_denoiser_noise_scale)
+        logs: dict[float, Tensor] = {}
+        log_targets = tuple(float(v) for v in (return_intermediates or ()))
+        next_log_idx = 0
+
+        cond_motion = obs_mask = None
+        if output_skip:
+            if "cond_motion_input" not in cond:
+                raise ValueError("output_skip=True requires cond['cond_motion_input']")
+            cmi = cond["cond_motion_input"]
+            motion_dim = shape[-1]
+            cond_motion = cmi[..., :motion_dim]
+            obs_mask = cmi[..., motion_dim:motion_dim + 1]
+
+        def _predict_clean(z_in: Tensor, t_rf_scalar: Tensor) -> Tensor:
+            t_batch_rf = t_rf_scalar.expand(shape[0])
+            t_idx = self.rf_time_to_index(t_batch_rf)
+            pred_cond = denoiser(z_in, t_idx, cond, cond_drop_mask=None, self_cond=None)
+            if cfg_scale != 1.0:
+                drop = torch.ones(shape[0], dtype=torch.bool, device=device)
+                pred_uncond = denoiser(z_in, t_idx, cond, cond_drop_mask=drop, self_cond=None)
+                x0 = pred_uncond + float(cfg_scale) * (pred_cond - pred_uncond)
+            else:
+                x0 = pred_cond
+            if output_skip and cond_motion is not None and obs_mask is not None:
+                x0 = obs_mask * cond_motion + (1.0 - obs_mask) * x0
+            return x0
+
+        for i in range(steps):
+            t_cur = times[i]
+            t_next = times[i + 1]
+            z_in = z
+            t_model = t_cur
+            if sampler == "rectified_flow_sde" and gamma > 0.0:
+                h = t_next - t_cur
+                alpha = torch.clamp(1.0 - gamma * h, min=0.0, max=1.0)
+                t_model = alpha * t_cur
+                eps = torch.randn_like(z) * float(self.rf_denoiser_noise_scale)
+                z_in = alpha * z + (1.0 - alpha) * eps
+
+            x0 = _predict_clean(z_in, t_model.reshape(()))
+            v = (x0 - z_in) / torch.clamp(1.0 - t_model, min=eps_time)
+            z = z_in + (t_next - t_model) * v
+
+            while next_log_idx < len(log_targets) and float(t_next.item()) >= log_targets[next_log_idx]:
+                logs[log_targets[next_log_idx]] = z.detach().clone()
+                next_log_idx += 1
+
+        if return_intermediates is not None:
+            if 1.0 not in logs:
+                logs[1.0] = z.detach().clone()
+            return z, logs
+        return z
 
 
 # ============================================================================
@@ -473,6 +643,45 @@ class AnchorDenoiserConfig:
     plan_per_part_tokens: bool = False
     plan_context_hint_mode: str = "time_only"
 
+    # v12 DiT/InterGen-style conditional transformer (per
+    # analyses/2026-05-11_v12_architecture_design_doc.md).
+    # When ``use_dit_block=True``: separate per-channel input projections
+    # summed (V12InputProjection) + per-block AdaLN-Zero + per-block plan
+    # cross-attn (PixArt placement) + AdaLN final layer. When False:
+    # legacy v11 path (concat + nn.TransformerEncoder + end-of-encoder
+    # plan_xattn x 1). Default False = back-compat preserved.
+    use_dit_block: bool = False
+
+    # v12-A1 flag (post 2026-05-11 cond_diversity_audit):
+    # when True (v12 default): AdaLN cond = t_emb + plan_pool_emb (InterGen).
+    # when False (A1): AdaLN cond = t_emb only; all plan info must flow
+    # through per-layer plan cross-attn. Forces the model to use per-anchor
+    # spatial detail rather than the masked-mean pool that washes it out.
+    # See analyses/2026-05-11_cond_diversity_audit.md §4 + v12 round report §7.
+    dit_block_use_plan_pool_in_cond: bool = True
+
+    # v13 (per analyses/2026-05-11_v13_dynhead_temporalconv_design.md):
+    #   use_v13_dynhead: replace V12FinalLayer with V13DynamicsHead
+    #     (base + cumsum-integrated delta residual, learnable γ scale).
+    #   use_v13_temporal_conv: insert depthwise temporal Conv1D residual
+    #     (zero-gated) between self-attn and plan-xattn inside every block.
+    #   Both flags require use_dit_block=True. Defaults preserve v12 A1.
+    use_v13_dynhead: bool = False
+    v13_dynhead_gamma_init: float = 0.1
+    v13_dynhead_learnable_gamma: bool = True
+    use_v13_temporal_conv: bool = False
+    v13_temporal_conv_kernel: int = 5
+
+    # v22 self-conditioning ablation. When enabled, the DiT input stream
+    # receives a zero-gated projection of an x0 prediction. During training it
+    # is generated by a no-grad first pass at the same x_t and t; during
+    # sampling it is the previous reverse step's x0 prediction.
+    use_self_conditioning: bool = False
+    self_conditioning_prob: float = 0.0
+    self_conditioning_mode: str = "standard"  # "standard" | "late_start"
+    self_conditioning_t_max: int = 700
+    self_conditioning_zero_init: bool = True
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -515,20 +724,22 @@ class AnchorDenoiser(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        per_frame_in = (
-            cfg.motion_dim
-            + cfg.cond_motion_dim
-            + cfg.z_int.total
-            + cfg.object_traj_dim
-        )
-        # v10 plan-context hint widens the per-frame input projection. The
-        # hint is encoded by the InteractionPlanEncoder (§5.5) and gives
-        # the motion-token branch explicit "where am I relative to the
-        # nearest anchor" features without replacing cross-attention.
-        if cfg.use_interaction_plan and cfg.plan_use_context_hint:
-            per_frame_in += cfg.plan_d_hint
-        self.in_proj = nn.Linear(per_frame_in, cfg.d_model)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.motion_dim)
+        # v11 path: concat-then-Linear input projection. Skipped under v12.
+        if not cfg.use_dit_block:
+            per_frame_in = (
+                cfg.motion_dim
+                + cfg.cond_motion_dim
+                + cfg.z_int.total
+                + cfg.object_traj_dim
+            )
+            # v10 plan-context hint widens the per-frame input projection. The
+            # hint is encoded by the InteractionPlanEncoder (§5.5) and gives
+            # the motion-token branch explicit "where am I relative to the
+            # nearest anchor" features without replacing cross-attention.
+            if cfg.use_interaction_plan and cfg.plan_use_context_hint:
+                per_frame_in += cfg.plan_d_hint
+            self.in_proj = nn.Linear(per_frame_in, cfg.d_model)
+            self.out_proj = nn.Linear(cfg.d_model, cfg.motion_dim)
 
         self.time_embed = nn.Sequential(
             SinusoidalTimestepEmbed(cfg.d_model),
@@ -557,16 +768,24 @@ class AnchorDenoiser(nn.Module):
 
         self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_seq_length + 2)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_model * cfg.ff_mult,
-            dropout=cfg.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
+        if cfg.use_self_conditioning and not cfg.use_dit_block:
+            raise ValueError(
+                "Self-conditioning is implemented for the v12 DiT path only; "
+                "set use_dit_block=True or disable use_self_conditioning."
+            )
+
+        # v11 path: vanilla self-attn encoder. v12 uses ConditionedEncoderLayer.
+        if not cfg.use_dit_block:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=cfg.d_model,
+                nhead=cfg.n_heads,
+                dim_feedforward=cfg.d_model * cfg.ff_mult,
+                dropout=cfg.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
 
         # Cross-attn for text / object tokens — applied AFTER encoder.
         # Simpler than alternating self/cross like MDM.trans_dec; still
@@ -608,12 +827,16 @@ class AnchorDenoiser(nn.Module):
                 context_hint_mode=cfg.plan_context_hint_mode,
             )
             self.plan_encoder = InteractionPlanEncoder(plan_enc_cfg)
-            self.plan_xattn = PlanCrossAttentionBlock(
-                d_model=cfg.d_model,
-                n_heads=cfg.n_heads,
-                ff_mult=cfg.ff_mult,
-                dropout=cfg.dropout,
-            )
+            # v11 path: single end-of-encoder plan cross-attn block.
+            # v12 path: per-block plan cross-attn lives inside each
+            # ConditionedEncoderLayer (built below); skip this single block.
+            if not cfg.use_dit_block:
+                self.plan_xattn = PlanCrossAttentionBlock(
+                    d_model=cfg.d_model,
+                    n_heads=cfg.n_heads,
+                    ff_mult=cfg.ff_mult,
+                    dropout=cfg.dropout,
+                )
             # Null plan tokens for explicit plan-CFG ablation. Stored
             # unconditionally (size 1×D) for state_dict stability; only
             # consumed when ``cfg_drop_plan=True``. The value broadcasts
@@ -626,6 +849,90 @@ class AnchorDenoiser(nn.Module):
         else:
             self.plan_encoder = None
             self.plan_xattn = None
+
+        # ─── v12 modules (per analyses/2026-05-11_v12_architecture_design_doc.md) ───
+        # When use_dit_block=True, replace v11's concat-input + vanilla
+        # encoder + end-of-encoder plan_xattn with:
+        #   - V12InputProjection: separate per-channel projections summed
+        #   - GlobalCondSummary: per-sample (B, D) cond for AdaLN
+        #   - ConditionedEncoderLayer × n_layers: AdaLN-Zero + plan xattn per block
+        #   - V12FinalLayer: AdaLN-Zero + zero-init linear readout
+        # text + obj cross-attn (above) stay at end-of-encoder (v11 carryover).
+        if cfg.use_dit_block:
+            from piano.models.dit_blocks import (
+                V12InputProjection,
+                GlobalCondSummary,
+                ConditionedEncoderLayer,
+                V12FinalLayer,
+                V13DynamicsHead,
+                initialize_weights_v12,
+            )
+            if not cfg.use_interaction_plan:
+                raise ValueError(
+                    "use_dit_block=True requires use_interaction_plan=True "
+                    "(GlobalCondSummary pools plan tokens and per-block plan "
+                    "cross-attn is the core of the v12 design)."
+                )
+            if not cfg.plan_use_context_hint:
+                raise ValueError(
+                    "use_dit_block=True requires plan_use_context_hint=True "
+                    "(v12 InputProjection includes the plan_hint channel)."
+                )
+            if cfg.cond_motion_dim > 0:
+                raise ValueError(
+                    "use_dit_block=True is not compatible with cond_motion_dim>0 "
+                    "(CondMDI inpainting channel was a v9 feature; v12 dropped it). "
+                    "Use cond_motion_dim=0."
+                )
+            if cfg.use_self_conditioning and cfg.self_conditioning_mode not in (
+                "standard", "late_start",
+            ):
+                raise ValueError(
+                    "self_conditioning_mode must be 'standard' or 'late_start', "
+                    f"got {cfg.self_conditioning_mode!r}"
+                )
+            self.v12_input_proj = V12InputProjection(
+                motion_dim=cfg.motion_dim,
+                zint_dim=cfg.z_int.total,
+                obj_traj_dim=cfg.object_traj_dim,
+                hint_dim=cfg.plan_d_hint,
+                d_model=cfg.d_model,
+                use_self_conditioning=cfg.use_self_conditioning,
+                self_conditioning_zero_init=cfg.self_conditioning_zero_init,
+            )
+            self.v12_cond_summary = GlobalCondSummary(
+                d_model=cfg.d_model,
+                use_plan_pool=cfg.dit_block_use_plan_pool_in_cond,
+            )
+            self.v12_blocks = nn.ModuleList([
+                ConditionedEncoderLayer(
+                    d_model=cfg.d_model,
+                    n_heads=cfg.n_heads,
+                    ff_mult=cfg.ff_mult,
+                    dropout=cfg.dropout,
+                    use_temporal_conv=cfg.use_v13_temporal_conv,
+                    temporal_conv_kernel=cfg.v13_temporal_conv_kernel,
+                )
+                for _ in range(cfg.n_layers)
+            ])
+            if cfg.use_v13_dynhead:
+                self.v12_final_layer = V13DynamicsHead(
+                    d_model=cfg.d_model,
+                    motion_dim=cfg.motion_dim,
+                    gamma_init=cfg.v13_dynhead_gamma_init,
+                    learnable_gamma=cfg.v13_dynhead_learnable_gamma,
+                )
+            else:
+                self.v12_final_layer = V12FinalLayer(
+                    d_model=cfg.d_model,
+                    motion_dim=cfg.motion_dim,
+                )
+            initialize_weights_v12(
+                input_proj=self.v12_input_proj,
+                blocks=self.v12_blocks,
+                final_layer=self.v12_final_layer,
+                cond_summary=self.v12_cond_summary,
+            )
 
     @staticmethod
     def _broadcast_drop(mask: Tensor | None, x: Tensor, null_value: Tensor) -> Tensor:
@@ -644,9 +951,15 @@ class AnchorDenoiser(nn.Module):
         t: Tensor,            # (B,) long, diffusion step
         cond: dict,           # see top-level docstring
         cond_drop_mask: Tensor | None,  # (B,) bool — True = drop conditioning
+        self_cond: Tensor | None = None,
     ) -> Tensor:
         B, T, _ = x_t.shape
         cfg = self.cfg
+        if self_cond is not None and self_cond.shape != x_t.shape:
+            raise ValueError(
+                f"self_cond shape {tuple(self_cond.shape)} must match x_t "
+                f"shape {tuple(x_t.shape)}"
+            )
 
         z_int: Tensor = cond["z_int"]                  # (B, T, zint_total)
         obj_traj: Tensor = cond["object_world_traj"]   # (B, T, 9)
@@ -657,6 +970,15 @@ class AnchorDenoiser(nn.Module):
         # --- CFG drop: replace conditioning channels with null embeddings ---
         z_int_eff = self._broadcast_drop(cond_drop_mask, z_int, self.null_zint)
         obj_traj_eff = self._broadcast_drop(cond_drop_mask, obj_traj, self.null_obj_traj)
+
+        # ─── v12 path (use_dit_block=True): DiT/InterGen-style forward ───
+        if cfg.use_dit_block:
+            return self._forward_v12(
+                x_t=x_t, t=t, z_int_eff=z_int_eff, obj_traj_eff=obj_traj_eff,
+                init_pose=init_pose, text_tok=text_tok, obj_tok=obj_tok,
+                cond=cond, cond_drop_mask=cond_drop_mask,
+                self_cond=self_cond, T=T,
+            )
 
         # --- Per-frame projection: concat motion + (cond_motion) + z_int + object_traj ---
         # CondMDI inpainting channel: caller has already concatenated
@@ -752,6 +1074,89 @@ class AnchorDenoiser(nn.Module):
         x0 = self.out_proj(h_out)                                        # (B, T, motion_dim)
         return x0
 
+    def _forward_v12(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        z_int_eff: Tensor,
+        obj_traj_eff: Tensor,
+        init_pose: Tensor,
+        text_tok: Tensor,
+        obj_tok: Tensor,
+        cond: dict,
+        cond_drop_mask: Tensor | None,
+        self_cond: Tensor | None,
+        T: int,
+    ) -> Tensor:
+        """v12 forward path — per analyses/2026-05-11_v12_architecture_design_doc.md §5."""
+        cfg = self.cfg
+        B = x_t.shape[0]
+
+        # ─── Plan encoder (carryover from v11) ───
+        plan_dict = cond.get("interaction_plan", None)
+        if plan_dict is None:
+            raise KeyError(
+                "v12 (use_dit_block=True) requires cond['interaction_plan']"
+            )
+        plan_tokens, plan_mask, plan_hint = self.plan_encoder(plan_dict, T)
+        if cfg.cfg_drop_plan:
+            plan_tokens = self._broadcast_drop(
+                cond_drop_mask, plan_tokens, self.null_plan_token,
+            )
+            if plan_hint is not None and hasattr(self, "null_plan_hint"):
+                plan_hint = self._broadcast_drop(
+                    cond_drop_mask, plan_hint, self.null_plan_hint,
+                )
+
+        # ─── Timestep embedding (B, D) ───
+        t_emb = self.time_embed(t)                                       # (B, D)
+
+        # ─── §4.3 Input projection (per-channel summed, residual stream) ───
+        # Per-frame conditions flow through here; v11's bandwidth bottleneck
+        # (single Linear(217,512)) is replaced by 4 separate projections.
+        h = self.v12_input_proj(
+            x_t=x_t,
+            z_int=z_int_eff,
+            obj_traj=obj_traj_eff,
+            plan_hint=plan_hint,
+            self_cond=self_cond,
+        )                                                                # (B, T, D)
+
+        # ─── §4.4 Global condition vector for AdaLN (per-sample) ───
+        # c = t_emb + plan_pool_emb. Drives AdaLN modulation in every block
+        # and in the final layer. Per-sample = same modulation across all T frames.
+        c = self.v12_cond_summary(
+            t_emb=t_emb, plan_tokens=plan_tokens, plan_mask=plan_mask,
+        )                                                                # (B, D)
+
+        # ─── Prepend init_pose token (time_tok dropped — timestep is in AdaLN) ───
+        pose_tok = self.pose_proj(init_pose).unsqueeze(1)                # (B, 1, D)
+        seq = torch.cat([pose_tok, h], dim=1)                            # (B, T+1, D)
+        seq = self.pos_enc(seq)
+
+        # ─── §4.5 ConditionedEncoderLayer × n_layers ───
+        # PyTorch nn.MultiheadAttention key_padding_mask: True = ignore.
+        # plan_mask is True at valid positions → invert.
+        plan_kpm = ~plan_mask.bool()                                     # (B, K)
+        for block in self.v12_blocks:
+            seq = block(seq, c, plan_tokens, plan_kpm)
+
+        # ─── Text + obj cross-attn at end of encoder (v11 carryover) ───
+        text_kv = self.text_proj(text_tok)
+        text_kv = self._broadcast_drop(cond_drop_mask, text_kv, self.null_text)
+        text_attn, _ = self.text_xattn(seq, text_kv, text_kv, need_weights=False)
+        seq = self.text_norm(seq + text_attn)
+
+        obj_kv = self.object_proj(obj_tok)
+        obj_kv = self._broadcast_drop(cond_drop_mask, obj_kv, self.null_obj_tokens)
+        obj_attn, _ = self.obj_xattn(seq, obj_kv, obj_kv, need_weights=False)
+        seq = self.obj_norm(seq + obj_attn)
+
+        # ─── §4.6 Final layer (drop pose prefix token, AdaLN-Zero readout) ───
+        h_motion = seq[:, 1:, :]                                         # (B, T, D)
+        x0 = self.v12_final_layer(h_motion, c)                           # (B, T, motion_dim)
+        return x0
+
 
 # ============================================================================
 # Public bundle
@@ -800,16 +1205,93 @@ class MotionAnchorDiff(nn.Module):
         """
         B, T, _ = x_start.shape
         device = x_start.device
+
+        if self.diffusion.objective == "rectified_flow":
+            if self.cfg.diffusion.prediction_target != "x0":
+                raise ValueError("rectified_flow objective currently requires prediction_target='x0'")
+            t_rf = self.diffusion.sample_rf_t(B, device=device)
+            t_idx = self.diffusion.rf_time_to_index(t_rf)
+            noise = torch.randn_like(x_start) * float(self.diffusion.rf_denoiser_noise_scale)
+            z_t = self.diffusion.rf_interpolate(x_start, t_rf, noise)
+
+            # CFG dropout: per-sample bernoulli over the full conditioning.
+            drop_mask = torch.rand(B, device=device) < self.cfg.cfg_drop_prob
+            x0_raw = self.denoiser(
+                z_t, t_idx, cond, cond_drop_mask=drop_mask, self_cond=None,
+            )
+            denoiser_cfg = self.cfg.denoiser
+            x0_pred = _apply_observed_x0_skip(
+                x0_raw, cond,
+                motion_dim=denoiser_cfg.motion_dim,
+                enabled=bool(denoiser_cfg.cond_motion_output_skip),
+            )
+            denom = (1.0 - t_rf).view(B, 1, 1).clamp_min(float(self.diffusion.rf_eps_time))
+            v_pred = (x0_pred - z_t) / denom
+            v_target = x_start - noise
+            return {
+                "x0_raw": x0_raw,
+                "x0_pred": x0_pred,
+                "x0_target": x_start,
+                "diff_pred": v_pred,
+                "diff_target": v_target,
+                "x_t": z_t,
+                "t": t_idx,
+                "rf_t": t_rf,
+                "rf_v_pred_norm": v_pred.detach().pow(2).mean().sqrt(),
+                "rf_v_target_norm": v_target.detach().pow(2).mean().sqrt(),
+                "rf_x0_pred_norm": x0_pred.detach().pow(2).mean().sqrt(),
+                "self_conditioning_used_fraction": torch.zeros((), device=device),
+                "self_conditioning_allowed_fraction": torch.zeros((), device=device),
+            }
+
         t = torch.randint(0, self.diffusion.num_steps, (B,), device=device)
         noise = torch.randn_like(x_start)
         x_t = self.diffusion.q_sample(x_start, t, noise)
 
         # CFG dropout: per-sample bernoulli over the full conditioning.
         drop_mask = torch.rand(B, device=device) < self.cfg.cfg_drop_prob
-        net_out = self.denoiser(x_t, t, cond, cond_drop_mask=drop_mask)
-
         target = self.cfg.diffusion.prediction_target
         denoiser_cfg = self.cfg.denoiser
+        self_cond: Tensor | None = None
+        sc_used_mask = torch.zeros(B, device=device, dtype=torch.bool)
+        sc_allowed_mask = torch.zeros(B, device=device, dtype=torch.bool)
+        if (
+            bool(denoiser_cfg.use_self_conditioning)
+            and float(denoiser_cfg.self_conditioning_prob) > 0.0
+        ):
+            mode = str(denoiser_cfg.self_conditioning_mode)
+            if mode == "standard":
+                sc_allowed_mask = torch.ones(B, device=device, dtype=torch.bool)
+            elif mode == "late_start":
+                sc_allowed_mask = t <= int(denoiser_cfg.self_conditioning_t_max)
+            else:
+                raise ValueError(
+                    "self_conditioning_mode must be 'standard' or 'late_start', "
+                    f"got {mode!r}"
+                )
+            sc_used_mask = (
+                torch.rand(B, device=device) < float(denoiser_cfg.self_conditioning_prob)
+            ) & sc_allowed_mask
+            if sc_used_mask.any():
+                # Training self_cond is generated by a no-grad first pass at
+                # the same x_t and t. Inference self_cond comes from the
+                # previous reverse step, so this is standard self-conditioning
+                # but only an approximation to true rollout conditioning.
+                with torch.no_grad():
+                    sc_raw = self.denoiser(
+                        x_t, t, cond, cond_drop_mask=None, self_cond=None,
+                    )
+                    if target == "v":
+                        sc_x0 = self.diffusion.predict_x0_from_v(x_t, t, sc_raw)
+                    else:
+                        sc_x0 = sc_raw
+                    self_cond = torch.zeros_like(x_start)
+                    self_cond[sc_used_mask] = sc_x0.detach()[sc_used_mask]
+
+        net_out = self.denoiser(
+            x_t, t, cond, cond_drop_mask=drop_mask, self_cond=self_cond,
+        )
+
         output_skip = bool(denoiser_cfg.cond_motion_output_skip)
 
         if target == "v":
@@ -847,6 +1329,8 @@ class MotionAnchorDiff(nn.Module):
             "diff_target": diff_target,
             "x_t": x_t,
             "t": t,
+            "self_conditioning_used_fraction": sc_used_mask.float().mean(),
+            "self_conditioning_allowed_fraction": sc_allowed_mask.float().mean(),
         }
 
     @torch.no_grad()
@@ -875,6 +1359,12 @@ class MotionAnchorDiff(nn.Module):
         shape = (B, seq_length, self.cfg.denoiser.motion_dim)
         if output_skip is None:
             output_skip = bool(self.cfg.denoiser.cond_motion_output_skip)
+        if self.diffusion.objective == "rectified_flow" or sampler.startswith("rectified_flow"):
+            return self.diffusion.rf_sample_loop(
+                self.denoiser, shape, cond, cfg_scale=cfg_scale,
+                device=cond["z_int"].device, output_skip=output_skip,
+                sampler_type=sampler if sampler.startswith("rectified_flow") else None,
+            )
         return self.diffusion.p_sample_loop(
             self.denoiser, shape, cond, cfg_scale=cfg_scale,
             replacement=replacement, output_skip=output_skip,

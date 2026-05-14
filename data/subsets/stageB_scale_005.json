@@ -1,0 +1,59 @@
+{
+  "seed": 42,
+  "scale": 5,
+  "config_basis": "configs\\training\\anchordiff_v12_dit_block_no_planpool_FULL_N10.yaml",
+  "indices": [
+    463,
+    325,
+    466,
+    480,
+    442
+  ],
+  "clips": [
+    {
+      "global_idx": 463,
+      "subset": "neuraldome",
+      "seq_id": "subject07_smallsofa_1222_1",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 325,
+      "subset": "imhd",
+      "seq_id": "20231015_wangjy_pan_freestyle4_0_431_1",
+      "object_id": "pan",
+      "text": ""
+    },
+    {
+      "global_idx": 466,
+      "subset": "neuraldome",
+      "seq_id": "subject06_smallsofa_480",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 480,
+      "subset": "neuraldome",
+      "seq_id": "subject08_talltable_0_2",
+      "object_id": "talltable",
+      "text": ""
+    },
+    {
+      "global_idx": 442,
+      "subset": "neuraldome",
+      "seq_id": "subject08_pillow_450_1",
+      "object_id": "pillow",
+      "text": ""
+    }
+  ],
+  "unique_objects": [
+    "pan",
+    "pillow",
+    "smallsofa",
+    "talltable"
+  ],
+  "unique_subsets": [
+    "imhd",
+    "neuraldome"
+  ]
+}

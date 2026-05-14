@@ -310,6 +310,25 @@ def main() -> None:
     plan_gt = _extract_plan(main_batch)
     plan_other = _extract_plan(secondary_batch)
 
+    # Plan-target zeroing (per claude_code_v11_next_localdyn_target_routing.md §C.2).
+    # If the trained checkpoint zeroed plan target geometry, all plan
+    # variants supplied to the diagnostic must also zero those channels
+    # so the model receives in-distribution inputs. Anchor-realisation
+    # metric still uses the ORIGINAL plan_gt's anchor_target_world for
+    # evaluation — only the channels fed into the encoder are zeroed.
+    _zero_plan_target = bool(cfg.model.get("zero_plan_target_for_stageB", False))
+
+    def _maybe_zero_plan_target(plan: dict) -> dict:
+        if not _zero_plan_target:
+            return plan
+        out = dict(plan)
+        out["anchor_target_local"] = torch.zeros_like(out["anchor_target_local"])
+        out["anchor_target_world"] = torch.zeros_like(out["anchor_target_world"])
+        out["segment_target_summary_local"] = torch.zeros_like(
+            out["segment_target_summary_local"]
+        )
+        return out
+
     obj_pos_world = main_batch["object_positions"].to(device)
     obj_rot_world = main_batch["object_rotations"].to(device)
 
@@ -387,7 +406,7 @@ def main() -> None:
     # 1. Plan-variant sweep under FULL conditioning
     for vname, plan in plan_variants.items():
         torch.manual_seed(args.seed)
-        cond = {**cond_main, "interaction_plan": plan}
+        cond = {**cond_main, "interaction_plan": _maybe_zero_plan_target(plan)}
         with torch.no_grad():
             x0 = model.sample(cond=cond, seq_length=T, cfg_scale=args.cfg_scale)
         jpos_pred = _fk_decode_135(x0, rest_offsets, T)
@@ -408,7 +427,7 @@ def main() -> None:
             continue  # already done
         torch.manual_seed(args.seed)
         plan = plan_variants[plan_name]
-        cond = _cond_for_mode(mode, {**cond_main, "interaction_plan": plan})
+        cond = _cond_for_mode(mode, {**cond_main, "interaction_plan": _maybe_zero_plan_target(plan)})
         with torch.no_grad():
             x0 = model.sample(cond=cond, seq_length=T, cfg_scale=args.cfg_scale)
         jpos_pred = _fk_decode_135(x0, rest_offsets, T)

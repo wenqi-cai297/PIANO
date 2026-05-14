@@ -1,0 +1,23 @@
+{
+  "seed": 42,
+  "scale": 1,
+  "config_basis": "configs\\training\\anchordiff_v12_dit_block_no_planpool_FULL_N10.yaml",
+  "indices": [
+    463
+  ],
+  "clips": [
+    {
+      "global_idx": 463,
+      "subset": "neuraldome",
+      "seq_id": "subject07_smallsofa_1222_1",
+      "object_id": "smallsofa",
+      "text": ""
+    }
+  ],
+  "unique_objects": [
+    "smallsofa"
+  ],
+  "unique_subsets": [
+    "neuraldome"
+  ]
+}

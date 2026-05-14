@@ -1,0 +1,922 @@
+{
+  "subset_name": "S1",
+  "target_n": 100,
+  "actual_n": 100,
+  "anchor_object_cluster": [
+    "whitechair",
+    "woodchair"
+  ],
+  "anchor_action": "lift",
+  "seed": 42,
+  "indices": [
+    6883,
+    6453,
+    6373,
+    6591,
+    6579,
+    6562,
+    6472,
+    6450,
+    6912,
+    6822,
+    6422,
+    6863,
+    6732,
+    6375,
+    6374,
+    6444,
+    6532,
+    6564,
+    6798,
+    6869,
+    6960,
+    6835,
+    6527,
+    6886,
+    6924,
+    6730,
+    6561,
+    6744,
+    6862,
+    6592,
+    6368,
+    6480,
+    6916,
+    6662,
+    6878,
+    6479,
+    6925,
+    6661,
+    6926,
+    6913,
+    6686,
+    6446,
+    6675,
+    6663,
+    6588,
+    6388,
+    6752,
+    6816,
+    6459,
+    6685,
+    6418,
+    6629,
+    6676,
+    6526,
+    6394,
+    6850,
+    6563,
+    6626,
+    6885,
+    6899,
+    6448,
+    6858,
+    6870,
+    6808,
+    6648,
+    6728,
+    6517,
+    6806,
+    6518,
+    6516,
+    6922,
+    6660,
+    6468,
+    6673,
+    6873,
+    6657,
+    6376,
+    6644,
+    6790,
+    6420,
+    6589,
+    6677,
+    6824,
+    6762,
+    6805,
+    6519,
+    6892,
+    6741,
+    6854,
+    6794,
+    6961,
+    6750,
+    6497,
+    6914,
+    6455,
+    6371,
+    6875,
+    6528,
+    6707,
+    6915
+  ],
+  "clips": [
+    {
+      "global_idx": 6883,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_015",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6453,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_111",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6373,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_027",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6591,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_027",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6579,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_013",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6562,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_061",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6472,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_whitechair_011",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6450,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_108",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6912,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_012",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6822,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_022",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6422,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_079",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, move the whitechair, and put down the whitechair."
+    },
+    {
+      "global_idx": 6863,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_007",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6732,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_067",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6375,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_029",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6374,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_028",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6444,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_102",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6532,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_029",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6564,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_063",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6798,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_069",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6869,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_017",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, then kick the woodchair to move, and set it back down."
+    },
+    {
+      "global_idx": 6960,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_063",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6835,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_036",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6527,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_024",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6886,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_018",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, then kick the woodchair to move, and set it back down."
+    },
+    {
+      "global_idx": 6924,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_026",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6730,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_065",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6561,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_060",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6744,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_010",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6862,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_006",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6592,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_028",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6368,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_022",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6480,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_whitechair_019",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6916,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_016",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6662,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_029",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6878,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_009",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6479,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_whitechair_018",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6925,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_027",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6661,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_028",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6926,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_028",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6913,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_013",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6686,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_019",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6446,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_104",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6675,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_008",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6663,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_030",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6588,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_024",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6388,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_042",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6752,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_018",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6816,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_016",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6459,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_117",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6685,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_018",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6418,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_073",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, move the whitechair, and put down the whitechair."
+    },
+    {
+      "global_idx": 6629,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_068",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6676,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_009",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6526,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_023",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6394,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_048",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6850,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_051",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6563,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_062",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6626,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_064",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6885,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_017",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6899,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_033",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6448,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_106",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6858,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_002",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6870,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_018",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, then kick the woodchair to move, and set it back down."
+    },
+    {
+      "global_idx": 6808,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_008",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6648,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_015",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6728,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_063",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6517,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_014",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6806,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_006",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6518,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_015",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6516,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_013",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6922,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_024",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6660,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_027",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6468,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_whitechair_007",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, move the whitechair, and put down the whitechair."
+    },
+    {
+      "global_idx": 6673,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_006",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6873,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_003",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6657,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_024",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6376,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_030",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6644,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_011",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6790,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_061",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6420,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_077",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, move the whitechair, and put down the whitechair."
+    },
+    {
+      "global_idx": 6589,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_025",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6677,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_010",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6824,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_024",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6762,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_028",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6805,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_005",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6519,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_016",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6892,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_026",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6741,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_007",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6854,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_woodchair_055",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6794,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_065",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6961,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_064",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6750,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_016",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6497,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_whitechair_036",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6914,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_014",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6455,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_113",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, flip it upside down and place it on top of the table."
+    },
+    {
+      "global_idx": 6371,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_025",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 6875,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_woodchair_005",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 6528,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_025",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 6707,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_woodchair_042",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    },
+    {
+      "global_idx": 6915,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_015",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair over your head, walk and then place the woodchair on the floor."
+    }
+  ],
+  "unique_objects": [
+    "whitechair",
+    "woodchair"
+  ],
+  "unique_actions": [
+    "lift"
+  ]
+}

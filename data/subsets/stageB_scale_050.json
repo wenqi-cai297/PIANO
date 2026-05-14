@@ -1,0 +1,453 @@
+{
+  "seed": 42,
+  "scale": 50,
+  "config_basis": "configs\\training\\anchordiff_v12_dit_block_no_planpool_FULL_N10.yaml",
+  "indices": [
+    463,
+    325,
+    466,
+    480,
+    442,
+    345,
+    366,
+    444,
+    187,
+    100,
+    172,
+    338,
+    488,
+    324,
+    402,
+    262,
+    312,
+    215,
+    351,
+    375,
+    230,
+    506,
+    293,
+    198,
+    75,
+    339,
+    245,
+    452,
+    76,
+    462,
+    336,
+    235,
+    106,
+    147,
+    567,
+    265,
+    552,
+    138,
+    483,
+    304,
+    14,
+    548,
+    439,
+    193,
+    118,
+    347,
+    116,
+    186,
+    357,
+    562
+  ],
+  "clips": [
+    {
+      "global_idx": 463,
+      "subset": "neuraldome",
+      "seq_id": "subject07_smallsofa_1222_1",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 325,
+      "subset": "imhd",
+      "seq_id": "20231015_wangjy_pan_freestyle4_0_431_1",
+      "object_id": "pan",
+      "text": ""
+    },
+    {
+      "global_idx": 466,
+      "subset": "neuraldome",
+      "seq_id": "subject06_smallsofa_480",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 480,
+      "subset": "neuraldome",
+      "seq_id": "subject08_talltable_0_2",
+      "object_id": "talltable",
+      "text": ""
+    },
+    {
+      "global_idx": 442,
+      "subset": "neuraldome",
+      "seq_id": "subject08_pillow_450_1",
+      "object_id": "pillow",
+      "text": ""
+    },
+    {
+      "global_idx": 345,
+      "subset": "neuraldome",
+      "seq_id": "subject10_baseball_1647",
+      "object_id": "baseball",
+      "text": ""
+    },
+    {
+      "global_idx": 366,
+      "subset": "neuraldome",
+      "seq_id": "subject06_book_300",
+      "object_id": "book",
+      "text": ""
+    },
+    {
+      "global_idx": 444,
+      "subset": "neuraldome",
+      "seq_id": "subject10_pingpong_1500",
+      "object_id": "pingpong",
+      "text": ""
+    },
+    {
+      "global_idx": 187,
+      "subset": "chairs",
+      "seq_id": "Sub1474_Obj48_Seg0_0_0",
+      "object_id": "48",
+      "text": ""
+    },
+    {
+      "global_idx": 100,
+      "subset": "chairs",
+      "seq_id": "Sub1409_Obj158_Seg0_0_1",
+      "object_id": "158",
+      "text": ""
+    },
+    {
+      "global_idx": 172,
+      "subset": "chairs",
+      "seq_id": "Sub0748_Obj46_Seg0_0_2",
+      "object_id": "46",
+      "text": ""
+    },
+    {
+      "global_idx": 338,
+      "subset": "imhd",
+      "seq_id": "20230901_songzn_suitcase_suitcase_twohands_carry_0_0_0",
+      "object_id": "suitcase",
+      "text": ""
+    },
+    {
+      "global_idx": 488,
+      "subset": "neuraldome",
+      "seq_id": "subject10_tennis_490",
+      "object_id": "tennis",
+      "text": ""
+    },
+    {
+      "global_idx": 324,
+      "subset": "imhd",
+      "seq_id": "20231015_dujsh_pan_freestyle1_0_280",
+      "object_id": "pan",
+      "text": ""
+    },
+    {
+      "global_idx": 402,
+      "subset": "neuraldome",
+      "seq_id": "subject07_desk_0",
+      "object_id": "desk",
+      "text": ""
+    },
+    {
+      "global_idx": 262,
+      "subset": "chairs",
+      "seq_id": "Sub1070_Obj98_Seg0_315_1",
+      "object_id": "98",
+      "text": ""
+    },
+    {
+      "global_idx": 312,
+      "subset": "imhd",
+      "seq_id": "20231014_dujsh_kettlebell_kettlebell_swing4_0_0",
+      "object_id": "kettlebell",
+      "text": ""
+    },
+    {
+      "global_idx": 215,
+      "subset": "chairs",
+      "seq_id": "Sub0825_Obj81_Seg0_0_0",
+      "object_id": "81",
+      "text": ""
+    },
+    {
+      "global_idx": 351,
+      "subset": "neuraldome",
+      "seq_id": "subject01_baseball_503",
+      "object_id": "baseball",
+      "text": ""
+    },
+    {
+      "global_idx": 375,
+      "subset": "neuraldome",
+      "seq_id": "subject08_box_552",
+      "object_id": "box",
+      "text": ""
+    },
+    {
+      "global_idx": 230,
+      "subset": "chairs",
+      "seq_id": "Sub0975_Obj83_Seg0_0",
+      "object_id": "83",
+      "text": ""
+    },
+    {
+      "global_idx": 506,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_clothesstand_033",
+      "object_id": "clothesstand",
+      "text": ""
+    },
+    {
+      "global_idx": 293,
+      "subset": "imhd",
+      "seq_id": "20231015_wangjy_chair_freestyle1_0_0_0",
+      "object_id": "chair",
+      "text": ""
+    },
+    {
+      "global_idx": 198,
+      "subset": "chairs",
+      "seq_id": "Sub0305_Obj64_Seg0_0",
+      "object_id": "64",
+      "text": ""
+    },
+    {
+      "global_idx": 75,
+      "subset": "chairs",
+      "seq_id": "Sub0274_Obj141_Seg0_0_1",
+      "object_id": "141",
+      "text": ""
+    },
+    {
+      "global_idx": 339,
+      "subset": "imhd",
+      "seq_id": "20230901_songzn_suitcase_suitcase_twohands_carry_0_0_2",
+      "object_id": "suitcase",
+      "text": ""
+    },
+    {
+      "global_idx": 245,
+      "subset": "chairs",
+      "seq_id": "Sub1735_Obj87_Seg0_0",
+      "object_id": "87",
+      "text": ""
+    },
+    {
+      "global_idx": 452,
+      "subset": "neuraldome",
+      "seq_id": "subject08_pingpong_0",
+      "object_id": "pingpong",
+      "text": ""
+    },
+    {
+      "global_idx": 76,
+      "subset": "chairs",
+      "seq_id": "Sub0271_Obj141_Seg0_240",
+      "object_id": "141",
+      "text": ""
+    },
+    {
+      "global_idx": 462,
+      "subset": "neuraldome",
+      "seq_id": "subject01_smallsofa_1050",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 336,
+      "subset": "imhd",
+      "seq_id": "20230901_songzn_suitcase_suitcase_twohands_carry_0_1200",
+      "object_id": "suitcase",
+      "text": ""
+    },
+    {
+      "global_idx": 235,
+      "subset": "chairs",
+      "seq_id": "Sub1781_Obj85_Seg0_276_0",
+      "object_id": "85",
+      "text": ""
+    },
+    {
+      "global_idx": 106,
+      "subset": "chairs",
+      "seq_id": "Sub1438_Obj162_Seg0_168",
+      "object_id": "162",
+      "text": ""
+    },
+    {
+      "global_idx": 147,
+      "subset": "chairs",
+      "seq_id": "Sub0651_Obj30_Seg0_300",
+      "object_id": "30",
+      "text": ""
+    },
+    {
+      "global_idx": 567,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_smallbox_038",
+      "object_id": "smallbox",
+      "text": ""
+    },
+    {
+      "global_idx": 265,
+      "subset": "chairs",
+      "seq_id": "Sub1889_Obj99_Seg0_0",
+      "object_id": "99",
+      "text": ""
+    },
+    {
+      "global_idx": 552,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_plasticbox_036",
+      "object_id": "plasticbox",
+      "text": ""
+    },
+    {
+      "global_idx": 138,
+      "subset": "chairs",
+      "seq_id": "Sub0078_Obj24_Seg0_0_2",
+      "object_id": "24",
+      "text": ""
+    },
+    {
+      "global_idx": 483,
+      "subset": "neuraldome",
+      "seq_id": "subject02_tennis_626",
+      "object_id": "tennis",
+      "text": ""
+    },
+    {
+      "global_idx": 304,
+      "subset": "imhd",
+      "seq_id": "20231014_dujsh_dumbbell_dumbbell_right_lunges2_0_0_1",
+      "object_id": "dumbbell",
+      "text": ""
+    },
+    {
+      "global_idx": 14,
+      "subset": "chairs",
+      "seq_id": "Sub1903_Obj110_Seg0_0",
+      "object_id": "110",
+      "text": ""
+    },
+    {
+      "global_idx": 548,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_052",
+      "object_id": "monitor",
+      "text": ""
+    },
+    {
+      "global_idx": 439,
+      "subset": "neuraldome",
+      "seq_id": "subject10_pillow_200",
+      "object_id": "pillow",
+      "text": ""
+    },
+    {
+      "global_idx": 193,
+      "subset": "chairs",
+      "seq_id": "Sub1404_Obj49_Seg0_0_0",
+      "object_id": "49",
+      "text": ""
+    },
+    {
+      "global_idx": 118,
+      "subset": "chairs",
+      "seq_id": "Sub1671_Obj17_Seg0_207",
+      "object_id": "17",
+      "text": ""
+    },
+    {
+      "global_idx": 347,
+      "subset": "neuraldome",
+      "seq_id": "subject01_baseball_315",
+      "object_id": "baseball",
+      "text": ""
+    },
+    {
+      "global_idx": 116,
+      "subset": "chairs",
+      "seq_id": "Sub1659_Obj17_Seg0_0_0",
+      "object_id": "17",
+      "text": ""
+    },
+    {
+      "global_idx": 186,
+      "subset": "chairs",
+      "seq_id": "Sub1474_Obj48_Seg0_0_1",
+      "object_id": "48",
+      "text": ""
+    },
+    {
+      "global_idx": 357,
+      "subset": "neuraldome",
+      "seq_id": "subject07_bigsofa_1346_1",
+      "object_id": "bigsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 562,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_smallbox_010",
+      "object_id": "smallbox",
+      "text": ""
+    }
+  ],
+  "unique_objects": [
+    "110",
+    "141",
+    "158",
+    "162",
+    "17",
+    "24",
+    "30",
+    "46",
+    "48",
+    "49",
+    "64",
+    "81",
+    "83",
+    "85",
+    "87",
+    "98",
+    "99",
+    "baseball",
+    "bigsofa",
+    "book",
+    "box",
+    "chair",
+    "clothesstand",
+    "desk",
+    "dumbbell",
+    "kettlebell",
+    "monitor",
+    "pan",
+    "pillow",
+    "pingpong",
+    "plasticbox",
+    "smallbox",
+    "smallsofa",
+    "suitcase",
+    "talltable",
+    "tennis"
+  ],
+  "unique_subsets": [
+    "chairs",
+    "imhd",
+    "neuraldome",
+    "omomo_correct_v2"
+  ]
+}

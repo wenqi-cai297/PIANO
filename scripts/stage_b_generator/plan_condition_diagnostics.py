@@ -372,6 +372,24 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         cfg_drop_plan=bool(cfg.model.denoiser.get("cfg_drop_plan", False)),
         plan_per_part_tokens=bool(cfg.model.denoiser.get("plan_per_part_tokens", False)),
         plan_context_hint_mode=str(cfg.model.denoiser.get("plan_context_hint_mode", "time_only")),
+        use_dit_block=bool(cfg.model.denoiser.get("use_dit_block", False)),
+        dit_block_use_plan_pool_in_cond=bool(
+            cfg.model.denoiser.get("dit_block_use_plan_pool_in_cond", True)
+        ),
+        use_v13_dynhead=bool(cfg.model.denoiser.get("use_v13_dynhead", False)),
+        v13_dynhead_gamma_init=float(cfg.model.denoiser.get("v13_dynhead_gamma_init", 0.1)),
+        v13_dynhead_learnable_gamma=bool(
+            cfg.model.denoiser.get("v13_dynhead_learnable_gamma", True)
+        ),
+        use_v13_temporal_conv=bool(cfg.model.denoiser.get("use_v13_temporal_conv", False)),
+        v13_temporal_conv_kernel=int(cfg.model.denoiser.get("v13_temporal_conv_kernel", 5)),
+        use_self_conditioning=bool(cfg.model.denoiser.get("use_self_conditioning", False)),
+        self_conditioning_prob=float(cfg.model.denoiser.get("self_conditioning_prob", 0.0)),
+        self_conditioning_mode=str(cfg.model.denoiser.get("self_conditioning_mode", "standard")),
+        self_conditioning_t_max=int(cfg.model.denoiser.get("self_conditioning_t_max", 700)),
+        self_conditioning_zero_init=bool(
+            cfg.model.denoiser.get("self_conditioning_zero_init", True)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -382,7 +400,16 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
     diff_cfg = DiffusionConfig(
         num_steps=int(cfg.model.diffusion.num_steps),
         schedule=str(cfg.model.diffusion.schedule),
+        objective=str(cfg.model.diffusion.get("objective", "ddpm")),
         prediction_target=str(cfg.model.diffusion.get("prediction_target", "x0")),
+        rf_eps_time=float(cfg.model.diffusion.get("rf_eps_time", 0.05)),
+        rf_time_schedule=str(cfg.model.diffusion.get("rf_time_schedule", "uniform")),
+        rf_denoiser_p_mean=float(cfg.model.diffusion.get("rf_denoiser_p_mean", -1.5)),
+        rf_denoiser_p_std=float(cfg.model.diffusion.get("rf_denoiser_p_std", 0.8)),
+        rf_denoiser_noise_scale=float(cfg.model.diffusion.get("rf_denoiser_noise_scale", 1.0)),
+        rf_num_sampling_steps=int(cfg.model.diffusion.get("rf_num_sampling_steps", 100)),
+        rf_sampler_type=str(cfg.model.diffusion.get("rf_sampler_type", "rectified_flow_ode")),
+        rf_sde_gamma=float(cfg.model.diffusion.get("rf_sde_gamma", 0.0)),
     )
     model = MotionAnchorDiff(
         AnchorDiffConfig(
@@ -420,12 +447,35 @@ def _build_cond(
     import torch.nn.functional as F
     phase_soft = F.one_hot(phase.clamp_min(0).long(), num_classes=z_dims.phase_classes).float()
     support_soft = F.one_hot(support.clamp_min(0).long(), num_classes=z_dims.support_classes).float()
-    z_int = pack_z_int(contact_state, contact_target_xyz, phase_soft, support_soft, z_dims)
+
+    # Mirror the trainer's fine-grained Stage-B zeroing (per
+    # claude_code_v11_after_full_frozen_fix_handoff.md §C). Without this
+    # the diagnostic feeds the WEAK_DENSE / PLAN_ONLY checkpoints OOD
+    # signal in channels the model was trained to ignore.
+    if bool(cfg.model.get("zero_contact_state_for_stageB", False)):
+        contact_state = torch.zeros_like(contact_state)
+    if bool(cfg.model.get("zero_contact_target_for_stageB", False)):
+        contact_target_xyz_for_z = torch.zeros_like(contact_target_xyz)
+    else:
+        contact_target_xyz_for_z = contact_target_xyz
+    if bool(cfg.model.get("zero_phase_for_stageB", False)):
+        phase_soft = torch.zeros_like(phase_soft)
+    if bool(cfg.model.get("zero_support_for_stageB", False)):
+        support_soft = torch.zeros_like(support_soft)
+    z_int = pack_z_int(contact_state, contact_target_xyz_for_z, phase_soft, support_soft, z_dims)
+    if bool(cfg.model.get("zero_z_int_for_stageB", False)):
+        z_int = torch.zeros_like(z_int)
 
     target_world = lift_object_local_to_world(
         contact_target_xyz, obj_pos_world, obj_rot_world,
     ).reshape(B, T, -1)
     object_traj = torch.cat([obj_com, obj_rot6d, target_world], dim=-1)
+    if (
+        bool(cfg.model.get("zero_dense_contact_target_for_stageB", False))
+        and object_traj.shape[-1] >= 24
+    ):
+        object_traj = object_traj.clone()
+        object_traj[..., 9:] = 0.0
 
     init_pose = joints[:, 0, :, :].reshape(B, -1)
     text_features, _ = encode_text_per_token(clip_model, batch["text"], device)

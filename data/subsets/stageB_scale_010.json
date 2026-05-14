@@ -1,0 +1,105 @@
+{
+  "seed": 42,
+  "scale": 10,
+  "config_basis": "configs\\training\\anchordiff_v12_dit_block_no_planpool_FULL_N10.yaml",
+  "indices": [
+    463,
+    325,
+    466,
+    480,
+    442,
+    345,
+    366,
+    444,
+    187,
+    100
+  ],
+  "clips": [
+    {
+      "global_idx": 463,
+      "subset": "neuraldome",
+      "seq_id": "subject07_smallsofa_1222_1",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 325,
+      "subset": "imhd",
+      "seq_id": "20231015_wangjy_pan_freestyle4_0_431_1",
+      "object_id": "pan",
+      "text": ""
+    },
+    {
+      "global_idx": 466,
+      "subset": "neuraldome",
+      "seq_id": "subject06_smallsofa_480",
+      "object_id": "smallsofa",
+      "text": ""
+    },
+    {
+      "global_idx": 480,
+      "subset": "neuraldome",
+      "seq_id": "subject08_talltable_0_2",
+      "object_id": "talltable",
+      "text": ""
+    },
+    {
+      "global_idx": 442,
+      "subset": "neuraldome",
+      "seq_id": "subject08_pillow_450_1",
+      "object_id": "pillow",
+      "text": ""
+    },
+    {
+      "global_idx": 345,
+      "subset": "neuraldome",
+      "seq_id": "subject10_baseball_1647",
+      "object_id": "baseball",
+      "text": ""
+    },
+    {
+      "global_idx": 366,
+      "subset": "neuraldome",
+      "seq_id": "subject06_book_300",
+      "object_id": "book",
+      "text": ""
+    },
+    {
+      "global_idx": 444,
+      "subset": "neuraldome",
+      "seq_id": "subject10_pingpong_1500",
+      "object_id": "pingpong",
+      "text": ""
+    },
+    {
+      "global_idx": 187,
+      "subset": "chairs",
+      "seq_id": "Sub1474_Obj48_Seg0_0_0",
+      "object_id": "48",
+      "text": ""
+    },
+    {
+      "global_idx": 100,
+      "subset": "chairs",
+      "seq_id": "Sub1409_Obj158_Seg0_0_1",
+      "object_id": "158",
+      "text": ""
+    }
+  ],
+  "unique_objects": [
+    "158",
+    "48",
+    "baseball",
+    "book",
+    "pan",
+    "pillow",
+    "pingpong",
+    "smallsofa",
+    "talltable"
+  ],
+  "unique_subsets": [
+    "chairs",
+    "imhd",
+    "neuraldome"
+  ]
+}

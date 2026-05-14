@@ -1,0 +1,204 @@
+# V12 DiT-block FULL N=10 — DiT/InterGen-style conditional transformer.
+#
+# Per the v12 design doc (analyses/2026-05-11_v12_architecture_design_doc.md)
+# and implementation doc (analyses/2026-05-11_v12_implementation_doc.md).
+#
+# Single-variable change vs anchordiff_v11_per_part_tokens_FULL_N10_localdyn_v2.yaml:
+#   model.denoiser.use_dit_block: false → true
+#   loss.stable_local_vel_cm_weight: 0.05 → 0.0    (isolate architecture change)
+#   loss.stable_local_speed_moment_weight: 0.02 → 0.0
+#
+# Architecture (per design doc §4):
+#   - Per-channel input projections (motion / z_int / obj_traj / plan_hint), summed
+#   - Per-block AdaLN-Zero (DiT 6-output form: shift/scale/gate × MSA + MLP)
+#   - Per-block plan cross-attn (PixArt placement, unmodulated, output proj zero-init)
+#   - AdaLN cond vector c = timestep_emb + plan_pool_emb (InterGen pattern)
+#   - Per-frame conditions flow through residual stream (not AdaLN)
+#   - Text + obj cross-attn at end of encoder (v11 carryover)
+#   - init_pose token prepended; time_tok dropped (timestep is in AdaLN)
+#
+# Zero-init recipe:
+#   - aux input proj (zint, obj, hint) = 0
+#   - per-block adaLN_modulation final Linear = 0
+#   - per-block plan_xattn.out_proj = 0
+#   - final_layer.adaLN_modulation final Linear = 0
+#   - final_layer.linear = 0
+#   - motion_proj = Xavier (motion must flow at init)
+#   - cond_summary MLP = normal(std=0.02)
+# Step-0 output: exactly 0 (verified by smoke test).
+#
+# Pass criteria (per implementation doc §6):
+#   - far_unobs ≤ 22.5 cm on FULL/gt (vs current best 21.45 cm)
+#   - stable_local_vel ≥ ×0.60 GT at inference (vs current best ×0.59)
+#   - root_vel ≤ ×1.4 GT
+#   - plan content variants nontrivial (wrong_clip Δm135 ≥ 0.5)
+#   - visual: motion not frozen (user confirms)
+#   - v12_adaLN_norm + v12_xattn_out_proj_norm > 0.01 across all layers
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  # FULL conditioning — no zero flags active.
+  zero_z_int_for_stageB: false
+  zero_dense_contact_target_for_stageB: false
+  zero_contact_state_for_stageB: false
+  zero_contact_target_for_stageB: false
+  zero_phase_for_stageB: false
+  zero_support_for_stageB: false
+  zero_plan_target_for_stageB: false
+
+  denoiser:
+    motion_dim: 135
+    object_traj_dim: 24
+    cond_motion_dim: 0
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+
+    use_interaction_plan: true
+    plan_k_max: 12
+    plan_s_max: 12
+    plan_num_anchor_types: 5
+    plan_num_parts: 5
+    plan_use_segment_tokens: false
+    plan_use_context_hint: true
+    plan_d_hint: 32
+    plan_d_time_embed: 64
+    cfg_drop_plan: false
+
+    plan_per_part_tokens: true
+    plan_context_hint_mode: "target_aware"
+
+    # *** v12 ACTIVATION ***
+    use_dit_block: true
+
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_plan"
+  force_world_frame: true
+  subsample_n_per_object: 10
+  subsample_seed: 42
+  overfit_n_clips: 0
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null
+  batch_size: 16
+  num_epochs: 80
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 5
+  val_best_key: "anchor_l2"
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+
+  plan_anchor_weight: 1.0
+  plan_segment_weight: 0.0
+  plan_transition_vel_weight: 1.0
+  plan_transition_acc_weight: 1.0
+  plan_transition_window: 3
+
+  # Root-stability losses ON (carryover from v11 N=10 baseline).
+  stable_root_vel_weight: 0.5
+  stable_root_acc_weight: 0.25
+  stable_support_erode: 4
+
+  # Legacy m²-MSE local losses OFF (carryover).
+  stable_local_vel_weight: 0.0
+  stable_local_acc_weight: 0.0
+
+  # *** v11 round 2 cm-scale local-dyn losses OFF for v12 first run ***
+  # Per implementation doc §1 + §11 open question 1: isolate architecture
+  # change from loss change. If v12 alone improves local-vel, we'll add
+  # these back as a Phase 2 experiment.
+  stable_local_vel_cm_weight: 0.0
+  stable_local_speed_moment_weight: 0.0
+  stable_local_acc_cm_weight: 0.0
+
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v12_dit_block_FULL_N10"
+  log_every_n_steps: 10
+  save_every_n_epochs: 50
+
+output_dir: "runs/training/stageB_anchordiff_v12_dit_block_FULL_N10"

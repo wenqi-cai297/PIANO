@@ -235,6 +235,14 @@ def main() -> None:
         "segment_support", "segment_conf", "segment_mask",
     ]
     plan_gt = {k: main_batch[f"plan_{k}"].to(device) for k in plan_keys}
+    # Plan-target zeroing for ckpts trained with zero_plan_target_for_stageB=true
+    # (per claude_code_v11_next_localdyn_target_routing.md §C.2).
+    if bool(cfg.model.get("zero_plan_target_for_stageB", False)):
+        plan_gt["anchor_target_local"] = torch.zeros_like(plan_gt["anchor_target_local"])
+        plan_gt["anchor_target_world"] = torch.zeros_like(plan_gt["anchor_target_world"])
+        plan_gt["segment_target_summary_local"] = torch.zeros_like(
+            plan_gt["segment_target_summary_local"]
+        )
     cond_main["interaction_plan"] = plan_gt
 
     # GT geometry

@@ -1,0 +1,936 @@
+{
+  "subset_name": "S3",
+  "target_n": 100,
+  "actual_n": 100,
+  "anchor_object_cluster": [
+    "whitechair",
+    "woodchair"
+  ],
+  "anchor_action": "lift",
+  "seed": 42,
+  "indices": [
+    5469,
+    5143,
+    2895,
+    3697,
+    2913,
+    6396,
+    2243,
+    6099,
+    4109,
+    2996,
+    4649,
+    3743,
+    3927,
+    5314,
+    4517,
+    3623,
+    4771,
+    3294,
+    5526,
+    6647,
+    6287,
+    4908,
+    4935,
+    4461,
+    3764,
+    5767,
+    5873,
+    4290,
+    3526,
+    3121,
+    3165,
+    5264,
+    4348,
+    4158,
+    4333,
+    4298,
+    4438,
+    6138,
+    5558,
+    2856,
+    5323,
+    5253,
+    6924,
+    5216,
+    3168,
+    2899,
+    4281,
+    5556,
+    4127,
+    5851,
+    6133,
+    3210,
+    3785,
+    3529,
+    4765,
+    4390,
+    3332,
+    4330,
+    3501,
+    4429,
+    3787,
+    6187,
+    6532,
+    3005,
+    4379,
+    5874,
+    6092,
+    4823,
+    3167,
+    2844,
+    5244,
+    4774,
+    6007,
+    1775,
+    6858,
+    3119,
+    6579,
+    5671,
+    6077,
+    3740,
+    3441,
+    4289,
+    4501,
+    3622,
+    6139,
+    4278,
+    6390,
+    3438,
+    4229,
+    1597,
+    6926,
+    4252,
+    3868,
+    5766,
+    5768,
+    4403,
+    3941,
+    4332,
+    5419,
+    6790
+  ],
+  "clips": [
+    {
+      "global_idx": 5469,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_suitcase_008",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 5143,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_smalltable_031",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable by one of the edges, rotate it, drag the smalltable and place the legs back down."
+    },
+    {
+      "global_idx": 2895,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_clothesstand_045",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 3697,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_largebox_015",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, rotate the largebox, and set it back down."
+    },
+    {
+      "global_idx": 2913,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_clothesstand_012",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 6396,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_050",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 2243,
+      "subset": "neuraldome",
+      "seq_id": "subject06_monitor_469",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "A person lifts a monitor with both hands, turns around, takes a few steps, and then switches to holding the monitor betw"
+    },
+    {
+      "global_idx": 6099,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_010",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 4109,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_largetable_052",
+      "object_id": "largetable",
+      "action": "lift",
+      "text": "Lift the largetable, so only two legs are off the floor. Slide your feet and rotate the largetable as you slide. Lower t"
+    },
+    {
+      "global_idx": 2996,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_clothesstand_064",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 4649,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_plasticbox_041",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, rotate the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 3743,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_largebox_007",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 3927,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_largetable_012",
+      "object_id": "largetable",
+      "action": "lift",
+      "text": "Lift the largetable, move the largetable and put down the largetable."
+    },
+    {
+      "global_idx": 5314,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_smalltable_014",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable, move the smalltable and put down the smalltable."
+    },
+    {
+      "global_idx": 4517,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_plasticbox_013",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, move the plasticbox, and put down the plasticbox."
+    },
+    {
+      "global_idx": 3623,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_largebox_028",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, rotate the largebox, and set it back down."
+    },
+    {
+      "global_idx": 4771,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_020",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 3294,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_floorlamp_003",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, move the floorlamp, and put down the floorlamp."
+    },
+    {
+      "global_idx": 5526,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_040",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, rotate the suitcase, and set it back down."
+    },
+    {
+      "global_idx": 6647,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_woodchair_014",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 6287,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_tripod_109",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 4908,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_smallbox_025",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, rotate the smallbox, and set it back down."
+    },
+    {
+      "global_idx": 4935,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_smallbox_008",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 4461,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_plasticbox_023",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, rotate the plasticbox, and set it back down."
+    },
+    {
+      "global_idx": 3764,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_largebox_029",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 5767,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_trashcan_019",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, rotate the trashcan, and set it back down."
+    },
+    {
+      "global_idx": 5873,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_trashcan_007",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, move the trashcan, and put down the trashcan."
+    },
+    {
+      "global_idx": 4290,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_014",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 3526,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_largebox_020",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 3121,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_clothesstand_007",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 3165,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_clothesstand_052",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 5264,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_smalltable_017",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable above your head, spin it and put the smalltable down."
+    },
+    {
+      "global_idx": 4348,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_monitor_007",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor, and then rotate the monitor to adjust its orientation.."
+    },
+    {
+      "global_idx": 4158,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_045",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor, and then rotate the monitor to adjust its orientation.."
+    },
+    {
+      "global_idx": 4333,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_monitor_019",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 4298,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_022",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 4438,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_067",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 6138,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_049",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 5558,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_072",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 2856,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_clothesstand_005",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 5323,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_smalltable_024",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable above your head, spin it and put the smalltable down."
+    },
+    {
+      "global_idx": 5253,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_smalltable_006",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable, move the smalltable and put down the smalltable."
+    },
+    {
+      "global_idx": 6924,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_026",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 5216,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_smalltable_046",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable, so only two legs are off the floor. Slide your feet and rotate the smalltable as you slide. Lower t"
+    },
+    {
+      "global_idx": 3168,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_clothesstand_055",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 2899,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_clothesstand_049",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 4281,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_005",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 5556,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_suitcase_070",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 4127,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_014",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 5851,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub16_trashcan_041",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, move the trashcan, and put down the trashcan."
+    },
+    {
+      "global_idx": 6133,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_044",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 3210,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_floorlamp_037",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 3785,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_largebox_013",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, rotate the largebox, and set it back down."
+    },
+    {
+      "global_idx": 3529,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_largebox_023",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 4765,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_013",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 4390,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_014",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor, and then rotate the monitor to adjust its orientation.."
+    },
+    {
+      "global_idx": 3332,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_floorlamp_041",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 4330,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_monitor_015",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 3501,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_floorlamp_041",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 4429,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_058",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 3787,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_largebox_015",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, rotate the largebox, and set it back down."
+    },
+    {
+      "global_idx": 6187,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_tripod_013",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 6532,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub4_whitechair_029",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, rotate the whitechair, and set it back down."
+    },
+    {
+      "global_idx": 3005,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_clothesstand_074",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 4379,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_002",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor. Then lift the monitor, move the monitor, and put down the "
+    },
+    {
+      "global_idx": 5874,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_trashcan_008",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, move the trashcan, and put down the trashcan."
+    },
+    {
+      "global_idx": 6092,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_003",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 4823,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_086",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 3167,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_clothesstand_054",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 2844,
+      "subset": "neuraldome",
+      "seq_id": "subject10_trolleycase_1431",
+      "object_id": "trolleycase",
+      "action": "lift",
+      "text": "A person lifts the trolley case with both of their hands, walks clockwise, lifts the trolley case with both of their han"
+    },
+    {
+      "global_idx": 5244,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_smalltable_027",
+      "object_id": "smalltable",
+      "action": "lift",
+      "text": "Lift the smalltable, so only two legs are off the floor. Slide your feet and rotate the smalltable as you slide. Lower t"
+    },
+    {
+      "global_idx": 4774,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_smallbox_023",
+      "object_id": "smallbox",
+      "action": "lift",
+      "text": "Lift the smallbox, move the smallbox, and put down the smallbox."
+    },
+    {
+      "global_idx": 6007,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_tripod_044",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 1775,
+      "subset": "neuraldome",
+      "seq_id": "subject062_bigsofa_1140",
+      "object_id": "bigsofa",
+      "action": "lift",
+      "text": "A person lifts the end of a big sofa with both hands, puts it down, then walks clockwise to the back of the big sofa."
+    },
+    {
+      "global_idx": 6858,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub2_woodchair_002",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, move the woodchair, and put down the woodchair."
+    },
+    {
+      "global_idx": 3119,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_clothesstand_005",
+      "object_id": "clothesstand",
+      "action": "lift",
+      "text": "Lift the clothesstand, move the clothesstand, and put down the clothesstand."
+    },
+    {
+      "global_idx": 6579,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_whitechair_013",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair over your head, walk and then place the whitechair on the floor."
+    },
+    {
+      "global_idx": 5671,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub8_suitcase_046",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 6077,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_tripod_064",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 3740,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_largebox_004",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 3441,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_floorlamp_069",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 4289,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_013",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor, and then rotate the monitor to adjust its orientation.."
+    },
+    {
+      "global_idx": 4501,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_plasticbox_057",
+      "object_id": "plasticbox",
+      "action": "lift",
+      "text": "Lift the plasticbox, move the plasticbox, and put down the plasticbox."
+    },
+    {
+      "global_idx": 3622,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub12_largebox_027",
+      "object_id": "largebox",
+      "action": "lift",
+      "text": "Lift the largebox, move the largebox, and put down the largebox."
+    },
+    {
+      "global_idx": 6139,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_tripod_050",
+      "object_id": "tripod",
+      "action": "lift",
+      "text": "Lift the tripod, move the tripod, and put down the tripod."
+    },
+    {
+      "global_idx": 4278,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub17_monitor_002",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 6390,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub10_whitechair_044",
+      "object_id": "whitechair",
+      "action": "lift",
+      "text": "Lift the whitechair, move the whitechair, and put down the whitechair."
+    },
+    {
+      "global_idx": 3438,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_floorlamp_066",
+      "object_id": "floorlamp",
+      "action": "lift",
+      "text": "Lift the floorlamp, adjust the orientation of the floorlamp, and set it back down."
+    },
+    {
+      "global_idx": 4229,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub11_monitor_116",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, put down the monitor while rotating it."
+    },
+    {
+      "global_idx": 1597,
+      "subset": "imhd",
+      "seq_id": "20231014_dujsh_dumbbell_dumbbell_left_lunges2_0_433_1",
+      "object_id": "dumbbell",
+      "action": "lift",
+      "text": "A person lifts a dumbbell with their left hand, turns right, and then alternates lifting their left and right legs forwa"
+    },
+    {
+      "global_idx": 6926,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub6_woodchair_028",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, rotate the woodchair, and set it back down."
+    },
+    {
+      "global_idx": 4252,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub14_monitor_008",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 3868,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_largetable_043",
+      "object_id": "largetable",
+      "action": "lift",
+      "text": "Lift the largetable, so only two legs are off the floor. Slide your feet and rotate the largetable as you slide. Lower t"
+    },
+    {
+      "global_idx": 5766,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_trashcan_018",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, rotate the trashcan, and set it back down."
+    },
+    {
+      "global_idx": 5768,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_trashcan_020",
+      "object_id": "trashcan",
+      "action": "lift",
+      "text": "Lift the trashcan, rotate the trashcan, and set it back down."
+    },
+    {
+      "global_idx": 4403,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub9_monitor_027",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, rotate the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 3941,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub1_largetable_026",
+      "object_id": "largetable",
+      "action": "lift",
+      "text": "Lift the largetable above your head, spin it and put the largetable down."
+    },
+    {
+      "global_idx": 4332,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub3_monitor_018",
+      "object_id": "monitor",
+      "action": "lift",
+      "text": "Lift the monitor, move the monitor, and put down the monitor."
+    },
+    {
+      "global_idx": 5419,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_suitcase_010",
+      "object_id": "suitcase",
+      "action": "lift",
+      "text": "Lift the suitcase, move the suitcase, and put down the suitcase."
+    },
+    {
+      "global_idx": 6790,
+      "subset": "omomo_correct_v2",
+      "seq_id": "sub15_woodchair_061",
+      "object_id": "woodchair",
+      "action": "lift",
+      "text": "Lift the woodchair, flip it upside down and place it on top of the table."
+    }
+  ],
+  "unique_objects": [
+    "bigsofa",
+    "clothesstand",
+    "dumbbell",
+    "floorlamp",
+    "largebox",
+    "largetable",
+    "monitor",
+    "plasticbox",
+    "smallbox",
+    "smalltable",
+    "suitcase",
+    "trashcan",
+    "tripod",
+    "trolleycase",
+    "whitechair",
+    "woodchair"
+  ],
+  "unique_actions": [
+    "lift"
+  ]
+}
