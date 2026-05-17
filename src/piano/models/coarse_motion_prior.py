@@ -102,6 +102,14 @@ class CoarsePriorDenoiserConfig:
     max_seq_length: int = 256
     attention_mode: str = "none"               # "none" | "block_causal"
     block_size: int = 16                       # only used if attention_mode == "block_causal"
+    # Round-18: optional object-trajectory hint channel. 0 = disabled (object-free,
+    # back-compat with Round-12/14 checkpoints). 9 = obj_com (3) + obj_rot6d (6)
+    # in the frame documented by the active cache contract (Round-18-fix
+    # uses `obj_pos_root0_world + obj_rot6d_world`, matching Coarse-v1
+    # exactly), injected via a CMC-style zero-init-last-linear HintBlock
+    # (additive to the motion input embedding after positional encoding).
+    obj_traj_dim: int = 0
+    obj_traj_hint_hidden_mult: int = 1         # hidden dim = d_model * mult; default = d_model
 
 
 # ============================================================================
@@ -165,6 +173,55 @@ class CoarseAdaLNBlock(nn.Module):
         return x
 
 
+class ObjTrajHintBlock(nn.Module):
+    """Per-frame additive spatial-cue MLP for the object-trajectory channel.
+
+    Mirrors the CMC HintBlock pattern (external/CMC/models/omnimdm_spatial.py:167-185):
+    a 4-layer MLP with **zero-init last linear** so the obj_traj contribution is
+    exactly zero at step 0, and the gate opens during training. This degenerates
+    the S1-O model to the object-free S1-A baseline at random init, providing
+    the cleanest possible "fair starting point" for a paired ablation.
+
+    Input shape : (B, T, obj_traj_dim)
+    Output shape: (B, T, d_model)  — added per-frame to the motion input embedding.
+    """
+
+    def __init__(self, obj_traj_dim: int, d_model: int, hidden_mult: int = 1) -> None:
+        super().__init__()
+        if obj_traj_dim <= 0:
+            raise ValueError(f"obj_traj_dim must be > 0, got {obj_traj_dim}")
+        hidden = d_model * max(1, hidden_mult)
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(obj_traj_dim, hidden),
+                nn.Linear(hidden, hidden),
+                nn.Linear(hidden, d_model),
+                nn.Linear(d_model, d_model),       # last layer; zero-init below
+            ]
+        )
+        self.act = nn.SiLU()
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        # First three linears: small normal init so the hidden activations
+        # are non-trivial as soon as the gate opens.
+        for layer in self.layers[:-1]:
+            nn.init.normal_(layer.weight, std=0.02)
+            nn.init.zeros_(layer.bias)
+        # Last linear: zero-init so step-0 output is exactly 0 → S1-O ==
+        # S1-A at init under matched seed.
+        nn.init.zeros_(self.layers[-1].weight)
+        nn.init.zeros_(self.layers[-1].bias)
+
+    def forward(self, obj_traj: Tensor) -> Tensor:
+        h = obj_traj
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if i < len(self.layers) - 1:
+                h = self.act(h)
+        return h
+
+
 class CoarseFinalLayer(nn.Module):
     """Same pattern as v12 ``V12FinalLayer``: AdaLN-Zero shift/scale +
     zero-init Linear to output dim."""
@@ -221,6 +278,18 @@ class CoarsePriorDenoiser(nn.Module):
         # Null embedding for text-only CFG dropout.
         self.null_text = nn.Parameter(torch.zeros(cfg.text_dim))
 
+        # Round-18 follow-up: HintBlock instantiation MOVED to the END of
+        # __init__ (after blocks + final_layer + _initialize_weights). This
+        # guarantees that under the same `torch.manual_seed`, Plan A
+        # (obj_traj_dim=0) and S1-O (obj_traj_dim=9) consume IDENTICAL RNG
+        # for the shared `in_proj / time_embed / text_proj / init_proj /
+        # blocks / final_layer` parameters → bitwise-equal shared weights.
+        # The HintBlock + null_obj_traj attributes are placeholder-set here
+        # so attribute access in forward() doesn't AttributeError before the
+        # post-init step assigns them.
+        self.obj_traj_hint = None
+        self.register_parameter("null_obj_traj", None)
+
         # Positional encoding only on the T tokens — NO prefix/register tokens
         # so attention masks remain exactly (T, T).
         self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_seq_length)
@@ -245,6 +314,21 @@ class CoarsePriorDenoiser(nn.Module):
         self._cached_mask: Tensor | None = None
 
         self._initialize_weights()
+
+        # Round-18 follow-up fairness: build HintBlock + null_obj_traj
+        # ONLY AFTER all shared parameters are created + re-initialised by
+        # `_initialize_weights()`. This means the RNG state that the
+        # HintBlock consumes does NOT perturb the base denoiser's weights.
+        # Under matched seed, Plan A and S1-O have bitwise-equal shared
+        # params; S1-O has extra params only for the HintBlock + null
+        # embedding.
+        if cfg.obj_traj_dim > 0:
+            self.obj_traj_hint = ObjTrajHintBlock(
+                obj_traj_dim=cfg.obj_traj_dim,
+                d_model=cfg.d_model,
+                hidden_mult=cfg.obj_traj_hint_hidden_mult,
+            )
+            self.null_obj_traj = nn.Parameter(torch.zeros(cfg.obj_traj_dim))
 
     def _initialize_weights(self) -> None:
         # Input projection: xavier on weights, zero on bias.
@@ -305,7 +389,8 @@ class CoarsePriorDenoiser(nn.Module):
         x_t: Tensor,                     # (B, T, coarse_dim)
         t: Tensor,                       # (B,) long
         cond: dict,
-        cond_drop_mask: Tensor | None = None,    # (B,) bool — True drops text
+        cond_drop_mask: Tensor | None = None,    # (B,) bool — True drops TEXT (back-compat alias)
+        obj_traj_drop_mask: Tensor | None = None,   # (B,) bool — True drops obj_traj (Round-18)
     ) -> Tensor:
         cfg = self.cfg
         B, T, D_in = x_t.shape
@@ -323,11 +408,37 @@ class CoarsePriorDenoiser(nn.Module):
         valid_mask: Tensor | None = cond.get("valid_mask", None)  # (B, T) bool
 
         # CFG drop: text only — init pose is deterministic scene fact, kept.
+        # The legacy cond_drop_mask continues to drop text only (back-compat
+        # with Round-12/14 checkpoints + the old single-channel CFG policy).
         text_pool_eff = self._broadcast_drop(cond_drop_mask, text_pool, self.null_text)
 
         # Per-frame projection + positional encoding.
         h = self.in_proj(x_t)                            # (B, T, D)
         h = self.pos_enc(h)
+
+        # Round-18: object-trajectory HintBlock (additive, zero-init at start).
+        # Only consumed when the model was constructed with obj_traj_dim > 0.
+        # cond key is `obj_traj` (frame-agnostic — the cache contract
+        # documents the frame: Round-18-fix uses `obj_pos_root0_world +
+        # obj_rot6d_world`, matching Coarse-v1's frame exactly).
+        if self.obj_traj_hint is not None:
+            if "obj_traj" not in cond:
+                raise KeyError(
+                    "model has obj_traj_dim > 0 but cond is missing "
+                    "'obj_traj' field"
+                )
+            obj_traj: Tensor = cond["obj_traj"]            # (B, T, obj_traj_dim)
+            if obj_traj.shape[-1] != cfg.obj_traj_dim:
+                raise ValueError(
+                    f"obj_traj last dim {obj_traj.shape[-1]} != "
+                    f"obj_traj_dim {cfg.obj_traj_dim}"
+                )
+            # Independent CFG dropout for obj_traj. Falls back to no-drop if
+            # the trainer hasn't passed an obj_traj_drop_mask.
+            obj_traj_eff = self._broadcast_drop(
+                obj_traj_drop_mask, obj_traj, self.null_obj_traj,
+            )
+            h = h + self.obj_traj_hint(obj_traj_eff)        # (B, T, D)
 
         # AdaLN cond vector.
         t_emb = self.time_embed(t)                       # (B, D)
@@ -397,8 +508,13 @@ class CoarsePriorDiff(nn.Module):
         t: Tensor,
         cond: dict,
         cond_drop_mask: Tensor | None = None,
+        obj_traj_drop_mask: Tensor | None = None,
     ) -> Tensor:
-        return self.denoiser(x_t, t, cond, cond_drop_mask=cond_drop_mask)
+        return self.denoiser(
+            x_t, t, cond,
+            cond_drop_mask=cond_drop_mask,
+            obj_traj_drop_mask=obj_traj_drop_mask,
+        )
 
     # ---------- sampling ---------- #
 
@@ -410,6 +526,7 @@ class CoarsePriorDiff(nn.Module):
         cfg_scale: float = 1.0,
         device: torch.device | None = None,
         sampler: str = "ddpm",
+        inpaint_frame0: bool = False,
     ) -> Tensor:
         """Reverse-diffusion sample loop for Coarse-v1.
 
@@ -417,21 +534,76 @@ class CoarsePriorDiff(nn.Module):
         this denoiser's narrow ``cond`` schema. No ``cond_motion`` /
         ``replacement`` / ``output_skip`` — those were CondMDI-era v9
         features that don't apply to Stage-1.
+
+        Round-18 additions:
+
+        - obj_traj is read from ``cond["obj_traj"]`` automatically
+          when the model has ``obj_traj_dim > 0`` (no API change here).
+        - ``inpaint_frame0=True`` enables RePaint-style hard-clamping of
+          frame 0 to the conditioned init pose at every reverse step. At
+          each timestep t (and t-1) the known init pose is forward-diffused
+          to the correct noise level and substituted into ``x[:, 0, :]``.
+          The model's predicted x0 also has frame 0 forced to ``init_coarse``
+          before forming the posterior. This is the canonical "force known
+          frames" pattern (CMC's SIM applied to a single-frame mask).
         """
         device = device or self.diffusion.betas.device
         B, T, D = shape
         x = torch.randn(shape, device=device)
         from piano.models.motion_anchordiff import _extract
 
+        # Frame-0 inpainting needs the conditioned init pose as (B, D).
+        init_for_inpaint: Tensor | None = None
+        if inpaint_frame0:
+            init_for_inpaint = cond.get("init_coarse", None)
+            if init_for_inpaint is None:
+                raise KeyError(
+                    "inpaint_frame0=True but cond is missing 'init_coarse' field"
+                )
+            if init_for_inpaint.dim() == 1:
+                # Allow a single-clip (D,) tensor; promote to (B, D).
+                init_for_inpaint = init_for_inpaint.unsqueeze(0).expand(B, -1)
+            if init_for_inpaint.shape != (B, D):
+                raise ValueError(
+                    f"init_coarse shape {tuple(init_for_inpaint.shape)} != ({B}, {D})"
+                )
+            # Replace the random frame-0 with the GT init pose forward-diffused
+            # to the start-of-chain noise level (timestep T-1).
+            t_max = torch.full((B,), self.diffusion.num_steps - 1, device=device, dtype=torch.long)
+            noise0 = torch.randn(B, D, device=device)
+            x_init0 = self.diffusion.q_sample(
+                init_for_inpaint.unsqueeze(1).contiguous(),         # (B, 1, D)
+                t_max,
+                noise0.unsqueeze(1),                                  # (B, 1, D)
+            ).squeeze(1)
+            x[:, 0, :] = x_init0
+
         for t_int in reversed(range(self.diffusion.num_steps)):
             t = torch.full((B,), t_int, device=device, dtype=torch.long)
-            x0_cond = self.denoiser(x, t, cond, cond_drop_mask=None)
+            x0_cond = self.denoiser(
+                x, t, cond, cond_drop_mask=None, obj_traj_drop_mask=None,
+            )
             if cfg_scale != 1.0:
+                # CFG-uncond branch drops TEXT only by default; obj_traj is
+                # treated as a deterministic spatial cue at sampling time
+                # (matches CMC Stage-1 sample.py — Stage-1 doesn't CFG the
+                # spatial hint either). If a future round wants to CFG
+                # obj_traj, add an `obj_traj_cfg_scale` arg here.
                 drop = torch.ones(B, dtype=torch.bool, device=device)
-                x0_uncond = self.denoiser(x, t, cond, cond_drop_mask=drop)
+                x0_uncond = self.denoiser(
+                    x, t, cond, cond_drop_mask=drop, obj_traj_drop_mask=None,
+                )
                 x0 = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
             else:
                 x0 = x0_cond
+
+            if inpaint_frame0 and init_for_inpaint is not None:
+                # Force x0_pred at frame 0 to the GT init pose. This means
+                # the posterior mean at frame 0 is the q_posterior of the
+                # GT init pose, so frame 0 of the next x_{t-1} stays
+                # consistent with the conditioned init.
+                x0 = x0.clone()
+                x0[:, 0, :] = init_for_inpaint
 
             mean = self.diffusion.posterior_mean_from_x0(x0, x, t)
             if sampler == "ddpm_det" or t_int == 0:
@@ -442,6 +614,24 @@ class CoarsePriorDiff(nn.Module):
                     self.diffusion.posterior_log_variance_clipped, t, x.shape,
                 )
                 x = mean + (0.5 * log_var).exp() * noise
+
+            if inpaint_frame0 and init_for_inpaint is not None and t_int > 0:
+                # Re-inject the GT init pose at the new noise level for x_{t-1}.
+                t_prev = torch.full((B,), t_int - 1, device=device, dtype=torch.long)
+                noise_prev = torch.randn(B, D, device=device)
+                x_init_prev = self.diffusion.q_sample(
+                    init_for_inpaint.unsqueeze(1).contiguous(),
+                    t_prev,
+                    noise_prev.unsqueeze(1),
+                ).squeeze(1)
+                x[:, 0, :] = x_init_prev
+
+        # Final pass: lock frame 0 to GT init pose exactly (no diffusion noise
+        # since we're at t=0). This guarantees the returned sample has
+        # x[:, 0, :] == init_coarse to numerical precision.
+        if inpaint_frame0 and init_for_inpaint is not None:
+            x = x.clone()
+            x[:, 0, :] = init_for_inpaint
         return x
 
 
@@ -452,5 +642,6 @@ __all__ = [
     "CoarsePriorDiff",
     "CoarseAdaLNBlock",
     "CoarseFinalLayer",
+    "ObjTrajHintBlock",
     "make_block_causal_bool_mask",
 ]

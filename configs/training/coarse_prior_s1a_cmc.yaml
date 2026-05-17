@@ -1,0 +1,103 @@
+# Stage-1 Coarse-v1 prior — Plan A (Round-18): object-free CMC-scale baseline.
+#
+# Per Round-16 §11.1 + Round-17 §10.3 + SUGGESTION.md §"Step 6".
+# This is the "paired control" — same recipe as S1-O but with obj_traj_dim=0,
+# so any S1-O improvement at eval time is attributable to obj_traj
+# specifically (not to the capacity / training-recipe upgrade itself).
+#
+# Hard constraints honored:
+# - No object trajectory: obj_traj_dim=0. Uses the existing Round-14
+#   object-free cache cache/stage1_coarse_v1_full/.
+# - No mask experiment: attention_mode="none" (bidirectional). Round-14
+#   S1-B's hard block-causal mask is deprecated per Round-15 §5.
+# - No interaction plan, no z_int, no contact targets, no point cloud.
+#
+# Compared to Round-14 coarse_prior_s1a.yaml (4-layer / 384-dim / 20k steps),
+# this scales to CMC-class capacity + adds EMA + val-loss tracking +
+# periodic ckpt + bf16 + root-only acc/jerk loss.
+# total_steps and batch_size are CLI-overridable for smoke. Default is set
+# for full training; smoke uses --max-train-steps 200 + --val-every-n-steps 0
+# + --save-every-n-steps 0.
+
+model:
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+
+  denoiser:
+    coarse_dim: 23
+    text_dim: 512
+    init_pose_dim: 23
+    d_model: 512                # CMC-scale (Round-14 was 384)
+    n_layers: 8                 # CMC-scale (Round-14 was 4)
+    n_heads: 4
+    ff_mult: 4                  # ff_size = 2048 (FrankenMotion-style)
+    dropout: 0.1
+    max_seq_length: 196
+    # Plan A: bidirectional, object-free.
+    attention_mode: "none"
+    block_size: 16
+    # Round-18: obj_traj disabled. Plan C will set this to 9.
+    obj_traj_dim: 0
+
+data:
+  # IMPORTANT: Plan A uses the EXISTING Round-14 object-free cache.
+  # Round-18 leaves this cache untouched (no rebuild).
+  cache_root: "cache/stage1_coarse_v1_full"
+
+training:
+  batch_size: 16              # 16 × accum 4 = effective 64 (CMC-scale budget on A6000)
+  gradient_accumulation_steps: 4
+  num_workers: 0
+  seed: 42
+  # Round-18: independent per-channel CFG dropout. cfg_drop_prob (legacy)
+  # falls back as the text-only drop prob when the new fields are absent.
+  cfg_drop_prob: 0.1
+  cfg_drop_prob_text: 0.1
+  cfg_drop_prob_obj_traj: 0.0   # Plan A has no obj_traj
+  # bf16 mixed precision (Accelerate). 2× wallclock savings vs fp32; the
+  # x0-pred MSE objective is well-behaved at bf16 per MDM-family practice.
+  mixed_precision: "bf16"
+  # Long-run target. Smoke runs override via --max-train-steps.
+  total_steps: 100000
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000          # bumped from 100 (Round-14) for the longer run
+  # Round-18: EMA, periodic ckpt, val-loss tracking. Smoke runs disable
+  # via --no-ema + --save-every-n-steps 999999 + --val-every-n-steps 0.
+  ema_decay: 0.9999
+  save_every_n_steps: 10000
+  val_every_n_steps: 5000
+  val_max_batches: 0           # 0 = full val pass; smoke can shrink to N
+
+loss:
+  state_velocity_weight: 1.0
+  # Round-18 new: root-only acc² + jerk² MSE. 0.1 is the conservative
+  # initial weight per SUGGESTION.md §"Step 4"; trainer logs the relative
+  # magnitudes of l_mse / l_state_vel / l_root_acc_jerk in smoke so the
+  # weight can be tuned afterwards.
+  root_acc_jerk_weight: 0.1
+  channel_weights:
+    root_local_trans: 1.5
+    root_vel: 2.5
+    yaw_sincos: 1.0
+    yaw_vel: 2.5
+    pelvis_rot6d: 1.0
+    spine3_rot6d: 1.0
+    head_height: 0.5
+    shoulder_height: 0.5
+
+logging:
+  project: "piano"
+  run_name: "stage1_s1a_cmc_round18"
+  wandb: true
+  group: "stage1_round18_plan_a_vs_plan_c"
+  tags: ["round18", "stage1", "plan_a", "object_free", "cmc_scale"]
+  log_every_n_steps: 50
+
+output_dir: "runs/training/stage1_s1a_cmc_round18"

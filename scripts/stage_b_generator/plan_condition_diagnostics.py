@@ -750,8 +750,8 @@ def main() -> None:
     # Markdown
     if args.md is not None:
         md_lines: list[str] = []
-        md_lines.append("# v10 plan-tokens — plan condition sensitivity")
-        md_lines.append(f"**Date:** 2026-05-10")
+        md_lines.append("# Stage-B plan condition sensitivity")
+        md_lines.append(f"**Date:** 2026-05-14")
         md_lines.append(f"**Config:** `{args.config}`")
         md_lines.append(f"**Checkpoint:** `{args.ckpt}`")
         md_lines.append(f"**cfg_scale:** {args.cfg_scale}    **seed:** {args.seed}    **T:** {T}\n")

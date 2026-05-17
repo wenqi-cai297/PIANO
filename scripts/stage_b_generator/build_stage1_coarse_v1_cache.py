@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from collections import defaultdict
@@ -65,6 +66,14 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+
+
+# Round-18-fix-server: v18 config path; overridable via PIANO_V18_CFG env var
+# so server runs can point at `_local`-paths variant without --config flag.
+_DEFAULT_V18_CFG = os.environ.get(
+    "PIANO_V18_CFG",
+    "configs/training/anchordiff_v18_a1_FULL_DATA.yaml",
+)
 
 from piano.data.dataset import (
     AugmentConfig, HOIDataset, build_subject_split, extract_subject_id,
@@ -160,7 +169,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=Path,
-        default=Path("configs/training/anchordiff_v18_a1_FULL_DATA.yaml"),
+        default=Path(_DEFAULT_V18_CFG),
     )
     parser.add_argument(
         "--output-root", type=Path,

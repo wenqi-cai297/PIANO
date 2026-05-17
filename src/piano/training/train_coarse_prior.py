@@ -36,6 +36,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -86,6 +87,14 @@ class CoarsePriorBatch:
     seq_len: Tensor                     # (B,) long
     subsets: list[str]
     seq_ids: list[str]
+    # Round-18 + Round-18-fix: optional object-trajectory channel,
+    # present iff the active cache stores obj_traj per clip. The active
+    # Round-19 cache field name is `obj_traj_root0_world` (root0-relative
+    # world-axis); the legacy Round-18 cache field name was
+    # `obj_traj_canonical` (body-canonical with Y-rotation + MoMask
+    # floor-Y; superseded — kept on disk for forensic comparison).
+    # Shape (B, T_max, 9) normalized. None = object-free mode.
+    obj_traj_norm: Tensor | None = None
 
 
 class Stage1CacheDataset(Dataset):
@@ -132,6 +141,30 @@ class Stage1CacheDataset(Dataset):
         self.norm_mean = np.asarray(norm["global"]["mean"], dtype=np.float32)
         self.norm_std = np.asarray(norm["global"]["std_clamped"], dtype=np.float32)
         self.norm_dim = int(norm["n_dims"])
+        # Round-18 + Round-18-fix: optional obj_traj normalization stats.
+        # Look up by the new field name first (`obj_traj_root0_world`,
+        # Round-18-fix), then the old name (`obj_traj_canonical`,
+        # original Round-18) as a fallback so the trainer still loads
+        # the legacy cache cleanly even though configs no longer point
+        # at it. We DON'T accept both at once (mixing schemas would be
+        # a bug).
+        global_block = norm.get("global", {})
+        obj_block = global_block.get("obj_traj_root0_world", None)
+        self.obj_traj_field_name: str | None = None
+        if obj_block is not None:
+            self.obj_traj_field_name = "obj_traj_root0_world"
+        else:
+            obj_block = global_block.get("obj_traj_canonical", None)
+            if obj_block is not None:
+                self.obj_traj_field_name = "obj_traj_canonical"
+        if obj_block is not None:
+            self.obj_traj_norm_mean = np.asarray(obj_block["mean"], dtype=np.float32)
+            self.obj_traj_norm_std = np.asarray(obj_block["std_clamped"], dtype=np.float32)
+            self.obj_traj_dim = int(self.obj_traj_norm_mean.shape[0])
+        else:
+            self.obj_traj_norm_mean = None
+            self.obj_traj_norm_std = None
+            self.obj_traj_dim = 0
 
     def __len__(self) -> int:
         return len(self.records)
@@ -154,7 +187,7 @@ class Stage1CacheDataset(Dataset):
             text_pool = np.zeros((self.text_dim,), dtype=np.float32)
         else:
             text_pool = self.clip_embeddings[int(text_row)].astype(np.float32)
-        return {
+        sample = {
             "coarse_norm": coarse_norm,
             "init_norm": init_norm,
             "text_pool": text_pool,
@@ -162,6 +195,22 @@ class Stage1CacheDataset(Dataset):
             "subset": r["subset"],
             "seq_id": r["seq_id"],
         }
+        # Round-18 + Round-18-fix: load obj_traj when both the cache
+        # exposes the normalization stats AND the clip npz has the field.
+        # New cache (Round-18-fix) stores `obj_traj_root0_world` at
+        # `(seq_len, 9)`. Old cache (Round-18 original) stored
+        # `obj_traj_canonical` at `(196, 9)` (padded). The trainer trims
+        # to T regardless via `[:T]`. Z-score normalize on the same
+        # train-only stats. Padding to T_pad happens in the collate fn.
+        if (
+            self.obj_traj_dim > 0
+            and self.obj_traj_field_name is not None
+            and self.obj_traj_field_name in npz.files
+        ):
+            obj_traj = npz[self.obj_traj_field_name].astype(np.float32)[:T]  # (T, 9)
+            obj_traj_norm = (obj_traj - self.obj_traj_norm_mean) / self.obj_traj_norm_std
+            sample["obj_traj_norm"] = obj_traj_norm
+        return sample
 
 
 def coarse_prior_collate(
@@ -176,6 +225,14 @@ def coarse_prior_collate(
     seq_lens = np.zeros((B,), dtype=np.int64)
     subsets: list[str] = []
     seq_ids: list[str] = []
+    # Round-18: pad obj_traj iff every sample in the batch has it. Mixed
+    # batches (some with, some without) are not supported — the cache is
+    # either obj-traj-enabled or not, per the schema.
+    has_obj_traj = "obj_traj_norm" in samples[0]
+    obj_traj_buf: np.ndarray | None = None
+    if has_obj_traj:
+        Dobj = samples[0]["obj_traj_norm"].shape[1]
+        obj_traj_buf = np.zeros((B, T_pad, Dobj), dtype=np.float32)
     for i, s in enumerate(samples):
         T = int(s["seq_len"])
         coarse_buf[i, :T] = s["coarse_norm"]
@@ -185,6 +242,8 @@ def coarse_prior_collate(
         seq_lens[i] = T
         subsets.append(s["subset"])
         seq_ids.append(s["seq_id"])
+        if obj_traj_buf is not None:
+            obj_traj_buf[i, :T] = s["obj_traj_norm"]
     return CoarsePriorBatch(
         coarse_v1_norm=torch.from_numpy(coarse_buf),
         init_coarse_norm=torch.from_numpy(init_buf),
@@ -193,6 +252,7 @@ def coarse_prior_collate(
         seq_len=torch.from_numpy(seq_lens),
         subsets=subsets,
         seq_ids=seq_ids,
+        obj_traj_norm=torch.from_numpy(obj_traj_buf) if obj_traj_buf is not None else None,
     )
 
 
@@ -214,6 +274,13 @@ class CoarsePriorLossWeights:
     shoulder_height: float = 0.5          # dim [22]
     # State-velocity loss (finite-difference) weight (Codex §5.3).
     state_vel: float = 1.0
+    # Round-18 (per Round-17 §7.4 + Round-15 safety-gate evidence):
+    # root-only acc² + jerk² MSE on root_local_trans dims [0:3]. Default 0.0
+    # for back-compat with Round-12/14 configs; new Round-18 configs set it
+    # to 0.1 per the SUGGESTION.md guidance. Operates on z-score-normalized
+    # root channels — adjust weight to taste after observing the relative
+    # magnitudes of l_mse / l_state_vel / l_root_acc_jerk in smoke logs.
+    root_acc_jerk: float = 0.0
 
     def per_dim_weights(self, n_dims: int = 23) -> Tensor:
         w = torch.zeros(n_dims, dtype=torch.float32)
@@ -271,6 +338,110 @@ def masked_state_velocity_loss(
     return sq.sum() / denom
 
 
+def masked_root_acc_jerk_loss(
+    pred: Tensor,                # (B, T, D)
+    target: Tensor,              # (B, T, D)
+    valid_mask: Tensor,          # (B, T) bool
+    *,
+    root_dims: tuple[int, int] = (0, 3),
+) -> tuple[Tensor, Tensor]:
+    """Finite-difference acceleration² + jerk² MSE on root_local_trans only.
+
+    A frame triple (t-1, t, t+1) is "valid" iff all three frames are real
+    (not padding); jerk uses a 4-frame window. Returns ``(acc_term, jerk_term)``
+    each as a scalar Tensor on the same device. Operates on z-score-normalized
+    inputs (caller passes already-normalized x0 and x0_pred), so the magnitude
+    of the term is dimensionless and directly comparable to the channel-weighted
+    MSE.
+
+    Round-18 introduction. Per Round-17 §7.4 + Round-15 safety-gate evidence:
+    S1-B's catastrophic root_jerk_p95 (15-22× GT on imhd / neur / omo) is
+    exactly the failure mode an acc/jerk regulariser would penalise. Scoped
+    to root channels [0:3] only so chairs's under-jittery root_jerk (xGT 0.58)
+    isn't over-corrected.
+    """
+    lo, hi = root_dims
+    if pred.shape[-1] < hi or target.shape[-1] < hi:
+        raise ValueError(
+            f"root_dims=[{lo}:{hi}] exceeds last dim "
+            f"pred={pred.shape[-1]} target={target.shape[-1]}"
+        )
+    p_root = pred[..., lo:hi]                                    # (B, T, 3)
+    g_root = target[..., lo:hi]                                  # (B, T, 3)
+    vmask = valid_mask.to(pred.device).float()                   # (B, T)
+    # Acceleration: Δ² over (t-1, t, t+1) windows. Length T-2.
+    if pred.shape[1] >= 3:
+        p_acc = p_root[:, 2:] - 2.0 * p_root[:, 1:-1] + p_root[:, :-2]      # (B, T-2, 3)
+        g_acc = g_root[:, 2:] - 2.0 * g_root[:, 1:-1] + g_root[:, :-2]
+        triple_mask = vmask[:, 2:] * vmask[:, 1:-1] * vmask[:, :-2]         # (B, T-2)
+        sq_acc = (p_acc - g_acc).pow(2).sum(dim=-1)                          # (B, T-2)
+        sq_acc = sq_acc * triple_mask
+        denom_acc = triple_mask.sum().clamp_min(1.0)
+        acc_term = sq_acc.sum() / denom_acc
+    else:
+        acc_term = pred.sum() * 0.0
+    # Jerk: Δ³ over (t-1, t, t+1, t+2) windows. Length T-3.
+    if pred.shape[1] >= 4:
+        p_jerk = (
+            p_root[:, 3:]
+            - 3.0 * p_root[:, 2:-1]
+            + 3.0 * p_root[:, 1:-2]
+            - p_root[:, :-3]
+        )                                                                    # (B, T-3, 3)
+        g_jerk = (
+            g_root[:, 3:]
+            - 3.0 * g_root[:, 2:-1]
+            + 3.0 * g_root[:, 1:-2]
+            - g_root[:, :-3]
+        )
+        quad_mask = (
+            vmask[:, 3:] * vmask[:, 2:-1] * vmask[:, 1:-2] * vmask[:, :-3]
+        )                                                                    # (B, T-3)
+        sq_jerk = (p_jerk - g_jerk).pow(2).sum(dim=-1)                       # (B, T-3)
+        sq_jerk = sq_jerk * quad_mask
+        denom_jerk = quad_mask.sum().clamp_min(1.0)
+        jerk_term = sq_jerk.sum() / denom_jerk
+    else:
+        jerk_term = pred.sum() * 0.0
+    return acc_term, jerk_term
+
+
+def masked_per_dim_mse(
+    pred: Tensor,                # (B, T, D)
+    target: Tensor,              # (B, T, D)
+    valid_mask: Tensor,          # (B, T) bool
+) -> Tensor:
+    """Per-dim mean squared error over valid frames. Returns (D,).
+
+    Numerically identical to the per-frame masked MSE used by
+    ``masked_weighted_mse`` once weighted-summed across dims:
+        l_mse = (masked_per_dim_mse(...) * per_dim_w).sum()
+    is equal to ``masked_weighted_mse(pred, target, valid_mask, per_dim_w)``.
+
+    Exposing the per-dim vector lets the trainer log a per-channel-group
+    breakdown to wandb without changing the backprop semantics.
+    """
+    sq = (pred - target).pow(2)                                # (B, T, D)
+    mask = valid_mask.to(sq.device).float().unsqueeze(-1)      # (B, T, 1)
+    sq = sq * mask
+    denom = mask.squeeze(-1).sum().clamp_min(1.0)              # total valid (B, T) frames
+    return sq.sum(dim=(0, 1)) / denom                          # (D,)
+
+
+# Per-channel-group dim indices (matches CoarsePriorLossWeights groups). Used
+# only for wandb logging — does not affect the loss math.
+CHANNEL_GROUP_DIMS: dict[str, tuple[int, ...]] = {
+    "root_local_trans": (0, 1, 2),
+    "root_vel":         (3, 4, 5),
+    "yaw_sincos":       (6, 7),
+    "yaw_vel":          (8,),
+    "pelvis_rot6d":     (9, 10, 11, 12, 13, 14),
+    "spine3_rot6d":     (15, 16, 17, 18, 19, 20),
+    "head_height":      (21,),
+    "shoulder_height":  (22,),
+}
+
+
 # ============================================================================
 # Trainer
 # ============================================================================
@@ -295,6 +466,12 @@ def build_model(cfg: DictConfig) -> CoarsePriorDiff:
         max_seq_length=int(cfg.model.denoiser.max_seq_length),
         attention_mode=str(cfg.model.denoiser.attention_mode),
         block_size=int(cfg.model.denoiser.get("block_size", 16)),
+        # Round-18: obj_traj plumbing. Default 0 preserves Round-12/14
+        # behavior (object-free); Plan C / S1-O configs override to 9.
+        obj_traj_dim=int(cfg.model.denoiser.get("obj_traj_dim", 0)),
+        obj_traj_hint_hidden_mult=int(
+            cfg.model.denoiser.get("obj_traj_hint_hidden_mult", 1),
+        ),
     )
     return CoarsePriorDiff(CoarsePriorConfig(diffusion=diff_cfg, denoiser=den_cfg))
 
@@ -312,11 +489,95 @@ def build_loss_weights(cfg: DictConfig) -> CoarsePriorLossWeights:
         head_height=float(w.get("head_height", 0.5)),
         shoulder_height=float(w.get("shoulder_height", 0.5)),
         state_vel=float(L.get("state_velocity_weight", 1.0)),
+        # Round-18: optional root-only acc² + jerk² MSE weight. 0.0 = disabled
+        # (back-compat with Round-12/14 configs). New Round-18 configs set
+        # this to 0.1 per the SUGGESTION.md guidance; trainer logs the
+        # relative magnitudes of l_mse / l_state_vel / l_root_acc_jerk so
+        # the user can tune the weight after observing smoke runs.
+        root_acc_jerk=float(L.get("root_acc_jerk_weight", 0.0)),
     )
+
+
+# ============================================================================
+# EMA helper (mirrors MDM-family TrainLoop.update_average_model pattern)
+# ============================================================================
+
+
+class EMAState:
+    """Maintains an exponentially-decayed copy of model parameters.
+
+    Mirrors ``avg_model_beta`` from the MDM-family canonical TrainLoop
+    (external/guided-motion-diffusion/train/training_loop.py:347-358). At each
+    optimizer step, ``ema_param = decay * ema_param + (1-decay) * live_param``.
+
+    Sampling-time consumers should use ``apply_to(model)`` (and restore via
+    ``restore(model)``) to temporarily swap the live model parameters with
+    the EMA ones — this preserves the live optimizer state for continued
+    training.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
+        self.decay = float(decay)
+        # Store EMA copies as detached float32 tensors on the SAME device as
+        # the source parameters. Accelerate's model.prepare() will place the
+        # live model on cuda before this is called; we mirror that placement.
+        self._ema: dict[str, Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self._ema[name] = p.detach().clone().float()
+        # Track buffers separately so things like positional encoding pe
+        # buffers don't accidentally get EMA-treated; we just snapshot them.
+        self._buffers_snapshot: dict[str, Tensor] = {}
+        for name, b in model.named_buffers():
+            self._buffers_snapshot[name] = b.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        decay = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad or name not in self._ema:
+                continue
+            ema_p = self._ema[name]
+            if ema_p.device != p.device:
+                ema_p = ema_p.to(p.device)
+                self._ema[name] = ema_p
+            # ema = decay * ema + (1 - decay) * p
+            ema_p.mul_(decay).add_(p.detach().float(), alpha=1.0 - decay)
+
+    @torch.no_grad()
+    def state_dict(self) -> dict[str, Tensor]:
+        return {k: v.detach().clone().cpu() for k, v in self._ema.items()}
+
+    @torch.no_grad()
+    def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        for k, v in state.items():
+            if k in self._ema:
+                self._ema[k] = v.detach().clone()
+
+    # ---- swap helpers for eval-time use ----
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module) -> dict[str, Tensor]:
+        """Replace live model params with EMA params; return backup dict so
+        the caller can ``restore`` afterwards."""
+        backup: dict[str, Tensor] = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad or name not in self._ema:
+                continue
+            backup[name] = p.detach().clone()
+            p.data.copy_(self._ema[name].to(p.device, p.dtype))
+        return backup
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module, backup: dict[str, Tensor]) -> None:
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name].to(p.device, p.dtype))
 
 
 def make_dataloader(
     cfg: DictConfig, split: str, *, max_seq_length: int, shuffle: bool,
+    shuffle_generator: torch.Generator | None = None,
 ) -> DataLoader:
     ds = Stage1CacheDataset(
         cache_root=Path(cfg.data.cache_root),
@@ -330,11 +591,146 @@ def make_dataloader(
         ds,
         batch_size=bs,
         shuffle=shuffle,
+        # Round-18-fix: explicit `generator` for shuffle when provided.
+        # Decouples DataLoader shuffle RNG from the global RNG so model-
+        # construction RNG consumption (e.g. HintBlock init) doesn't
+        # perturb the train batch order across Plan A and S1-O.
+        generator=shuffle_generator if shuffle else None,
         drop_last=False,
         collate_fn=_collate,
         num_workers=int(cfg.training.get("num_workers", 0)),
         pin_memory=True,
     )
+
+
+@torch.no_grad()
+def _run_validation_pass(
+    *,
+    model: nn.Module,
+    ema_state: "EMAState | None",
+    val_loader: DataLoader,
+    accelerator: Accelerator,
+    diff,
+    num_steps: int,
+    per_dim_w: Tensor,
+    loss_w: CoarsePriorLossWeights,
+    model_obj_traj_dim: int,
+    val_max_batches: int = 0,
+    val_diff_seed: int = 0,
+) -> dict[str, float]:
+    """Run one validation pass under both live AND EMA weights and report
+    the same loss the trainer optimizes. ``val_max_batches=0`` = full pass.
+
+    Returns a dict with ``loss_live``, ``loss_ema`` (NaN if EMA disabled),
+    ``n_batches``, and per-component breakdowns. Restores the live model
+    after the EMA pass so training can continue uninterrupted.
+
+    Round-18 final polish: validation diffusion RNG is now deterministic
+    from ``val_diff_seed`` (caller passes a function of ``(seed, step)``).
+    Under matched seed, Plan A and S1-O see IDENTICAL `t` and `noise` in
+    every val batch — removes the spurious noise that biased best-EMA
+    selection across paired runs. The LIVE and EMA passes share the SAME
+    val_diff_seed (so they evaluate on bit-exact identical noise levels),
+    which is what we want when comparing live vs EMA loss within a single
+    val invocation. No validation draw is taken from the global RNG, so
+    validation does NOT perturb the training-side RNG stream.
+    """
+    model.eval()
+    device = accelerator.device
+
+    def _loss_one_pass(label: str) -> tuple[float, float, float, float, int]:
+        total_loss = 0.0
+        total_mse = 0.0
+        total_sv = 0.0
+        total_rj = 0.0
+        n_b = 0
+        val_diff_rng = torch.Generator(device=device)
+        val_diff_rng.manual_seed(int(val_diff_seed))
+        for vi, batch in enumerate(val_loader):
+            if val_max_batches > 0 and vi >= val_max_batches:
+                break
+            x0 = batch.coarse_v1_norm.to(device)
+            B = x0.shape[0]
+            t = torch.randint(
+                0, num_steps, (B,), device=device, generator=val_diff_rng,
+            )
+            noise = torch.randn(
+                x0.shape, device=device, dtype=x0.dtype, generator=val_diff_rng,
+            )
+            x_t = diff.q_sample(x0, t, noise)
+            cond = {
+                "text_pool": batch.text_pool.to(device),
+                "init_coarse": batch.init_coarse_norm.to(device),
+                "valid_mask": batch.valid_mask.to(device),
+            }
+            if model_obj_traj_dim > 0:
+                if batch.obj_traj_norm is None:
+                    raise RuntimeError(
+                        "val: model has obj_traj_dim > 0 but val batch lacks obj_traj_norm"
+                    )
+                cond["obj_traj"] = batch.obj_traj_norm.to(device)
+            x0_pred = accelerator.unwrap_model(model).forward_x0(
+                x_t, t, cond, cond_drop_mask=None, obj_traj_drop_mask=None,
+            )
+            valid_mask = batch.valid_mask.to(device)
+            per_dim_mse = masked_per_dim_mse(x0_pred, x0, valid_mask)
+            l_mse = (per_dim_mse * per_dim_w).sum()
+            l_sv = masked_state_velocity_loss(
+                x0_pred, x0, valid_mask, state_dims=STATE_LIKE_DIMS,
+            )
+            if float(loss_w.root_acc_jerk) > 0.0:
+                a, j = masked_root_acc_jerk_loss(x0_pred, x0, valid_mask)
+                l_rj = a + j
+            else:
+                l_rj = x0.sum() * 0.0
+            loss = (
+                l_mse
+                + float(loss_w.state_vel) * l_sv
+                + float(loss_w.root_acc_jerk) * l_rj
+            )
+            total_loss += float(loss.detach().item())
+            total_mse += float(l_mse.detach().item())
+            total_sv += float(l_sv.detach().item())
+            total_rj += float(l_rj.detach().item())
+            n_b += 1
+        if n_b == 0:
+            return float("nan"), float("nan"), float("nan"), float("nan"), 0
+        return (
+            total_loss / n_b,
+            total_mse / n_b,
+            total_sv / n_b,
+            total_rj / n_b,
+            n_b,
+        )
+
+    # Live pass.
+    live_loss, live_mse, live_sv, live_rj, n_b = _loss_one_pass("live")
+
+    # EMA pass (if available): swap, evaluate, restore.
+    if ema_state is not None:
+        backup = ema_state.apply_to(accelerator.unwrap_model(model))
+        try:
+            ema_loss, ema_mse, ema_sv, ema_rj, _ = _loss_one_pass("ema")
+        finally:
+            ema_state.restore(accelerator.unwrap_model(model), backup)
+    else:
+        ema_loss = float("nan")
+        ema_mse = float("nan")
+        ema_sv = float("nan")
+        ema_rj = float("nan")
+
+    model.train()
+    return {
+        "loss_live": float(live_loss),
+        "loss_ema": float(ema_loss),
+        "mse_live": float(live_mse),
+        "mse_ema": float(ema_mse),
+        "state_vel_live": float(live_sv),
+        "state_vel_ema": float(ema_sv),
+        "root_acc_jerk_live": float(live_rj),
+        "root_acc_jerk_ema": float(ema_rj),
+        "n_batches": int(n_b),
+    }
 
 
 def cosine_lr(step: int, *, total_steps: int, warmup_steps: int, base_lr: float) -> float:
@@ -380,6 +776,22 @@ def main() -> int:
              "S1-A/S1-B sweep must pass --seed explicitly per run so "
              "six runs do not all share seed 42.",
     )
+    # Round-18 trainer extensions. Most live in the YAML and can be CLI-
+    # overridden for smoke-time tuning.
+    parser.add_argument(
+        "--save-every-n-steps", type=int, default=None,
+        help="If set, overrides cfg.training.save_every_n_steps. Smoke runs "
+             "typically pass a large number to skip periodic ckpts.",
+    )
+    parser.add_argument(
+        "--val-every-n-steps", type=int, default=None,
+        help="If set, overrides cfg.training.val_every_n_steps. 0 disables "
+             "validation entirely.",
+    )
+    parser.add_argument(
+        "--no-ema", action="store_true",
+        help="Disable EMA even if cfg.training.ema_decay > 0. Smoke shortcut.",
+    )
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -420,7 +832,16 @@ def main() -> int:
 
     max_seq = int(cfg.model.denoiser.max_seq_length)
     # Use the cache's max_seq_length (Coarse-v1 capped at this length).
-    train_loader = make_dataloader(cfg, "train", max_seq_length=max_seq, shuffle=True)
+    # Round-18-fix: pass an explicit generator to the train DataLoader so
+    # shuffle order is deterministic from `seed` alone (NOT affected by
+    # how much RNG model construction consumed). This guarantees same-seed
+    # Plan A and S1-O see the same batch order across steps.
+    loader_rng = torch.Generator()
+    loader_rng.manual_seed(seed * 10_000 + 2)
+    train_loader = make_dataloader(
+        cfg, "train", max_seq_length=max_seq, shuffle=True,
+        shuffle_generator=loader_rng,
+    )
     val_loader = make_dataloader(cfg, "val", max_seq_length=max_seq, shuffle=False)
 
     # Optional sub-set for tiny-overfit test.
@@ -446,13 +867,38 @@ def main() -> int:
     warmup_steps = int(cfg.training.scheduler.get("warmup_steps", 100))
 
     use_wandb = (not args.no_wandb) and bool(cfg.logging.get("wandb", False))
+    # Only main process logs to wandb under multi-GPU; single-GPU is the
+    # default on the local box but this guard keeps DDP usage clean.
+    if use_wandb and not accelerator.is_main_process:
+        use_wandb = False
     if use_wandb:
         try:
             import wandb
+            base_name = str(cfg.logging.get("run_name", out_dir.name))
+            # Suffix the wandb run name with the resolved seed so 6
+            # paired-seed runs of the same mode are distinct on the UI
+            # (the YAML run_name alone is identical across seeds).
+            full_run_name = f"{base_name}_seed{seed}"
+            # Build tag set so the wandb UI can filter by mode / mask.
+            attn_mode = str(cfg.model.denoiser.get("attention_mode", "none"))
+            base_tags = list(cfg.logging.get("tags", ["round14", "stage1"]))
+            if attn_mode == "block_causal":
+                base_tags = base_tags + ["s1b", "block_causal"]
+            else:
+                base_tags = base_tags + ["s1a", "bidirectional"]
             wandb.init(
                 project=str(cfg.logging.get("project", "piano")),
-                name=str(cfg.logging.get("run_name", out_dir.name)),
+                name=full_run_name,
+                group=str(cfg.logging.get("group", "stage1_paired_s1a_vs_s1b")),
+                tags=base_tags,
                 config=OmegaConf.to_container(cfg, resolve=True),
+                # All wandb-local artefacts inside the per-run output_dir
+                # so the project root stays tidy under runs/training/.
+                dir=str(out_dir),
+            )
+            accelerator.print(
+                f"[stage1] wandb run = {full_run_name}  "
+                f"group=stage1_paired_s1a_vs_s1b  tags={base_tags}"
             )
         except Exception as e:
             accelerator.print(f"[stage1] wandb init failed ({e}); continuing without it")
@@ -476,11 +922,71 @@ def main() -> int:
     accelerator.print(f"[stage1] cache_root = {resolved_cache_root}")
     accelerator.print(f"[stage1] seed = {seed}")
 
+    # ---------------- Round-18 trainer extensions ---------------- #
+    # Independent CFG dropout probabilities; back-compat to cfg_drop_prob.
+    _legacy_drop = float(cfg.training.get("cfg_drop_prob", 0.1))
+    cfg_drop_prob_text = float(cfg.training.get("cfg_drop_prob_text", _legacy_drop))
+    cfg_drop_prob_obj_traj = float(cfg.training.get("cfg_drop_prob_obj_traj", _legacy_drop))
+    # Whether the active model expects obj_traj (depends on the loaded config).
+    model_obj_traj_dim = int(cfg.model.denoiser.get("obj_traj_dim", 0))
+
+    # EMA setup. Disabled by default for back-compat with Round-14 (which
+    # had no EMA); new Round-18 configs set ema_decay > 0. CLI --no-ema
+    # forces off regardless of config.
+    ema_decay = float(cfg.training.get("ema_decay", 0.0))
+    use_ema = bool(ema_decay > 0.0 and not args.no_ema and accelerator.is_main_process)
+    ema_state: EMAState | None = None
+    if use_ema:
+        ema_state = EMAState(
+            accelerator.unwrap_model(model), decay=ema_decay,
+        )
+        accelerator.print(f"[stage1] EMA enabled, decay = {ema_decay}")
+
+    # Periodic ckpt + val cadence.
+    save_every_n_steps = int(
+        args.save_every_n_steps
+        if args.save_every_n_steps is not None
+        else cfg.training.get("save_every_n_steps", 0)
+    )
+    val_every_n_steps = int(
+        args.val_every_n_steps
+        if args.val_every_n_steps is not None
+        else cfg.training.get("val_every_n_steps", 0)
+    )
+    val_max_batches = int(cfg.training.get("val_max_batches", 0))  # 0 = full pass
+
+    # Best-val tracking (used to pick which periodic ckpt to mark BEST).
+    best_val_loss = float("inf")
+    best_val_step = -1
+    best_val_path: str | None = None
+
+    # Round-18-fix: dedicated `torch.Generator` for diffusion-step + noise
+    # sampling so the timestep `t` and noise sequence are IDENTICAL across
+    # Plan A (obj_traj_dim=0) and S1-O (obj_traj_dim=9) at the same seed.
+    # The generator is initialised on the same device as the model so
+    # randint/randn don't host-roundtrip.
+    diff_rng = torch.Generator(device=accelerator.device)
+    diff_rng.manual_seed(seed * 10_000 + 1)
+
+    # Round-18 final polish: dedicated generators for text + obj_traj
+    # CFG dropout. Decoupling these from the GLOBAL RNG ensures that:
+    # (1) Plan A and S1-O see the SAME text-dropout mask sequence at the
+    #     same seed (so the "text-conditioning signal" being dropped is
+    #     paired-fair), and
+    # (2) S1-O's extra obj_traj-dropout draws DON'T shift any other
+    #     stream (diffusion, text, data loader, model construction).
+    # All three RNG streams (diff, text, obj) are independent of each
+    # other and of the global RNG.
+    text_drop_rng = torch.Generator(device=accelerator.device)
+    text_drop_rng.manual_seed(seed * 10_000 + 3)
+    obj_drop_rng = torch.Generator(device=accelerator.device)
+    obj_drop_rng.manual_seed(seed * 10_000 + 4)
+
     # ---------------- training loop ---------------- #
     step = 0
     train_iter = iter(train_loader)
     loss_log: list[dict[str, float]] = []
-    cfg_drop_prob = float(cfg.training.get("cfg_drop_prob", 0.1))
+    val_log: list[dict[str, float]] = []
     diff = accelerator.unwrap_model(model).diffusion
     num_steps = int(cfg.model.diffusion.num_steps)
     t_start = time.time()
@@ -501,8 +1007,14 @@ def main() -> int:
 
             x0 = batch.coarse_v1_norm.to(accelerator.device)              # (B, T, 23)
             B = x0.shape[0]
-            t = torch.randint(0, num_steps, (B,), device=accelerator.device)
-            noise = torch.randn_like(x0)
+            # Round-18-fix: `t` and `noise` use the dedicated `diff_rng`
+            # generator — identical across Plan A and S1-O at same seed.
+            t = torch.randint(
+                0, num_steps, (B,), device=accelerator.device, generator=diff_rng,
+            )
+            noise = torch.randn(
+                x0.shape, device=accelerator.device, dtype=x0.dtype, generator=diff_rng,
+            )
             x_t = diff.q_sample(x0, t, noise)
 
             cond = {
@@ -510,38 +1022,128 @@ def main() -> int:
                 "init_coarse": batch.init_coarse_norm.to(accelerator.device),
                 "valid_mask": batch.valid_mask.to(accelerator.device),
             }
+            # Round-18-fix: obj_traj is in the batch iff (a) the active cache
+            # exposes it AND (b) the active model expects it. Mismatches
+            # are caught here loud so we don't silently train a model that
+            # ignores its obj_traj_dim slot. Cond key is `obj_traj`
+            # (frame-agnostic; the cache contract documents the frame).
+            if model_obj_traj_dim > 0:
+                if batch.obj_traj_norm is None:
+                    raise RuntimeError(
+                        "model has obj_traj_dim > 0 but the active cache "
+                        "does not expose obj_traj. Check that data.cache_root "
+                        "points at an objtraj cache."
+                    )
+                cond["obj_traj"] = batch.obj_traj_norm.to(accelerator.device)
+            # Round-18 final polish: independent dedicated generators for
+            # text and obj_traj CFG dropout. The text dropout mask is now
+            # IDENTICAL across Plan A and S1-O at the same seed (both draw
+            # from text_drop_rng). S1-O's obj_traj dropout uses its own
+            # obj_drop_rng so it doesn't perturb the text stream OR the
+            # diffusion-side `t`/`noise`. Plan A doesn't touch obj_drop_rng
+            # so it's idle there; not a fairness concern.
             cond_drop_mask = (
-                torch.rand(B, device=accelerator.device) < cfg_drop_prob
-                if cfg_drop_prob > 0 else None
+                torch.rand(B, device=accelerator.device, generator=text_drop_rng)
+                    < cfg_drop_prob_text
+                if cfg_drop_prob_text > 0 else None
             )
+            obj_traj_drop_mask = None
+            if model_obj_traj_dim > 0 and cfg_drop_prob_obj_traj > 0:
+                obj_traj_drop_mask = (
+                    torch.rand(B, device=accelerator.device, generator=obj_drop_rng)
+                        < cfg_drop_prob_obj_traj
+                )
 
             x0_pred = accelerator.unwrap_model(model).forward_x0(
-                x_t, t, cond, cond_drop_mask=cond_drop_mask,
+                x_t, t, cond,
+                cond_drop_mask=cond_drop_mask,
+                obj_traj_drop_mask=obj_traj_drop_mask,
             )
 
             valid_mask = batch.valid_mask.to(accelerator.device)
-            l_mse = masked_weighted_mse(x0_pred, x0, valid_mask, per_dim_w)
+            # Compute per-dim MSE once and aggregate to the weighted total.
+            # Numerically identical to masked_weighted_mse(...) for backprop,
+            # but the per-dim vector is reused below for the wandb breakdown.
+            per_dim_mse = masked_per_dim_mse(x0_pred, x0, valid_mask)        # (D,)
+            l_mse = (per_dim_mse * per_dim_w).sum()
             l_state_vel = masked_state_velocity_loss(
                 x0_pred, x0, valid_mask, state_dims=STATE_LIKE_DIMS,
             )
-            loss = l_mse + float(loss_w.state_vel) * l_state_vel
+            # Round-18: root-only acc/jerk MSE. Disabled (weight 0.0) by
+            # default for back-compat. Smoke runs log component magnitudes
+            # so the operator can see the relative scale before choosing a
+            # production weight.
+            if float(loss_w.root_acc_jerk) > 0.0:
+                l_root_acc, l_root_jerk = masked_root_acc_jerk_loss(
+                    x0_pred, x0, valid_mask, root_dims=(0, 3),
+                )
+                l_root_acc_jerk = l_root_acc + l_root_jerk
+            else:
+                l_root_acc = x0.sum() * 0.0
+                l_root_jerk = x0.sum() * 0.0
+                l_root_acc_jerk = x0.sum() * 0.0
+            loss = (
+                l_mse
+                + float(loss_w.state_vel) * l_state_vel
+                + float(loss_w.root_acc_jerk) * l_root_acc_jerk
+            )
 
             accelerator.backward(loss)
+            grad_norm_t: Tensor | None = None
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm_t = accelerator.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0,
+                )
             optim.step()
             optim.zero_grad()
+
+            # Round-18: EMA update once per real optimizer step (gated by
+            # sync_gradients so micro-batches under grad accumulation don't
+            # produce N updates). Main-process only — EMA lives outside the
+            # accelerator.unwrap_model state.
+            if (
+                ema_state is not None
+                and accelerator.sync_gradients
+                and accelerator.is_main_process
+            ):
+                ema_state.update(accelerator.unwrap_model(model))
 
         # Logging
         if accelerator.sync_gradients:
             loss_v = loss.detach().item()
             mse_v = l_mse.detach().item()
             sv_v = l_state_vel.detach().item()
+            l_root_acc_v = float(l_root_acc.detach().item())
+            l_root_jerk_v = float(l_root_jerk.detach().item())
+            l_root_acc_jerk_total = float(l_root_acc_jerk.detach().item())
+            grad_norm_v = (
+                float(grad_norm_t.detach().item())
+                if grad_norm_t is not None else float("nan")
+            )
+            x0_std_v = float(x0_pred.detach().std().item())
+            x0_abs_mean_v = float(x0_pred.detach().abs().mean().item())
+            # Per-channel-group weighted contribution to l_mse. The sum of
+            # all group contributions equals `mse_v` by construction
+            # (per_dim_mse * per_dim_w summed over disjoint dim groups).
+            per_dim_mse_d = per_dim_mse.detach()
+            per_dim_w_d = per_dim_w.detach()
+            grp_contrib: dict[str, float] = {}
+            for grp_name, dim_idxs in CHANNEL_GROUP_DIMS.items():
+                dims_t = torch.tensor(dim_idxs, device=per_dim_mse_d.device)
+                grp_per_dim = per_dim_mse_d.index_select(0, dims_t)
+                grp_per_w = per_dim_w_d.index_select(0, dims_t)
+                grp_contrib[grp_name] = float(
+                    (grp_per_dim * grp_per_w).sum().item()
+                )
+
             if step % int(cfg.logging.get("log_every_n_steps", 50)) == 0 or step == total_steps - 1:
                 accelerator.print(
                     f"[stage1] step {step:5d}  lr={lr_now:.2e}  "
                     f"loss={loss_v:.4f}  mse={mse_v:.4f}  "
                     f"state_vel={sv_v:.4f}  "
+                    f"root_acc_jerk={l_root_acc_jerk_total:.4f} "
+                    f"(acc={l_root_acc_v:.4f} jerk={l_root_jerk_v:.4f})  "
+                    f"gnorm={grad_norm_v:.3f}  "
                     f"elapsed={time.time() - t_start:.1f}s"
                 )
                 loss_log.append({
@@ -549,16 +1151,115 @@ def main() -> int:
                     "loss": float(loss_v),
                     "mse": float(mse_v),
                     "state_vel": float(sv_v),
+                    "root_acc": l_root_acc_v,
+                    "root_jerk": l_root_jerk_v,
+                    "root_acc_jerk_total": l_root_acc_jerk_total,
                     "lr": float(lr_now),
+                    "grad_norm": grad_norm_v,
+                    "x0_pred_std": x0_std_v,
+                    "x0_pred_abs_mean": x0_abs_mean_v,
+                    "mse_grp": grp_contrib,
                 })
                 if use_wandb:
                     import wandb
+                    log_payload = {
+                        # Basic training scalars (the user-facing essentials).
+                        "train/loss":       float(loss_v),
+                        "train/mse":        float(mse_v),
+                        "train/state_vel":  float(sv_v),
+                        "train/root_acc":   l_root_acc_v,
+                        "train/root_jerk":  l_root_jerk_v,
+                        "train/root_acc_jerk_total": l_root_acc_jerk_total,
+                        "train/lr":         float(lr_now),
+                        # Health metrics — cheap to compute, very useful for
+                        # spotting collapse / blow-up runs.
+                        "train/grad_norm":  grad_norm_v,
+                        "train/x0_pred_std":      x0_std_v,
+                        "train/x0_pred_abs_mean": x0_abs_mean_v,
+                        # Wall-clock for cross-run comparison.
+                        "train/elapsed_seconds": float(time.time() - t_start),
+                    }
+                    # Per-channel-group weighted MSE contribution. Sum of these
+                    # 8 fields equals "train/mse" by construction.
+                    for grp_name, grp_val in grp_contrib.items():
+                        log_payload[f"train/mse_grp/{grp_name}"] = grp_val
+                    wandb.log(log_payload, step=step)
+
+            # ─── Round-18: periodic checkpoint + validation ──────────
+            if (
+                accelerator.is_main_process
+                and save_every_n_steps > 0
+                and (step + 1) % save_every_n_steps == 0
+                and (step + 1) < total_steps
+            ):
+                ckpt_step_path = out_dir / f"ckpt-{step + 1:06d}.pt"
+                _payload = {
+                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "config": OmegaConf.to_container(cfg, resolve=True),
+                    "step": int(step + 1),
+                    "checkpoint_name": ckpt_step_path.name,
+                    "cache_root": resolved_cache_root,
+                    "seed": seed,
+                }
+                if ema_state is not None:
+                    _payload["ema"] = ema_state.state_dict()
+                    _payload["ema_decay"] = ema_decay
+                accelerator.save(_payload, ckpt_step_path)
+                accelerator.print(f"[stage1] periodic ckpt → {ckpt_step_path}")
+
+            if (
+                accelerator.is_main_process
+                and val_every_n_steps > 0
+                and (step + 1) % val_every_n_steps == 0
+            ):
+                # Round-18 final polish: val_diff_seed deterministic from
+                # (seed, step+1) so under matched training seed the
+                # validation `t`/`noise` are bit-exact across Plan A and
+                # S1-O at every val invocation. This removes a spurious
+                # source of variance in best-EMA selection across paired
+                # runs.
+                val_metrics = _run_validation_pass(
+                    model=model,
+                    ema_state=ema_state,
+                    val_loader=val_loader,
+                    accelerator=accelerator,
+                    diff=diff,
+                    num_steps=num_steps,
+                    per_dim_w=per_dim_w,
+                    loss_w=loss_w,
+                    model_obj_traj_dim=model_obj_traj_dim,
+                    val_max_batches=val_max_batches,
+                    val_diff_seed=seed * 1_000_000 + (step + 1),
+                )
+                val_metrics["step"] = int(step + 1)
+                val_log.append(val_metrics)
+                ema_val = val_metrics.get("loss_ema", float("nan"))
+                live_val = val_metrics.get("loss_live", float("nan"))
+                accelerator.print(
+                    f"[stage1] val step {step + 1}  "
+                    f"loss_live={live_val:.4f}  loss_ema={ema_val:.4f}  "
+                    f"n_batches={val_metrics.get('n_batches', 0)}"
+                )
+                if use_wandb:
+                    import wandb
                     wandb.log({
-                        "train/loss": float(loss_v),
-                        "train/mse": float(mse_v),
-                        "train/state_vel": float(sv_v),
-                        "train/lr": float(lr_now),
-                    }, step=step)
+                        "val/loss_live": float(live_val),
+                        "val/loss_ema": float(ema_val),
+                        "val/n_batches": int(val_metrics.get("n_batches", 0)),
+                    }, step=step + 1)
+                # Track best val (prefer EMA, fall back to live).
+                cmp_val = ema_val if math.isfinite(ema_val) else live_val
+                if math.isfinite(cmp_val) and cmp_val < best_val_loss:
+                    best_val_loss = float(cmp_val)
+                    best_val_step = int(step + 1)
+                    # Mark this step's periodic ckpt as best if it exists.
+                    cand = out_dir / f"ckpt-{step + 1:06d}.pt"
+                    if cand.exists():
+                        best_val_path = str(cand)
+                    accelerator.print(
+                        f"[stage1] new best val loss = {best_val_loss:.4f} "
+                        f"at step {best_val_step}  (ckpt: {best_val_path or 'pending periodic save'})"
+                    )
             step += 1
 
     # Save final state.
@@ -573,7 +1274,7 @@ def main() -> int:
             ckpt_path = None
         else:
             ckpt_path = out_dir / str(args.checkpoint_name)
-            accelerator.save({
+            _final_payload = {
                 "model": accelerator.unwrap_model(model).state_dict(),
                 "config": OmegaConf.to_container(cfg, resolve=True),
                 "step": step,
@@ -583,7 +1284,14 @@ def main() -> int:
                 # or wrong-seed checkpoint after the fact.
                 "cache_root": resolved_cache_root,
                 "seed": seed,
-            }, ckpt_path)
+            }
+            # Round-18: include EMA state when enabled. Sampling tools
+            # should load the "ema" entry preferentially for best-quality
+            # generation.
+            if ema_state is not None:
+                _final_payload["ema"] = ema_state.state_dict()
+                _final_payload["ema_decay"] = ema_decay
+            accelerator.save(_final_payload, ckpt_path)
             accelerator.print(f"[stage1] wrote {ckpt_path}")
         # Loss log is always written (it does not impersonate a model
         # checkpoint and is useful for the round report).
@@ -599,6 +1307,36 @@ def main() -> int:
             }, indent=2),
             encoding="utf-8",
         )
+        # Round-18: emit a separate val + best-ckpt summary so post-hoc
+        # selection has the canonical record. Always written even if val
+        # never ran (the file then contains empty val_log + sentinel).
+        (out_dir / "training_summary.json").write_text(
+            json.dumps({
+                "total_steps": total_steps,
+                "cache_root": resolved_cache_root,
+                "seed": seed,
+                "ema_enabled": bool(ema_state is not None),
+                "ema_decay": ema_decay if ema_state is not None else 0.0,
+                "save_every_n_steps": save_every_n_steps,
+                "val_every_n_steps": val_every_n_steps,
+                "val_log": val_log,
+                "best_val_loss": float(best_val_loss) if best_val_loss != float("inf") else None,
+                "best_val_step": int(best_val_step) if best_val_step >= 0 else None,
+                "best_val_ckpt_path": best_val_path,
+                "model_obj_traj_dim": model_obj_traj_dim,
+                "cfg_drop_prob_text": cfg_drop_prob_text,
+                "cfg_drop_prob_obj_traj": cfg_drop_prob_obj_traj,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    # Cleanly close the wandb run so the next paired invocation can call
+    # wandb.init() without interference.
+    if use_wandb:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
     return 0
 
 

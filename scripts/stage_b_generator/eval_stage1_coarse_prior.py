@@ -160,6 +160,56 @@ def _per_clip_metrics(coarse: np.ndarray) -> dict[str, float]:
     return out
 
 
+def _object_relative_metrics(
+    coarse: np.ndarray,                    # (T, 23) denormalized Coarse-v1
+    obj_traj: np.ndarray,                  # (T, 9) denormalized obj_pos (3) + obj_rot6d (6)
+) -> dict[str, float]:
+    """Object-relative metrics that use ALL valid frames — no contact-label
+    dependency (per Round-17 §9.3 + SUGGESTION.md §"Object-relative eval
+    must not require contact labels as a primary metric").
+
+    Operates in the frame documented by the active cache contract. Under
+    Round-18-fix, both inputs are in root0-relative, world-axis coordinates
+    (cache field name: `obj_traj_root0_world`). Both inputs are
+    valid-truncated by the caller. Metric formulae are frame-agnostic
+    (norms + dot products), so the same code works against the legacy
+    `obj_traj_canonical` field too.
+    """
+    T = coarse.shape[0]
+    out: dict[str, float] = {}
+    if T < 2 or obj_traj.shape[0] < 2:
+        return out
+    root = coarse[:, ROOT_TRANS_DIMS]      # (T, 3) root_local_trans
+    obj_com = obj_traj[:, 0:3]             # (T, 3) obj position
+    valid_T = min(root.shape[0], obj_com.shape[0])
+    root = root[:valid_T]
+    obj_com = obj_com[:valid_T]
+    # 1) Root-object distance trajectory: ||root(t) - obj(t)|| per frame.
+    dist = np.linalg.norm(root - obj_com, axis=-1)       # (T,)
+    out["root_obj_dist_mean"] = float(np.mean(dist))
+    out["root_obj_dist_p50"] = float(np.median(dist))
+    out["root_obj_dist_p95"] = float(np.percentile(dist, 95))
+    out["root_obj_dist_range"] = float(dist.max() - dist.min())
+    # 2) Facing-to-object alignment: cosine(human facing vector, root→obj direction in XZ).
+    # Human facing comes from coarse's yaw sin/cos. `forward_xz = (yaw_sin, yaw_cos)`
+    # is the unit-vector direction the body is facing in the X-Z plane.
+    yaw_sin = coarse[:valid_T, 6]
+    yaw_cos = coarse[:valid_T, 7]
+    forward_xz = np.stack([yaw_sin, yaw_cos], axis=-1)
+    # Normalize defensively (yaw sin/cos should be unit-length but
+    # generated samples may drift).
+    fn = np.linalg.norm(forward_xz, axis=-1, keepdims=True)
+    forward_xz = forward_xz / np.clip(fn, 1e-6, None)
+    # Direction from root to object in X-Z plane.
+    to_obj_xz = (obj_com - root)[:, [0, 2]]              # (T, 2)
+    ton = np.linalg.norm(to_obj_xz, axis=-1, keepdims=True)
+    to_obj_xz = to_obj_xz / np.clip(ton, 1e-6, None)
+    cos_align = (forward_xz * to_obj_xz).sum(axis=-1)    # (T,) in [-1, 1]
+    out["facing_to_obj_cos_mean"] = float(np.mean(cos_align))
+    out["facing_to_obj_cos_p95"] = float(np.percentile(cos_align, 95))
+    return out
+
+
 METRIC_KEYS = (
     "root_vel_mean_abs", "root_acc_p95", "root_jerk_p95",
     "yaw_range",
@@ -177,7 +227,15 @@ METRIC_KEYS = (
 # ============================================================================
 
 
-def _build_model_from_ckpt(ckpt: dict[str, Any]) -> CoarsePriorDiff:
+def _build_model_from_ckpt(
+    ckpt: dict[str, Any], *, prefer_ema: bool = True,
+) -> tuple[CoarsePriorDiff, bool]:
+    """Build the Stage-1 model from a checkpoint. Returns ``(model, loaded_ema)``.
+
+    Round-18: when ``prefer_ema=True`` AND the ckpt has an ``"ema"`` state dict,
+    the EMA copy is loaded into the model and the LIVE state dict is ignored.
+    This matches MDM-family practice — sampling-time inference uses EMA weights.
+    """
     cfg_d = ckpt["config"]
     diff = DiffusionConfig(
         num_steps=int(cfg_d["model"]["diffusion"]["num_steps"]),
@@ -198,10 +256,26 @@ def _build_model_from_ckpt(ckpt: dict[str, Any]) -> CoarsePriorDiff:
         max_seq_length=int(den_d["max_seq_length"]),
         attention_mode=str(den_d["attention_mode"]),
         block_size=int(den_d.get("block_size", 16)),
+        obj_traj_dim=int(den_d.get("obj_traj_dim", 0)),
+        obj_traj_hint_hidden_mult=int(den_d.get("obj_traj_hint_hidden_mult", 1)),
     )
     model = CoarsePriorDiff(CoarsePriorConfig(diffusion=diff, denoiser=den))
+    # Load LIVE state first so any keys missing from the EMA partial overlay
+    # still get initialized (EMA only holds requires_grad parameters, not
+    # buffers like positional encoding).
     model.load_state_dict(ckpt["model"], strict=True)
-    return model
+    loaded_ema = False
+    if prefer_ema and "ema" in ckpt:
+        ema_sd = ckpt["ema"]
+        # Apply EMA over the live model in-place for the trainable params
+        # the EMA tracked.
+        own = model.state_dict()
+        for k, v in ema_sd.items():
+            if k in own and own[k].shape == v.shape:
+                own[k] = v.to(own[k].dtype)
+        model.load_state_dict(own, strict=True)
+        loaded_ema = True
+    return model, loaded_ema
 
 
 # ============================================================================
@@ -323,6 +397,23 @@ def main() -> int:
         help="Override DDPM steps for faster smoke eval. Default = ckpt config value.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("analyses"))
+    # Round-18 additions.
+    parser.add_argument(
+        "--no-prefer-ema", action="store_true",
+        help="If set, load LIVE weights even when the ckpt has an EMA copy. "
+             "Default (preferred) is to use EMA weights for sampling.",
+    )
+    parser.add_argument(
+        "--inpaint-frame0", action="store_true",
+        help="Force frame 0 of the generated sample to equal the conditioned "
+             "init pose via RePaint-style x_t replacement. Round-18 sampler "
+             "extension.",
+    )
+    parser.add_argument(
+        "--cfg-scale-text", type=float, default=1.0,
+        help="Classifier-free guidance scale for the text branch at sampling. "
+             "1.0 = no guidance (default). Higher = stronger text adherence.",
+    )
     args = parser.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
@@ -395,8 +486,16 @@ def main() -> int:
 
     # Now (and only now) load the checkpoint + build the model.
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    model = _build_model_from_ckpt(ckpt)
+    model, loaded_ema = _build_model_from_ckpt(
+        ckpt, prefer_ema=not args.no_prefer_ema,
+    )
+    if loaded_ema:
+        print("[eval] loaded EMA weights (Round-18; pass --no-prefer-ema to use LIVE)")
+    elif "ema" in ckpt and args.no_prefer_ema:
+        print("[eval] ckpt has EMA but --no-prefer-ema set; using LIVE weights")
     model.eval()
+    # Round-18: detect obj_traj requirement from the loaded model config.
+    model_obj_traj_dim = int(model.cfg.denoiser.obj_traj_dim)
 
     if args.num_ddpm_steps is not None:
         # Quick override for smoke-eval speed: rebuild diffusion with fewer steps.
@@ -424,6 +523,38 @@ def main() -> int:
     norm = json.loads((cache_root / "normalization_train.json").read_text("utf-8"))
     mean = np.asarray(norm["global"]["mean"], dtype=np.float32)
     std = np.asarray(norm["global"]["std_clamped"], dtype=np.float32)
+    # Round-18 + Round-18-fix: obj_traj normalization stats.
+    # New cache uses `obj_traj_root0_world`; legacy cache used
+    # `obj_traj_canonical`. Probe new name first, then fall back.
+    global_block = norm.get("global", {})
+    obj_block = global_block.get("obj_traj_root0_world", None)
+    obj_field_name: str | None = None
+    if obj_block is not None:
+        obj_field_name = "obj_traj_root0_world"
+    else:
+        obj_block = global_block.get("obj_traj_canonical", None)
+        if obj_block is not None:
+            obj_field_name = "obj_traj_canonical"
+    if obj_block is not None:
+        obj_mean = np.asarray(obj_block["mean"], dtype=np.float32)
+        obj_std = np.asarray(obj_block["std_clamped"], dtype=np.float32)
+    else:
+        obj_mean = None
+        obj_std = None
+    if model_obj_traj_dim > 0 and obj_mean is None:
+        raise SystemExit(
+            f"[eval] model needs obj_traj (obj_traj_dim={model_obj_traj_dim}) but "
+            f"cache at {cache_root} has no obj_traj normalization stats. "
+            f"Point --cache-root at an objtraj cache."
+        )
+    if model_obj_traj_dim == 0 and obj_mean is not None:
+        print(
+            f"[eval] WARNING — cache has obj_traj ({obj_field_name}) but model "
+            f"has obj_traj_dim=0; the obj_traj fields will be loaded but not "
+            f"consumed (object-free model)."
+        )
+    if obj_field_name is not None:
+        print(f"[eval] obj_traj cache field = {obj_field_name}")
 
     # Selection: prefer fixed Round-9-style selection JSON when provided,
     # else fall back to random per-subset balanced selection (smoke).
@@ -497,7 +628,23 @@ def main() -> int:
             else np.zeros((512,), dtype=np.float32)
         )
 
+        # Round-18 + Round-18-fix: load obj_traj from the clip npz when
+        # the active cache stores it. Probes the new field name first,
+        # then the legacy one, so both cache flavors evaluate cleanly.
+        obj_traj_raw: np.ndarray | None = None
+        obj_traj_norm: np.ndarray | None = None
+        for cand_field in ("obj_traj_root0_world", "obj_traj_canonical"):
+            if cand_field in npz.files:
+                obj_traj_raw = npz[cand_field].astype(np.float32)[:T]  # (T, 9)
+                break
+        if obj_traj_raw is not None and obj_mean is not None and obj_std is not None:
+            obj_traj_norm = (obj_traj_raw - obj_mean) / obj_std
+
         gt_metrics = _per_clip_metrics(gt)
+        gt_obj_metrics = (
+            _object_relative_metrics(gt, obj_traj_raw)
+            if obj_traj_raw is not None else {}
+        )
 
         # Sample for each requested seed.
         for seed in seeds:
@@ -508,9 +655,20 @@ def main() -> int:
                 "init_coarse": torch.from_numpy(init_norm).unsqueeze(0).to(device),
                 "valid_mask": valid_mask,
             }
+            if model_obj_traj_dim > 0:
+                if obj_traj_norm is None:
+                    raise SystemExit(
+                        f"[eval] model needs obj_traj for clip {r['seq_id']} but "
+                        "cache does not expose obj_traj for this clip"
+                    )
+                cond["obj_traj"] = torch.from_numpy(
+                    obj_traj_norm,
+                ).unsqueeze(0).to(device)
             with torch.no_grad():
                 gen_norm = model.sample(
-                    shape=(1, T, COARSE_DIM), cond=cond, cfg_scale=1.0, device=device,
+                    shape=(1, T, COARSE_DIM), cond=cond,
+                    cfg_scale=float(args.cfg_scale_text), device=device,
+                    inpaint_frame0=bool(args.inpaint_frame0),
                 )
             gen_norm_np = gen_norm.squeeze(0).cpu().numpy()
             gen = gen_norm_np * std + mean                              # denormalize
@@ -521,6 +679,18 @@ def main() -> int:
                 f"xGT.{k}": (gen_metrics[k] / gt_metrics[k]) if gt_metrics[k] > 1e-6 else float("nan")
                 for k in METRIC_KEYS
             }
+            # Round-18: object-relative metrics (skip if no obj_traj available).
+            gen_obj_metrics = (
+                _object_relative_metrics(gen, obj_traj_raw)
+                if obj_traj_raw is not None else {}
+            )
+            obj_xGT = {}
+            for k in gt_obj_metrics:
+                gv = gen_obj_metrics.get(k, float("nan"))
+                gtv = gt_obj_metrics.get(k, float("nan"))
+                obj_xGT[f"xGT.obj.{k}"] = (
+                    float(gv / gtv) if gtv is not None and abs(gtv) > 1e-6 else float("nan")
+                )
             per_clip.append({
                 "clip_idx_in_manifest": int(idx),
                 "subset": r["subset"],
@@ -531,6 +701,9 @@ def main() -> int:
                 "gen": gen_metrics,
                 "xGT": ratios,
                 "gen_finite": bool(np.isfinite(gen).all()),
+                "gt_obj_metrics": gt_obj_metrics,
+                "gen_obj_metrics": gen_obj_metrics,
+                "obj_xGT": obj_xGT,
             })
         if (clip_i + 1) % 4 == 0:
             print(
@@ -553,6 +726,28 @@ def main() -> int:
             vals = [r["xGT"][f"xGT.{k}"] for r in rows]
             vals = [v for v in vals if np.isfinite(v)]
             agg["xGT_mean"][k] = float(np.mean(vals)) if vals else float("nan")
+        # Round-18: object-relative metric aggregates (skip if no obj_traj
+        # available for this subset's clips).
+        obj_keys: set[str] = set()
+        for r in rows:
+            obj_keys.update(r.get("gt_obj_metrics", {}).keys())
+        if obj_keys:
+            agg["gen_obj_mean"] = {}
+            agg["gt_obj_mean"] = {}
+            agg["obj_xGT_mean"] = {}
+            for k in sorted(obj_keys):
+                gen_vals = [r["gen_obj_metrics"].get(k, float("nan")) for r in rows
+                            if "gen_obj_metrics" in r]
+                gt_vals = [r["gt_obj_metrics"].get(k, float("nan")) for r in rows
+                           if "gt_obj_metrics" in r]
+                xg_vals = [r["obj_xGT"].get(f"xGT.obj.{k}", float("nan")) for r in rows
+                           if "obj_xGT" in r]
+                gen_vals_f = [v for v in gen_vals if np.isfinite(v)]
+                gt_vals_f = [v for v in gt_vals if np.isfinite(v)]
+                xg_vals_f = [v for v in xg_vals if np.isfinite(v)]
+                agg["gen_obj_mean"][k] = float(np.mean(gen_vals_f)) if gen_vals_f else float("nan")
+                agg["gt_obj_mean"][k] = float(np.mean(gt_vals_f)) if gt_vals_f else float("nan")
+                agg["obj_xGT_mean"][k] = float(np.mean(xg_vals_f)) if xg_vals_f else float("nan")
         per_subset[subset] = agg
 
     # Output
@@ -580,6 +775,14 @@ def main() -> int:
         "selection_source": selection_source,
         "selection_matched": matched_records,
         "selection_missing": missing_records,
+        # Round-18 metadata for downstream paired analyses + tracking
+        # whether EMA / frame-0 inpainting / obj_traj were active.
+        "round18_meta": {
+            "model_obj_traj_dim": int(model_obj_traj_dim),
+            "loaded_ema": bool(loaded_ema),
+            "inpaint_frame0": bool(args.inpaint_frame0),
+            "cfg_scale_text": float(args.cfg_scale_text),
+        },
     }
     out_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
     print(f"[eval] wrote {out_path}")

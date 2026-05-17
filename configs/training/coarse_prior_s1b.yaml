@@ -63,7 +63,13 @@ loss:
 logging:
   project: "piano"
   run_name: "stage1_coarse_prior_s1b"
-  wandb: false
+  wandb: true              # Round-13 final-polish + Round-14 follow-up:
+                           # web-UI monitoring enabled. trainer adds the
+                           # resolved seed as a suffix to the wandb run name
+                           # (e.g. "stage1_coarse_prior_s1b_seed42") so the
+                           # 6 paired-seed runs are distinct.
+  group: "stage1_paired_s1a_vs_s1b"
+  tags: ["round14", "stage1"]
   log_every_n_steps: 50
 
 output_dir: "runs/training/stage1_coarse_prior_s1b"
