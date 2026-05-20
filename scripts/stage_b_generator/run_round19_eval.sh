@@ -2,9 +2,9 @@
 # Round-19 paired evaluation driver.
 #
 # Iterates the (12 runs × 2 ckpts × 3 cfg_scales) eval matrix using
-# eval_stage1_coarse_prior.py. Parallelizes across GPU0 + GPU1 by
-# splitting the matrix into two halves (Plan A → GPU0, S1-O → GPU1)
-# launched concurrently per seed × ckpt × cfg combination.
+# eval_stage1_coarse_prior.py. **Single-GPU serial** mode — runs Plan A
+# and S1-O sequentially on GPU0 per (seed, ckpt, cfg) iteration. Set
+# GPU_ID below if a different GPU index is desired.
 #
 # Matrix:
 #   12 runs  = 6 seeds × {Plan A, S1-O}
@@ -18,8 +18,7 @@
 #
 # Per-config eval = 32 clips × 3 sample seeds = 96 samples × 1000-step
 # DDPM ≈ 11-15 min on A6000. Total matrix = 12 × 2 × 3 = 72 configs.
-# Wallclock with 2-GPU parallelization (per-seed pair concurrent):
-#   6 seeds × 2 ckpts × 3 cfgs × 13 min ≈ ~8 h
+# Wallclock single-GPU serial: 72 configs × 13 min ≈ ~16 h.
 #
 # Prereqs:
 #   - All 12 ckpts in runs/training/stage1_*_round19_seed{42..47}/
@@ -43,6 +42,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 # ----------- config -----------
+GPU_ID=${GPU_ID:-0}                       # set via env: GPU_ID=1 bash run_round19_eval.sh
 SEEDS=(42 43 44 45 46 47)
 CFG_SCALES=(1.0 2.5 5.0)
 # Ckpt labels: best_val (resolved from training_summary.json) + a fixed
@@ -64,6 +64,7 @@ echo "[round19-eval] eval dir:  ${EVAL_DIR}" | tee -a "${MASTER_LOG}"
 echo "[round19-eval] seeds:     ${SEEDS[*]}" | tee -a "${MASTER_LOG}"
 echo "[round19-eval] ckpts:     ${CKPT_LABELS[*]}" | tee -a "${MASTER_LOG}"
 echo "[round19-eval] cfgs:      ${CFG_SCALES[*]}" | tee -a "${MASTER_LOG}"
+echo "[round19-eval] gpu:       cuda:${GPU_ID} (serial mode)" | tee -a "${MASTER_LOG}"
 echo "" | tee -a "${MASTER_LOG}"
 
 # Sanity: selection JSON must exist (run build_round19_eval_selection.py first).
@@ -147,7 +148,7 @@ print(p)
     fi
 }
 
-# ----------- main matrix loop -----------
+# ----------- main matrix loop (single-GPU serial) -----------
 for SEED in "${SEEDS[@]}"; do
     for CKPT_LABEL in "${CKPT_LABELS[@]}"; do
         for CFG in "${CFG_SCALES[@]}"; do
@@ -158,17 +159,14 @@ for SEED in "${SEEDS[@]}"; do
             RUN_PLAN_A="runs/training/stage1_s1a_cmc_round19_seed${SEED}"
             RUN_S1O="runs/training/stage1_s1o_round19_seed${SEED}"
 
-            # Concurrent: Plan A → GPU0, S1-O → GPU1.
-            run_one_eval 0 "${RUN_PLAN_A}" "s1a_cmc" "${SEED}" "${CFG}" \
-                "${CKPT_LABEL}" "${CACHE_PLAN_A}" &
-            PID_A=$!
-            run_one_eval 1 "${RUN_S1O}" "s1o" "${SEED}" "${CFG}" \
-                "${CKPT_LABEL}" "${CACHE_S1O}" &
-            PID_O=$!
-
+            # Serial: Plan A then S1-O on the same GPU.
             set +e
-            wait ${PID_A}; RC_A=$?
-            wait ${PID_O}; RC_O=$?
+            run_one_eval "${GPU_ID}" "${RUN_PLAN_A}" "s1a_cmc" "${SEED}" "${CFG}" \
+                "${CKPT_LABEL}" "${CACHE_PLAN_A}"
+            RC_A=$?
+            run_one_eval "${GPU_ID}" "${RUN_S1O}" "s1o" "${SEED}" "${CFG}" \
+                "${CKPT_LABEL}" "${CACHE_S1O}"
+            RC_O=$?
             set -e
             if [[ ${RC_A} -ne 0 || ${RC_O} -ne 0 ]]; then
                 echo "[round19-eval]   PAIR FAIL: Plan A rc=${RC_A}  S1-O rc=${RC_O}" \
