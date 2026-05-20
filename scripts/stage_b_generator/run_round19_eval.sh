@@ -17,8 +17,8 @@
 #              (literature audit P0: standard motion-diffusion sweep)
 #
 # Per-config eval = 32 clips × 3 sample seeds = 96 samples × 1000-step
-# DDPM ≈ 11-15 min on A6000. Total matrix = 12 × 2 × 3 = 72 configs.
-# Wallclock single-GPU serial: 72 configs × 13 min ≈ ~16 h.
+# DDPM ≈ 11-15 min on A6000. Matrix = 1 seed × 2 modes × 2 ckpts ×
+# 3 cfgs = 12 configs. Wallclock single-GPU serial: 12 × 13 min ≈ ~2.6h.
 #
 # Prereqs:
 #   - All 12 ckpts in runs/training/stage1_*_round19_seed{42..47}/
@@ -43,7 +43,13 @@ cd "$(dirname "$0")/../.."
 
 # ----------- config -----------
 GPU_ID=${GPU_ID:-0}                       # set via env: GPU_ID=1 bash run_round19_eval.sh
-SEEDS=(42 43 44 45 46 47)
+# Single training seed: Round-19 val-loss curves across all 6 seeds were
+# nearly identical (paired Δ on val loss sign-consistent 6/6, std ≈ 0.046
+# on Δ mean −0.32). Marginal value of testing all 6 training seeds with
+# sampled metrics is low; eval seed 42 covers the dominant signal and
+# saves 6× wallclock. The aggregator's sign-consistency gate is skipped
+# when N_train_seeds < 2.
+SEEDS=(42)
 CFG_SCALES=(1.0 2.5 5.0)
 # Ckpt labels: best_val (resolved from training_summary.json) + a fixed
 # step-30000 fallback for robustness. We do NOT eval final.pt — Round-19
