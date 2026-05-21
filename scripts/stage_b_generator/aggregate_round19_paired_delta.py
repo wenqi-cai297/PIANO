@@ -50,11 +50,12 @@ import numpy as np
 # ============================================================================
 
 # Expected pattern:
-#   stage1_<mode>_round19_seed<SEED>__<ckpt_label>__cfg<X_Y>.json
-# where mode ∈ {s1a_cmc, s1o}, SEED ∈ {42..47}, ckpt_label is e.g.
-# best_val or ckpt-030000, and cfg<X_Y> e.g. cfg1_0 / cfg2_5 / cfg5_0.
+#   stage1_<mode>_round<RR>_seed<SEED>__<ckpt_label>__cfg<X_Y>.json
+# where mode ∈ {s1a_cmc, s1o}, RR ∈ {19, 20} (Round-19 paired sweep and
+# Round-20 method-iteration eval share this aggregator), SEED ∈ {42..47},
+# ckpt_label is e.g. best_val or ckpt-030000, cfg<X_Y> e.g. cfg1_0.
 _FNAME_RE = re.compile(
-    r"^stage1_(?P<mode>s1a_cmc|s1o)_round19_seed(?P<seed>\d+)"
+    r"^stage1_(?P<mode>s1a_cmc|s1o)_round(?P<round>19|20)_seed(?P<seed>\d+)"
     r"__(?P<ckpt>[^_]+(?:_[^_]+)*)__cfg(?P<cfg>[\d_]+)\.json$"
 )
 
