@@ -29,6 +29,9 @@ Tests:
 - t12: root acc/jerk loss finite + scale logged on a tiny tensor.
 - t13: frame-0 inpainting at sampling — generated x[:, 0, :] equals
        conditioned init_coarse exactly after denormalization.
+- t24: Round-20 mirrored-text CLIP cache coverage — every manifest text
+       and its direction-mirrored counterpart must exist in both Plan A
+       and S1-O text embedding indices.
 
 Exit code 0 = all pass.
 """
@@ -44,6 +47,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from piano.data.dataset import _swap_left_right_in_text
 
 # Round-18-fix-server: v18 config path; overridable via PIANO_V18_CFG env var
 # (server passes a `_local`-paths variant; local default is the Windows-path
@@ -1084,6 +1088,125 @@ def t22_mirror_duplicate_paired_data_bit_exact() -> bool:
     return True
 
 
+def _load_text_index(cache_root: Path) -> dict[str, Any]:
+    path = cache_root / "text_embeddings_index.json"
+    return json.loads(path.read_text("utf-8"))
+
+
+def _load_text_embedding_npz(cache_root: Path) -> tuple[np.ndarray, list[str]]:
+    path = cache_root / "text_embeddings_clip_vit_b32.npz"
+    npz = np.load(path, allow_pickle=True)
+    embeddings = npz["embeddings"].astype(np.float32, copy=False)
+    texts = [str(x) for x in npz["texts"].tolist()]
+    return embeddings, texts
+
+
+def _expected_text_candidates(cache_root: Path) -> set[str]:
+    out: set[str] = set()
+    for split in ("train", "val"):
+        for r in _load_manifest_entries(cache_root, split):
+            text = r.get("text", "")
+            out.add(text)
+            out.add(_swap_left_right_in_text(text))
+    return out
+
+
+def t24_mirrored_text_embedding_cache_complete() -> bool:
+    """Round-20 launch gate: the CLIP text cache must contain every
+    manifest caption and every caption produced by the production mirror
+    text helper.
+
+    t22 only probes the first few mirrored dataset indices for paired
+    fairness. This full-cache check catches long-tail mirrored strings
+    such as leftward/rightward captions before training hits them.
+    """
+    if not PLAN_A_CACHE.exists() or not OBJTRAJ_CACHE.exists():
+        _print("t24", f"FAIL — cache missing: PLAN_A={PLAN_A_CACHE.exists()} "
+               f"OBJTRAJ={OBJTRAJ_CACHE.exists()}")
+        return False
+    try:
+        payload_a = _load_text_index(PLAN_A_CACHE)
+        payload_o = _load_text_index(OBJTRAJ_CACHE)
+        emb_a, texts_a = _load_text_embedding_npz(PLAN_A_CACHE)
+        emb_o, texts_o = _load_text_embedding_npz(OBJTRAJ_CACHE)
+    except FileNotFoundError as e:
+        _print("t24", f"FAIL — missing text embedding cache file: {e}")
+        return False
+
+    if not payload_a.get("include_mirrored_texts", False):
+        _print("t24", "FAIL — Plan A text_embeddings_index.json was not built "
+               "with --include-mirrored-texts")
+        return False
+    if not payload_o.get("include_mirrored_texts", False):
+        _print("t24", "FAIL — S1-O text_embeddings_index.json was not built "
+               "with --include-mirrored-texts")
+        return False
+
+    index_a = payload_a.get("index", {})
+    index_o = payload_o.get("index", {})
+    if index_a != index_o:
+        only_a = sorted(set(index_a) - set(index_o))[:3]
+        only_o = sorted(set(index_o) - set(index_a))[:3]
+        _print("t24", "FAIL — Plan A and S1-O text_embeddings_index.json differ; "
+               f"only_plan_a_examples={only_a!r} only_s1o_examples={only_o!r}")
+        return False
+    if texts_a != texts_o:
+        _print("t24", "FAIL — Plan A and S1-O text_embeddings_clip_vit_b32.npz "
+               "texts arrays differ")
+        return False
+    if emb_a.shape != emb_o.shape or not np.array_equal(emb_a, emb_o):
+        _print("t24", "FAIL — Plan A and S1-O CLIP embedding arrays are not "
+               f"bit-exact equal; shapes plan_a={emb_a.shape} s1o={emb_o.shape}")
+        return False
+    if emb_a.ndim != 2 or emb_a.shape[1] != int(payload_a.get("dim", -1)):
+        _print("t24", f"FAIL — Plan A embeddings shape {emb_a.shape} does not "
+               f"match dim={payload_a.get('dim')}")
+        return False
+    if not np.isfinite(emb_a).all():
+        _print("t24", "FAIL — CLIP embeddings contain non-finite values")
+        return False
+
+    expected_a = _expected_text_candidates(PLAN_A_CACHE)
+    expected_o = _expected_text_candidates(OBJTRAJ_CACHE)
+    if expected_a != expected_o:
+        _print("t24", "FAIL — Plan A and S1-O mirrored text candidate sets differ; "
+               f"only_plan_a={sorted(expected_a - expected_o)[:3]!r} "
+               f"only_s1o={sorted(expected_o - expected_a)[:3]!r}")
+        return False
+
+    missing = sorted(expected_a - set(index_a))
+    if missing:
+        _print("t24", f"FAIL — {len(missing)} manifest/mirrored text strings are "
+               "missing from text_embeddings_index.json; re-run "
+               "cache_stage1_clip_text_embeddings.py with --include-mirrored-texts. "
+               f"examples={missing[:5]!r}")
+        return False
+
+    n_meta = int(payload_a.get("n_unique_texts", -1))
+    if n_meta != len(index_a):
+        _print("t24", f"FAIL — Plan A n_unique_texts={n_meta} but index has "
+               f"{len(index_a)} entries")
+        return False
+    if len(texts_a) != len(index_a) or emb_a.shape[0] != len(index_a):
+        _print("t24", f"FAIL — text cache row count mismatch: "
+               f"len(texts)={len(texts_a)} embeddings.shape={emb_a.shape} "
+               f"len(index)={len(index_a)}")
+        return False
+    bad_rows = [
+        (text, row, texts_a[row] if 0 <= row < len(texts_a) else None)
+        for text, row in index_a.items()
+        if not isinstance(row, int) or row < 0 or row >= len(texts_a) or texts_a[row] != text
+    ]
+    if bad_rows:
+        _print("t24", f"FAIL — text_embeddings_index.json row mapping disagrees "
+               f"with npz texts array; examples={bad_rows[:3]!r}")
+        return False
+    _print("t24", f"PASS — {len(expected_a)} manifest + mirrored text candidates "
+           f"covered by both caches; Plan A/S1-O text indices are identical "
+           f"and embeddings are bit-exact (n_unique_texts={len(index_a)})")
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
@@ -1115,6 +1238,7 @@ def main() -> int:
         # Round-20 mirror-augmentation paired-fairness additions:
         ("t22", t22_mirror_duplicate_paired_data_bit_exact),
         ("t23", t23_plan_a_s1o_manifest_entries_in_sync),
+        ("t24", t24_mirrored_text_embedding_cache_complete),
     ]
     failures: list[str] = []
     for tag, fn in checks:

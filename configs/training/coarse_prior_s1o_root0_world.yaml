@@ -63,7 +63,7 @@ data:
   cache_root: "cache/stage1_coarse_v1_objtraj_root0_world_round18_fix"
   # Round-20 strategy: deterministic mirror doubling for train only.
   # Requires text embeddings cached with --include-mirrored-texts so
-  # left/right prompts stay aligned with mirrored Coarse-v1 + obj_traj.
+  # direction-mirrored prompts stay aligned with mirrored Coarse-v1 + obj_traj.
   augmentation:
     enabled: true
     mirror_prob: 0.0
