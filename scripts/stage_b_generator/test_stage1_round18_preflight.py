@@ -59,10 +59,11 @@ from piano.models.coarse_motion_prior import (
 )
 from piano.models.motion_anchordiff import DiffusionConfig
 from piano.training.train_coarse_prior import (
-    EMAState, masked_root_acc_jerk_loss,
+    EMAState, Stage1CacheDataset, masked_root_acc_jerk_loss,
 )
 
 
+PLAN_A_CACHE = Path("cache/stage1_coarse_v1_full")
 OBJTRAJ_CACHE = Path("cache/stage1_coarse_v1_objtraj_root0_world_round18_fix")
 LEGACY_OBJTRAJ_CACHE = Path("cache/stage1_coarse_v1_objtraj_round18")     # kept for forensic comparison
 FRAME_PREFLIGHT_JSON = Path("analyses/round18_preflight/frame_convention_preflight.json")
@@ -929,6 +930,161 @@ def t13_frame0_inpainting_locks_init() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# t22 + t23: Round-20 mirror augmentation paired fairness
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _load_manifest_entries(cache_root: Path, split: str) -> list[dict[str, Any]]:
+    path = cache_root / f"manifest_{split}.jsonl"
+    return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+
+
+def t23_plan_a_s1o_manifest_entries_in_sync() -> bool:
+    """Round-20 prerequisite: Plan A's manifest_train.jsonl and S1-O's
+    manifest_train.jsonl must list the same (subset, seq_id) tuples in
+    the same order. The DataLoader's `loader_rng`-shuffled idx sequence
+    addresses `dataset.records[base_idx]` in both modes, so a mismatch
+    here would make idx N reference different clips per mode → step-0
+    bit-exact paired fairness assumption silently breaks.
+
+    Round-19 setup verified that both caches contain 6 969 / 1 314 clips
+    after splitting; this test additionally asserts byte-level ordering
+    parity on (subset, seq_id, seq_len, text) per row.
+    """
+    if not PLAN_A_CACHE.exists() or not OBJTRAJ_CACHE.exists():
+        _print("t23", f"FAIL — cache missing: PLAN_A={PLAN_A_CACHE.exists()} "
+               f"OBJTRAJ={OBJTRAJ_CACHE.exists()}")
+        return False
+    fail_split: str | None = None
+    diff_count = 0
+    first_diff: dict[str, Any] | None = None
+    for split in ("train", "val"):
+        entries_a = _load_manifest_entries(PLAN_A_CACHE, split)
+        entries_o = _load_manifest_entries(OBJTRAJ_CACHE, split)
+        if len(entries_a) != len(entries_o):
+            _print("t23", f"FAIL — split {split!r}: row count differs "
+                   f"plan_a={len(entries_a)} s1o={len(entries_o)}")
+            return False
+        for i, (ra, ro) in enumerate(zip(entries_a, entries_o)):
+            tup_a = (ra.get("subset"), ra.get("seq_id"), ra.get("seq_len"), ra.get("text"))
+            tup_o = (ro.get("subset"), ro.get("seq_id"), ro.get("seq_len"), ro.get("text"))
+            if tup_a != tup_o:
+                diff_count += 1
+                if first_diff is None:
+                    first_diff = {"split": split, "idx": i, "plan_a": tup_a, "s1o": tup_o}
+                fail_split = split
+    if diff_count > 0:
+        _print("t23", f"FAIL — {diff_count} row mismatches across splits; "
+               f"first at {first_diff!r}")
+        return False
+    _print("t23", "PASS — Plan A and S1-O manifest_{train,val}.jsonl are "
+           "byte-identical on (subset, seq_id, seq_len, text) tuples in order")
+    return True
+
+
+def t22_mirror_duplicate_paired_data_bit_exact() -> bool:
+    """Round-20: with `mirror_duplicate=true`, Stage1CacheDataset's
+    `__getitem__(idx)` for matched idx must produce IDENTICAL
+    `coarse_norm` and `init_norm` tensors across the Plan A cache and
+    the S1-O cache. Both:
+
+    - resolve `base_idx = idx // 2` against `records[base_idx]`
+    - decide `force_mirror = bool(idx % 2)`
+    - apply `mirror_coarse_v1` deterministically (same input → same output)
+
+    Combined with t23 (manifests in sync), this proves the data pipeline
+    feeds bit-exact Coarse-v1 inputs into Plan A and S1-O at the same
+    shuffled idx — the precondition for step-0 paired-loss bit-exact
+    under Round-20's mirror_duplicate augmentation.
+
+    Also verifies `obj_traj_norm` is finite + the right shape for S1-O.
+    """
+    if not PLAN_A_CACHE.exists() or not OBJTRAJ_CACHE.exists():
+        _print("t22", f"FAIL — cache missing: PLAN_A={PLAN_A_CACHE.exists()} "
+               f"OBJTRAJ={OBJTRAJ_CACHE.exists()}")
+        return False
+    aug = {
+        "enabled": True,
+        "mirror_prob": 0.0,
+        "mirror_duplicate": True,
+        "require_mirrored_text_embeddings": True,
+    }
+    try:
+        ds_a = Stage1CacheDataset(
+            PLAN_A_CACHE, split="train", max_seq_length=196,
+            augmentation=aug, seed=42,
+        )
+        ds_o = Stage1CacheDataset(
+            OBJTRAJ_CACHE, split="train", max_seq_length=196,
+            augmentation=aug, seed=42,
+        )
+    except KeyError as e:
+        _print("t22", f"FAIL — missing mirrored text embedding (re-run "
+               f"cache_stage1_clip_text_embeddings.py with --include-mirrored-texts): {e!r}")
+        return False
+    if len(ds_a) != len(ds_o):
+        _print("t22", f"FAIL — dataset length differs plan_a={len(ds_a)} s1o={len(ds_o)}")
+        return False
+    if len(ds_a) % 2 != 0:
+        _print("t22", f"FAIL — mirror_duplicate length should be even, got {len(ds_a)}")
+        return False
+
+    # Sample 8 indices: 4 originals (0, 2, 4, 6) + 4 mirrors (1, 3, 5, 7).
+    probe_idxs = [0, 1, 2, 3, 4, 5, 6, 7]
+    n_obj_loaded = 0
+    for idx in probe_idxs:
+        sa = ds_a[idx]
+        so = ds_o[idx]
+        if sa["subset"] != so["subset"] or sa["seq_id"] != so["seq_id"]:
+            _print("t22", f"FAIL — idx={idx}: clip identity differs "
+                   f"plan_a=({sa['subset']!r},{sa['seq_id']!r}) "
+                   f"s1o=({so['subset']!r},{so['seq_id']!r})")
+            return False
+        if sa["seq_len"] != so["seq_len"]:
+            _print("t22", f"FAIL — idx={idx}: seq_len differs "
+                   f"plan_a={sa['seq_len']} s1o={so['seq_len']}")
+            return False
+        # coarse_norm + init_norm must be bit-exact between the two caches
+        # because mirror_coarse_v1 is deterministic and idx-driven; the only
+        # source of divergence would be cache-build differences in
+        # coarse_v1 itself (which we want to flag if it happens).
+        diff_coarse = float(np.abs(sa["coarse_norm"] - so["coarse_norm"]).max())
+        diff_init = float(np.abs(sa["init_norm"] - so["init_norm"]).max())
+        diff_text = float(np.abs(sa["text_pool"] - so["text_pool"]).max())
+        if diff_coarse > 0.0:
+            _print("t22", f"FAIL — idx={idx}: coarse_norm max|diff|={diff_coarse:.3e} "
+                   "(non-zero → cache content differs between Plan A and S1-O caches; "
+                   "rebuild one to match the other)")
+            return False
+        if diff_init > 0.0:
+            _print("t22", f"FAIL — idx={idx}: init_norm max|diff|={diff_init:.3e}")
+            return False
+        if diff_text > 0.0:
+            _print("t22", f"FAIL — idx={idx}: text_pool max|diff|={diff_text:.3e} "
+                   "(text indices diverge — caches may have different "
+                   "text_embeddings_index.json layouts)")
+            return False
+        if "obj_traj_norm" in so:
+            ot = so["obj_traj_norm"]
+            if not np.isfinite(ot).all():
+                _print("t22", f"FAIL — idx={idx}: S1-O obj_traj_norm has non-finite entries")
+                return False
+            if ot.shape[-1] != 9 or ot.shape[0] != so["seq_len"]:
+                _print("t22", f"FAIL — idx={idx}: S1-O obj_traj_norm shape {ot.shape} "
+                       f"!= (seq_len={so['seq_len']}, 9)")
+                return False
+            n_obj_loaded += 1
+    if n_obj_loaded != len(probe_idxs):
+        _print("t22", f"FAIL — S1-O dataset returned obj_traj_norm on only "
+               f"{n_obj_loaded}/{len(probe_idxs)} probe idxs (expected all)")
+        return False
+    _print("t22", f"PASS — {len(probe_idxs)} probe idxs: coarse_norm + init_norm + "
+           "text_pool bit-exact across Plan A and S1-O datasets under mirror_duplicate=True; "
+           "S1-O obj_traj_norm finite + correctly shaped")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
@@ -956,6 +1112,9 @@ def main() -> int:
         ("t19", t19_training_text_dropout_paired_fair),
         ("t20", t20_validation_diffusion_rng_paired_fair),
         ("t21", t21_obj_dropout_does_not_affect_text_or_diff_streams),
+        # Round-20 mirror-augmentation paired-fairness additions:
+        ("t22", t22_mirror_duplicate_paired_data_bit_exact),
+        ("t23", t23_plan_a_s1o_manifest_entries_in_sync),
     ]
     failures: list[str] = []
     for tag, fn in checks:

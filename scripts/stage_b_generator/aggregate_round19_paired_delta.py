@@ -104,6 +104,26 @@ def _ci_excludes_zero(ci_lo: float, ci_hi: float) -> bool:
     return (ci_lo > 0.0) or (ci_hi < 0.0)
 
 
+def _delta_favors_s1o(delta: float, direction: str) -> bool:
+    if not np.isfinite(delta):
+        return False
+    if direction == "lower":
+        return delta < 0.0
+    if direction == "higher":
+        return delta > 0.0
+    raise ValueError(f"unknown metric direction: {direction!r}")
+
+
+def _ci_favors_s1o(ci_lo: float, ci_hi: float, direction: str) -> bool:
+    if not _ci_excludes_zero(ci_lo, ci_hi):
+        return False
+    if direction == "lower":
+        return ci_hi < 0.0
+    if direction == "higher":
+        return ci_lo > 0.0
+    raise ValueError(f"unknown metric direction: {direction!r}")
+
+
 # ============================================================================
 # Load eval JSONs
 # ============================================================================
@@ -147,6 +167,16 @@ PRIMARY_METRICS = (
     "shoulder_height_vel_mean",
 )
 
+DIRECTION_METRICS = {
+    # Lower is better: absolute paired trajectory error in meters.
+    "root_pos_err_xz": "lower",
+    "root_traj_dtw_xz": "lower",
+    # Higher is better: cosine-style alignment in [-1, 1].
+    "direction_alignment": "higher",
+    "endpoint_direction_cos": "higher",
+}
+PRIMARY_DIRECTION_METRIC = "root_traj_dtw_xz"
+
 
 def _index_by_axis(records: list[tuple[dict, dict]]):
     """Index per-clip rows by (mode, seed, ckpt_label, cfg_scale,
@@ -167,6 +197,7 @@ def _index_by_axis(records: list[tuple[dict, dict]]):
             )
             idx[key] = {
                 "xGT": clip_row.get("xGT", {}),
+                "paired": clip_row.get("paired", {}),
                 "gen": clip_row.get("gen", {}),
                 "gt": clip_row.get("gt", {}),
                 "gen_finite": bool(clip_row.get("gen_finite", True)),
@@ -188,6 +219,7 @@ def _compute_cell_deltas(
     where both modes have a finite xGT.<metric> entry.
     """
     pairs_by_train_seed: dict[int, list[float]] = defaultdict(list)
+    pairs_by_clip: dict[tuple[int, str, str], list[float]] = defaultdict(list)
     deltas: list[float] = []
     s1a_vals: list[float] = []
     s1o_vals: list[float] = []
@@ -214,17 +246,82 @@ def _compute_cell_deltas(
         deltas.append(float(o) - float(a))
         s1a_vals.append(float(a))
         s1o_vals.append(float(o))
-        pairs_by_train_seed[k[3]].append(float(o) - float(a))
+        delta = float(o) - float(a)
+        pairs_by_train_seed[k[3]].append(delta)
+        pairs_by_clip[(k[3], k[0], k[1])].append(delta)
 
     per_train_seed_delta = {
         ts: float(np.mean(v)) for ts, v in sorted(pairs_by_train_seed.items())
     }
+    per_clip_delta = {
+        f"{ts}:{sub}:{seq}": float(np.mean(v))
+        for (ts, sub, seq), v in sorted(pairs_by_clip.items())
+    }
     return {
         "deltas": np.array(deltas, dtype=np.float64),
+        "cluster_deltas": np.array(list(per_clip_delta.values()), dtype=np.float64),
         "s1a_values": np.array(s1a_vals, dtype=np.float64),
         "s1o_values": np.array(s1o_vals, dtype=np.float64),
         "per_train_seed_delta": per_train_seed_delta,
+        "per_clip_delta": per_clip_delta,
         "n_paired": int(len(deltas)),
+        "n_clusters": int(len(per_clip_delta)),
+    }
+
+
+def _compute_paired_metric_deltas(
+    idx, ckpt_label: str, cfg_scale: float, subset: str, metric: str,
+):
+    """Paired deltas for metrics stored under per_clip[*]["paired"].
+
+    Delta is always S1-O minus Plan A. Whether that favors S1-O depends
+    on DIRECTION_METRICS[metric].
+    """
+    pairs_by_train_seed: dict[int, list[float]] = defaultdict(list)
+    pairs_by_clip: dict[tuple[int, str, str], list[float]] = defaultdict(list)
+    deltas: list[float] = []
+    s1a_vals: list[float] = []
+    s1o_vals: list[float] = []
+
+    grouped: dict[tuple, dict[str, dict]] = defaultdict(dict)
+    for key, val in idx.items():
+        c_lab, cfg, sub, seq, samp_seed, train_seed, mode = key
+        if c_lab != ckpt_label or cfg != cfg_scale or sub != subset:
+            continue
+        grouped[(sub, seq, samp_seed, train_seed)][mode] = val
+
+    for k, modes_dict in grouped.items():
+        if "s1a_cmc" not in modes_dict or "s1o" not in modes_dict:
+            continue
+        a = modes_dict["s1a_cmc"]["paired"].get(metric)
+        o = modes_dict["s1o"]["paired"].get(metric)
+        if a is None or o is None:
+            continue
+        if not (np.isfinite(a) and np.isfinite(o)):
+            continue
+        deltas.append(float(o) - float(a))
+        s1a_vals.append(float(a))
+        s1o_vals.append(float(o))
+        delta = float(o) - float(a)
+        pairs_by_train_seed[k[3]].append(delta)
+        pairs_by_clip[(k[3], k[0], k[1])].append(delta)
+
+    per_train_seed_delta = {
+        ts: float(np.mean(v)) for ts, v in sorted(pairs_by_train_seed.items())
+    }
+    per_clip_delta = {
+        f"{ts}:{sub}:{seq}": float(np.mean(v))
+        for (ts, sub, seq), v in sorted(pairs_by_clip.items())
+    }
+    return {
+        "deltas": np.array(deltas, dtype=np.float64),
+        "cluster_deltas": np.array(list(per_clip_delta.values()), dtype=np.float64),
+        "s1a_values": np.array(s1a_vals, dtype=np.float64),
+        "s1o_values": np.array(s1o_vals, dtype=np.float64),
+        "per_train_seed_delta": per_train_seed_delta,
+        "per_clip_delta": per_clip_delta,
+        "n_paired": int(len(deltas)),
+        "n_clusters": int(len(per_clip_delta)),
     }
 
 
@@ -387,6 +484,8 @@ def main() -> int:
         "n_bootstrap": int(args.n_bootstrap),
         "n_eval_jsons": int(len(records)),
         "primary_metrics": list(PRIMARY_METRICS),
+        "direction_metrics": DIRECTION_METRICS,
+        "primary_direction_metric": PRIMARY_DIRECTION_METRIC,
         "cells": {},
     }
 
@@ -408,12 +507,28 @@ def main() -> int:
                     mode_means[(metric, mode)] = (
                         float(np.mean(vals)) if vals else float("nan")
                     )
+            paired_mode_means: dict[tuple[str, str], float] = {}
+            for metric in DIRECTION_METRICS:
+                for mode in ("s1a_cmc", "s1o"):
+                    vals = []
+                    for k, v in idx.items():
+                        if k[0] != ckpt_label or k[1] != cfg_scale:
+                            continue
+                        if k[6] != mode:
+                            continue
+                        xv = v["paired"].get(metric)
+                        if xv is not None and np.isfinite(xv):
+                            vals.append(float(xv))
+                    paired_mode_means[(metric, mode)] = (
+                        float(np.mean(vals)) if vals else float("nan")
+                    )
 
             per_subset_results: dict[str, dict[str, Any]] = {}
             # Aggregate stats per metric across ALL subsets combined.
             combined_metric_stats: dict[str, dict[str, Any]] = {}
             for metric in PRIMARY_METRICS:
                 all_deltas: list[float] = []
+                all_cluster_deltas: list[float] = []
                 per_seed_means: dict[int, list[float]] = defaultdict(list)
 
                 for subset in subsets:
@@ -421,11 +536,13 @@ def main() -> int:
                         idx, ckpt_label, cfg_scale, subset, metric,
                     )
                     all_deltas.extend(sub_stats["deltas"].tolist())
+                    all_cluster_deltas.extend(sub_stats["cluster_deltas"].tolist())
                     for ts, d in sub_stats["per_train_seed_delta"].items():
                         per_seed_means[ts].append(d)
 
                     per_subset_results.setdefault(subset, {})[metric] = {
                         "n_paired": sub_stats["n_paired"],
+                        "n_clusters": sub_stats["n_clusters"],
                         "mean_delta": (
                             float(np.mean(sub_stats["deltas"]))
                             if sub_stats["deltas"].size else float("nan")
@@ -444,6 +561,10 @@ def main() -> int:
                 mean_delta, ci_lo, ci_hi = _bootstrap_paired_ci(
                     deltas_arr, n_boot=args.n_bootstrap,
                 )
+                cluster_deltas_arr = np.array(all_cluster_deltas, dtype=np.float64)
+                cluster_mean_delta, cluster_ci_lo, cluster_ci_hi = _bootstrap_paired_ci(
+                    cluster_deltas_arr, n_boot=args.n_bootstrap,
+                )
                 # Sign consistency at the training-seed-mean level.
                 per_seed_overall = {
                     ts: float(np.mean(v)) for ts, v in per_seed_means.items()
@@ -458,11 +579,20 @@ def main() -> int:
                     sign_cons = 0
                 combined_metric_stats[metric] = {
                     "n_paired_total": int(deltas_arr.size),
+                    "n_clip_clusters": int(cluster_deltas_arr.size),
                     "n_training_seeds": int(n_train_seeds),
                     "mean_delta": mean_delta,
                     "ci_lo": ci_lo,
                     "ci_hi": ci_hi,
                     "ci_excludes_zero": _ci_excludes_zero(ci_lo, ci_hi),
+                    "cluster_mean_delta": cluster_mean_delta,
+                    "cluster_ci_lo": cluster_ci_lo,
+                    "cluster_ci_hi": cluster_ci_hi,
+                    "cluster_ci_excludes_zero": _ci_excludes_zero(
+                        cluster_ci_lo, cluster_ci_hi,
+                    ),
+                    "cluster_sign_negative": int(np.sum(cluster_deltas_arr < 0.0)),
+                    "cluster_sign_positive": int(np.sum(cluster_deltas_arr > 0.0)),
                     "per_train_seed_mean_delta": per_seed_overall,
                     "sign_consistency": int(sign_cons),
                     "plan_a_overall_mean": mode_means.get(
@@ -473,14 +603,141 @@ def main() -> int:
                     ),
                 }
 
+            paired_metric_stats: dict[str, dict[str, Any]] = {}
+            for metric, direction in DIRECTION_METRICS.items():
+                all_deltas = []
+                all_cluster_deltas = []
+                per_seed_means: dict[int, list[float]] = defaultdict(list)
+
+                for subset in subsets:
+                    sub_stats = _compute_paired_metric_deltas(
+                        idx, ckpt_label, cfg_scale, subset, metric,
+                    )
+                    all_deltas.extend(sub_stats["deltas"].tolist())
+                    all_cluster_deltas.extend(sub_stats["cluster_deltas"].tolist())
+                    for ts, d in sub_stats["per_train_seed_delta"].items():
+                        per_seed_means[ts].append(d)
+
+                    per_subset_results.setdefault(subset, {})[f"paired.{metric}"] = {
+                        "n_paired": sub_stats["n_paired"],
+                        "n_clusters": sub_stats["n_clusters"],
+                        "mean_delta": (
+                            float(np.mean(sub_stats["deltas"]))
+                            if sub_stats["deltas"].size else float("nan")
+                        ),
+                        "plan_a_mean": (
+                            float(np.mean(sub_stats["s1a_values"]))
+                            if sub_stats["s1a_values"].size else float("nan")
+                        ),
+                        "s1o_mean": (
+                            float(np.mean(sub_stats["s1o_values"]))
+                            if sub_stats["s1o_values"].size else float("nan")
+                        ),
+                    }
+
+                deltas_arr = np.array(all_deltas, dtype=np.float64)
+                mean_delta, ci_lo, ci_hi = _bootstrap_paired_ci(
+                    deltas_arr, n_boot=args.n_bootstrap,
+                )
+                cluster_deltas_arr = np.array(all_cluster_deltas, dtype=np.float64)
+                cluster_mean_delta, cluster_ci_lo, cluster_ci_hi = _bootstrap_paired_ci(
+                    cluster_deltas_arr, n_boot=args.n_bootstrap,
+                )
+                per_seed_overall = {
+                    ts: float(np.mean(v)) for ts, v in per_seed_means.items()
+                    if v
+                }
+                if per_seed_overall:
+                    favor_s1o = sum(
+                        1 for d in per_seed_overall.values()
+                        if _delta_favors_s1o(d, direction)
+                    )
+                    n_train_seeds = len(per_seed_overall)
+                    sign_cons = favor_s1o
+                else:
+                    n_train_seeds = 0
+                    sign_cons = 0
+                paired_metric_stats[metric] = {
+                    "metric_direction": direction,
+                    "n_paired_total": int(deltas_arr.size),
+                    "n_clip_clusters": int(cluster_deltas_arr.size),
+                    "n_training_seeds": int(n_train_seeds),
+                    "mean_delta": mean_delta,
+                    "ci_lo": ci_lo,
+                    "ci_hi": ci_hi,
+                    "ci_excludes_zero": _ci_excludes_zero(ci_lo, ci_hi),
+                    "ci_favors_s1o": _ci_favors_s1o(ci_lo, ci_hi, direction),
+                    "delta_favors_s1o": _delta_favors_s1o(mean_delta, direction),
+                    "cluster_mean_delta": cluster_mean_delta,
+                    "cluster_ci_lo": cluster_ci_lo,
+                    "cluster_ci_hi": cluster_ci_hi,
+                    "cluster_ci_excludes_zero": _ci_excludes_zero(
+                        cluster_ci_lo, cluster_ci_hi,
+                    ),
+                    "cluster_ci_favors_s1o": _ci_favors_s1o(
+                        cluster_ci_lo, cluster_ci_hi, direction,
+                    ),
+                    "cluster_delta_favors_s1o": _delta_favors_s1o(
+                        cluster_mean_delta, direction,
+                    ),
+                    "cluster_sign_favors_s1o": int(np.sum(
+                        cluster_deltas_arr < 0.0
+                        if direction == "lower"
+                        else cluster_deltas_arr > 0.0
+                    )),
+                    "per_train_seed_mean_delta": per_seed_overall,
+                    "sign_consistency": int(sign_cons),
+                    "plan_a_overall_mean": paired_mode_means.get(
+                        (metric, "s1a_cmc"), float("nan")
+                    ),
+                    "s1o_overall_mean": paired_mode_means.get(
+                        (metric, "s1o"), float("nan")
+                    ),
+                }
+
             cell_key = f"{ckpt_label}__cfg{cfg_scale:.1f}"
             verdict = _shipgate_verdict(combined_metric_stats, mode_means)
+            primary_dir_stats = paired_metric_stats.get(PRIMARY_DIRECTION_METRIC, {})
+            direction_gate = {
+                "primary_metric": PRIMARY_DIRECTION_METRIC,
+                "ship_s1o_under_direction_gate": bool(
+                    primary_dir_stats.get("cluster_ci_favors_s1o", False)
+                ),
+                "mean_delta_S1O_minus_PlanA": primary_dir_stats.get(
+                    "mean_delta", float("nan")
+                ),
+                "tuple_ci_95_lo": primary_dir_stats.get("ci_lo", float("nan")),
+                "tuple_ci_95_hi": primary_dir_stats.get("ci_hi", float("nan")),
+                "cluster_mean_delta_S1O_minus_PlanA": primary_dir_stats.get(
+                    "cluster_mean_delta", float("nan")
+                ),
+                "cluster_ci_95_lo": primary_dir_stats.get(
+                    "cluster_ci_lo", float("nan")
+                ),
+                "cluster_ci_95_hi": primary_dir_stats.get(
+                    "cluster_ci_hi", float("nan")
+                ),
+                "cluster_ci_favors_s1o": bool(
+                    primary_dir_stats.get("cluster_ci_favors_s1o", False)
+                ),
+                "n_clip_clusters": int(primary_dir_stats.get("n_clip_clusters", 0)),
+                "reason": (
+                    f"Ship under direction-aware gate: {PRIMARY_DIRECTION_METRIC} "
+                    "cluster CI favors S1-O"
+                    if primary_dir_stats.get("cluster_ci_favors_s1o", False)
+                    else
+                    f"Reject under direction-aware gate: {PRIMARY_DIRECTION_METRIC} "
+                    "cluster CI does not favor S1-O"
+                ),
+            }
             full_results["cells"][cell_key] = {
                 "ckpt_label": ckpt_label,
                 "cfg_scale": cfg_scale,
                 "combined": combined_metric_stats,
+                "direction": paired_metric_stats,
                 "per_subset": per_subset_results,
                 "shipgate_verdict": verdict,
+                "directiongate_verdict": direction_gate,
             }
 
     # ----- write JSON -----
@@ -491,8 +748,33 @@ def main() -> int:
 
     # ----- write markdown report -----
     md_path = args.output_prefix.with_suffix(".md")
+
+    def _fmt_num(value: Any, digits: int = 3) -> str:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return "nan"
+        if not np.isfinite(x):
+            return "nan"
+        return f"{x:.{digits}f}"
+
+    def _fmt_signed(value: Any, digits: int = 3) -> str:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return "nan"
+        if not np.isfinite(x):
+            return "nan"
+        return f"{x:+.{digits}f}"
+
+    def _fmt_ci(lo: Any, hi: Any) -> str:
+        return f"[{_fmt_signed(lo)}, {_fmt_signed(hi)}]"
+
+    def _yesno(value: Any) -> str:
+        return "yes" if bool(value) else "no"
+
     lines: list[str] = []
-    lines.append(f"# Round-19 Paired Δ Report — {args.eval_dir.name}")
+    lines.append(f"# Round-19 Paired Delta Report - {args.eval_dir.name}")
     lines.append("")
     lines.append(f"- Eval directory: `{args.eval_dir}`")
     lines.append(f"- N eval JSONs loaded: {len(records)}")
@@ -501,44 +783,93 @@ def main() -> int:
     lines.append(f"- training seeds: {train_seeds}")
     lines.append(f"- bootstrap reps: {args.n_bootstrap}")
     lines.append("")
-    lines.append("## Ship-gate Verdict per (ckpt, cfg) Cell")
+    lines.append("## Legacy Ship-Gate Verdict per (ckpt, cfg) Cell")
     lines.append("")
-    lines.append("| ckpt | cfg | safety A | safety O | Δ root_vel | CI 95% | sign | SHIP? |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| ckpt | cfg | safety A | safety O | root_vel delta | tuple CI 95% | cluster CI 95% | sign | SHIP? |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for cell_key, cell in full_results["cells"].items():
         v = cell["shipgate_verdict"]
         sg = v["safety_gate"]
         pm = v["primary_metric_root_vel"]
+        rv = cell["combined"]["root_vel_mean_abs"]
         lines.append(
             f"| {cell['ckpt_label']} | {cell['cfg_scale']:.1f} | "
-            f"{sg['plan_a_acc_xGT']:.2f}{'✓' if sg['plan_a_pass'] else '✗'} | "
-            f"{sg['s1o_acc_xGT']:.2f}{'✓' if sg['s1o_pass'] else '✗'} | "
-            f"{pm['mean_delta_S1O_minus_PlanA']:+.3f} | "
-            f"[{pm['ci_95_lo']:+.3f}, {pm['ci_95_hi']:+.3f}] | "
-            f"{pm['sign_consistency']}/6 | "
-            f"{'✓ SHIP' if v['ship_decision']['ship_s1o_as_stage1_mainline'] else '✗'} |"
+            f"{_fmt_num(sg['plan_a_acc_xGT'], 2)} {'pass' if sg['plan_a_pass'] else 'fail'} | "
+            f"{_fmt_num(sg['s1o_acc_xGT'], 2)} {'pass' if sg['s1o_pass'] else 'fail'} | "
+            f"{_fmt_signed(pm['mean_delta_S1O_minus_PlanA'])} | "
+            f"{_fmt_ci(pm['ci_95_lo'], pm['ci_95_hi'])} | "
+            f"{_fmt_ci(rv['cluster_ci_lo'], rv['cluster_ci_hi'])} | "
+            f"{pm['sign_consistency']}/{pm['n_training_seeds']} | "
+            f"{_yesno(v['ship_decision']['ship_s1o_as_stage1_mainline'])} |"
         )
+
+    lines.append("")
+    lines.append("## Direction-Gate Verdict per (ckpt, cfg) Cell")
+    lines.append("")
+    lines.append("| ckpt | cfg | primary metric | Plan A mean | S1-O mean | cluster delta | cluster CI 95% | n clusters | SHIP under direction gate? |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for cell_key, cell in full_results["cells"].items():
+        dg = cell["directiongate_verdict"]
+        metric = dg["primary_metric"]
+        ds = cell["direction"][metric]
+        lines.append(
+            f"| {cell['ckpt_label']} | {cell['cfg_scale']:.1f} | "
+            f"{metric} | "
+            f"{_fmt_num(ds['plan_a_overall_mean'])} | "
+            f"{_fmt_num(ds['s1o_overall_mean'])} | "
+            f"{_fmt_signed(dg['cluster_mean_delta_S1O_minus_PlanA'])} | "
+            f"{_fmt_ci(dg['cluster_ci_95_lo'], dg['cluster_ci_95_hi'])} | "
+            f"{dg['n_clip_clusters']} | "
+            f"{_yesno(dg['ship_s1o_under_direction_gate'])} |"
+        )
+
     lines.append("")
     lines.append("## Per-Cell Detail")
     for cell_key, cell in full_results["cells"].items():
         lines.append("")
         lines.append(f"### {cell_key}")
         lines.append("")
-        lines.append(f"- Reason: {cell['shipgate_verdict']['ship_decision']['reason']}")
+        lines.append(f"- Legacy reason: {cell['shipgate_verdict']['ship_decision']['reason']}")
+        if cell.get("directiongate_verdict"):
+            lines.append(f"- Direction reason: {cell['directiongate_verdict']['reason']}")
         lines.append("")
-        lines.append("| metric | n_paired | Plan A mean xGT | S1-O mean xGT | Δ mean | CI lo | CI hi | CI excl. 0 | sign cons. |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("| metric | n paired | n clusters | Plan A mean xGT | S1-O mean xGT | tuple delta | tuple CI 95% | cluster delta | cluster CI 95% | tuple excl. 0 | cluster excl. 0 | sign cons. |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for metric in PRIMARY_METRICS:
             cs = cell["combined"][metric]
             lines.append(
                 f"| {metric} | {cs['n_paired_total']} | "
-                f"{cs['plan_a_overall_mean']:.3f} | "
-                f"{cs['s1o_overall_mean']:.3f} | "
-                f"{cs['mean_delta']:+.3f} | "
-                f"{cs['ci_lo']:+.3f} | {cs['ci_hi']:+.3f} | "
-                f"{'✓' if cs['ci_excludes_zero'] else '✗'} | "
+                f"{cs['n_clip_clusters']} | "
+                f"{_fmt_num(cs['plan_a_overall_mean'])} | "
+                f"{_fmt_num(cs['s1o_overall_mean'])} | "
+                f"{_fmt_signed(cs['mean_delta'])} | "
+                f"{_fmt_ci(cs['ci_lo'], cs['ci_hi'])} | "
+                f"{_fmt_signed(cs['cluster_mean_delta'])} | "
+                f"{_fmt_ci(cs['cluster_ci_lo'], cs['cluster_ci_hi'])} | "
+                f"{_yesno(cs['ci_excludes_zero'])} | "
+                f"{_yesno(cs['cluster_ci_excludes_zero'])} | "
                 f"{cs['sign_consistency']}/{cs['n_training_seeds']} |"
             )
+        if cell.get("direction"):
+            lines.append("")
+            lines.append("| direction metric | better | n paired | n clusters | Plan A mean | S1-O mean | tuple delta | tuple CI 95% | tuple favors S1-O | cluster delta | cluster CI 95% | cluster favors S1-O | cluster sign |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            for metric in DIRECTION_METRICS:
+                cs = cell["direction"][metric]
+                lines.append(
+                    f"| {metric} | {cs['metric_direction']} | "
+                    f"{cs['n_paired_total']} | "
+                    f"{cs['n_clip_clusters']} | "
+                    f"{_fmt_num(cs['plan_a_overall_mean'])} | "
+                    f"{_fmt_num(cs['s1o_overall_mean'])} | "
+                    f"{_fmt_signed(cs['mean_delta'])} | "
+                    f"{_fmt_ci(cs['ci_lo'], cs['ci_hi'])} | "
+                    f"{_yesno(cs['ci_favors_s1o'])} | "
+                    f"{_fmt_signed(cs['cluster_mean_delta'])} | "
+                    f"{_fmt_ci(cs['cluster_ci_lo'], cs['cluster_ci_hi'])} | "
+                    f"{_yesno(cs['cluster_ci_favors_s1o'])} | "
+                    f"{cs['cluster_sign_favors_s1o']}/{cs['n_clip_clusters']} |"
+                )
     md_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"[aggregate] wrote {md_path}")
     return 0

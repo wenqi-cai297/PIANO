@@ -97,7 +97,13 @@ run_one_eval() {
     local CKPT_LABEL="$6"
     local CACHE_ROOT="$7"
 
-    # Resolve ckpt path. best_val comes from training_summary.json.
+    # Resolve ckpt path. best_val comes from training_summary.json. Round-20
+    # trainer (commit adding resolve_best_val_checkpoint) returns
+    # best_val_ckpt_path=null when the true best-val step has no matching
+    # periodic ckpt on disk; in that case we fall back to
+    # best_val_nearest_ckpt_path so the eval still has something coherent
+    # to run on (and the resulting JSON's payload metadata records which
+    # branch was taken).
     local CKPT_PATH
     if [[ "${CKPT_LABEL}" == "best_val" ]]; then
         CKPT_PATH=$(python -c "
@@ -106,8 +112,17 @@ with open('${RUN_DIR}/training_summary.json') as f:
     s = json.load(f)
 p = s.get('best_val_ckpt_path')
 if p is None:
-    sys.exit('no best_val_ckpt_path in training_summary.json')
-print(p)
+    p = s.get('best_val_nearest_ckpt_path')
+    if p is None:
+        sys.exit(
+            'no best_val_ckpt_path AND no best_val_nearest_ckpt_path '
+            'in training_summary.json'
+        )
+    print(p)
+    print('[round19-eval][nearest-fallback] using nearest periodic ckpt: '
+          + str(p), file=sys.stderr)
+else:
+    print(p)
 ")
     else
         # Format like ckpt-030000.pt

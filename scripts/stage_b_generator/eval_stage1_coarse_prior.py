@@ -160,6 +160,76 @@ def _per_clip_metrics(coarse: np.ndarray) -> dict[str, float]:
     return out
 
 
+def _root_traj_dtw_xz(gen_xz: np.ndarray, gt_xz: np.ndarray) -> float:
+    """Normalized DTW distance between two root XZ trajectories."""
+    n = int(gen_xz.shape[0])
+    m = int(gt_xz.shape[0])
+    if n == 0 or m == 0:
+        return float("nan")
+    dp = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
+    dp[0, 0] = 0.0
+    for i in range(1, n + 1):
+        d = np.linalg.norm(gen_xz[i - 1][None, :] - gt_xz, axis=-1)
+        for j in range(1, m + 1):
+            dp[i, j] = d[j - 1] + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+    return float(dp[n, m] / max(n, m))
+
+
+def _paired_root_trajectory_metrics(
+    gen: np.ndarray,
+    gt: np.ndarray,
+) -> dict[str, float]:
+    """Direction-aware root trajectory metrics between generated and GT clips.
+
+    Coarse-v1 root channels are root0-relative world-axis XYZ in dims [0:3].
+    The spatial ship gate should compare horizontal motion, so these metrics
+    use dims [0, 2] only.
+    """
+    valid_T = min(int(gen.shape[0]), int(gt.shape[0]))
+    if valid_T <= 0:
+        return {
+            "root_pos_err_xz": float("nan"),
+            "root_traj_dtw_xz": float("nan"),
+            "direction_alignment": float("nan"),
+            "endpoint_direction_cos": float("nan"),
+        }
+    gen_xz = gen[:valid_T, [0, 2]].astype(np.float64)
+    gt_xz = gt[:valid_T, [0, 2]].astype(np.float64)
+
+    root_pos_err = float(np.mean(np.linalg.norm(gen_xz - gt_xz, axis=-1)))
+    root_traj_dtw = _root_traj_dtw_xz(gen_xz, gt_xz)
+
+    if valid_T < 2:
+        direction_alignment = float("nan")
+        endpoint_direction_cos = float("nan")
+    else:
+        gen_vel = np.diff(gen_xz, axis=0)
+        gt_vel = np.diff(gt_xz, axis=0)
+        gen_speed = np.linalg.norm(gen_vel, axis=-1)
+        gt_speed = np.linalg.norm(gt_vel, axis=-1)
+        denom = np.maximum(gen_speed * gt_speed, 1e-8)
+        frame_cos = np.sum(gen_vel * gt_vel, axis=-1) / denom
+        # Weight by GT speed so static frames do not dominate locomotion clips.
+        direction_alignment = float(
+            np.sum(frame_cos * gt_speed) / max(float(np.sum(gt_speed)), 1e-8)
+        )
+
+        gen_disp = gen_xz[-1] - gen_xz[0]
+        gt_disp = gt_xz[-1] - gt_xz[0]
+        disp_denom = max(
+            float(np.linalg.norm(gen_disp) * np.linalg.norm(gt_disp)),
+            1e-8,
+        )
+        endpoint_direction_cos = float(np.dot(gen_disp, gt_disp) / disp_denom)
+
+    return {
+        "root_pos_err_xz": root_pos_err,
+        "root_traj_dtw_xz": root_traj_dtw,
+        "direction_alignment": direction_alignment,
+        "endpoint_direction_cos": endpoint_direction_cos,
+    }
+
+
 def _object_relative_metrics(
     coarse: np.ndarray,                    # (T, 23) denormalized Coarse-v1
     obj_traj: np.ndarray,                  # (T, 9) denormalized obj_pos (3) + obj_rot6d (6)
@@ -219,6 +289,13 @@ METRIC_KEYS = (
     "pelvis_rot6d_vel_mean", "spine3_rot6d_vel_mean",
     "head_height_range", "head_height_vel_mean",
     "shoulder_height_range", "shoulder_height_vel_mean",
+)
+
+PAIRED_TRAJ_METRIC_KEYS = (
+    "root_pos_err_xz",
+    "root_traj_dtw_xz",
+    "direction_alignment",
+    "endpoint_direction_cos",
 )
 
 
@@ -675,6 +752,7 @@ def main() -> int:
             if not np.isfinite(gen).all():
                 print(f"  [warn] non-finite sample for clip {r['seq_id']} seed {seed}")
             gen_metrics = _per_clip_metrics(gen)
+            paired_metrics = _paired_root_trajectory_metrics(gen, gt)
             ratios = {
                 f"xGT.{k}": (gen_metrics[k] / gt_metrics[k]) if gt_metrics[k] > 1e-6 else float("nan")
                 for k in METRIC_KEYS
@@ -700,6 +778,7 @@ def main() -> int:
                 "gt": gt_metrics,
                 "gen": gen_metrics,
                 "xGT": ratios,
+                "paired": paired_metrics,
                 "gen_finite": bool(np.isfinite(gen).all()),
                 "gt_obj_metrics": gt_obj_metrics,
                 "gen_obj_metrics": gen_obj_metrics,
@@ -726,6 +805,16 @@ def main() -> int:
             vals = [r["xGT"][f"xGT.{k}"] for r in rows]
             vals = [v for v in vals if np.isfinite(v)]
             agg["xGT_mean"][k] = float(np.mean(vals)) if vals else float("nan")
+        paired_keys: set[str] = set()
+        for r in rows:
+            paired_keys.update(r.get("paired", {}).keys())
+        if paired_keys:
+            agg["paired_mean"] = {}
+            for k in sorted(paired_keys):
+                vals = [r["paired"].get(k, float("nan")) for r in rows
+                        if "paired" in r]
+                vals = [v for v in vals if np.isfinite(v)]
+                agg["paired_mean"][k] = float(np.mean(vals)) if vals else float("nan")
         # Round-18: object-relative metric aggregates (skip if no obj_traj
         # available for this subset's clips).
         obj_keys: set[str] = set()
@@ -769,6 +858,7 @@ def main() -> int:
         "per_clip": per_clip,
         "per_subset": per_subset,
         "metric_keys": list(METRIC_KEYS),
+        "paired_traj_metric_keys": list(PAIRED_TRAJ_METRIC_KEYS),
         # Round-13: persist selection mode so paired analyses know
         # whether two eval JSONs are actually comparable.
         "selection_mode": selection_mode,

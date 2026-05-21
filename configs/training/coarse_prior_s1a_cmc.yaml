@@ -44,6 +44,14 @@ data:
   # IMPORTANT: Plan A uses the EXISTING Round-14 object-free cache.
   # Round-18 leaves this cache untouched (no rebuild).
   cache_root: "cache/stage1_coarse_v1_full"
+  # Round-20 strategy: deterministic mirror doubling for train only.
+  # Requires text embeddings cached with --include-mirrored-texts so
+  # left/right prompts stay aligned with mirrored Coarse-v1 targets.
+  augmentation:
+    enabled: true
+    mirror_prob: 0.0
+    mirror_duplicate: true
+    require_mirrored_text_embeddings: true
 
 training:
   batch_size: 16              # 16 × accum 4 = effective 64 (CMC-scale budget on A6000)
@@ -58,8 +66,10 @@ training:
   # bf16 mixed precision (Accelerate). 2× wallclock savings vs fp32; the
   # x0-pred MSE objective is well-behaved at bf16 per MDM-family practice.
   mixed_precision: "bf16"
-  # Long-run target. Smoke runs override via --max-train-steps.
-  total_steps: 100000
+  # Round-20: Round-19 val minima landed around 30k-40k; continuing to
+  # 100k widened the train/val gap. Smoke runs override via
+  # --max-train-steps.
+  total_steps: 40000
   optimizer:
     name: "adamw"
     lr: 1.0e-4
@@ -71,11 +81,15 @@ training:
   # Round-18: EMA, periodic ckpt, val-loss tracking. Smoke runs disable
   # via --no-ema + --save-every-n-steps 999999 + --val-every-n-steps 0.
   ema_decay: 0.9999
-  save_every_n_steps: 10000
+  save_every_n_steps: 5000
   val_every_n_steps: 5000
   val_max_batches: 0           # 0 = full val pass; smoke can shrink to N
 
 loss:
+  # Round-20: x0-pred Min-SNR-gamma weighting, ported from Stage-B v24
+  # in the x0 form w_t=min(SNR_t,gamma), normalized per batch.
+  use_min_snr_weighting: true
+  min_snr_gamma: 5.0
   state_velocity_weight: 1.0
   # Round-18 new: root-only acc² + jerk² MSE. 0.1 is the conservative
   # initial weight per SUGGESTION.md §"Step 4"; trainer logs the relative
@@ -94,10 +108,10 @@ loss:
 
 logging:
   project: "piano"
-  run_name: "stage1_s1a_cmc_round18"
+  run_name: "stage1_s1a_cmc_round20"
   wandb: true
-  group: "stage1_round18_plan_a_vs_plan_c"
-  tags: ["round18", "stage1", "plan_a", "object_free", "cmc_scale"]
+  group: "stage1_round20_plan_a_vs_s1o"
+  tags: ["round20", "stage1", "plan_a", "object_free", "cmc_scale", "min_snr", "mirror_duplicate"]
   log_every_n_steps: 50
 
-output_dir: "runs/training/stage1_s1a_cmc_round18"
+output_dir: "runs/training/stage1_s1a_cmc_round20"

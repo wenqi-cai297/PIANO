@@ -61,6 +61,14 @@ data:
   # Round-18-fix cache: obj_traj in SAME frame as Coarse-v1 root_local_trans.
   # Built by scripts/stage_b_generator/build_stage1_coarse_v1_objtraj_root0_world_cache.py.
   cache_root: "cache/stage1_coarse_v1_objtraj_root0_world_round18_fix"
+  # Round-20 strategy: deterministic mirror doubling for train only.
+  # Requires text embeddings cached with --include-mirrored-texts so
+  # left/right prompts stay aligned with mirrored Coarse-v1 + obj_traj.
+  augmentation:
+    enabled: true
+    mirror_prob: 0.0
+    mirror_duplicate: true
+    require_mirrored_text_embeddings: true
 
 training:
   batch_size: 16
@@ -71,7 +79,10 @@ training:
   cfg_drop_prob_text: 0.1
   cfg_drop_prob_obj_traj: 0.1
   mixed_precision: "bf16"
-  total_steps: 100000
+  # Round-20: Round-19 val minima landed around 30k-40k; continuing to
+  # 100k widened the train/val gap. Smoke runs override via
+  # --max-train-steps.
+  total_steps: 40000
   optimizer:
     name: "adamw"
     lr: 1.0e-4
@@ -81,11 +92,15 @@ training:
     name: "cosine"
     warmup_steps: 1000
   ema_decay: 0.9999
-  save_every_n_steps: 10000
+  save_every_n_steps: 5000
   val_every_n_steps: 5000
   val_max_batches: 0
 
 loss:
+  # Round-20: x0-pred Min-SNR-gamma weighting, ported from Stage-B v24
+  # in the x0 form w_t=min(SNR_t,gamma), normalized per batch.
+  use_min_snr_weighting: true
+  min_snr_gamma: 5.0
   state_velocity_weight: 1.0
   root_acc_jerk_weight: 0.1
   channel_weights:
@@ -100,10 +115,10 @@ loss:
 
 logging:
   project: "piano"
-  run_name: "stage1_s1o_round18_fix"
+  run_name: "stage1_s1o_round20"
   wandb: true
-  group: "stage1_round18_fix_plan_a_vs_s1o"
-  tags: ["round18_fix", "stage1", "plan_c", "s1o", "object_traj_root0_world", "cmc_scale"]
+  group: "stage1_round20_plan_a_vs_s1o"
+  tags: ["round20", "stage1", "plan_c", "s1o", "object_traj_root0_world", "cmc_scale", "min_snr", "mirror_duplicate"]
   log_every_n_steps: 50
 
-output_dir: "runs/training/stage1_s1o_round18_fix"
+output_dir: "runs/training/stage1_s1o_round20"

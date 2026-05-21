@@ -44,6 +44,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
+from piano.data.dataset import _swap_left_right_in_text
 from piano.models.coarse_motion_prior import (
     CoarsePriorConfig, CoarsePriorDenoiserConfig, CoarsePriorDiff,
 )
@@ -71,6 +72,143 @@ STATE_LIKE_DIMS = (
     + list(range(21, 23))              # head + shoulder heights
 )
 STORED_VEL_DIMS = list(range(3, 6)) + [8]   # root_vel + yaw_vel
+
+# Cont6d X-reflection sign patterns — two conventions are in use in this repo
+# and they have DIFFERENT X-mirror sign patterns. Verified by R' = M R M
+# derivation on R_y(π/2):
+#
+# Convention 1 — ROWS (smpl_kinematics / pytorch3d): cont6d = first two rows
+#   of R, row-major flatten = [R00, R01, R02, R10, R11, R12]. Used by
+#   motion_135 (pelvis_rot6d + spine3_rot6d in Coarse-v1).
+# Convention 3 — CANONICAL_FRAME (first two columns of R, row-major flatten
+#   of (3,2)): cont6d = [R00, R01, R10, R11, R20, R21]. Used by
+#   build_stage1_coarse_v1_objtraj_root0_world_cache.py (obj_rot6d_world).
+#
+# DO NOT confuse the two — using the wrong sign pattern silently produces
+# a cont6d that decodes to a different rotation than M R M.
+_ROT6D_ROWS_MIRROR_SIGNS = np.asarray([1.0, -1.0, -1.0, -1.0, 1.0, 1.0], dtype=np.float32)
+_ROT6D_CANONICAL_FRAME_MIRROR_SIGNS = np.asarray([1.0, -1.0, -1.0, 1.0, -1.0, 1.0], dtype=np.float32)
+# Back-compat alias: pre-existing callers expecting `_ROT6D_MIRROR_SIGNS`
+# get the smpl_kinematics ROWS pattern (the one used by Coarse-v1).
+_ROT6D_MIRROR_SIGNS = _ROT6D_ROWS_MIRROR_SIGNS
+
+
+def mirror_coarse_v1(coarse: np.ndarray) -> np.ndarray:
+    """Mirror a Coarse-v1 sequence through world X=0.
+
+    Coarse-v1 stores root translation as (x, z, y); pelvis/spine3 rot6d
+    live at dims [9:15] / [15:21] in the smpl_kinematics ROWS cont6d
+    convention (the Round-12 `_facing_yaw_from_pelvis_rot6d` fix relies
+    on this — see `extract_coarse_motion_representation.py`). Reflection
+    uses R' = M R M ⇒ cont6d sign pattern [+, -, -, -, +, +] for the ROWS
+    convention.
+    """
+    if coarse.shape[-1] != 23:
+        raise ValueError(f"mirror_coarse_v1 expects last dim 23, got {coarse.shape[-1]}")
+    out = np.asarray(coarse, dtype=np.float32).copy()
+    out[..., 0] *= -1.0   # root_local_trans_x
+    out[..., 3] *= -1.0   # root_vel_x
+    out[..., 6] *= -1.0   # yaw_sin, since yaw -> -yaw under X reflection
+    out[..., 8] *= -1.0   # yaw velocity
+    out[..., 9:15] *= _ROT6D_ROWS_MIRROR_SIGNS
+    out[..., 15:21] *= _ROT6D_ROWS_MIRROR_SIGNS
+    return out
+
+
+def mirror_obj_traj_root0_world(obj_traj: np.ndarray) -> np.ndarray:
+    """Mirror obj_traj_root0_world = [obj_pos_xyz, obj_rot6d_canonical_frame]
+    through world X=0.
+
+    obj_rot6d at dims [3:9] is stored via
+    ``piano.utils.canonical_frame.matrix_to_rotation_6d_np`` which uses
+    the COLUMN-extracted, row-major-flattened layout
+    ``[R00, R01, R10, R11, R20, R21]`` — DIFFERENT from the smpl_kinematics
+    ROWS convention used by Coarse-v1's pelvis/spine3 rot6d. Under R' = M R M
+    the canonical_frame convention's X-mirror sign pattern is
+    ``[+, -, -, +, -, +]`` — verified by direct M R M derivation on
+    R_y(π/2). Using the ROWS pattern here would produce wrong values on
+    dims 3, 4 (the bug Codex's Round-20 implementation originally had).
+    """
+    if obj_traj.shape[-1] != 9:
+        raise ValueError(
+            f"mirror_obj_traj_root0_world expects last dim 9, got {obj_traj.shape[-1]}",
+        )
+    out = np.asarray(obj_traj, dtype=np.float32).copy()
+    out[..., 0] *= -1.0
+    out[..., 3:9] *= _ROT6D_CANONICAL_FRAME_MIRROR_SIGNS
+    return out
+
+
+def _parse_periodic_ckpt_step(path: Path) -> int | None:
+    name = path.name
+    if not (name.startswith("ckpt-") and name.endswith(".pt")):
+        return None
+    try:
+        return int(name[len("ckpt-"):-len(".pt")])
+    except ValueError:
+        return None
+
+
+def resolve_best_val_checkpoint(
+    out_dir: Path,
+    best_step: int | None,
+    *,
+    final_ckpt_path: Path | None = None,
+    final_step: int | None = None,
+) -> dict[str, Any]:
+    """Resolve exact and nearest checkpoint paths for the true best-val step."""
+    if best_step is None or int(best_step) < 0:
+        return {
+            "best_val_ckpt_path": None,
+            "best_val_ckpt_step": None,
+            "best_val_ckpt_exact": False,
+            "best_val_nearest_ckpt_path": None,
+            "best_val_nearest_ckpt_step": None,
+        }
+
+    step_i = int(best_step)
+    exact = Path(out_dir) / f"ckpt-{step_i:06d}.pt"
+    if exact.exists():
+        return {
+            "best_val_ckpt_path": str(exact),
+            "best_val_ckpt_step": step_i,
+            "best_val_ckpt_exact": True,
+            "best_val_nearest_ckpt_path": str(exact),
+            "best_val_nearest_ckpt_step": step_i,
+        }
+
+    if (
+        final_ckpt_path is not None
+        and final_step is not None
+        and int(final_step) == step_i
+        and Path(final_ckpt_path).exists()
+    ):
+        return {
+            "best_val_ckpt_path": str(final_ckpt_path),
+            "best_val_ckpt_step": step_i,
+            "best_val_ckpt_exact": True,
+            "best_val_nearest_ckpt_path": str(final_ckpt_path),
+            "best_val_nearest_ckpt_step": step_i,
+        }
+
+    candidates: list[tuple[int, Path]] = []
+    for path in Path(out_dir).glob("ckpt-*.pt"):
+        ckpt_step = _parse_periodic_ckpt_step(path)
+        if ckpt_step is not None and ckpt_step <= step_i:
+            candidates.append((ckpt_step, path))
+    if candidates:
+        nearest_step, nearest_path = max(candidates, key=lambda item: item[0])
+        nearest_path_s = str(nearest_path)
+    else:
+        nearest_step = None
+        nearest_path_s = None
+    return {
+        "best_val_ckpt_path": None,
+        "best_val_ckpt_step": None,
+        "best_val_ckpt_exact": False,
+        "best_val_nearest_ckpt_path": nearest_path_s,
+        "best_val_nearest_ckpt_step": nearest_step,
+    }
 
 
 # ============================================================================
@@ -108,6 +246,9 @@ class Stage1CacheDataset(Dataset):
         cache_root: Path,
         split: str,
         max_seq_length: int,
+        *,
+        augmentation: dict[str, Any] | None = None,
+        seed: int = 42,
     ) -> None:
         super().__init__()
         if split not in ("train", "val"):
@@ -115,6 +256,16 @@ class Stage1CacheDataset(Dataset):
         self.cache_root = Path(cache_root)
         self.split = split
         self.max_seq_length = int(max_seq_length)
+        aug = augmentation or {}
+        self.augment_enabled = bool(aug.get("enabled", False)) and split == "train"
+        self.mirror_prob = float(aug.get("mirror_prob", 0.0)) if self.augment_enabled else 0.0
+        self.mirror_duplicate = bool(aug.get("mirror_duplicate", False)) and self.augment_enabled
+        self.require_mirrored_text_embeddings = bool(
+            aug.get("require_mirrored_text_embeddings", True)
+        )
+        self.augmentation_seed = int(aug.get("seed", seed * 10_000 + 5))
+        if self.mirror_prob < 0.0 or self.mirror_prob > 1.0:
+            raise ValueError(f"augmentation.mirror_prob must be in [0, 1], got {self.mirror_prob}")
 
         manifest_path = self.cache_root / f"manifest_{split}.jsonl"
         self.records: list[dict[str, Any]] = []
@@ -167,21 +318,59 @@ class Stage1CacheDataset(Dataset):
             self.obj_traj_dim = 0
 
     def __len__(self) -> int:
-        return len(self.records)
+        n = len(self.records)
+        if self.mirror_duplicate:
+            n *= 2
+        return n
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        r = self.records[idx]
+        force_mirror = False
+        base_idx = int(idx)
+        if self.mirror_duplicate:
+            force_mirror = bool(base_idx % 2)
+            base_idx = base_idx // 2
+        r = self.records[base_idx]
         npz = np.load(self.cache_root / r["npz_path"], allow_pickle=False)
         coarse = npz["coarse_v1"].astype(np.float32)                   # (T, 23)
         init = npz["init_coarse_v1"].astype(np.float32)                # (23,)
         T = min(int(r["seq_len"]), self.max_seq_length, coarse.shape[0])
         coarse = coarse[:T]
+        text = r.get("text", "")
+
+        obj_traj: np.ndarray | None = None
+        if (
+            self.obj_traj_dim > 0
+            and self.obj_traj_field_name is not None
+            and self.obj_traj_field_name in npz.files
+        ):
+            obj_traj = npz[self.obj_traj_field_name].astype(np.float32)[:T]  # (T, 9)
+
+        if self.augment_enabled and not force_mirror and self.mirror_prob > 0.0:
+            rng = np.random.default_rng(self.augmentation_seed + int(idx))
+            force_mirror = bool(rng.random() < self.mirror_prob)
+        if force_mirror:
+            coarse = mirror_coarse_v1(coarse)
+            init = coarse[0].astype(np.float32)
+            text = _swap_left_right_in_text(text)
+            if obj_traj is not None and self.obj_traj_field_name == "obj_traj_root0_world":
+                obj_traj = mirror_obj_traj_root0_world(obj_traj)
+            elif obj_traj is not None:
+                raise RuntimeError(
+                    "Stage-1 mirror augmentation requires obj_traj_root0_world. "
+                    f"Found {self.obj_traj_field_name!r}; rebuild/use the Round-18-fix cache."
+                )
         # z-score normalize
         coarse_norm = (coarse - self.norm_mean) / self.norm_std
         init_norm = (init - self.norm_mean) / self.norm_std
-        text = r.get("text", "")
         text_row = self.text_index.get(text, None)
         if text_row is None:
+            if force_mirror and self.require_mirrored_text_embeddings:
+                raise KeyError(
+                    "mirrored text embedding is missing from text_embeddings_index.json. "
+                    "Re-run cache_stage1_clip_text_embeddings.py with "
+                    "--include-mirrored-texts before enabling Stage-1 mirror augmentation. "
+                    f"Missing text: {text!r}"
+                )
             # Should not happen since we cached every manifest text, but
             # guard with a zero pool feature.
             text_pool = np.zeros((self.text_dim,), dtype=np.float32)
@@ -202,12 +391,7 @@ class Stage1CacheDataset(Dataset):
         # `obj_traj_canonical` at `(196, 9)` (padded). The trainer trims
         # to T regardless via `[:T]`. Z-score normalize on the same
         # train-only stats. Padding to T_pad happens in the collate fn.
-        if (
-            self.obj_traj_dim > 0
-            and self.obj_traj_field_name is not None
-            and self.obj_traj_field_name in npz.files
-        ):
-            obj_traj = npz[self.obj_traj_field_name].astype(np.float32)[:T]  # (T, 9)
+        if obj_traj is not None:
             obj_traj_norm = (obj_traj - self.obj_traj_norm_mean) / self.obj_traj_norm_std
             sample["obj_traj_norm"] = obj_traj_norm
         return sample
@@ -309,6 +493,38 @@ def masked_weighted_mse(
     weighted = weighted * mask
     denom = mask.sum().clamp_min(1.0)
     return weighted.sum() / denom
+
+
+def masked_weighted_mse_with_sample_weights(
+    pred: Tensor,
+    target: Tensor,
+    valid_mask: Tensor,
+    per_dim_weights: Tensor,
+    sample_weights: Tensor | None = None,
+) -> Tensor:
+    """Channel-weighted MSE, optionally reweighted per batch item."""
+    sq = (pred - target).pow(2)
+    w = per_dim_weights.to(sq.device).view(1, 1, -1)
+    frame_loss = (sq * w).sum(dim=-1)
+    if sample_weights is not None:
+        frame_loss = frame_loss * sample_weights.to(sq.device).view(-1, 1)
+    mask = valid_mask.to(sq.device).float()
+    denom = mask.sum().clamp_min(1.0)
+    return (frame_loss * mask).sum() / denom
+
+
+def min_snr_x0_sample_weights(diff, t: Tensor, gamma: float) -> tuple[Tensor, dict[str, Tensor]]:
+    """Min-SNR-gamma weights for x0-prediction, normalized to mean 1."""
+    alpha_bar = diff.alphas_cumprod.to(device=t.device).gather(0, t)
+    snr = alpha_bar / (1.0 - alpha_bar + 1e-8)
+    weights = torch.clamp_max(snr, float(gamma))
+    stats = {
+        "mean": weights.mean().detach(),
+        "min": weights.min().detach(),
+        "max": weights.max().detach(),
+    }
+    weights = weights / weights.mean().clamp_min(1e-8)
+    return weights, stats
 
 
 def masked_state_velocity_loss(
@@ -579,10 +795,13 @@ def make_dataloader(
     cfg: DictConfig, split: str, *, max_seq_length: int, shuffle: bool,
     shuffle_generator: torch.Generator | None = None,
 ) -> DataLoader:
+    aug_cfg = cfg.data.get("augmentation", None)
     ds = Stage1CacheDataset(
         cache_root=Path(cfg.data.cache_root),
         split=split,
         max_seq_length=max_seq_length,
+        augmentation=OmegaConf.to_container(aug_cfg, resolve=True) if aug_cfg is not None else None,
+        seed=int(cfg.training.get("seed", 42)),
     )
     bs = int(cfg.training.batch_size)
     def _collate(samples):
@@ -615,6 +834,8 @@ def _run_validation_pass(
     per_dim_w: Tensor,
     loss_w: CoarsePriorLossWeights,
     model_obj_traj_dim: int,
+    use_min_snr_weighting: bool = False,
+    min_snr_gamma: float = 5.0,
     val_max_batches: int = 0,
     val_diff_seed: int = 0,
 ) -> dict[str, float]:
@@ -674,7 +895,12 @@ def _run_validation_pass(
             )
             valid_mask = batch.valid_mask.to(device)
             per_dim_mse = masked_per_dim_mse(x0_pred, x0, valid_mask)
-            l_mse = (per_dim_mse * per_dim_w).sum()
+            sample_weights = None
+            if use_min_snr_weighting:
+                sample_weights, _ = min_snr_x0_sample_weights(diff, t, min_snr_gamma)
+            l_mse = masked_weighted_mse_with_sample_weights(
+                x0_pred, x0, valid_mask, per_dim_w, sample_weights,
+            )
             l_sv = masked_state_velocity_loss(
                 x0_pred, x0, valid_mask, state_dims=STATE_LIKE_DIMS,
             )
@@ -865,6 +1091,8 @@ def main() -> int:
         else int(cfg.training.get("total_steps", 1000))
     )
     warmup_steps = int(cfg.training.scheduler.get("warmup_steps", 100))
+    use_min_snr_weighting = bool(cfg.loss.get("use_min_snr_weighting", False))
+    min_snr_gamma = float(cfg.loss.get("min_snr_gamma", 5.0))
 
     use_wandb = (not args.no_wandb) and bool(cfg.logging.get("wandb", False))
     # Only main process logs to wandb under multi-GPU; single-GPU is the
@@ -921,6 +1149,10 @@ def main() -> int:
     # the YAML-default seed.
     accelerator.print(f"[stage1] cache_root = {resolved_cache_root}")
     accelerator.print(f"[stage1] seed = {seed}")
+    accelerator.print(
+        f"[stage1] min_snr_weighting = {use_min_snr_weighting} "
+        f"(gamma={min_snr_gamma})"
+    )
 
     # ---------------- Round-18 trainer extensions ---------------- #
     # Independent CFG dropout probabilities; back-compat to cfg_drop_prob.
@@ -1062,10 +1294,23 @@ def main() -> int:
 
             valid_mask = batch.valid_mask.to(accelerator.device)
             # Compute per-dim MSE once and aggregate to the weighted total.
-            # Numerically identical to masked_weighted_mse(...) for backprop,
-            # but the per-dim vector is reused below for the wandb breakdown.
+            # The per-dim vector is reused below for the wandb breakdown;
+            # Min-SNR, when enabled, applies only to the diffusion MSE term.
             per_dim_mse = masked_per_dim_mse(x0_pred, x0, valid_mask)        # (D,)
-            l_mse = (per_dim_mse * per_dim_w).sum()
+            min_snr_weight_mean = x0.sum() * 0.0
+            min_snr_weight_min = x0.sum() * 0.0
+            min_snr_weight_max = x0.sum() * 0.0
+            sample_weights = None
+            if use_min_snr_weighting:
+                sample_weights, min_snr_stats = min_snr_x0_sample_weights(
+                    diff, t, min_snr_gamma,
+                )
+                min_snr_weight_mean = min_snr_stats["mean"]
+                min_snr_weight_min = min_snr_stats["min"]
+                min_snr_weight_max = min_snr_stats["max"]
+            l_mse = masked_weighted_mse_with_sample_weights(
+                x0_pred, x0, valid_mask, per_dim_w, sample_weights,
+            )
             l_state_vel = masked_state_velocity_loss(
                 x0_pred, x0, valid_mask, state_dims=STATE_LIKE_DIMS,
             )
@@ -1116,6 +1361,9 @@ def main() -> int:
             l_root_acc_v = float(l_root_acc.detach().item())
             l_root_jerk_v = float(l_root_jerk.detach().item())
             l_root_acc_jerk_total = float(l_root_acc_jerk.detach().item())
+            min_snr_weight_mean_v = float(min_snr_weight_mean.detach().item())
+            min_snr_weight_min_v = float(min_snr_weight_min.detach().item())
+            min_snr_weight_max_v = float(min_snr_weight_max.detach().item())
             grad_norm_v = (
                 float(grad_norm_t.detach().item())
                 if grad_norm_t is not None else float("nan")
@@ -1154,6 +1402,9 @@ def main() -> int:
                     "root_acc": l_root_acc_v,
                     "root_jerk": l_root_jerk_v,
                     "root_acc_jerk_total": l_root_acc_jerk_total,
+                    "min_snr_weight_mean": min_snr_weight_mean_v,
+                    "min_snr_weight_min": min_snr_weight_min_v,
+                    "min_snr_weight_max": min_snr_weight_max_v,
                     "lr": float(lr_now),
                     "grad_norm": grad_norm_v,
                     "x0_pred_std": x0_std_v,
@@ -1170,6 +1421,9 @@ def main() -> int:
                         "train/root_acc":   l_root_acc_v,
                         "train/root_jerk":  l_root_jerk_v,
                         "train/root_acc_jerk_total": l_root_acc_jerk_total,
+                        "train/min_snr_weight_mean": min_snr_weight_mean_v,
+                        "train/min_snr_weight_min": min_snr_weight_min_v,
+                        "train/min_snr_weight_max": min_snr_weight_max_v,
                         "train/lr":         float(lr_now),
                         # Health metrics — cheap to compute, very useful for
                         # spotting collapse / blow-up runs.
@@ -1228,6 +1482,8 @@ def main() -> int:
                     per_dim_w=per_dim_w,
                     loss_w=loss_w,
                     model_obj_traj_dim=model_obj_traj_dim,
+                    use_min_snr_weighting=use_min_snr_weighting,
+                    min_snr_gamma=min_snr_gamma,
                     val_max_batches=val_max_batches,
                     val_diff_seed=seed * 1_000_000 + (step + 1),
                 )
@@ -1252,13 +1508,14 @@ def main() -> int:
                 if math.isfinite(cmp_val) and cmp_val < best_val_loss:
                     best_val_loss = float(cmp_val)
                     best_val_step = int(step + 1)
-                    # Mark this step's periodic ckpt as best if it exists.
                     cand = out_dir / f"ckpt-{step + 1:06d}.pt"
-                    if cand.exists():
-                        best_val_path = str(cand)
+                    best_val_path = str(cand) if cand.exists() else None
+                    best_info_now = resolve_best_val_checkpoint(out_dir, best_val_step)
                     accelerator.print(
                         f"[stage1] new best val loss = {best_val_loss:.4f} "
-                        f"at step {best_val_step}  (ckpt: {best_val_path or 'pending periodic save'})"
+                        f"at step {best_val_step}  "
+                        f"(exact_ckpt: {best_val_path or 'none'}; "
+                        f"nearest_ckpt: {best_info_now['best_val_nearest_ckpt_path'] or 'none'})"
                     )
             step += 1
 
@@ -1293,6 +1550,12 @@ def main() -> int:
                 _final_payload["ema_decay"] = ema_decay
             accelerator.save(_final_payload, ckpt_path)
             accelerator.print(f"[stage1] wrote {ckpt_path}")
+        best_ckpt_info = resolve_best_val_checkpoint(
+            out_dir,
+            int(best_val_step) if best_val_step >= 0 else None,
+            final_ckpt_path=ckpt_path,
+            final_step=step,
+        )
         # Loss log is always written (it does not impersonate a model
         # checkpoint and is useful for the round report).
         (out_dir / "loss_log.json").write_text(
@@ -1322,10 +1585,16 @@ def main() -> int:
                 "val_log": val_log,
                 "best_val_loss": float(best_val_loss) if best_val_loss != float("inf") else None,
                 "best_val_step": int(best_val_step) if best_val_step >= 0 else None,
-                "best_val_ckpt_path": best_val_path,
+                "best_val_ckpt_path": best_ckpt_info["best_val_ckpt_path"],
+                "best_val_ckpt_step": best_ckpt_info["best_val_ckpt_step"],
+                "best_val_ckpt_exact": best_ckpt_info["best_val_ckpt_exact"],
+                "best_val_nearest_ckpt_path": best_ckpt_info["best_val_nearest_ckpt_path"],
+                "best_val_nearest_ckpt_step": best_ckpt_info["best_val_nearest_ckpt_step"],
                 "model_obj_traj_dim": model_obj_traj_dim,
                 "cfg_drop_prob_text": cfg_drop_prob_text,
                 "cfg_drop_prob_obj_traj": cfg_drop_prob_obj_traj,
+                "use_min_snr_weighting": use_min_snr_weighting,
+                "min_snr_gamma": min_snr_gamma,
             }, indent=2),
             encoding="utf-8",
         )

@@ -5,7 +5,8 @@
 #
 # Steps:
 #   3a) Plan A motion cache (cache/stage1_coarse_v1_full)
-#   3b) CLIP ViT-B/32 text embeddings (in 3a's cache root)
+#   3b) CLIP ViT-B/32 text embeddings (in 3a's cache root), including
+#       mirrored left/right text variants needed by Round-20 mirror aug.
 #   3c) S1-O obj_traj cache (cache/stage1_coarse_v1_objtraj_root0_world_round18_fix)
 #   4)  Frame convention preflight (4 subsets)
 #   5)  Round-18 19-test preflight suite
@@ -40,6 +41,7 @@ python scripts/stage_b_generator/cache_stage1_clip_text_embeddings.py \
     --cache-root cache/stage1_coarse_v1_full \
     --clip-version ViT-B/32 \
     --clip-download-root cache/clip \
+    --include-mirrored-texts \
     2>&1 | tee "${LOG_DIR}/step3b_clip_text.log"
 
 echo

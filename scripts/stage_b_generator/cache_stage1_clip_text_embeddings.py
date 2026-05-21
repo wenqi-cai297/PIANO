@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from piano.data.dataset import _swap_left_right_in_text
 from piano.utils.clip_utils import load_clip_text_encoder, set_clip_cache_root
 
 
@@ -53,6 +54,14 @@ def main() -> int:
     parser.add_argument("--clip-download-root", type=str, default="cache/clip")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--include-mirrored-texts",
+        action="store_true",
+        help=(
+            "Also cache left/right-swapped text strings so Stage-1 mirror "
+            "augmentation can keep CLIP conditioning consistent."
+        ),
+    )
     args = parser.parse_args()
 
     cache_root: Path = args.cache_root
@@ -64,6 +73,9 @@ def main() -> int:
         for line in (cache_root / name).read_text("utf-8").splitlines():
             if line.strip():
                 texts.append(json.loads(line).get("text", ""))
+    n_manifest_records = len(texts)
+    if args.include_mirrored_texts:
+        texts.extend(_swap_left_right_in_text(t) for t in list(texts))
     unique_texts = sorted(set(texts))
     print(f"[clip] total clips = {len(texts)}   unique texts = {len(unique_texts)}")
 
@@ -110,8 +122,10 @@ def main() -> int:
                 "clip_download_root": args.clip_download_root,
                 "dim": 512,
                 "encoding": "clip_model.encode_text (pooled / EOT projection)",
+                "include_mirrored_texts": bool(args.include_mirrored_texts),
                 "n_unique_texts": len(unique_texts),
-                "n_total_manifest_records": len(texts),
+                "n_manifest_records": n_manifest_records,
+                "n_total_encoded_text_candidates": len(texts),
                 "index": index,
             },
             indent=2,
