@@ -58,7 +58,7 @@ def main() -> int:
         "--include-mirrored-texts",
         action="store_true",
         help=(
-            "Also cache left/right-swapped text strings so Stage-1 mirror "
+            "Also cache direction-mirrored text strings so Stage-1 mirror "
             "augmentation can keep CLIP conditioning consistent."
         ),
     )

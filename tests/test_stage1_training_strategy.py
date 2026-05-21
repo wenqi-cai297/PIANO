@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from piano.data.dataset import _swap_left_right_in_text
 from piano.training.train_coarse_prior import (
     mirror_coarse_v1,
     mirror_obj_traj_root0_world,
@@ -54,6 +55,52 @@ def _cont6d_rows(R: np.ndarray) -> np.ndarray:
 def _cont6d_canonical_frame(R: np.ndarray) -> np.ndarray:
     """Pack R via canonical_frame's COLS-row-interleaved convention (obj_traj layout)."""
     return _matrix_to_rotation_6d_canonical_frame(R)
+
+
+def test_swap_left_right_in_text_mirrors_directional_language():
+    # Bare left↔right swap.
+    assert (
+        _swap_left_right_in_text("A person turns left and walks clockwise around the chair.")
+        == "A person turns right and walks counterclockwise around the chair."
+    )
+    assert (
+        _swap_left_right_in_text("A person walks counterclockwise, then uses the right hand.")
+        == "A person walks clockwise, then uses the left hand."
+    )
+    # Counter/anti-clockwise variants collapse to plain `clockwise`.
+    assert (
+        _swap_left_right_in_text("A person walks counter-clockwise and anti clockwise.")
+        == "A person walks clockwise and clockwise."
+    )
+    # Adverb form is normalized.
+    assert _swap_left_right_in_text("The person walks counterclockwisely.") == "The person walks clockwise."
+    # Same-sentence bidirectional swap atomicity.
+    assert _swap_left_right_in_text("Move from left to right.") == "Move from right to left."
+    # Bare-word false-positive guards on substrings.
+    assert _swap_left_right_in_text("bright cleft upright") == "bright cleft upright"
+
+    # Round-20 review extension: leftward(s) / rightward(s) swap
+    # (22+14 corpus entries previously missed by the bare regex because
+    # `t` is followed by a word char). Singular + plural both preserved.
+    assert (
+        _swap_left_right_in_text("A person leans leftward and then rightward.")
+        == "A person leans rightward and then leftward."
+    )
+    assert (
+        _swap_left_right_in_text("A person sits on a chair, bends rightwards, picks something.")
+        == "A person sits on a chair, bends leftwards, picks something."
+    )
+    assert (
+        _swap_left_right_in_text("body leftward and rightward")
+        == "body rightward and leftward"
+    )
+
+    # Round-20 review extension: leftmost ↔ rightmost (0 corpus entries
+    # today but semantically correct under X-mirror; future-proof).
+    assert (
+        _swap_left_right_in_text("The leftmost chair becomes the rightmost one after mirroring.")
+        == "The rightmost chair becomes the leftmost one after mirroring."
+    )
 
 
 def test_mirror_coarse_v1_is_involution_and_flips_expected_channels():

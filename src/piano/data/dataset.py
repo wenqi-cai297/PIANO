@@ -1349,23 +1349,72 @@ def collate_hoi(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Text L/R swap (helper for mirror augmentation)
+# Text directional swap (helper for mirror augmentation)
 # ---------------------------------------------------------------------------
 
 _LEFT_RE = re.compile(r"\bleft\b", re.IGNORECASE)
 _RIGHT_RE = re.compile(r"\bright\b", re.IGNORECASE)
+_CLOCKWISE_RE = re.compile(r"\bclockwise(?:ly)?\b", re.IGNORECASE)
+_COUNTERCLOCKWISE_RE = re.compile(
+    r"\b(?:counter[- ]?clockwise|anti[- ]?clockwise)(?:ly)?\b",
+    re.IGNORECASE,
+)
+# Round-20 review extension: a Stage-1 audit (scripts/stage_b_generator/
+# _round20_text_audit.py) over the full InterAct corpus found
+# 22 entries with ``leftward(s)`` and 14 with ``rightward(s)`` that the
+# bare ``\bleft\b`` / ``\bright\b`` swap silently misses (``t`` and the
+# following letter are both word chars → no boundary). ``leftmost`` /
+# ``rightmost`` have zero corpus hits today but are semantically clear
+# under X-mirror, so we swap them preemptively for corpus robustness.
+# Both are handled by a single callback so the L↔R substitution is
+# atomic (no need for the placeholder dance).
+_LEFT_RIGHT_PREFIX_RE = re.compile(
+    r"\b(left|right)(ward(?:s)?|most)\b", re.IGNORECASE,
+)
 _LEFT_PLACEHOLDER = "\x00LEFT\x00"
+_COUNTERCLOCKWISE_PLACEHOLDER = "\x00COUNTERCLOCKWISE\x00"
+
+
+def _swap_left_right_prefix(m: "re.Match[str]") -> str:
+    """Callback for `_LEFT_RIGHT_PREFIX_RE`: swap left↔right prefix,
+    preserve the rest of the matched token (``ward``, ``wards``, ``most``)
+    in lowercase. ``re.sub`` processes matches left-to-right without
+    re-scanning the replacement, so the callback is safe for inputs
+    containing BOTH directions (``leftward and rightward`` →
+    ``rightward and leftward``).
+    """
+    direction = m.group(1).lower()
+    rest = m.group(2).lower()
+    swapped = "right" if direction == "left" else "left"
+    return swapped + rest
 
 
 def _swap_left_right_in_text(text: str) -> str:
-    """Case-insensitive word-level swap of 'left' ↔ 'right'.
+    """Case-insensitive word-level swap of mirror-sensitive direction words.
 
-    Uses a NUL-byte placeholder to avoid the classic double-substitution
-    bug (``left → right → left`` in a single pass). Word boundaries stop
-    false positives on substrings like 'bright' or 'cleft'.
+    Currently handles, in priority order:
+
+    - ``left`` ↔ ``right`` (bare)
+    - ``clockwise`` ↔ ``counterclockwise`` (incl. ``counter[- ]?clockwise``,
+      ``anti[- ]?clockwise``, and ``...ly`` adverb form)
+    - ``leftward(s)`` ↔ ``rightward(s)`` (Round-20 review extension)
+    - ``leftmost`` ↔ ``rightmost`` (Round-20 review extension)
+
+    Uses NUL-byte placeholders for the bare-word swap and the
+    clockwise swap to avoid the classic double-substitution bug
+    (``left → right → left``); the ward/most extensions go through a
+    single-pass callback (``re.sub`` doesn't re-scan replacements, so
+    the L↔R direction labels can flip atomically). Word boundaries
+    stop false positives on substrings like ``bright`` / ``cleft`` /
+    ``upright``.
     """
     if not text:
         return text
     tmp = _LEFT_RE.sub(_LEFT_PLACEHOLDER, text)
     tmp = _RIGHT_RE.sub("left", tmp)
-    return tmp.replace(_LEFT_PLACEHOLDER, "right")
+    tmp = tmp.replace(_LEFT_PLACEHOLDER, "right")
+    tmp = _COUNTERCLOCKWISE_RE.sub(_COUNTERCLOCKWISE_PLACEHOLDER, tmp)
+    tmp = _CLOCKWISE_RE.sub("counterclockwise", tmp)
+    tmp = tmp.replace(_COUNTERCLOCKWISE_PLACEHOLDER, "clockwise")
+    tmp = _LEFT_RIGHT_PREFIX_RE.sub(_swap_left_right_prefix, tmp)
+    return tmp
