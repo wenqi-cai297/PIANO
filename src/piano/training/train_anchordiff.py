@@ -1804,6 +1804,9 @@ def main() -> None:
         plan_xattn_time_bias_init=float(
             cfg.model.denoiser.get("plan_xattn_time_bias_init", 0.5)
         ),
+        plan_tokens_force_null=bool(
+            cfg.model.denoiser.get("plan_tokens_force_null", False)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),

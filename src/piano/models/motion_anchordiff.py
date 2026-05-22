@@ -698,6 +698,18 @@ class AnchorDenoiserConfig:
     stage1_coarse_dim: int = 0
     cfg_drop_stage1_coarse: bool = False
 
+    # Round-23: ``plan_tokens_force_null`` is the no-plan ablation flag.
+    # When True, the v12 forward replaces ``plan_tokens`` with the learned
+    # ``null_plan_token`` (broadcast) and ``plan_hint`` with
+    # ``null_plan_hint`` AFTER the plan encoder forward, regardless of
+    # ``cond_drop_mask``. The interaction-plan condition is fully removed
+    # from the per-frame residual stream and the per-block cross-attention.
+    # Used to test whether plan information is load-bearing at full scale
+    # (paired ablation against the with-plan run). Must be combined with
+    # zeroed plan-aware loss weights (plan_anchor_weight=0, etc.) in the
+    # YAML config for a clean no-plan comparison.
+    plan_tokens_force_null: bool = False
+
     # Round-23: ALiBi-style relative-time bias on the per-block plan
     # cross-attention. The attention-inspection diagnostic (see
     # ``analyses/2026-05-22_round22_tier_b_v18_baseline_diagnostic_report.md``
@@ -1258,6 +1270,15 @@ class AnchorDenoiser(nn.Module):
                 plan_hint = self._broadcast_drop(
                     cond_drop_mask, plan_hint, self.null_plan_hint,
                 )
+        if cfg.plan_tokens_force_null:
+            # Round-23 no-plan ablation: unconditionally replace plan signals
+            # with their learned null embeddings. Cross-attn key_padding_mask
+            # stays valid so MHA doesn't degenerate to NaN (the constant K/V
+            # yields a constant attention output, contributing zero per-frame
+            # discrimination — equivalent to removing the plan condition).
+            plan_tokens = self.null_plan_token.expand_as(plan_tokens)
+            if plan_hint is not None and hasattr(self, "null_plan_hint"):
+                plan_hint = self.null_plan_hint.expand_as(plan_hint)
 
         # ─── Timestep embedding (B, D) ───
         t_emb = self.time_embed(t)                                       # (B, D)

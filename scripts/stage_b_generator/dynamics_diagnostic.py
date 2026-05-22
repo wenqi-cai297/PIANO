@@ -174,6 +174,7 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
             d.get("plan_xattn_relative_time_bias", False)
         ),
         plan_xattn_time_bias_init=float(d.get("plan_xattn_time_bias_init", 0.5)),
+        plan_tokens_force_null=bool(d.get("plan_tokens_force_null", False)),
         d_model=int(d.d_model),
         n_layers=int(d.n_layers),
         n_heads=int(d.n_heads),
