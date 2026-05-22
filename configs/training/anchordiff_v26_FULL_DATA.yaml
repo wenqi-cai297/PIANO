@@ -1,0 +1,212 @@
+# v26 mainline — plan branch confirmed redundant at full scale.
+#
+# Round-23 paired training (full data, 80 ep, 6969 train clips) showed
+# with-plan ≈ no-plan on every primary axis:
+#
+#   metric                          with-plan   no-plan
+#   ---------------------------     ---------   -------
+#   anchor_l2 (val best)            0.4017      0.4014
+#   plan §7.4 far-unobs (cm)        10.44       10.79
+#   plan §7.4 anchor_contact (cm)   32.50       32.41
+#   plan §7.4 GT-zero gap (cm)      0.06        0.32   (both fail < 5 cm gate)
+#
+# Round-24 anchor diagnostic showed the §7.4 anchor_contact "failure"
+# was a metric definition issue, not a model failure (joint-center vs
+# object-surface geometric offset). See
+# analyses/2026-05-23_round24_anchor_realization_diagnostic_report.md
+# for the full diagnosis.
+#
+# Decision: ship v26 = "plan branch disabled" as the new mainline.
+#
+# v26 config = v25 R23 no-plan config (architecturally identical,
+# checkpoint-compatible).  The plan_encoder / plan_xattn / ALiBi slope
+# params remain on the model (~8M of 80M total) but are forced to null
+# via `plan_tokens_force_null=true` and contribute zero gradient via
+# `plan_*_weight=0`.  A future janitorial PR will remove the dead
+# branches; until then, the v26 ckpt path is
+#   runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt
+#
+# Re-training from this config is OPTIONAL and would only produce a
+# bit-identical copy (seed=42, batch=16, accum=4 — all match R23 P1).
+# If retrained, use a new output_dir so the canonical ckpt isn't
+# overwritten.
+#
+# Round-24 ship gate (per redefined metric):
+#   - anchor_pose_error_cm < 20 cm  (overall: 18.77, hands ≈ 21, feet
+#                                    ≈ 29, pelvis ≈ 3.8 — overall
+#                                    nearly passes, pelvis essentially
+#                                    solved)
+#   - chair / hand interaction visually approved (2026-05-23 user review)
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  # CLEAN contract (Round-22 audit §5.1): kill dense z_int + lifted target.
+  zero_z_int_for_stageB: true
+  zero_dense_contact_target_for_stageB: true
+  zero_contact_state_for_stageB: true
+  zero_contact_target_for_stageB: true
+  zero_phase_for_stageB: true
+  zero_support_for_stageB: true
+  zero_plan_target_for_stageB: false
+
+  denoiser:
+    motion_dim: 135
+    object_traj_dim: 9                       # CLEAN: pose only
+    cond_motion_dim: 0
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    # Plan branch kept structurally identical to R23 no-plan ckpt for
+    # checkpoint compatibility, but force_null + zero loss weights
+    # ensure zero contribution.  See header for janitorial-PR plan.
+    use_interaction_plan: true
+    plan_k_max: 12
+    plan_s_max: 12
+    plan_num_anchor_types: 5
+    plan_num_parts: 5
+    plan_use_segment_tokens: false
+    plan_use_context_hint: true
+    plan_d_hint: 32
+    plan_d_time_embed: 64
+    cfg_drop_plan: false
+    plan_per_part_tokens: true
+    plan_context_hint_mode: "target_aware"
+    use_dit_block: true
+    dit_block_use_plan_pool_in_cond: false
+    use_v13_dynhead: false
+    use_v13_temporal_conv: false
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+    # Round-22: Stage-1 coarse oracle condition (THE load-bearing signal).
+    stage1_coarse_dim: 23
+    cfg_drop_stage1_coarse: false
+    # Round-23: ALiBi slopes kept for ckpt-compat (zero gradient effect
+    # because the plan_xattn block runs on null tokens).
+    plan_xattn_relative_time_bias: true
+    plan_xattn_time_bias_init: 0.5
+    # v26 mainline: plan branch disabled.
+    plan_tokens_force_null: true
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_plan"
+  force_world_frame: true
+  subsample_n_per_object: null               # ~8363 train clips, matches v18
+  overfit_n_clips: 0
+  stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null
+  batch_size: 16
+  num_epochs: 80                              # matches v18 / R23 P1 duration
+  num_workers: 4
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+  gradient_accumulation_steps: 4               # effective bs = 64
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 20                         # 4 val passes total
+  val_best_key: "anchor_l2"
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+  # v26 mainline: plan-aware losses zeroed.
+  plan_anchor_weight: 0.0
+  plan_segment_weight: 0.0
+  plan_transition_vel_weight: 0.0
+  plan_transition_acc_weight: 0.0
+  plan_transition_window: 3
+  stable_root_vel_weight: 0.5
+  stable_root_acc_weight: 0.25
+  stable_support_erode: 4
+  stable_local_vel_weight: 0.0
+  stable_local_acc_weight: 0.0
+  stable_local_vel_cm_weight: 0.0
+  stable_local_speed_moment_weight: 0.0
+  stable_local_acc_cm_weight: 0.0
+  # Round-20: Min-SNR-γ x0-pred weighting (Hang et al. ICCV 2023).
+  use_min_snr_weighting: true
+  min_snr_gamma: 5.0
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v26_FULL_DATA"
+  log_every_n_steps: 50
+  save_every_n_epochs: 20
+
+# NOTE: if you actually launch this config, the resulting ckpt will be
+# bit-identical to R23 no-plan (same seed, same arch, same data).  The
+# canonical v26 ckpt is the existing one; this output_dir exists only
+# so a re-run doesn't overwrite it.
+output_dir: "runs/training/stageB_anchordiff_v26_FULL_DATA"
