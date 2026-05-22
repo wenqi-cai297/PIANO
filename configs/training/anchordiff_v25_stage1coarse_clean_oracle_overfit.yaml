@@ -1,0 +1,201 @@
+# Round-22 P1 / overfit A: CLEAN Stage-2 contract + oracle Stage-1 Coarse-v1.
+# ~600-step 4-clip overfit (vs 5 steps in the smoke). Lets the new
+# stage1_coarse_proj + other zero-init projections learn non-trivial
+# weights so the plan/route condition sensitivity diagnostic has
+# something meaningful to probe. Architecture identical to the smoke
+# config so the resulting ckpt is loadable by
+# plan_condition_diagnostics.py.
+#
+#
+# Source: analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md §5.4
+# Companion to: anchordiff_v25_stage1coarse_full_oracle_smoke.yaml
+#
+# Clean contract = authoritative conditions only:
+#   - stage1_coarse (23-D oracle from GT motion_135) — ROUTE
+#   - interaction_plan tokens                        — PROGRAM
+#   - object_world_traj (object pose only, 9-D)      — scene state
+#   - object_tokens, text, init_pose                 — semantic + geometry
+#
+# Disabled vs v18 FULL:
+#   - z_int  → all 4 sub-channels zeroed (evidence-only under reframe)
+#   - object_world_traj[..., 9:24] (lifted target) → disabled via object_traj_dim=9
+#                                                    + zero_dense_contact_target=true
+#
+# This config is the "thesis-preserving" path. The companion FULL config keeps
+# every dense path on plus stage1_coarse to measure whether dense signals are
+# doing load-bearing work the plan + route doesn't already cover.
+#
+# Smoke: 4-clip overfit, x0-pred, no LR scheduler decay surprises. Do NOT
+# launch full training from this config; that is a later decision.
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  # CLEAN contract: turn off all dense z_int subchannels.
+  zero_z_int_for_stageB: true
+  zero_dense_contact_target_for_stageB: true
+  zero_contact_state_for_stageB: true
+  zero_contact_target_for_stageB: true
+  zero_phase_for_stageB: true
+  zero_support_for_stageB: true
+  # Keep plan target geometry as the authoritative target interface.
+  zero_plan_target_for_stageB: false
+
+  denoiser:
+    motion_dim: 135
+    # Object pose only (3 COM + 6 rot6d). DROPS the 15-D lifted contact
+    # target suffix that v18 FULL uses. Combined with
+    # zero_dense_contact_target_for_stageB above this is double-belt
+    # protection — the obj branch sees a 9-D tensor, no lifted-target
+    # dims to mistakenly read.
+    object_traj_dim: 9
+    cond_motion_dim: 0                # v12 path forbids > 0
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    use_interaction_plan: true
+    plan_k_max: 12
+    plan_s_max: 12
+    plan_num_anchor_types: 5
+    plan_num_parts: 5
+    plan_use_segment_tokens: false
+    plan_use_context_hint: true
+    plan_d_hint: 32
+    plan_d_time_embed: 64
+    cfg_drop_plan: false
+    plan_per_part_tokens: true
+    plan_context_hint_mode: "target_aware"
+    use_dit_block: true               # required for stage1_coarse branch
+    dit_block_use_plan_pool_in_cond: false   # v18 A1: t_emb only in AdaLN
+    use_v13_dynhead: false
+    use_v13_temporal_conv: false
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+    # Round-22 new: Stage-1 Coarse-v1 (23-D route/backbone) condition branch.
+    # V12InputProjection.stage1_coarse_proj is zero-init at construction, so
+    # step-0 output bit-exact preserved against pre-R22 v18 numerics.
+    stage1_coarse_dim: 23
+    cfg_drop_stage1_coarse: false     # don't perturb route under CFG sweeps
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_plan"
+  force_world_frame: true
+  # Smoke: tiny overfit subset so steps-per-epoch is small and behaviors are
+  # interpretable. Full training would be a separate config + explicit user
+  # approval per Round-22 verification order.
+  subsample_n_per_object: 1
+  overfit_n_clips: 4
+
+  # Round-22: Stage-1 Coarse-v1 normalization stats path (same cache the
+  # Round-20 S1-O ship config used).
+  stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.005
+
+training:
+  init_checkpoint: null
+  batch_size: 4
+  num_epochs: 600                 # 600 epochs × 1 batch = 600 train steps
+  num_workers: 0
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 100              # ~17% of 600
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 50             # 12 val passes over the run
+  val_best_key: "anchor_l2"
+
+loss:
+  anchor_weight: 1.0
+  contact_threshold: 0.5
+  plan_anchor_weight: 1.0
+  plan_segment_weight: 0.0
+  plan_transition_vel_weight: 1.0
+  plan_transition_acc_weight: 1.0
+  plan_transition_window: 3
+  stable_root_vel_weight: 0.5
+  stable_root_acc_weight: 0.25
+  stable_support_erode: 4
+  stable_local_vel_weight: 0.0
+  stable_local_acc_weight: 0.0
+  stable_local_vel_cm_weight: 0.0
+  stable_local_speed_moment_weight: 0.0
+  stable_local_acc_cm_weight: 0.0
+  use_min_snr_weighting: false
+  min_snr_gamma: 5.0
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+  pos_loss_weight: 5.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_v25_stage1coarse_clean_oracle_overfit"
+  log_every_n_steps: 25
+  save_every_n_epochs: 200         # 3 saves (200/400/600)
+
+output_dir: "runs/training/stageB_anchordiff_v25_stage1coarse_clean_oracle_overfit"
