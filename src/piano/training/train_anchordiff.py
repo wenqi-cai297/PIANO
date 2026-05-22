@@ -33,6 +33,10 @@ from piano.data.dataset import (
     collate_hoi,
     extract_subject_id,
 )
+from piano.data.stage1_coarse_oracle import (
+    extract_coarse_v1_batched,
+    load_stage1_coarse_norm,
+)
 from piano.models.motion_anchordiff import (
     AnchorDenoiserConfig,
     AnchorDiffConfig,
@@ -319,6 +323,16 @@ def build_anchordiff_step_fn(
     zero_phase_for_stageB: bool = False,
     zero_support_for_stageB: bool = False,
     zero_plan_target_for_stageB: bool = False,
+    # Round-22: Stage-1 Coarse-v1 (23-D route) oracle condition. When
+    # ``stage1_coarse_dim > 0``: step_fn extracts Coarse-v1 from each batch's
+    # ``motion`` + ``rest_offsets`` via ``extract_coarse_v1_batched``, z-scores
+    # it with the Stage-1 train norm stats, and attaches it to
+    # ``cond["stage1_coarse"]``. The Stage-2 denoiser's V12InputProjection
+    # consumes it via a zero-init projection. See
+    # ``analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md`` §6.
+    stage1_coarse_dim: int = 0,
+    stage1_coarse_norm_mean: np.ndarray | None = None,
+    stage1_coarse_norm_std: np.ndarray | None = None,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -328,6 +342,26 @@ def build_anchordiff_step_fn(
     `feature_weight_state.update(...)` after every K epochs; the next
     batch's `cache.get()` automatically picks up the new weights.
     """
+
+    # Round-22: pre-convert Stage-1 Coarse-v1 norm stats to device tensors
+    # once at step_fn construction (avoids per-step host→device copies). When
+    # the branch is disabled (stage1_coarse_dim == 0) these stay None.
+    if stage1_coarse_dim > 0:
+        if stage1_coarse_norm_mean is None or stage1_coarse_norm_std is None:
+            raise ValueError(
+                "stage1_coarse_dim > 0 requires stage1_coarse_norm_mean + std "
+                "(load via piano.data.stage1_coarse_oracle.load_stage1_coarse_norm)."
+            )
+        if stage1_coarse_norm_mean.shape != (stage1_coarse_dim,):
+            raise ValueError(
+                f"stage1_coarse_norm_mean shape {stage1_coarse_norm_mean.shape} "
+                f"!= ({stage1_coarse_dim},)"
+            )
+        stage1_coarse_mean_t = torch.from_numpy(stage1_coarse_norm_mean).to(device).float()
+        stage1_coarse_std_t = torch.from_numpy(stage1_coarse_norm_std).to(device).float()
+    else:
+        stage1_coarse_mean_t = None
+        stage1_coarse_std_t = None
 
     class _WeightCache:
         def __init__(self) -> None:
@@ -530,6 +564,30 @@ def build_anchordiff_step_fn(
             "text": text_features.float(),
             "object_tokens": obj_tokens,
         }
+
+        # ── Round-22: Stage-1 Coarse-v1 oracle condition ──
+        # Extract 23-D Coarse-v1 from GT motion_135 + rest_offsets, z-score
+        # with Stage-1 train stats, attach to cond. The denoiser's
+        # V12InputProjection.stage1_coarse_proj (zero-init) consumes it.
+        # See analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md.
+        if stage1_coarse_dim > 0:
+            if motion_representation != "smpl_pose_135_plan":
+                raise ValueError(
+                    "stage1_coarse_dim > 0 requires "
+                    "motion_representation='smpl_pose_135_plan' (motion[..., 132:135]"
+                    " must be root_world for the oracle extractor)."
+                )
+            rest_offsets_for_coarse = batch["rest_offsets"].to(device).float()  # (B, 22, 3)
+            coarse_v1_raw = extract_coarse_v1_batched(
+                motion=motion, rest_offsets=rest_offsets_for_coarse,
+            )                                                                    # (B, T, 23)
+            if coarse_v1_raw.shape[-1] != stage1_coarse_dim:
+                raise ValueError(
+                    f"Oracle Coarse-v1 dim {coarse_v1_raw.shape[-1]} != "
+                    f"stage1_coarse_dim={stage1_coarse_dim} from config."
+                )
+            coarse_v1_norm = (coarse_v1_raw - stage1_coarse_mean_t) / stage1_coarse_std_t
+            cond["stage1_coarse"] = coarse_v1_norm
 
         # --- v10 InteractionPlan: thread the compiled plan through cond ---
         # The dataset compiles the plan in __getitem__ for the
@@ -1736,6 +1794,10 @@ def main() -> None:
         self_conditioning_zero_init=bool(
             cfg.model.denoiser.get("self_conditioning_zero_init", True)
         ),
+        stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
+        cfg_drop_stage1_coarse=bool(
+            cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -2041,6 +2103,28 @@ def main() -> None:
     zero_plan_target_for_stageB = bool(
         cfg.model.get("zero_plan_target_for_stageB", False)
     )
+
+    # Round-22: Stage-1 Coarse-v1 oracle condition wiring.
+    stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    if stage1_coarse_dim > 0:
+        s1_cache_root = cfg.data.get("stage1_coarse_cache_root", None)
+        if s1_cache_root is None:
+            raise ValueError(
+                "stage1_coarse_dim > 0 requires data.stage1_coarse_cache_root in "
+                "the YAML config (path to the Stage-1 cache directory containing "
+                "normalization_train.json)."
+            )
+        stage1_coarse_norm_mean, stage1_coarse_norm_std = load_stage1_coarse_norm(
+            str(s1_cache_root)
+        )
+        accelerator.print(
+            f"[StageB Round-22] Stage-1 coarse oracle conditioning ENABLED — "
+            f"cache_root={s1_cache_root}  dim={stage1_coarse_dim}  "
+            f"mean[:3]={stage1_coarse_norm_mean[:3].tolist()}"
+        )
+    else:
+        stage1_coarse_norm_mean = None
+        stage1_coarse_norm_std = None
     if zero_z_int_for_stageB and (
         not zero_contact_state_for_stageB
         or not zero_contact_target_for_stageB
@@ -2135,6 +2219,9 @@ def main() -> None:
         zero_phase_for_stageB=zero_phase_for_stageB,
         zero_support_for_stageB=zero_support_for_stageB,
         zero_plan_target_for_stageB=zero_plan_target_for_stageB,
+        stage1_coarse_dim=stage1_coarse_dim,
+        stage1_coarse_norm_mean=stage1_coarse_norm_mean,
+        stage1_coarse_norm_std=stage1_coarse_norm_std,
     )
 
     # --- Smoke test: one batch through forward + backward ---

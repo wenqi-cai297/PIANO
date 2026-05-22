@@ -682,6 +682,22 @@ class AnchorDenoiserConfig:
     self_conditioning_t_max: int = 700
     self_conditioning_zero_init: bool = True
 
+    # Round-22: Stage-1 Coarse-v1 (23-D route/backbone) condition branch.
+    # When ``stage1_coarse_dim > 0``: V12InputProjection instantiates a
+    # zero-init ``stage1_coarse_proj`` so the step-0 output is bit-exact
+    # equal to the pre-R22 path; the trainer must populate
+    # ``cond["stage1_coarse"]`` of shape (B, T, stage1_coarse_dim).
+    # ``cfg_drop_stage1_coarse`` controls whether the branch participates
+    # in CFG dropout (default False — Round-22 smokes don't perturb the
+    # route stream under cfg sweeps).
+    # Frame convention: Coarse-v1 root_local_trans is root0-relative
+    # world axis (matches S1-O obj_traj_root0_world frame). See
+    # ``analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md`` §6.
+    # Currently requires ``use_dit_block=True`` — v11 legacy path does
+    # not support this branch.
+    stage1_coarse_dim: int = 0
+    cfg_drop_stage1_coarse: bool = False
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -724,6 +740,14 @@ class AnchorDenoiser(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        # Round-22 guard: Stage-1 coarse branch is v12-only.
+        if cfg.stage1_coarse_dim > 0 and not cfg.use_dit_block:
+            raise ValueError(
+                "stage1_coarse_dim > 0 requires use_dit_block=True (v12). "
+                "The v11 legacy concat-then-Linear path does not support the "
+                "Stage-1 Coarse-v1 branch. Set use_dit_block=true in the config."
+            )
+
         # v11 path: concat-then-Linear input projection. Skipped under v12.
         if not cfg.use_dit_block:
             per_frame_in = (
@@ -765,6 +789,16 @@ class AnchorDenoiser(nn.Module):
             )
         else:
             self.register_parameter("null_cond_motion_input", None)
+
+        # Round-22: Stage-1 Coarse-v1 null embedding for cfg_drop_stage1_coarse=True.
+        # Stored unconditionally for state_dict stability; consumed only when the
+        # branch is active (stage1_coarse_dim > 0) AND cfg_drop_stage1_coarse=True.
+        if cfg.stage1_coarse_dim > 0:
+            self.null_stage1_coarse = nn.Parameter(
+                torch.zeros(cfg.stage1_coarse_dim)
+            )
+        else:
+            self.register_parameter("null_stage1_coarse", None)
 
         self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_seq_length + 2)
 
@@ -884,6 +918,11 @@ class AnchorDenoiser(nn.Module):
                     "(CondMDI inpainting channel was a v9 feature; v12 dropped it). "
                     "Use cond_motion_dim=0."
                 )
+            # Round-22: Stage-1 coarse branch is v12-only — v11 legacy path
+            # has no V12InputProjection to extend, and adding it there would
+            # invalidate the bandwidth-bottleneck audit.
+            # (No-op when stage1_coarse_dim == 0; guard fires only if a caller
+            # tries to enable it on the v11 path — see _build_v11_input below.)
             if cfg.use_self_conditioning and cfg.self_conditioning_mode not in (
                 "standard", "late_start",
             ):
@@ -899,6 +938,7 @@ class AnchorDenoiser(nn.Module):
                 d_model=cfg.d_model,
                 use_self_conditioning=cfg.use_self_conditioning,
                 self_conditioning_zero_init=cfg.self_conditioning_zero_init,
+                stage1_coarse_dim=cfg.stage1_coarse_dim,
             )
             self.v12_cond_summary = GlobalCondSummary(
                 d_model=cfg.d_model,
@@ -1113,13 +1153,27 @@ class AnchorDenoiser(nn.Module):
 
         # ─── §4.3 Input projection (per-channel summed, residual stream) ───
         # Per-frame conditions flow through here; v11's bandwidth bottleneck
-        # (single Linear(217,512)) is replaced by 4 separate projections.
+        # (single Linear(217,512)) is replaced by 4 (Round-22: 5) projections.
+        stage1_coarse_eff: Tensor | None = None
+        if cfg.stage1_coarse_dim > 0:
+            if "stage1_coarse" not in cond:
+                raise KeyError(
+                    "stage1_coarse_dim > 0 requires cond['stage1_coarse'] "
+                    "(B, T, stage1_coarse_dim). The trainer must populate "
+                    "this from oracle GT extraction or the S1-O sampler."
+                )
+            stage1_coarse_eff = cond["stage1_coarse"]
+            if cfg.cfg_drop_stage1_coarse:
+                stage1_coarse_eff = self._broadcast_drop(
+                    cond_drop_mask, stage1_coarse_eff, self.null_stage1_coarse,
+                )
         h = self.v12_input_proj(
             x_t=x_t,
             z_int=z_int_eff,
             obj_traj=obj_traj_eff,
             plan_hint=plan_hint,
             self_cond=self_cond,
+            stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)
 
         # ─── §4.4 Global condition vector for AdaLN (per-sample) ───

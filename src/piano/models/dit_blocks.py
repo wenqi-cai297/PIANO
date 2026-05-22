@@ -62,17 +62,22 @@ class V12InputProjection(nn.Module):
     Decouples gradient through each channel (vs v11's single Linear(217, 512)
     which had the dense_channel_audit-confirmed bandwidth-bottleneck issue).
 
-    Aux projections (zint, obj, hint) are zero-init'd so step-0 output equals
-    motion_proj(x_t) only — preserving v11-like initial behavior. Aux channels
-    activate as their projections learn non-zero weights.
+    Aux projections (zint, obj, hint, stage1_coarse) are zero-init'd so step-0
+    output equals motion_proj(x_t) only — preserving v11-like initial behavior.
+    Aux channels activate as their projections learn non-zero weights.
+
+    Round-22 adds the optional ``stage1_coarse_proj`` branch for Stage-1
+    Coarse-v1 (23-D route/backbone) conditioning. When ``stage1_coarse_dim==0``
+    the branch is absent and step-0 output is bit-exact equal to the pre-R22
+    v18 path. See ``analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md``
+    §5-6 for the design rationale.
 
     Bandwidth per channel (effective rank bounded by input dim):
-      motion (135-d) -> up to 135 of 512 (26.4%)
-      zint   (26-d)  -> up to 26 of 512  (5.1%)
-      obj    (24-d)  -> up to 24 of 512  (4.7%)
-      hint   (32-d)  -> up to 32 of 512  (6.3%)
-    Total occupied: 217/512 (42.4%). Remaining 295/512 is filled by encoder
-    self-attention higher-order interactions.
+      motion         (135-d) -> up to 135 of 512 (26.4%)
+      zint           (26-d)  -> up to 26 of 512  (5.1%)
+      obj            (24-d)  -> up to 24 of 512  (4.7%)
+      hint           (32-d)  -> up to 32 of 512  (6.3%)
+      stage1_coarse  (23-d)  -> up to 23 of 512  (4.5%)   [Round-22]
     """
 
     def __init__(
@@ -84,10 +89,12 @@ class V12InputProjection(nn.Module):
         d_model: int,
         use_self_conditioning: bool = False,
         self_conditioning_zero_init: bool = True,
+        stage1_coarse_dim: int = 0,
     ) -> None:
         super().__init__()
         self.use_self_conditioning = bool(use_self_conditioning)
         self.self_conditioning_zero_init = bool(self_conditioning_zero_init)
+        self.stage1_coarse_dim = int(stage1_coarse_dim)
         self.motion_proj = nn.Linear(motion_dim, d_model)
         self.zint_proj = nn.Linear(zint_dim, d_model)
         self.obj_proj = nn.Linear(obj_traj_dim, d_model)
@@ -98,6 +105,10 @@ class V12InputProjection(nn.Module):
         else:
             self.self_cond_proj = None
             self.register_parameter("self_cond_gate", None)
+        if self.stage1_coarse_dim > 0:
+            self.stage1_coarse_proj = nn.Linear(self.stage1_coarse_dim, d_model)
+        else:
+            self.stage1_coarse_proj = None
         # Init in `initialize_weights_v12` (called by AnchorDenoiser).
 
     def forward(
@@ -107,6 +118,7 @@ class V12InputProjection(nn.Module):
         obj_traj: Tensor,
         plan_hint: Tensor,
         self_cond: Tensor | None = None,
+        stage1_coarse: Tensor | None = None,
     ) -> Tensor:
         """All inputs (B, T, *). Output (B, T, d_model)."""
         h = (
@@ -119,6 +131,14 @@ class V12InputProjection(nn.Module):
             if self_cond is None:
                 self_cond = torch.zeros_like(x_t)
             h = h + self.self_cond_gate * self.self_cond_proj(self_cond)
+        if self.stage1_coarse_proj is not None:
+            if stage1_coarse is None:
+                raise KeyError(
+                    "V12InputProjection.stage1_coarse_dim>0 but "
+                    "stage1_coarse cond tensor was not provided. The trainer "
+                    "must populate cond['stage1_coarse'] (B, T, stage1_coarse_dim)."
+                )
+            h = h + self.stage1_coarse_proj(stage1_coarse)
         return h
 
 
@@ -470,7 +490,12 @@ def initialize_weights_v12(
     nn.init.zeros_(input_proj.motion_proj.bias)
 
     # 2. Aux input projections zero-init (bandwidth allocation starts cold).
-    for proj in (input_proj.zint_proj, input_proj.obj_proj, input_proj.hint_proj):
+    aux_projs = [input_proj.zint_proj, input_proj.obj_proj, input_proj.hint_proj]
+    if getattr(input_proj, "stage1_coarse_proj", None) is not None:
+        # Round-22: same zero-init contract so step-0 output is preserved
+        # bit-exact against the pre-R22 v18 path when the branch is enabled.
+        aux_projs.append(input_proj.stage1_coarse_proj)
+    for proj in aux_projs:
         nn.init.zeros_(proj.weight)
         nn.init.zeros_(proj.bias)
     if getattr(input_proj, "self_cond_proj", None) is not None:
