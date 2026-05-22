@@ -48,8 +48,30 @@ PY="conda run --no-capture-output -n ${CONDA_ENV} python"
 LOG_DIR="runs/training/round23_fullscale_launch_logs"
 mkdir -p "${LOG_DIR}"
 
-CONFIG_WITH_PLAN="configs/training/anchordiff_v25_round23_clean_alibi_FULL_DATA.yaml"
-CONFIG_NO_PLAN="configs/training/anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA.yaml"
+# Auto-prefer the _local.yaml variant if present (server convention —
+# Windows paths in the tracked config get replaced by Linux paths in
+# the gitignored *_local.yaml on the server). See
+# scripts/stage_b_generator/run_round23_make_local_configs.sh for one-line
+# generation from the tracked variants.
+CONFIG_WITH_PLAN_BASE="configs/training/anchordiff_v25_round23_clean_alibi_FULL_DATA.yaml"
+CONFIG_WITH_PLAN_LOCAL="configs/training/anchordiff_v25_round23_clean_alibi_FULL_DATA_local.yaml"
+CONFIG_NO_PLAN_BASE="configs/training/anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA.yaml"
+CONFIG_NO_PLAN_LOCAL="configs/training/anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA_local.yaml"
+
+if [[ -f "${CONFIG_WITH_PLAN_LOCAL}" ]]; then
+    CONFIG_WITH_PLAN="${CONFIG_WITH_PLAN_LOCAL}"
+    echo "[r23-fullscale] using local config: ${CONFIG_WITH_PLAN_LOCAL}"
+else
+    CONFIG_WITH_PLAN="${CONFIG_WITH_PLAN_BASE}"
+    echo "[r23-fullscale] WARN: ${CONFIG_WITH_PLAN_LOCAL} not found — falling back to tracked base"
+fi
+if [[ -f "${CONFIG_NO_PLAN_LOCAL}" ]]; then
+    CONFIG_NO_PLAN="${CONFIG_NO_PLAN_LOCAL}"
+    echo "[r23-fullscale] using local config: ${CONFIG_NO_PLAN_LOCAL}"
+else
+    CONFIG_NO_PLAN="${CONFIG_NO_PLAN_BASE}"
+    echo "[r23-fullscale] WARN: ${CONFIG_NO_PLAN_LOCAL} not found — falling back to tracked base"
+fi
 
 LOG_WITH_PLAN="${LOG_DIR}/with_plan.log"
 LOG_NO_PLAN="${LOG_DIR}/no_plan.log"
