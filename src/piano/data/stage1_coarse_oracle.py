@@ -240,7 +240,7 @@ def load_stage1_coarse_norm(
     if not p.exists():
         raise FileNotFoundError(
             f"Stage-1 normalization stats missing at {p}. "
-            "Run scripts/stage_b_generator/build_stage1_coarse_v1_full_cache.py "
+            "Run scripts/stage_b_generator/build_stage1_coarse_v1_cache.py "
             "to produce the cache."
         )
     payload: dict[str, Any] = json.loads(p.read_text("utf-8"))

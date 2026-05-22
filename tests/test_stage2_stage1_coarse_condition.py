@@ -33,6 +33,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 # Add scripts/stage_b_generator to sys.path so we can import the canonical
 # numpy extractor for the equivalence test (it's not packaged in the wheel).
@@ -43,10 +44,12 @@ if str(_SCRIPTS) not in sys.path:
 from extract_coarse_motion_representation import (  # type: ignore  # noqa: E402
     extract_coarse_v0_v1,
 )
+import plan_condition_diagnostics as pcd  # type: ignore  # noqa: E402
 
 from piano.data.stage1_coarse_oracle import (  # noqa: E402
     COARSE_V1_DIM,
     extract_coarse_v1_batched,
+    load_stage1_coarse_norm,
 )
 from piano.models.motion_anchordiff import (  # noqa: E402
     AnchorDenoiser,
@@ -93,6 +96,7 @@ def _build_denoiser_config(
     object_traj_dim: int = 24,
     use_dit_block: bool = True,
     use_interaction_plan: bool = True,
+    cfg_drop_stage1_coarse: bool = False,
 ) -> AnchorDenoiserConfig:
     return AnchorDenoiserConfig(
         motion_dim=135,
@@ -117,7 +121,7 @@ def _build_denoiser_config(
         use_dit_block=use_dit_block,
         dit_block_use_plan_pool_in_cond=False,
         stage1_coarse_dim=stage1_coarse_dim,
-        cfg_drop_stage1_coarse=False,
+        cfg_drop_stage1_coarse=cfg_drop_stage1_coarse,
         d_model=64,
         n_layers=2,
         n_heads=2,
@@ -162,6 +166,67 @@ def _make_synthetic_cond(B: int, T: int, cfg: AnchorDenoiserConfig, *, seed: int
     if cfg.stage1_coarse_dim > 0:
         cond["stage1_coarse"] = torch.randn(B, T, cfg.stage1_coarse_dim, generator=g)
     return cond
+
+
+def _build_full_denoiser_config_from_yaml(
+    config_path: str | Path,
+    *,
+    stage1_coarse_dim: int,
+) -> AnchorDenoiserConfig:
+    cfg = OmegaConf.load(config_path)
+    z_dims = ZIntDims(
+        num_parts=int(cfg.model.z_int.num_parts),
+        phase_classes=int(cfg.model.z_int.phase_classes),
+        support_classes=int(cfg.model.z_int.support_classes),
+    )
+    d = cfg.model.denoiser
+    return AnchorDenoiserConfig(
+        motion_dim=int(d.motion_dim),
+        z_int=z_dims,
+        object_traj_dim=int(d.object_traj_dim),
+        init_pose_dim=int(d.init_pose_dim),
+        text_dim=int(d.text_dim),
+        object_token_dim=int(d.object_token_dim),
+        object_num_tokens=int(d.object_num_tokens),
+        cond_motion_dim=int(d.get("cond_motion_dim", 0)),
+        cond_motion_output_skip=bool(d.get("cond_motion_output_skip", False)),
+        cfg_drop_cond_motion=bool(d.get("cfg_drop_cond_motion", False)),
+        cond_motion_xt_inject=bool(d.get("cond_motion_xt_inject", False)),
+        use_interaction_plan=bool(d.get("use_interaction_plan", False)),
+        plan_k_max=int(d.get("plan_k_max", 12)),
+        plan_s_max=int(d.get("plan_s_max", 12)),
+        plan_num_anchor_types=int(d.get("plan_num_anchor_types", 5)),
+        plan_num_parts=int(d.get("plan_num_parts", 5)),
+        plan_use_segment_tokens=bool(d.get("plan_use_segment_tokens", False)),
+        plan_use_context_hint=bool(d.get("plan_use_context_hint", True)),
+        plan_d_hint=int(d.get("plan_d_hint", 32)),
+        plan_d_time_embed=int(d.get("plan_d_time_embed", 64)),
+        cfg_drop_plan=bool(d.get("cfg_drop_plan", False)),
+        plan_per_part_tokens=bool(d.get("plan_per_part_tokens", False)),
+        plan_context_hint_mode=str(d.get("plan_context_hint_mode", "time_only")),
+        use_dit_block=bool(d.get("use_dit_block", False)),
+        dit_block_use_plan_pool_in_cond=bool(
+            d.get("dit_block_use_plan_pool_in_cond", True)
+        ),
+        use_v13_dynhead=bool(d.get("use_v13_dynhead", False)),
+        v13_dynhead_gamma_init=float(d.get("v13_dynhead_gamma_init", 0.1)),
+        v13_dynhead_learnable_gamma=bool(d.get("v13_dynhead_learnable_gamma", True)),
+        use_v13_temporal_conv=bool(d.get("use_v13_temporal_conv", False)),
+        v13_temporal_conv_kernel=int(d.get("v13_temporal_conv_kernel", 5)),
+        use_self_conditioning=bool(d.get("use_self_conditioning", False)),
+        self_conditioning_prob=float(d.get("self_conditioning_prob", 0.0)),
+        self_conditioning_mode=str(d.get("self_conditioning_mode", "standard")),
+        self_conditioning_t_max=int(d.get("self_conditioning_t_max", 700)),
+        self_conditioning_zero_init=bool(d.get("self_conditioning_zero_init", True)),
+        stage1_coarse_dim=int(stage1_coarse_dim),
+        cfg_drop_stage1_coarse=bool(d.get("cfg_drop_stage1_coarse", False)),
+        d_model=int(d.d_model),
+        n_layers=int(d.n_layers),
+        n_heads=int(d.n_heads),
+        ff_mult=int(d.ff_mult),
+        dropout=float(d.dropout),
+        max_seq_length=int(cfg.data.max_seq_length),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -478,3 +543,208 @@ def test_v11_path_rejects_stage1_coarse_branch():
     cfg = _build_denoiser_config(stage1_coarse_dim=23, use_dit_block=False, use_interaction_plan=False)
     with pytest.raises(ValueError, match="stage1_coarse_dim > 0 requires use_dit_block=True"):
         AnchorDenoiser(cfg)
+
+
+def test_cfg_drop_stage1_coarse_replaces_route_with_null():
+    """When cfg_drop_stage1_coarse=True, dropped rows should receive the
+    learned null route before V12InputProjection sees the tensor.
+    """
+    cfg = _build_denoiser_config(
+        stage1_coarse_dim=23,
+        cfg_drop_stage1_coarse=True,
+    )
+    torch.manual_seed(0)
+    model = AnchorDenoiser(cfg).eval()
+    B, T = 2, 16
+    cond = _make_synthetic_cond(B, T, cfg, seed=0)
+    x_t = torch.randn(B, T, cfg.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    drop = torch.tensor([False, True])
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture(_module, args, kwargs):
+        captured["stage1_coarse"] = kwargs["stage1_coarse"].detach().clone()
+        return args, kwargs
+
+    handle = model.v12_input_proj.register_forward_pre_hook(
+        _capture, with_kwargs=True,
+    )
+    try:
+        with torch.no_grad():
+            model(x_t, t, cond, cond_drop_mask=drop)
+    finally:
+        handle.remove()
+
+    routed = captured["stage1_coarse"]
+    assert torch.equal(routed[0], cond["stage1_coarse"][0])
+    assert torch.equal(routed[1], torch.zeros_like(routed[1]))
+
+
+def test_plan_diagnostic_object_traj_contract_9d_and_24d():
+    B, T = 2, 5
+    obj_com = torch.randn(B, T, 3)
+    obj_rot6d = torch.randn(B, T, 6)
+    contact_target_xyz = torch.randn(B, T, 5, 3)
+    obj_pos_world = torch.zeros(B, T, 3)
+    obj_rot_world = torch.zeros(B, T, 3)
+
+    cfg9 = OmegaConf.create({
+        "model": {
+            "zero_dense_contact_target_for_stageB": True,
+            "denoiser": {"object_traj_dim": 9},
+        }
+    })
+    out9 = pcd._build_object_traj_for_cfg(
+        cfg=cfg9,
+        obj_com=obj_com,
+        obj_rot6d=obj_rot6d,
+        contact_target_xyz=contact_target_xyz,
+        obj_pos_world=obj_pos_world,
+        obj_rot_world=obj_rot_world,
+    )
+    assert out9.shape == (B, T, 9)
+    assert torch.equal(out9[..., :3], obj_com)
+    assert torch.equal(out9[..., 3:9], obj_rot6d)
+
+    cfg24 = OmegaConf.create({
+        "model": {
+            "zero_dense_contact_target_for_stageB": True,
+            "denoiser": {"object_traj_dim": 24},
+        }
+    })
+    out24 = pcd._build_object_traj_for_cfg(
+        cfg=cfg24,
+        obj_com=obj_com,
+        obj_rot6d=obj_rot6d,
+        contact_target_xyz=contact_target_xyz,
+        obj_pos_world=obj_pos_world,
+        obj_rot_world=obj_rot_world,
+    )
+    assert out24.shape == (B, T, 24)
+    assert torch.equal(out24[..., :9], torch.cat([obj_com, obj_rot6d], dim=-1))
+    assert torch.equal(out24[..., 9:], torch.zeros_like(out24[..., 9:]))
+
+
+def test_plan_diagnostic_build_cond_adds_stage1_coarse_and_uses_9d_obj(monkeypatch):
+    B, T = 2, 8
+    motion0, rest0 = _make_synthetic_motion_135(T, seed=101)
+    motion1, rest1 = _make_synthetic_motion_135(T, seed=102)
+    motion = torch.from_numpy(np.stack([motion0, motion1]))
+    rest = torch.from_numpy(np.stack([rest0, rest1]))
+
+    batch = {
+        "motion": motion,
+        "joints": torch.randn(B, T, 22, 3),
+        "object_pc": torch.randn(B, 64, 3),
+        "contact_state": torch.ones(B, T, 5),
+        "contact_target_xyz": torch.randn(B, T, 5, 3),
+        "phase": torch.zeros(B, T, dtype=torch.long),
+        "support": torch.zeros(B, T, dtype=torch.long),
+        "obj_com_canonical": torch.randn(B, T, 3),
+        "obj_rot6d_canonical": torch.randn(B, T, 6),
+        "object_positions": torch.zeros(B, T, 3),
+        "object_rotations": torch.zeros(B, T, 3),
+        "seq_len": torch.full((B,), T, dtype=torch.long),
+        "text": ["a", "b"],
+        "rest_offsets": rest,
+    }
+    cfg = OmegaConf.create({
+        "model": {
+            "zero_z_int_for_stageB": True,
+            "zero_dense_contact_target_for_stageB": True,
+            "zero_contact_state_for_stageB": True,
+            "zero_contact_target_for_stageB": True,
+            "zero_phase_for_stageB": True,
+            "zero_support_for_stageB": True,
+            "denoiser": {
+                "object_traj_dim": 9,
+                "stage1_coarse_dim": 23,
+            },
+        },
+        "data": {"motion_representation": "smpl_pose_135_plan"},
+    })
+    mean = torch.zeros(1, 1, 23)
+    std = torch.ones(1, 1, 23)
+
+    monkeypatch.setattr(
+        pcd,
+        "encode_text_per_token",
+        lambda _clip, texts, device: (
+            torch.zeros(len(texts), 77, 512, device=device),
+            None,
+        ),
+    )
+
+    class _ObjectEncoder(torch.nn.Module):
+        def forward(self, object_pc):
+            return torch.zeros(object_pc.shape[0], 128, 256, device=object_pc.device)
+
+    cond, out_T = pcd._build_cond(
+        batch=batch,
+        model=None,
+        object_encoder=_ObjectEncoder(),
+        clip_model=None,
+        z_dims=ZIntDims(num_parts=5, phase_classes=3, support_classes=3),
+        cfg=cfg,
+        device=torch.device("cpu"),
+        stage1_norm=(mean, std),
+    )
+    assert out_T == T
+    assert cond["object_world_traj"].shape == (B, T, 9)
+    assert cond["stage1_coarse"].shape == (B, T, 23)
+    assert torch.all(cond["z_int"] == 0)
+    expected = extract_coarse_v1_batched(motion.float(), rest.float())
+    assert torch.allclose(cond["stage1_coarse"], expected, atol=1e-6)
+
+
+def test_stage1_norm_missing_cache_message_points_to_existing_builder(tmp_path):
+    with pytest.raises(FileNotFoundError, match="build_stage1_coarse_v1_cache.py"):
+        load_stage1_coarse_norm(tmp_path)
+
+
+def test_actual_v18_checkpoint_loads_into_round22_denoiser_forward_equal():
+    ckpt = Path("runs/training/stageB_anchordiff_v18_a1_FULL_DATA/final.pt")
+    cfg_path = Path("configs/training/anchordiff_v18_a1_FULL_DATA.yaml")
+    if not ckpt.exists():
+        pytest.skip(f"local v18 checkpoint not present: {ckpt}")
+
+    cfg_ref = _build_full_denoiser_config_from_yaml(cfg_path, stage1_coarse_dim=0)
+    cfg_new = _build_full_denoiser_config_from_yaml(cfg_path, stage1_coarse_dim=23)
+    model_ref = AnchorDenoiser(cfg_ref).eval()
+    model_new = AnchorDenoiser(cfg_new).eval()
+
+    payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    state = payload.get("model", payload)
+    denoiser_state = {
+        k[len("denoiser."):]: v
+        for k, v in state.items()
+        if k.startswith("denoiser.")
+    }
+    missing_ref, unexpected_ref = model_ref.load_state_dict(denoiser_state, strict=False)
+    assert missing_ref == []
+    assert unexpected_ref == []
+
+    missing_new, unexpected_new = model_new.load_state_dict(denoiser_state, strict=False)
+    assert sorted(missing_new) == sorted([
+        "null_stage1_coarse",
+        "v12_input_proj.stage1_coarse_proj.weight",
+        "v12_input_proj.stage1_coarse_proj.bias",
+    ])
+    assert unexpected_new == []
+    assert model_new.null_stage1_coarse.abs().max().item() == 0.0
+    assert model_new.v12_input_proj.stage1_coarse_proj.weight.abs().max().item() == 0.0
+    assert model_new.v12_input_proj.stage1_coarse_proj.bias.abs().max().item() == 0.0
+
+    B, T = 1, 4
+    cond_ref = _make_synthetic_cond(B, T, cfg_ref, seed=7)
+    cond_new = _make_synthetic_cond(B, T, cfg_new, seed=7)
+    x_t = torch.randn(B, T, cfg_ref.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    drop = torch.zeros(B, dtype=torch.bool)
+    with torch.no_grad():
+        out_ref = model_ref(x_t, t, cond_ref, cond_drop_mask=drop)
+        out_new = model_new(x_t, t, cond_new, cond_drop_mask=drop)
+    assert torch.equal(out_ref, out_new), (
+        f"actual v18 ckpt forward changed after R22 load; "
+        f"max|diff|={(out_ref - out_new).abs().max().item():.3e}"
+    )

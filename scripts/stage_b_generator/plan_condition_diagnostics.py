@@ -47,6 +47,10 @@ from torch.utils.data import DataLoader, Subset
 from piano.data.dataset import (
     HOIDataset, collate_hoi, build_subject_split, extract_subject_id,
 )
+from piano.data.stage1_coarse_oracle import (
+    extract_coarse_v1_batched,
+    load_stage1_coarse_norm,
+)
 from piano.models.motion_anchordiff import (
     AnchorDenoiserConfig, AnchorDiffConfig, DiffusionConfig,
     MotionAnchorDiff, ZIntDims, pack_z_int,
@@ -147,6 +151,44 @@ def _part_swapped_plan(plan: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
     out["anchor_target_world"] = torch.roll(
         out["anchor_target_world"], shifts=1, dims=-2,
     )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 route variant constructors (Round-22)
+# ---------------------------------------------------------------------------
+
+
+def _gt_route(stage1_coarse: torch.Tensor) -> torch.Tensor:
+    return stage1_coarse.clone()
+
+
+def _zero_route(stage1_coarse: torch.Tensor) -> torch.Tensor:
+    return torch.zeros_like(stage1_coarse)
+
+
+def _shuffled_route(stage1_coarse: torch.Tensor, seed: int) -> torch.Tensor:
+    """Permute Stage-1 coarse frames within each clip."""
+    out = stage1_coarse.clone()
+    device = out.device
+    rng = torch.Generator(device="cpu").manual_seed(int(seed))
+    B, T, _ = out.shape
+    for b in range(B):
+        perm = torch.randperm(T, generator=rng).to(device)
+        out[b] = out[b, perm]
+    return out
+
+
+def _wrong_clip_route(
+    stage1_coarse: torch.Tensor,
+    other_stage1_coarse: torch.Tensor,
+) -> torch.Tensor:
+    if other_stage1_coarse.shape == stage1_coarse.shape:
+        return other_stage1_coarse.clone()
+    # Defensive fallback for unusual diagnostic batches with different padded T.
+    out = torch.zeros_like(stage1_coarse)
+    T = min(stage1_coarse.shape[1], other_stage1_coarse.shape[1])
+    out[:, :T] = other_stage1_coarse[:, :T]
     return out
 
 
@@ -294,6 +336,28 @@ def _compute_metrics(
     }
 
 
+def _append_route_consistency_metrics(
+    metrics: dict[str, float],
+    *,
+    x0_pred: torch.Tensor,
+    rest_offsets: torch.Tensor,
+    seq_mask: torch.Tensor,
+    cond_stage1_coarse: torch.Tensor | None,
+    stage1_norm: tuple[torch.Tensor, torch.Tensor] | None,
+) -> None:
+    """Measure whether generated motion realizes the supplied route condition."""
+    if cond_stage1_coarse is None or stage1_norm is None:
+        return
+    mean_t, std_t = stage1_norm
+    pred_raw = extract_coarse_v1_batched(x0_pred, rest_offsets)
+    pred_norm = (pred_raw - mean_t) / std_t
+    err = (pred_norm - cond_stage1_coarse).pow(2).sum(-1).sqrt()
+    mask_f = seq_mask.float()
+    metrics["stage1_coarse_norm_l2"] = float(
+        (err * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loader / model
 # ---------------------------------------------------------------------------
@@ -390,6 +454,10 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         self_conditioning_zero_init=bool(
             cfg.model.denoiser.get("self_conditioning_zero_init", True)
         ),
+        stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
+        cfg_drop_stage1_coarse=bool(
+            cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -425,11 +493,69 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
     return model, object_encoder, z_dims
 
 
+def _stage1_norm_for_cfg(
+    cfg,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    if stage1_coarse_dim <= 0:
+        return None
+    cache_root = cfg.data.get("stage1_coarse_cache_root", None)
+    if cache_root is None:
+        raise ValueError(
+            "stage1_coarse_dim > 0 requires data.stage1_coarse_cache_root "
+            "in the YAML config (directory containing normalization_train.json)."
+        )
+    mean, std = load_stage1_coarse_norm(str(cache_root))
+    if mean.shape != (stage1_coarse_dim,) or std.shape != (stage1_coarse_dim,):
+        raise ValueError(
+            f"Stage-1 norm stats shape mismatch: mean={mean.shape}, "
+            f"std={std.shape}, stage1_coarse_dim={stage1_coarse_dim}"
+        )
+    mean_t = torch.from_numpy(mean).to(device=device, dtype=torch.float32).view(1, 1, -1)
+    std_t = torch.from_numpy(std).to(device=device, dtype=torch.float32).view(1, 1, -1)
+    return mean_t, std_t
+
+
+def _build_object_traj_for_cfg(
+    *,
+    cfg,
+    obj_com: torch.Tensor,
+    obj_rot6d: torch.Tensor,
+    contact_target_xyz: torch.Tensor,
+    obj_pos_world: torch.Tensor,
+    obj_rot_world: torch.Tensor,
+) -> torch.Tensor:
+    """Mirror train_anchordiff._build_object_traj for diagnostic conds."""
+    object_traj_dim = int(cfg.model.denoiser.object_traj_dim)
+    components = [obj_com, obj_rot6d]
+    if object_traj_dim >= 24:
+        B, T = obj_com.shape[:2]
+        target_world = lift_object_local_to_world(
+            contact_target_xyz, obj_pos_world, obj_rot_world,
+        ).reshape(B, T, -1)
+        components.append(target_world)
+    object_traj = torch.cat(components, dim=-1)
+    if object_traj.shape[-1] != object_traj_dim:
+        raise ValueError(
+            f"object_traj_dim={object_traj_dim} but diagnostic built "
+            f"{object_traj.shape[-1]} dims"
+        )
+    if (
+        bool(cfg.model.get("zero_dense_contact_target_for_stageB", False))
+        and object_traj.shape[-1] >= 24
+    ):
+        object_traj = object_traj.clone()
+        object_traj[..., 9:] = 0.0
+    return object_traj
+
+
 def _build_cond(
     batch: dict, model: MotionAnchorDiff, object_encoder: ObjectEncoder,
     clip_model, z_dims: ZIntDims, cfg, device: torch.device,
+    stage1_norm: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[dict, int]:
-    """Mirror the trainer's cond construction (excluding plan)."""
+    """Mirror the trainer's cond construction (excluding plan variants)."""
     motion = batch["motion"].to(device)
     joints = batch["joints"].to(device)
     object_pc = batch["object_pc"].to(device)
@@ -466,16 +592,14 @@ def _build_cond(
     if bool(cfg.model.get("zero_z_int_for_stageB", False)):
         z_int = torch.zeros_like(z_int)
 
-    target_world = lift_object_local_to_world(
-        contact_target_xyz, obj_pos_world, obj_rot_world,
-    ).reshape(B, T, -1)
-    object_traj = torch.cat([obj_com, obj_rot6d, target_world], dim=-1)
-    if (
-        bool(cfg.model.get("zero_dense_contact_target_for_stageB", False))
-        and object_traj.shape[-1] >= 24
-    ):
-        object_traj = object_traj.clone()
-        object_traj[..., 9:] = 0.0
+    object_traj = _build_object_traj_for_cfg(
+        cfg=cfg,
+        obj_com=obj_com,
+        obj_rot6d=obj_rot6d,
+        contact_target_xyz=contact_target_xyz_for_z,
+        obj_pos_world=obj_pos_world,
+        obj_rot_world=obj_rot_world,
+    )
 
     init_pose = joints[:, 0, :, :].reshape(B, -1)
     text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
@@ -487,6 +611,32 @@ def _build_cond(
         "text": text_features.float(),
         "object_tokens": obj_tokens,
     }
+    stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    if stage1_coarse_dim > 0:
+        if str(cfg.data.get("motion_representation", "motion_263")) != "smpl_pose_135_plan":
+            raise ValueError(
+                "stage1_coarse_dim > 0 requires "
+                "data.motion_representation='smpl_pose_135_plan'."
+            )
+        if "rest_offsets" not in batch:
+            raise KeyError(
+                "stage1_coarse_dim > 0 requires batch['rest_offsets'] for "
+                "Coarse-v1 oracle extraction."
+            )
+        if stage1_norm is None:
+            stage1_norm = _stage1_norm_for_cfg(cfg, device)
+        assert stage1_norm is not None
+        mean_t, std_t = stage1_norm
+        coarse_raw = extract_coarse_v1_batched(
+            motion=motion.float(),
+            rest_offsets=batch["rest_offsets"].to(device).float(),
+        )
+        if coarse_raw.shape[-1] != stage1_coarse_dim:
+            raise ValueError(
+                f"Oracle Coarse-v1 dim {coarse_raw.shape[-1]} != "
+                f"stage1_coarse_dim={stage1_coarse_dim}"
+            )
+        cond["stage1_coarse"] = (coarse_raw - mean_t) / std_t
     return cond, T
 
 
@@ -566,8 +716,15 @@ def main() -> None:
         download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
     )
 
-    cond_main, T = _build_cond(main_batch, model, object_encoder, clip_model, z_dims, cfg, device)
-    cond_sec, _ = _build_cond(secondary_batch, model, object_encoder, clip_model, z_dims, cfg, device)
+    stage1_norm = _stage1_norm_for_cfg(cfg, device)
+    cond_main, T = _build_cond(
+        main_batch, model, object_encoder, clip_model, z_dims, cfg, device,
+        stage1_norm=stage1_norm,
+    )
+    cond_sec, _ = _build_cond(
+        secondary_batch, model, object_encoder, clip_model, z_dims, cfg, device,
+        stage1_norm=stage1_norm,
+    )
 
     # Plan dicts (pull plan_* fields back into the schema the encoder wants)
     def _extract_plan(batch: dict) -> dict[str, torch.Tensor]:
@@ -608,9 +765,15 @@ def main() -> None:
     results: dict[str, dict] = {}
     motion_outputs: dict[str, torch.Tensor] = {}
 
-    for name, plan in variants.items():
+    def _run_one_variant(
+        *,
+        plan: dict[str, torch.Tensor],
+        stage1_coarse: torch.Tensor | None = None,
+    ) -> tuple[dict[str, float], torch.Tensor]:
         torch.manual_seed(args.seed)
         cond = {**cond_main, "interaction_plan": plan}
+        if stage1_coarse is not None:
+            cond["stage1_coarse"] = stage1_coarse
         with torch.no_grad():
             x0_pred = model.sample(
                 cond=cond, seq_length=T, cfg_scale=args.cfg_scale,
@@ -629,6 +792,18 @@ def main() -> None:
             anchor_target_world=plan["anchor_target_world"],
             part_to_joint=part_to_joint, window=3,
         )
+        _append_route_consistency_metrics(
+            metrics,
+            x0_pred=x0_pred,
+            rest_offsets=rest_offsets,
+            seq_mask=seq_mask,
+            cond_stage1_coarse=cond.get("stage1_coarse", None),
+            stage1_norm=stage1_norm,
+        )
+        return metrics, x0_pred
+
+    for name, plan in variants.items():
+        metrics, x0_pred = _run_one_variant(plan=plan)
         results[name] = metrics
         motion_outputs[name] = x0_pred.cpu()
 
@@ -637,6 +812,47 @@ def main() -> None:
     for name, x0 in motion_outputs.items():
         delta = (x0 - base).pow(2).sum(-1).sqrt().mean().item()
         results[name]["motion_135_delta_vs_gt"] = float(delta)
+
+    # Round-22 route sensitivity: hold plan fixed to GT and vary
+    # cond["stage1_coarse"]. Skipped automatically for pre-R22 configs.
+    route_results: dict[str, dict] = {}
+    route_motion_outputs: dict[str, torch.Tensor] = {}
+    conflict_results: dict[str, dict] = {}
+    conflict_motion_outputs: dict[str, torch.Tensor] = {}
+    if "stage1_coarse" in cond_main:
+        route_variants = {
+            "gt_route": _gt_route(cond_main["stage1_coarse"]),
+            "zero_route": _zero_route(cond_main["stage1_coarse"]),
+            "shuffled_route": _shuffled_route(cond_main["stage1_coarse"], seed=args.seed),
+            "wrong_clip_route": _wrong_clip_route(
+                cond_main["stage1_coarse"], cond_sec["stage1_coarse"],
+            ),
+        }
+        for name, route in route_variants.items():
+            metrics, x0_pred = _run_one_variant(plan=_gt_plan(plan_gt), stage1_coarse=route)
+            route_results[name] = metrics
+            route_motion_outputs[name] = x0_pred.cpu()
+        route_base = route_motion_outputs["gt_route"]
+        for name, x0 in route_motion_outputs.items():
+            delta = (x0 - route_base).pow(2).sum(-1).sqrt().mean().item()
+            route_results[name]["motion_135_delta_vs_gt_route"] = float(delta)
+
+        conflict_variants = {
+            "gt_plan_wrong_route": (_gt_plan(plan_gt), route_variants["wrong_clip_route"]),
+            "wrong_plan_gt_route": (_wrong_clip_plan(plan_gt, plan_other), route_variants["gt_route"]),
+            "target_perturbed_plan_gt_route": (
+                _target_perturbed_plan(plan_gt, sigma_m=0.10, seed=args.seed),
+                route_variants["gt_route"],
+            ),
+        }
+        for name, (plan, route) in conflict_variants.items():
+            metrics, x0_pred = _run_one_variant(plan=plan, stage1_coarse=route)
+            conflict_results[name] = metrics
+            conflict_motion_outputs[name] = x0_pred.cpu()
+        conflict_base = route_motion_outputs["gt_route"]
+        for name, x0 in conflict_motion_outputs.items():
+            delta = (x0 - conflict_base).pow(2).sum(-1).sqrt().mean().item()
+            conflict_results[name]["motion_135_delta_vs_gt_plan_gt_route"] = float(delta)
 
     # ---------------------------------------------------------------------
     # Optional rendering: write per-variant MP4 next to the metrics
@@ -741,6 +957,8 @@ def main() -> None:
             "transition_vel_jump_under_3cm_per_frame": bool(pass_gate_transition),
         },
         "metrics": results,
+        "route_metrics": route_results,
+        "conflict_metrics": conflict_results,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -785,19 +1003,57 @@ def main() -> None:
             "plan_anchor_contact_realization_cm",
             "motion_135_delta_vs_gt",
         ]
+        if any("stage1_coarse_norm_l2" in row for row in results.values()):
+            cols.append("stage1_coarse_norm_l2")
         md_lines.append("| variant | " + " | ".join(c.replace("_", " ") for c in cols) + " |")
         md_lines.append("|" + "|".join(["---"] * (len(cols) + 1)) + "|")
         for name in ["gt", "zero", "shuffled_time", "wrong_clip", "reversed_time",
                      "target_perturbed", "part_swapped"]:
-            row = [name] + [f"{results[name][c]:.3f}" for c in cols]
+            row = [name] + [f"{results[name].get(c, float('nan')):.3f}" for c in cols]
             md_lines.append("| " + " | ".join(row) + " |")
+        if route_results:
+            md_lines.append("\n## Metrics by Stage-1 Route Variant\n")
+            route_cols = [
+                "global_joint_error_cm",
+                "near_anchor_window_error_cm",
+                "far_unobserved_error_cm",
+                "plan_anchor_contact_realization_cm",
+                "stage1_coarse_norm_l2",
+                "motion_135_delta_vs_gt_route",
+            ]
+            md_lines.append("| variant | " + " | ".join(c.replace("_", " ") for c in route_cols) + " |")
+            md_lines.append("|" + "|".join(["---"] * (len(route_cols) + 1)) + "|")
+            for name in ["gt_route", "zero_route", "shuffled_route", "wrong_clip_route"]:
+                row = [name] + [f"{route_results[name].get(c, float('nan')):.3f}" for c in route_cols]
+                md_lines.append("| " + " | ".join(row) + " |")
+        if conflict_results:
+            md_lines.append("\n## Plan / Route Conflict Cases\n")
+            conflict_cols = [
+                "global_joint_error_cm",
+                "near_anchor_window_error_cm",
+                "far_unobserved_error_cm",
+                "plan_anchor_contact_realization_cm",
+                "stage1_coarse_norm_l2",
+                "motion_135_delta_vs_gt_plan_gt_route",
+            ]
+            md_lines.append("| variant | " + " | ".join(c.replace("_", " ") for c in conflict_cols) + " |")
+            md_lines.append("|" + "|".join(["---"] * (len(conflict_cols) + 1)) + "|")
+            for name in [
+                "gt_plan_wrong_route",
+                "wrong_plan_gt_route",
+                "target_perturbed_plan_gt_route",
+            ]:
+                row = [name] + [f"{conflict_results[name].get(c, float('nan')):.3f}" for c in conflict_cols]
+                md_lines.append("| " + " | ".join(row) + " |")
         md_lines.append("\n## Interpretation\n")
         md_lines.append(
             "If GT-plan unobs error is significantly lower than zero / wrong / "
             "shuffled / reversed unobs error, plan information is being routed "
             "to unobserved-frame predictions. If unobs error is flat across "
             "variants (≤ 1 cm spread), the model is ignoring the plan — proceed "
-            "to architectural alternatives (per-layer cross-attn, drop z_int)."
+            "to architectural alternatives. For Round-22 configs, route variants "
+            "test whether Stage-1 coarse is used; conflict cases test whether "
+            "route overwhelms the interaction plan."
         )
         args.md.parent.mkdir(parents=True, exist_ok=True)
         args.md.write_text("\n".join(md_lines), encoding="utf-8")
@@ -808,6 +1064,18 @@ def main() -> None:
     for name in ["gt", "zero", "shuffled_time", "wrong_clip", "reversed_time",
                  "target_perturbed", "part_swapped"]:
         print(f"  {name:18s}  {results[name]['far_unobserved_error_cm']:.3f}")
+    if route_results:
+        print("\nFar-unobs error (cm) by Stage-1 route variant:")
+        for name in ["gt_route", "zero_route", "shuffled_route", "wrong_clip_route"]:
+            print(f"  {name:18s}  {route_results[name]['far_unobserved_error_cm']:.3f}")
+    if conflict_results:
+        print("\nFar-unobs error (cm) by plan/route conflict case:")
+        for name in [
+            "gt_plan_wrong_route",
+            "wrong_plan_gt_route",
+            "target_perturbed_plan_gt_route",
+        ]:
+            print(f"  {name:30s}  {conflict_results[name]['far_unobserved_error_cm']:.3f}")
     print(f"\nPass: unobs={pass_gate_unobs}  anchor={pass_gate_anchor}  trans={pass_gate_transition}")
 
 

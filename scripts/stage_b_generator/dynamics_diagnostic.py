@@ -35,6 +35,10 @@ from torch.utils.data import DataLoader, Subset
 from piano.data.dataset import (
     HOIDataset, collate_hoi, build_subject_split, extract_subject_id,
 )
+from piano.data.stage1_coarse_oracle import (
+    extract_coarse_v1_batched,
+    load_stage1_coarse_norm,
+)
 from piano.models.motion_anchordiff import (
     AnchorDenoiserConfig, AnchorDiffConfig, DiffusionConfig,
     MotionAnchorDiff, ZIntDims, pack_z_int,
@@ -164,6 +168,8 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         self_conditioning_mode=str(d.get("self_conditioning_mode", "standard")),
         self_conditioning_t_max=int(d.get("self_conditioning_t_max", 700)),
         self_conditioning_zero_init=bool(d.get("self_conditioning_zero_init", True)),
+        stage1_coarse_dim=int(d.get("stage1_coarse_dim", 0)),
+        cfg_drop_stage1_coarse=bool(d.get("cfg_drop_stage1_coarse", False)),
         d_model=int(d.d_model),
         n_layers=int(d.n_layers),
         n_heads=int(d.n_heads),
@@ -197,6 +203,62 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         feature_dim=int(cfg.model.object_encoder.feature_dim),
     ).to(device).eval()
     return model, object_encoder, z_dims
+
+
+def _stage1_norm_for_cfg(
+    cfg,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    if stage1_coarse_dim <= 0:
+        return None
+    cache_root = cfg.data.get("stage1_coarse_cache_root", None)
+    if cache_root is None:
+        raise ValueError(
+            "stage1_coarse_dim > 0 requires data.stage1_coarse_cache_root "
+            "in the YAML config (directory containing normalization_train.json)."
+        )
+    mean, std = load_stage1_coarse_norm(str(cache_root))
+    if mean.shape != (stage1_coarse_dim,) or std.shape != (stage1_coarse_dim,):
+        raise ValueError(
+            f"Stage-1 norm stats shape mismatch: mean={mean.shape}, "
+            f"std={std.shape}, stage1_coarse_dim={stage1_coarse_dim}"
+        )
+    mean_t = torch.from_numpy(mean).to(device=device, dtype=torch.float32).view(1, 1, -1)
+    std_t = torch.from_numpy(std).to(device=device, dtype=torch.float32).view(1, 1, -1)
+    return mean_t, std_t
+
+
+def _build_object_traj_for_cfg(
+    *,
+    cfg,
+    obj_com: torch.Tensor,
+    obj_rot6d: torch.Tensor,
+    contact_target_xyz: torch.Tensor,
+    obj_pos_world: torch.Tensor,
+    obj_rot_world: torch.Tensor,
+) -> torch.Tensor:
+    object_traj_dim = int(cfg.model.denoiser.object_traj_dim)
+    components = [obj_com, obj_rot6d]
+    if object_traj_dim >= 24:
+        B, T = obj_com.shape[:2]
+        target_world = lift_object_local_to_world(
+            contact_target_xyz, obj_pos_world, obj_rot_world,
+        ).reshape(B, T, -1)
+        components.append(target_world)
+    object_traj = torch.cat(components, dim=-1)
+    if object_traj.shape[-1] != object_traj_dim:
+        raise ValueError(
+            f"object_traj_dim={object_traj_dim} but diagnostic built "
+            f"{object_traj.shape[-1]} dims"
+        )
+    if (
+        bool(cfg.model.get("zero_dense_contact_target_for_stageB", False))
+        and object_traj.shape[-1] >= 24
+    ):
+        object_traj = object_traj.clone()
+        object_traj[..., 9:] = 0.0
+    return object_traj
 
 
 def _build_cond(
@@ -234,16 +296,14 @@ def _build_cond(
     if bool(cfg.model.get("zero_z_int_for_stageB", False)):
         z_int = torch.zeros_like(z_int)
 
-    target_world = lift_object_local_to_world(
-        contact_target_xyz, obj_pos_world, obj_rot_world,
-    ).reshape(B, T, -1)
-    object_traj = torch.cat([obj_com, obj_rot6d, target_world], dim=-1)
-    if (
-        bool(cfg.model.get("zero_dense_contact_target_for_stageB", False))
-        and object_traj.shape[-1] >= 24
-    ):
-        object_traj = object_traj.clone()
-        object_traj[..., 9:] = 0.0
+    object_traj = _build_object_traj_for_cfg(
+        cfg=cfg,
+        obj_com=obj_com,
+        obj_rot6d=obj_rot6d,
+        contact_target_xyz=contact_target_xyz_for_z,
+        obj_pos_world=obj_pos_world,
+        obj_rot_world=obj_rot_world,
+    )
 
     init_pose = joints[:, 0, :, :].reshape(B, -1)
     text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
@@ -255,6 +315,31 @@ def _build_cond(
         "text": text_features.float(),
         "object_tokens": obj_tokens,
     }
+    stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    if stage1_coarse_dim > 0:
+        if str(cfg.data.get("motion_representation", "motion_263")) != "smpl_pose_135_plan":
+            raise ValueError(
+                "stage1_coarse_dim > 0 requires "
+                "data.motion_representation='smpl_pose_135_plan'."
+            )
+        if "rest_offsets" not in batch:
+            raise KeyError(
+                "stage1_coarse_dim > 0 requires batch['rest_offsets'] for "
+                "Coarse-v1 oracle extraction."
+            )
+        stage1_norm = _stage1_norm_for_cfg(cfg, device)
+        assert stage1_norm is not None
+        mean_t, std_t = stage1_norm
+        coarse_raw = extract_coarse_v1_batched(
+            motion=motion.float(),
+            rest_offsets=batch["rest_offsets"].to(device).float(),
+        )
+        if coarse_raw.shape[-1] != stage1_coarse_dim:
+            raise ValueError(
+                f"Oracle Coarse-v1 dim {coarse_raw.shape[-1]} != "
+                f"stage1_coarse_dim={stage1_coarse_dim}"
+            )
+        cond["stage1_coarse"] = (coarse_raw - mean_t) / std_t
     return cond, T
 
 
