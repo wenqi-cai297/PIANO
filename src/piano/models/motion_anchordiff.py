@@ -698,6 +698,28 @@ class AnchorDenoiserConfig:
     stage1_coarse_dim: int = 0
     cfg_drop_stage1_coarse: bool = False
 
+    # Round-23: ALiBi-style relative-time bias on the per-block plan
+    # cross-attention. The attention-inspection diagnostic (see
+    # ``analyses/2026-05-22_round22_tier_b_v18_baseline_diagnostic_report.md``
+    # §5 + ``scripts/stage_b_generator/plan_cross_attention_inspector.py``)
+    # showed that v18 + R22 both produce vertical-band attention patterns
+    # — motion-tokens-at-all-frames attend to the same 1-2 plan tokens
+    # regardless of motion-frame time (top1=nearest-anchor ≈ 5-30%, near
+    # chance). The fix adds an additive pre-softmax bias to plan
+    # cross-attention proportional to ``-|motion_time - plan_token_time|``
+    # so the model has an explicit inductive bias toward temporally
+    # nearby anchors. Slopes are learnable per (layer, head).
+    #
+    # When ``plan_xattn_relative_time_bias=False`` (default), the
+    # cross-attention behaves identically to v18/R22 — bit-exact
+    # equivalent forward, no new parameters added. When ``True``, slopes
+    # initialized to ``plan_xattn_time_bias_init`` (default 0.5 — non-
+    # trivial inductive bias at init that the model can refine; set
+    # explicitly to 0.0 to preserve strict zero-init invariant for ckpt
+    # loadability tests).
+    plan_xattn_relative_time_bias: bool = False
+    plan_xattn_time_bias_init: float = 0.5
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -974,6 +996,95 @@ class AnchorDenoiser(nn.Module):
                 cond_summary=self.v12_cond_summary,
             )
 
+            # Round-23: ALiBi-style relative-time bias slopes (per layer × head).
+            if cfg.plan_xattn_relative_time_bias:
+                self.plan_xattn_time_bias_slopes = nn.Parameter(
+                    torch.full(
+                        (cfg.n_layers, cfg.n_heads),
+                        float(cfg.plan_xattn_time_bias_init),
+                    )
+                )
+            else:
+                self.register_parameter("plan_xattn_time_bias_slopes", None)
+
+    def _compute_plan_xattn_dist_norm(
+        self,
+        plan_dict: dict,
+        plan_tokens_shape: tuple,           # (B, K_total, D)
+        T: int,
+        motion_token_start: int,
+        seq_total_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        """Build the (B, T_q, K_total) per-token motion-time-distance
+        tensor used by the Round-23 ALiBi-style plan cross-attention
+        bias. Returns distances normalized to [0, 1] by T.
+
+        Padded plan-token slots get distance=0 (they are masked out by
+        ``key_padding_mask`` anyway, so the value doesn't affect the
+        softmax). The init_pose prefix token (position 0 in the motion
+        sequence) gets distance=0 to all anchors (it's a scene fact,
+        not a time-indexed motion frame).
+        """
+        cfg = self.cfg
+        B = plan_tokens_shape[0]
+        K_total = plan_tokens_shape[1]
+        K_max = int(cfg.plan_k_max)
+        P = int(cfg.plan_num_parts)
+        S_max = int(cfg.plan_s_max)
+
+        # Plan-token times: anchor part first (per_part_tokens or per-anchor),
+        # then segment tokens if enabled.
+        anchor_time = plan_dict["anchor_time"].to(device).float()        # (B, K_max)
+        if cfg.plan_per_part_tokens:
+            # Row-major (k, p) flatten; all P parts share anchor k's time.
+            anchor_token_time = (
+                anchor_time.view(B, K_max, 1).expand(B, K_max, P).reshape(B, K_max * P)
+            )                                                            # (B, K_max*P)
+        else:
+            anchor_token_time = anchor_time                              # (B, K_max)
+
+        if cfg.plan_use_segment_tokens:
+            # Use segment start as the representative time.
+            segment_time = plan_dict["segment_start"].to(device).float() # (B, S_max)
+            plan_token_time = torch.cat([anchor_token_time, segment_time], dim=1)
+        else:
+            plan_token_time = anchor_token_time
+
+        # Sanity: shape should match K_total from the encoder output.
+        if plan_token_time.shape[1] != K_total:
+            raise ValueError(
+                f"plan_token_time width {plan_token_time.shape[1]} != "
+                f"K_total {K_total} (encoder layout mismatch)"
+            )
+
+        # Motion-time for each query position. The sequence is
+        # [init_pose_tok, motion_frame_0, motion_frame_1, ...]. Init_pose
+        # uses motion_time=0 (treated as "no temporal preference"); each
+        # motion frame uses its frame index.
+        motion_time = torch.zeros(seq_total_len, device=device, dtype=torch.float32)
+        motion_time[motion_token_start:] = torch.arange(
+            T, device=device, dtype=torch.float32,
+        )                                                                # (T_q,)
+
+        # Distance |t_q - plan_time_k| / T, broadcast.
+        # motion_time: (T_q,) → (1, T_q, 1)
+        # plan_token_time: (B, K) → (B, 1, K)
+        dist = (
+            motion_time.view(1, seq_total_len, 1)
+            - plan_token_time.view(B, 1, K_total)
+        ).abs() / max(T, 1)                                              # (B, T_q, K)
+
+        # Zero out the init_pose prefix row so it doesn't get any
+        # time-distance preference (it's a scene fact, not a frame).
+        init_pose_mask = torch.zeros(seq_total_len, device=device, dtype=torch.bool)
+        init_pose_mask[:motion_token_start] = True
+        dist = torch.where(
+            init_pose_mask.view(1, seq_total_len, 1),
+            torch.zeros_like(dist), dist,
+        )
+        return dist
+
     @staticmethod
     def _broadcast_drop(mask: Tensor | None, x: Tensor, null_value: Tensor) -> Tensor:
         """If ``mask[b]`` is True, replace ``x[b]`` with the null embedding."""
@@ -1192,8 +1303,40 @@ class AnchorDenoiser(nn.Module):
         # PyTorch nn.MultiheadAttention key_padding_mask: True = ignore.
         # plan_mask is True at valid positions → invert.
         plan_kpm = ~plan_mask.bool()                                     # (B, K)
-        for block in self.v12_blocks:
-            seq = block(seq, c, plan_tokens, plan_kpm)
+
+        # Round-23: optional ALiBi-style relative-time bias for plan
+        # cross-attention. See AnchorDenoiserConfig.plan_xattn_relative_time_bias.
+        # Computed once per forward (independent of layer) modulo the
+        # per-layer learnable slopes.
+        if cfg.plan_xattn_relative_time_bias:
+            dist_norm = self._compute_plan_xattn_dist_norm(
+                plan_dict=plan_dict,
+                plan_tokens_shape=plan_tokens.shape,
+                T=T,
+                motion_token_start=1,
+                seq_total_len=seq.shape[1],
+                device=seq.device,
+            )                                                            # (B, T_q, K) in [0, 1]
+        else:
+            dist_norm = None
+
+        n_heads_for_bias = int(cfg.n_heads)
+        for layer_idx, block in enumerate(self.v12_blocks):
+            if dist_norm is not None:
+                slopes_L = self.plan_xattn_time_bias_slopes[layer_idx]     # (n_heads,)
+                # bias: (B, n_heads, T_q, K) → reshape to (B*n_heads, T_q, K)
+                bias = (
+                    -slopes_L.view(1, n_heads_for_bias, 1, 1)
+                    * dist_norm.unsqueeze(1)                                # (B, 1, T_q, K)
+                )                                                           # (B, n_heads, T_q, K)
+                B_bias, _, Tq_bias, K_bias = bias.shape
+                bias = bias.reshape(B_bias * n_heads_for_bias, Tq_bias, K_bias)
+            else:
+                bias = None
+            seq = block(
+                seq, c, plan_tokens, plan_kpm,
+                plan_xattn_attn_bias=bias,
+            )
 
         # ─── Text + obj cross-attn at end of encoder (v11 carryover) ───
         text_kv = self.text_proj(text_tok)

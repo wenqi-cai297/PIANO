@@ -458,6 +458,12 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         cfg_drop_stage1_coarse=bool(
             cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
         ),
+        plan_xattn_relative_time_bias=bool(
+            cfg.model.denoiser.get("plan_xattn_relative_time_bias", False)
+        ),
+        plan_xattn_time_bias_init=float(
+            cfg.model.denoiser.get("plan_xattn_time_bias_init", 0.5)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),

@@ -170,6 +170,10 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         self_conditioning_zero_init=bool(d.get("self_conditioning_zero_init", True)),
         stage1_coarse_dim=int(d.get("stage1_coarse_dim", 0)),
         cfg_drop_stage1_coarse=bool(d.get("cfg_drop_stage1_coarse", False)),
+        plan_xattn_relative_time_bias=bool(
+            d.get("plan_xattn_relative_time_bias", False)
+        ),
+        plan_xattn_time_bias_init=float(d.get("plan_xattn_time_bias_init", 0.5)),
         d_model=int(d.d_model),
         n_layers=int(d.n_layers),
         n_heads=int(d.n_heads),

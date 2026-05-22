@@ -305,7 +305,17 @@ class ConditionedEncoderLayer(nn.Module):
         plan_kv: Tensor,                # (B, K, D)  plan tokens
         plan_key_padding_mask: Tensor,  # (B, K) bool, True at padded positions (PyTorch convention)
         motion_token_start: int = 1,    # index where actual motion tokens begin (after prefix)
+        plan_xattn_attn_bias: Tensor | None = None,   # Round-23 ALiBi-style relative-time bias
     ) -> Tensor:
+        """Round-23 ``plan_xattn_attn_bias`` argument: optional additive
+        attention-score bias of shape ``(B*n_heads, T_q, T_k)`` applied to
+        the plan cross-attention before softmax. Encodes "this motion
+        frame is close in time to this plan token" so cross-attention has
+        an inductive bias toward temporally-nearest anchors. When ``None``
+        (default), the cross-attention behaves exactly as in v18. See
+        ``analyses/2026-05-22_round22_tier_b_v18_baseline_diagnostic_report.md``
+        §5 + ``AnchorDenoiserConfig.plan_xattn_relative_time_bias``.
+        """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )  # each (B, D)
@@ -327,6 +337,7 @@ class ConditionedEncoderLayer(nn.Module):
         xattn_out, _ = self.plan_xattn(
             x, plan_kv, plan_kv,
             key_padding_mask=plan_key_padding_mask,
+            attn_mask=plan_xattn_attn_bias,
             need_weights=False,
         )
         x = x + xattn_out
