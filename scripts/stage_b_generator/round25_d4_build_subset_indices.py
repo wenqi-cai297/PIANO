@@ -23,10 +23,14 @@ Usage:
     conda run -n piano python scripts/stage_b_generator/round25_d4_build_subset_indices.py \
         --config configs/training/anchordiff_v26_FULL_DATA_local.yaml \
         --selection-json analyses/round25_multimodal_eval_subset.json \
-        --n 8 \
+        --n-clips 8 \
         --output analyses/round25_d4_indices_8.json
 
-    (and again with --n 16 --output analyses/round25_d4_indices_16.json)
+    (and again with --n-clips 16 --output analyses/round25_d4_indices_16.json)
+
+    NOTE: use --n-clips (not bare --n). Argparse abbreviation matching
+    inside `conda run` greedily matches `--n` to `--name`, so the
+    canonical name is --n-clips.
 
 Note: D1 selection is the val-bucket clip list. D4 overfit needs
 TRAIN-bucket indices. So we re-curate from D1 val candidates by
@@ -61,8 +65,13 @@ def main() -> int:
                         help="Optional: pre-curated TRAIN-bucket selection JSON. "
                              "If provided, --selection-json is ignored and the train "
                              "list is used directly.")
-    parser.add_argument("--n", type=int, default=8,
-                        help="Number of train clips to include (8 or 16).")
+    parser.add_argument("--n-clips", "--n", type=int, default=8,
+                        dest="n",
+                        help="Number of train clips to include (8 or 16). "
+                             "Use --n-clips (canonical) — `--n` works as an "
+                             "alias inside `python` but is ambiguous with "
+                             "`conda run --name`, so the launcher uses "
+                             "--n-clips.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--match-by-category", action="store_true",
                         help="If set and --selection-json is given (but not "
