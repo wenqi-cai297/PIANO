@@ -98,7 +98,12 @@ def main() -> int:
     cfg_scales = [float(x) for x in args.cfg_scale_grid.split(",")]
     nstep_grid = [int(x) for x in args.num_steps_grid.split(",")]
     seeds = [int(x) for x in args.seeds.split(",")]
-    n_combos = len(cfg_scales) * len(nstep_grid) * len(seeds)
+    # n_combos counts (cfg, nstep) pairs — eval_i increments per such pair
+    # after the seeds-loop completes. The seeds are averaged inside each
+    # pair. Earlier versions of this code counted seeds in n_combos which
+    # made the progress denominator wrong (showed e.g. "[190/576]" when
+    # eval_i actually maxed at 192).
+    n_combos = len(cfg_scales) * len(nstep_grid)
 
     cfg = OmegaConf.load(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,9 +135,10 @@ def main() -> int:
               f"{nstep_grid} → [default] (dummy; runs default num_steps once). "
               f"Saves {len(nstep_grid)-1}× of redundant evals.")
         nstep_grid = [0]                                        # 0 sentinel = use default
-        n_combos = len(cfg_scales) * len(nstep_grid) * len(seeds)
+        n_combos = len(cfg_scales) * len(nstep_grid)            # pairs (seeds avgd inside)
         print(f"[p11] Adjusted plan: {len(cfg_scales)} cfg × {len(nstep_grid)} step × "
-              f"{len(seeds)} seeds = {n_combos} combos per clip.")
+              f"{len(seeds)} seeds = {n_combos} pairs per clip "
+              f"({n_combos * len(seeds)} sampler calls).")
 
     s1_cache = _load_stage1_cache(args.stage1_cache_root, split=args.bucket)
     s1_mean = s1_cache["s1_mean"]
