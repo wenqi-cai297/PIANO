@@ -2,6 +2,12 @@
 # Same data + same 5-epoch budget as V0; the only knob change is the
 # per-joint loss weighting in train_anchordiff.py's loss_pos_full block.
 #
+# Endpoint share within the dense FK loss: V0 = 4 / 22, V1 = 8 / 26,
+# V2 = 20 / 38. Loss SCALE is preserved by the weight-sum denominator
+# (see train_anchordiff.py around the loss_pos_full block) so V0/V1/V2
+# values are directly comparable as relative-emphasis variants of the
+# same loss — NOT as an additive endpoint loss term.
+#
 # Pair with anchordiff_v26_d5_v1_hand2x_foot2x.yaml and
 # anchordiff_v26_d5_v2_hand5x_foot5x.yaml. The three runs share
 # everything except hand/foot endpoint weights; difference in

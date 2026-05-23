@@ -1,5 +1,17 @@
-# Round-25 D5 baseline (V0): current v26 loss weights, on a 200-clip
-# subset for ~5 epoch smoke comparison.
+# Round-25 D5 baseline (V0): current v26 loss weights, on a
+# subsample_n_per_object=1 subset for ~5 epoch smoke comparison.
+#
+# Codex audit note
+# (analyses/2026-05-23_codex_round25_p0_implementation_review.md §4 C6):
+# - subsample_n_per_object=1 yields ~74 clips on local metadata
+#   (32 chairs + 9 imhd + 20 neuraldome + 13 omomo objects), NOT the
+#   ~200 the design doc earlier estimated. The smaller sample reduces
+#   D5 statistical power but the V0/V1/V2 internal comparison is
+#   still valid because all three share the same subset.
+# - warmup_steps=100 differs from v26 mainline (500). All three D5
+#   variants share warmup_steps=100, so V1/V2-vs-V0 comparison is
+#   internally controlled, but V0 should NOT be described as
+#   "bit-for-bit v26 except for endpoint weights".
 #
 # Pair with anchordiff_v26_d5_v1_hand2x_foot2x.yaml and
 # anchordiff_v26_d5_v2_hand5x_foot5x.yaml. The three runs share
@@ -91,10 +103,10 @@ data:
   support_collapse_hand_support: true
   motion_representation: "smpl_pose_135_plan"
   force_world_frame: true
-  # D5: take ~200 train clips per subset cap so the three variants
-  # converge ~5 epochs in 30-45 min. With per-object subsample = 1
-  # we pick one clip per object across all 4 subsets, capping size.
-  # Adjust to taste.
+  # D5: subsample_n_per_object=1 keeps one clip per object across the
+  # 4 subsets → ~74 clips on local metadata (NOT ~200; see header). To
+  # actually get ~200 clips, raise subsample_n_per_object to 3 — but
+  # then update V1/V2 to match for fair comparison.
   subsample_n_per_object: 1
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"

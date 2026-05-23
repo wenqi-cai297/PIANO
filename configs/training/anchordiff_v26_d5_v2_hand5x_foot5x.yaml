@@ -3,6 +3,9 @@
 # bracket V1. If V2 still doesn't move limb error, H2 (loss imbalance)
 # is firmly ruled out.
 #
+# Endpoint share within the dense FK loss: V0 = 4 / 22, V1 = 8 / 26,
+# V2 = 20 / 38. Loss SCALE is preserved by the weight-sum denominator.
+#
 # Pair with anchordiff_v26_d5_v1_hand2x_foot2x.yaml and
 # anchordiff_v26_d5_v2_hand5x_foot5x.yaml. The three runs share
 # everything except hand/foot endpoint weights; difference in

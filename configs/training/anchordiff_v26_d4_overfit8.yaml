@@ -13,15 +13,19 @@
 # Design source:
 #   analyses/2026-05-23_round25_diagnostic_bundle_design.md §D4.
 #
-# Inherits architecture / loss / data settings from
-# anchordiff_v26_FULL_DATA.yaml — only changes:
-#   - data.overfit_n_clips = 8
-#   - training.num_epochs = 600
-#   - logging.run_name + output_dir
-#
-# At ~80 grad steps per epoch (bs 1, no accum because overfit
-# subset is small), 600 epochs ≈ 48000 grad steps ≈ 30 min on
-# cuda:0 (matches R22 overfit timings).
+# Codex audit fix (analyses/2026-05-23_codex_round25_p0_implementation_review.md §5 E1):
+# overfit_n_clips alone takes the first-N train clips alphabetically,
+# NOT the multimodal subset. Trainer also supports
+# data.subset_indices_file (precedence over overfit_n_clips) which is
+# the correct mechanism for selecting D1-derived multimodal clips.
+# Required preprocessing step:
+#   conda run -n piano python scripts/stage_b_generator/round25_d4_build_subset_indices.py \
+#       --config <this config> \
+#       --train-selection-json <hand-curated train-bucket selection> \
+#       --n 8 \
+#       --output analyses/round25_d4_indices_8.json
+# (Or use --selection-json + --match-by-category as a heuristic fallback.)
+# The path is referenced under data.subset_indices_file below.
 
 model:
   cfg_drop_prob: 0.15
@@ -106,9 +110,13 @@ data:
   motion_representation: "smpl_pose_135_plan"
   force_world_frame: true
   subsample_n_per_object: null
-  # D4 overfit knob: take only the first 8 clips of the train bucket.
-  # If a multimodal-only overfit is needed, populate
-  # data.subset_indices_file with the indices of the 8 chosen clips.
+  # D4 overfit knob: USE subset_indices_file (takes precedence over
+  # overfit_n_clips per train_anchordiff.py:1707-1718). Build the JSON
+  # via round25_d4_build_subset_indices.py first; see header comment.
+  # overfit_n_clips remains as a fallback if subset_indices_file is
+  # unset (first-8 train clips alphabetically — DOES NOT test the
+  # intended multimodal hypothesis).
+  subset_indices_file: "analyses/round25_d4_indices_8.json"
   overfit_n_clips: 8
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
 

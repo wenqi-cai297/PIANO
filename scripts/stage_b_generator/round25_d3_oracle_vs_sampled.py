@@ -1,4 +1,4 @@
-"""Round-25 D3: oracle vs sampled Stage-1 comparison.
+"""Round-25 D3: oracle vs sampled Stage-1 comparison (REVISED post-Codex audit).
 
 Stage-2 (v26) was trained with GT-derived ORACLE Stage-1 coarse as
 conditioning. At inference, the deployable pipeline uses a SAMPLED
@@ -16,32 +16,28 @@ Discriminates between:
 Design source:
     analyses/2026-05-23_round25_diagnostic_bundle_design.md §D3.
 
+Codex audit fixes (analyses/2026-05-23_codex_round25_p0_implementation_review.md §3):
+  B1: write sampled coarse to ``cond["stage1_coarse"]`` (NOT
+      ``stage1_coarse_norm``) — that is the key the Stage-2 model reads.
+  B2: default Stage-1 cache root to the actual S1-O ckpt cache
+      ``cache/stage1_coarse_v1_objtraj_root0_world_round18_fix``.
+  B4: read 9-D ``obj_traj_root0_world`` directly from the Stage-1 cache
+      .npz (NOT a 6-D fallback that conflates axis-angle with rot6d).
+  text_pool: read pooled CLIP embeddings from the Stage-1 cache
+      (NOT call OpenAI ``encode_text(strings)`` which expects token IDs).
+  Cross-cache norm: Stage-1 sampler output is in Stage-1 cache norm
+      space; Stage-2 v26 expects v26's own cache norm space. Denorm
+      with Stage-1 stats then re-norm with Stage-2 stats before
+      writing to ``cond["stage1_coarse"]``.
+
 Usage:
     conda run -n piano python scripts/stage_b_generator/round25_d3_oracle_vs_sampled.py \
         --config configs/training/anchordiff_v26_FULL_DATA_local.yaml \
         --ckpt   runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt \
         --stage1-ckpt runs/training/stage1_s1o_round20_seed42/final.pt \
+        --stage1-cache-root cache/stage1_coarse_v1_objtraj_root0_world_round18_fix \
         --selection-json analyses/round25_multimodal_eval_subset.json \
         --output analyses/round25_d3_oracle_vs_sampled.json
-
-Output:
-    {output}.json + sibling .md report.
-
-Key metric per clip:
-    - anchor_pose_error_oracle_cm  : v26 sampled with GT-derived
-                                      Stage-1 coarse (training-time
-                                      condition)
-    - anchor_pose_error_sampled_cm : v26 sampled with Stage-1-sampler
-                                      output (deployment-time condition)
-    - gap_cm                        : sampled − oracle. Positive = worse
-                                      under sampled Stage-1.
-
-Decision rule:
-    | mean(gap_cm) | reading                                              |
-    |--------------|------------------------------------------------------|
-    | ≈ 0          | Stage-1 sampler is fine; not the bottleneck          |
-    | > 5 cm       | Stage-1 sampler is the limit; Tier A 23→31D illusory |
-    | < -2 cm      | Sampled better than oracle (unexpected, investigate) |
 """
 from __future__ import annotations
 
@@ -72,25 +68,55 @@ from round25_d2_diversity_diagnostic import (  # noqa: E402
 )
 
 from piano.data.dataset import collate_hoi  # noqa: E402
-from piano.data.stage1_coarse_oracle import (  # noqa: E402
-    extract_coarse_v1_batched,
-    load_stage1_coarse_norm,
-)
 from piano.utils.clip_utils import load_clip_text_encoder  # noqa: E402
 
 
-def _stage1_init_pose_from_motion(motion_135: torch.Tensor) -> torch.Tensor:
-    """Replicate Stage-1's init_coarse_v1 = coarse_v1[0] convention.
-
-    The Stage-1 trainer + eval use ``init_coarse_v1 = coarse_v1[0]``
-    (frame-0 of the 23-D coarse) as init_pose conditioning. Here we
-    compute this from GT motion to mirror what the Stage-1 sampler
-    would see in deployment.
-    """
-    raise NotImplementedError(
-        "_stage1_init_pose_from_motion: see inline call site; we compute "
-        "init via extract_coarse_v1_batched(motion[:, :1], ...).squeeze(1)"
-    )
+def _load_stage1_cache(cache_root: Path, split: str = "val") -> dict[str, Any]:
+    """Load Stage-1 cache: manifest + norm + CLIP pooled embeddings."""
+    manifest = [
+        json.loads(line) for line in
+        (cache_root / f"manifest_{split}.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    norm = json.loads((cache_root / "normalization_train.json").read_text("utf-8"))
+    g = norm["global"]
+    # Stage-1 23-D coarse stats (legacy schema, still present in round18_fix
+    # cache for back-compat with eval_stage1_coarse_prior.py:601-602).
+    s1_mean = np.asarray(g["mean"], dtype=np.float32)
+    s1_std = np.asarray(g["std_clamped"], dtype=np.float32)
+    # Stage-1 obj_traj_root0_world (9-D) stats — new-schema nested block,
+    # per eval_stage1_coarse_prior.py:603-617.
+    obj_block = g.get("obj_traj_root0_world", None)
+    if obj_block is None:
+        obj_block = g.get("obj_traj_canonical", None)
+    if obj_block is not None:
+        obj_mean = np.asarray(obj_block["mean"], dtype=np.float32)
+        obj_std = np.asarray(obj_block["std_clamped"], dtype=np.float32)
+    else:
+        obj_mean = obj_std = None
+    # Pooled CLIP embeddings (text → 512-D), per
+    # eval_stage1_coarse_prior.py:597-599.
+    clip_npz = np.load(cache_root / "text_embeddings_clip_vit_b32.npz",
+                       allow_pickle=True)
+    clip_emb = clip_npz["embeddings"]
+    text_index = json.loads(
+        (cache_root / "text_embeddings_index.json").read_text("utf-8"),
+    )["index"]
+    # Build (subset, seq_id) → manifest index.
+    by_key: dict[tuple[str, str], int] = {}
+    for i, r in enumerate(manifest):
+        by_key[(r["subset"], r["seq_id"])] = i
+    return {
+        "manifest": manifest,
+        "s1_mean": s1_mean,
+        "s1_std": s1_std,
+        "obj_mean": obj_mean,
+        "obj_std": obj_std,
+        "clip_emb": clip_emb,
+        "text_index": text_index,
+        "by_key": by_key,
+        "cache_root": cache_root,
+    }
 
 
 def main() -> int:
@@ -102,8 +128,9 @@ def main() -> int:
     parser.add_argument("--stage1-ckpt", type=Path, required=True,
                         help="Stage-1 S1-O ckpt (Round-20 SHIP).")
     parser.add_argument("--stage1-cache-root", type=Path,
-                        default=Path("cache/stage1_coarse_v1_full"),
-                        help="Used to load Stage-1 normalization_train.json (mean, std).")
+                        default=Path("cache/stage1_coarse_v1_objtraj_root0_world_round18_fix"),
+                        help="Stage-1 cache dir matching the Stage-1 ckpt training. "
+                             "Default = the round18_fix cache used by S1-O.")
     parser.add_argument("--selection-json", type=Path, required=True)
     parser.add_argument("--bucket", default="val", choices=["train", "val"])
     parser.add_argument("--cfg-scale", type=float, default=1.0)
@@ -116,36 +143,38 @@ def main() -> int:
     cfg = OmegaConf.load(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- Load Stage-1 ckpt and its normalizer ----
+    # ---- Load Stage-1 ckpt and cache ----
     print(f"[d3] loading Stage-1 ckpt {args.stage1_ckpt} ...")
     stage1_ckpt = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
     stage1_model, loaded_ema = build_stage1_model(stage1_ckpt, prefer_ema=True)
     stage1_model = stage1_model.to(device).eval()
     print(f"[d3] Stage-1 EMA loaded: {loaded_ema}")
-
-    s1_mean, s1_std = load_stage1_coarse_norm(args.stage1_cache_root)
-    s1_mean_t = torch.from_numpy(s1_mean).to(device)
-    s1_std_t = torch.from_numpy(s1_std).to(device)
-
-    # Stage-1's obj_traj dim (may be 0 for older ckpts).
-    s1_obj_traj_dim = int(stage1_ckpt["config"]["model"]["denoiser"].get("obj_traj_dim", 0))
+    s1_obj_traj_dim = int(
+        stage1_ckpt["config"]["model"]["denoiser"].get("obj_traj_dim", 0),
+    )
     print(f"[d3] Stage-1 obj_traj_dim = {s1_obj_traj_dim}")
 
-    # Stage-1's obj_traj normalization (if obj_traj_dim > 0).
-    s1_obj_mean = s1_obj_std = None
+    print(f"[d3] loading Stage-1 cache from {args.stage1_cache_root} ...")
+    s1_cache = _load_stage1_cache(args.stage1_cache_root, split=args.bucket)
+    s1_mean_t = torch.from_numpy(s1_cache["s1_mean"]).to(device)        # (23,)
+    s1_std_t = torch.from_numpy(s1_cache["s1_std"]).to(device)          # (23,)
     if s1_obj_traj_dim > 0:
-        # Mirror what eval_stage1_coarse_prior loads: per-cache obj_traj
-        # mean/std from normalization_train.json under "obj_traj" key.
-        norm_path = args.stage1_cache_root / "normalization_train.json"
-        norm = json.loads(norm_path.read_text("utf-8"))
-        if "obj_traj" in norm:
-            s1_obj_mean = np.asarray(norm["obj_traj"]["mean"], dtype=np.float32)
-            s1_obj_std = np.asarray(norm["obj_traj"]["std_clamped"], dtype=np.float32)
-        else:
-            print("[d3] WARNING: stage1 obj_traj_dim > 0 but no obj_traj norm "
-                  "in cache; using zero mean / unit std")
-            s1_obj_mean = np.zeros((s1_obj_traj_dim,), dtype=np.float32)
-            s1_obj_std = np.ones((s1_obj_traj_dim,), dtype=np.float32)
+        if s1_cache["obj_mean"] is None:
+            raise SystemExit(
+                "[d3] Stage-1 obj_traj_dim > 0 but cache has no "
+                "global.obj_traj_root0_world (or _canonical) norm block. "
+                f"Check {args.stage1_cache_root}/normalization_train.json"
+            )
+        s1_obj_mean_t = torch.from_numpy(s1_cache["obj_mean"]).to(device)  # (9,)
+        s1_obj_std_t = torch.from_numpy(s1_cache["obj_std"]).to(device)
+    else:
+        s1_obj_mean_t = s1_obj_std_t = None
+
+    # ---- Stage-2 v26 normalizer for stage1_coarse condition ----
+    stage1_norm = _stage1_norm_for_cfg(cfg, device)
+    if stage1_norm is None:
+        raise SystemExit("[d3] v26 config has stage1_coarse_dim=0; nothing to compare")
+    v26_mean_t, v26_std_t = stage1_norm                                # (1, 1, 23)
 
     # ---- Selection ----
     sel_obj = json.loads(args.selection_json.read_text("utf-8"))
@@ -170,7 +199,6 @@ def main() -> int:
         model_name=str(cfg.model.text_encoder.clip_version),
         download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
     )
-    stage1_norm = _stage1_norm_for_cfg(cfg, device)
     model.eval()
 
     plan_keys = [
@@ -184,13 +212,25 @@ def main() -> int:
 
     per_clip: list[dict] = []
     matched_iter = iter(matched)
+    skipped: list[dict] = []
     for batch in loader:
         sel_entry = next(matched_iter)
         subset = str(batch["subset"][0])
         seq_id = str(batch["seq_id"][0])
         text = str(batch["text"][0])
 
-        # ---- Build cond for oracle path (stage1_coarse derived from GT) ----
+        # ---- Stage-1 cache lookup for this clip ----
+        key = (subset, seq_id)
+        if key not in s1_cache["by_key"]:
+            print(f"  [d3 SKIP] {subset}/{seq_id} not in Stage-1 cache manifest")
+            skipped.append({"subset": subset, "seq_id": seq_id,
+                            "reason": "not in Stage-1 cache manifest"})
+            continue
+        idx = s1_cache["by_key"][key]
+        rec = s1_cache["manifest"][idx]
+        npz = np.load(s1_cache["cache_root"] / rec["npz_path"], allow_pickle=False)
+
+        # ---- Build cond_oracle (Stage-2 v26 oracle path, ground truth Stage-1) ----
         cond_oracle, T = _build_cond(
             batch, model, object_encoder, clip_model, z_dims, cfg, device,
             stage1_norm=stage1_norm,
@@ -205,58 +245,79 @@ def main() -> int:
         seq_len = int(batch["seq_len"][0].item())
         valid_T = min(T, seq_len)
 
-        # ---- Sampled Stage-1 path: sample 23-D coarse from Stage-1 model ----
-        # init_coarse for Stage-1 = frame-0 of GT's coarse (oracle init).
-        # This is what Stage-1 eval does: text + init_coarse + (optional obj_traj).
+        # ---- Stage-1 sampling: build cond from Stage-1 cache .npz ----
+        # init_coarse: take frame-0 of the cached coarse (matches
+        # eval_stage1_coarse_prior.py:698-699 convention).
+        init = npz["init_coarse_v1"].astype(np.float32)                  # (23,)
+        init_norm_np = (init - s1_cache["s1_mean"]) / s1_cache["s1_std"]
+        init_norm = torch.from_numpy(init_norm_np).unsqueeze(0).to(device)  # (1, 23)
+
+        # text_pool: read pooled CLIP from Stage-1 cache (NOT call CLIP on strings).
+        text_row = s1_cache["text_index"].get(text, None)
+        if text_row is None:
+            print(f"  [d3 SKIP] {subset}/{seq_id} text not in Stage-1 CLIP index")
+            skipped.append({"subset": subset, "seq_id": seq_id,
+                            "reason": "text not in Stage-1 CLIP index"})
+            continue
+        text_pool_np = s1_cache["clip_emb"][int(text_row)].astype(np.float32)  # (512,)
+        text_pool = torch.from_numpy(text_pool_np).unsqueeze(0).to(device)
+
+        # Stage-1 T may differ from Stage-2 T (cache stores its own seq_len).
+        # Pin to Stage-2's T so the produced (1, T, 23) matches what
+        # cond_oracle["stage1_coarse"] expects.
+        T_for_stage1 = T
+
+        s1_cond: dict[str, torch.Tensor] = {
+            "text_pool": text_pool,
+            "init_coarse": init_norm,
+            "valid_mask": torch.ones(1, T_for_stage1, dtype=torch.bool, device=device),
+        }
+        if s1_obj_traj_dim > 0:
+            # obj_traj_root0_world (9-D = root0-world position 3 + rot6d 6),
+            # NOT obj_com_canonical + obj_rot6d_canonical from the v26 batch.
+            # Read from the Stage-1 cache npz directly.
+            obj_field = None
+            for cand in ("obj_traj_root0_world", "obj_traj_canonical"):
+                if cand in npz.files:
+                    obj_field = cand
+                    break
+            if obj_field is None:
+                print(f"  [d3 SKIP] {subset}/{seq_id} cache has no obj_traj field")
+                skipped.append({"subset": subset, "seq_id": seq_id,
+                                "reason": "cache has no obj_traj_root0_world"})
+                continue
+            obj_raw = npz[obj_field].astype(np.float32)                  # (T_s1, 9)
+            if obj_raw.shape[0] < T_for_stage1:
+                # Pad with last-frame repeat — defensive, shouldn't normally hit
+                pad_len = T_for_stage1 - obj_raw.shape[0]
+                obj_raw = np.concatenate(
+                    [obj_raw, np.tile(obj_raw[-1:], (pad_len, 1))], axis=0,
+                )
+            obj_raw = obj_raw[:T_for_stage1]
+            obj_norm_np = (obj_raw - s1_cache["obj_mean"]) / s1_cache["obj_std"]
+            s1_cond["obj_traj"] = torch.from_numpy(obj_norm_np).unsqueeze(0).to(device)
+
+        torch.manual_seed(args.seed)
         with torch.no_grad():
-            oracle_coarse_full = extract_coarse_v1_batched(
-                gt_motion, rest_offsets,
-            )                                                 # (1, T, 23) raw
-            init_coarse = oracle_coarse_full[:, 0]            # (1, 23)
-            init_coarse_norm = (init_coarse - s1_mean_t) / s1_std_t   # (1, 23)
-
-            text_pool = batch.get("text_pool")
-            if text_pool is None:
-                # Re-encode via clip_model: mirror _build_cond pathway.
-                texts = [str(t) for t in batch["text"]]
-                text_pool = clip_model.encode_text(texts).to(device).float()
-            else:
-                text_pool = text_pool.to(device).float()
-
-            s1_cond: dict[str, torch.Tensor] = {
-                "text_pool": text_pool,
-                "init_coarse": init_coarse_norm,
-                "valid_mask": torch.ones(1, T, dtype=torch.bool, device=device),
-            }
-            if s1_obj_traj_dim > 0:
-                # obj_traj from batch — should be (1, T, 9). Normalize with Stage-1 norm.
-                obj_traj_raw = batch.get("obj_traj")
-                if obj_traj_raw is None:
-                    # Fallback: derive from object_positions + object_rotations + size.
-                    obj_traj_raw = torch.cat(
-                        [batch["object_positions"].to(device),
-                         batch["object_rotations"].to(device)],
-                        dim=-1,
-                    )[:, :T]   # 6-D fallback; only valid if Stage-1 uses 6-D obj
-                else:
-                    obj_traj_raw = obj_traj_raw[:, :T].to(device)
-                obj_mean_t = torch.from_numpy(s1_obj_mean).to(device)
-                obj_std_t = torch.from_numpy(s1_obj_std).to(device)
-                s1_cond["obj_traj"] = (obj_traj_raw.float() - obj_mean_t) / obj_std_t
-
-            torch.manual_seed(args.seed)
             sampled_norm = stage1_model.sample(
-                shape=(1, T, STAGE1_COARSE_DIM), cond=s1_cond,
+                shape=(1, T_for_stage1, STAGE1_COARSE_DIM), cond=s1_cond,
                 cfg_scale=args.cfg_scale_stage1, device=device,
                 inpaint_frame0=True,
-            )                                                  # (1, T, 23) normalized
-            # Build cond_sampled by REPLACING the stage1_coarse_norm of cond_oracle.
-            # cond_oracle["stage1_coarse_norm"] is already normalized in _build_cond.
-            # The sampled output is also in the same normalization (same s1_mean/s1_std).
-            cond_sampled = {k: v for k, v in cond_oracle.items()}
-            cond_sampled["stage1_coarse_norm"] = sampled_norm
+            )                                                            # (1, T, 23) in Stage-1 norm
 
-        # ---- Sample Stage-2 under each path ----
+        # ---- Cross-cache renormalization ----
+        # Stage-1 output is in Stage-1 cache's mean/std space.
+        # Stage-2 v26 expects stage1_coarse_norm in v26's own cache space
+        # (cache/stage1_coarse_v1_full), which has DIFFERENT stats.
+        # Denorm with Stage-1 stats then re-norm with Stage-2 stats.
+        sampled_raw = sampled_norm * s1_std_t.view(1, 1, -1) + s1_mean_t.view(1, 1, -1)
+        sampled_v26_norm = (sampled_raw - v26_mean_t) / v26_std_t       # (1, T, 23)
+
+        # cond_sampled: shallow-copy oracle cond, OVERWRITE stage1_coarse.
+        cond_sampled = {k: v for k, v in cond_oracle.items()}
+        cond_sampled["stage1_coarse"] = sampled_v26_norm
+
+        # ---- Stage-2 sampling under each condition ----
         torch.manual_seed(args.seed)
         with torch.no_grad():
             pred_oracle = model.sample(
@@ -317,11 +378,16 @@ def main() -> int:
         "config": str(args.config),
         "ckpt": str(args.ckpt),
         "stage1_ckpt": str(args.stage1_ckpt),
+        "stage1_cache_root": str(args.stage1_cache_root),
         "selection_json": str(args.selection_json),
         "bucket": args.bucket,
         "cfg_scale_stage2": args.cfg_scale,
         "cfg_scale_stage1": args.cfg_scale_stage1,
         "seed": args.seed,
+        "n_matched": len(matched),
+        "n_processed": len(per_clip),
+        "n_skipped": len(skipped),
+        "skipped": skipped,
         "overall": _agg(per_clip),
         "by_mode_category": {k: _agg(v) for k, v in by_category.items()},
         "by_subset": {k: _agg(v) for k, v in by_subset.items()},
@@ -339,7 +405,8 @@ def main() -> int:
     lines.append("# Round-25 D3 oracle vs sampled Stage-1 diagnostic\n")
     lines.append(f"**Stage-2 ckpt:** `{args.ckpt}`")
     lines.append(f"**Stage-1 ckpt:** `{args.stage1_ckpt}`")
-    lines.append(f"**Selection:** `{args.selection_json}` ({len(per_clip)} clips)")
+    lines.append(f"**Stage-1 cache:** `{args.stage1_cache_root}`")
+    lines.append(f"**Selection:** `{args.selection_json}` ({len(per_clip)}/{len(matched)} clips processed; {len(skipped)} skipped)")
     lines.append(f"**cfg_scale (stage1 / stage2):** {args.cfg_scale_stage1} / {args.cfg_scale}    **seed:** {args.seed}\n")
     lines.append("## Decision rule\n")
     lines.append("| mean(gap_cm) | reading |")
@@ -370,6 +437,10 @@ def main() -> int:
             f"| {cat} | {agg['n']} | {agg['oracle_mean']:.2f} | "
             f"{agg['sampled_mean']:.2f} | {agg['gap_mean']:+.2f} |"
         )
+    if skipped:
+        lines.append(f"\n## Skipped clips ({len(skipped)})\n")
+        for s in skipped[:20]:
+            lines.append(f"- {s['subset']}/{s['seq_id']}: {s['reason']}")
     md.write_text("\n".join(lines), encoding="utf-8")
     print(f"[d3] wrote Markdown to {md}")
     return 0
