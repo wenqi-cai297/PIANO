@@ -42,6 +42,27 @@ S1_CKPT="runs/training/stage1_s1o_round20_seed42/final.pt"
 S1_CACHE="cache/stage1_coarse_v1_objtraj_root0_world_round18_fix"
 
 SINGLE_GPU="${ROUND25_SINGLE_GPU:-0}"
+# Resume support: set ROUND25_RESUME_FROM to skip stages already done.
+#   ROUND25_RESUME_FROM=prep_b  → skip PREP-A (d1 propose)
+#   ROUND25_RESUME_FROM=phase_a → skip PREP-A + PREP-B
+#   ROUND25_RESUME_FROM=phase_b → skip PREP-A + PREP-B + PHASE-A
+#   ROUND25_RESUME_FROM=phase_c → skip everything before D5 (saves D4 retraining)
+#   ROUND25_RESUME_FROM=phase_d → skip everything before D5-V2
+RESUME_FROM="${ROUND25_RESUME_FROM:-}"
+
+_should_skip() {
+    # _should_skip <current_stage_index>
+    # Returns 0 (skip) if RESUME_FROM is set and points later than current.
+    local stages=(prep_a prep_b phase_a phase_b phase_c phase_d)
+    [[ -z "${RESUME_FROM}" ]] && return 1
+    local target_idx=-1 current_idx=-1 i
+    for ((i=0; i<${#stages[@]}; i++)); do
+        [[ "${stages[i]}" == "$1" ]] && current_idx=$i
+        [[ "${stages[i]}" == "${RESUME_FROM}" ]] && target_idx=$i
+    done
+    [[ $target_idx -lt 0 ]] && { echo "WARN: unknown ROUND25_RESUME_FROM=${RESUME_FROM}"; return 1; }
+    [[ $current_idx -lt $target_idx ]]
+}
 
 # ---------- preflight ----------
 for F in "${V26_CFG_LOCAL}" "${V26_CKPT}" "${S1_CKPT}"; do
@@ -96,40 +117,48 @@ run_step_bg() {
 # ============================================================
 # PREP-A: D1 propose val + train (sequential)
 # ============================================================
-run_step "d1_propose_val" \
-    conda run --no-capture-output -n piano python -u \
-        scripts/stage_b_generator/round25_d1_propose_multimodal_candidates.py \
-        --config "${V26_CFG_LOCAL}" \
-        --output analyses/round25_multimodal_candidates_val.json \
-        --bucket val --top-k 250 --min-confidence 0.5
+if _should_skip prep_a; then
+    echo "[SKIP] PREP-A (ROUND25_RESUME_FROM=${RESUME_FROM})"
+else
+    run_step "d1_propose_val" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round25_d1_propose_multimodal_candidates.py \
+            --config "${V26_CFG_LOCAL}" \
+            --output analyses/round25_multimodal_candidates_val.json \
+            --bucket val --top-k 250 --min-confidence 0.5
 
-run_step "d1_propose_train" \
-    conda run --no-capture-output -n piano python -u \
-        scripts/stage_b_generator/round25_d1_propose_multimodal_candidates.py \
-        --config "${V26_CFG_LOCAL}" \
-        --output analyses/round25_multimodal_candidates_train.json \
-        --bucket train --top-k 400 --min-confidence 0.5
+    run_step "d1_propose_train" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round25_d1_propose_multimodal_candidates.py \
+            --config "${V26_CFG_LOCAL}" \
+            --output analyses/round25_multimodal_candidates_train.json \
+            --bucket train --top-k 400 --min-confidence 0.5
+fi
 
 # ============================================================
 # PREP-B: D1 curate + D4 indices (sequential, fast)
 # ============================================================
-run_step "d1_curate" \
-    conda run --no-capture-output -n piano python -u \
-        scripts/stage_b_generator/round25_curate_subsets.py
+if _should_skip prep_b; then
+    echo "[SKIP] PREP-B (ROUND25_RESUME_FROM=${RESUME_FROM})"
+else
+    run_step "d1_curate" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round25_curate_subsets.py
 
-run_step "d4_build_indices_8" \
-    conda run --no-capture-output -n piano python -u \
-        scripts/stage_b_generator/round25_d4_build_subset_indices.py \
-        --config "${V26_CFG_LOCAL}" \
-        --train-selection-json analyses/round25_d4_train_selection.json \
-        --n-clips 8 --output analyses/round25_d4_indices_8.json
+    run_step "d4_build_indices_8" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round25_d4_build_subset_indices.py \
+            --config "${V26_CFG_LOCAL}" \
+            --train-selection-json analyses/round25_d4_train_selection.json \
+            --n-clips 8 --output analyses/round25_d4_indices_8.json
 
-run_step "d4_build_indices_16" \
-    conda run --no-capture-output -n piano python -u \
-        scripts/stage_b_generator/round25_d4_build_subset_indices.py \
-        --config "${V26_CFG_LOCAL}" \
-        --train-selection-json analyses/round25_d4_train_selection.json \
-        --n-clips 16 --output analyses/round25_d4_indices_16.json
+    run_step "d4_build_indices_16" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round25_d4_build_subset_indices.py \
+            --config "${V26_CFG_LOCAL}" \
+            --train-selection-json analyses/round25_d4_train_selection.json \
+            --n-clips 16 --output analyses/round25_d4_indices_16.json
+fi
 
 if [[ "${SINGLE_GPU}" == "1" ]]; then
     echo
@@ -168,6 +197,9 @@ else
     # DUAL-GPU MODE: 4 parallel phases
     # ============================================================
 
+    if _should_skip phase_a; then
+        echo "[SKIP] PHASE-A (ROUND25_RESUME_FROM=${RESUME_FROM})"
+    else
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PHASE-A: D2 (cuda:0) || D3 (cuda:1)"
@@ -193,16 +225,28 @@ else
 
     echo "    PID D2=${PID_D2}  D3=${PID_D3}"
     echo "    follow logs: tail -f ${LOG_DIR}/d2_diversity.log ${LOG_DIR}/d3_oracle_vs_sampled.log"
-    wait $PID_D2 $PID_D3
-    echo "[$(date '+%F %T')] PHASE-A DONE"
+    EX_D2=0; EX_D3=0
+    wait $PID_D2 || EX_D2=$?
+    wait $PID_D3 || EX_D3=$?
+    if [[ $EX_D2 -ne 0 || $EX_D3 -ne 0 ]]; then
+        echo "WARN: PHASE-A failures (D2=${EX_D2} D3=${EX_D3}); continuing anyway."
+    fi
+    echo "[$(date '+%F %T')] PHASE-A DONE (D2=${EX_D2} D3=${EX_D3})"
+    fi  # end skip-guard phase_a
 
+    if _should_skip phase_b; then
+        echo "[SKIP] PHASE-B (ROUND25_RESUME_FROM=${RESUME_FROM})"
+    else
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PHASE-B: D4-8 (cuda:0) || D4-16 (cuda:1)"
     echo "================================================================"
+    # PORT FIX: parallel accelerate launches default to TCP port 29500
+    # for rendezvous → second one EADDRINUSE-crashes. Give each its own port.
     run_step_bg "d4_overfit8" 0 \
         conda run --no-capture-output -n piano accelerate launch \
             --num_processes 1 --mixed_precision bf16 \
+            --main_process_port 29500 \
             src/piano/training/train_anchordiff.py \
             --config configs/training/anchordiff_v26_d4_overfit8_local.yaml &
     PID_D4_8=$!
@@ -210,14 +254,26 @@ else
     run_step_bg "d4_overfit16" 1 \
         conda run --no-capture-output -n piano accelerate launch \
             --num_processes 1 --mixed_precision bf16 \
+            --main_process_port 29501 \
             src/piano/training/train_anchordiff.py \
             --config configs/training/anchordiff_v26_d4_overfit16_local.yaml &
     PID_D4_16=$!
 
     echo "    PID D4-8=${PID_D4_8}  D4-16=${PID_D4_16}"
-    wait $PID_D4_8 $PID_D4_16
-    echo "[$(date '+%F %T')] PHASE-B DONE"
+    # Robust wait: capture individual exit codes, do NOT abort the
+    # pipeline if a single stage failed (set -e + plain `wait` would).
+    EX_D4_8=0; EX_D4_16=0
+    wait $PID_D4_8 || EX_D4_8=$?
+    wait $PID_D4_16 || EX_D4_16=$?
+    if [[ $EX_D4_8 -ne 0 || $EX_D4_16 -ne 0 ]]; then
+        echo "WARN: PHASE-B failures (D4-8=${EX_D4_8} D4-16=${EX_D4_16}); continuing to PHASE-C anyway."
+    fi
+    echo "[$(date '+%F %T')] PHASE-B DONE (D4-8=${EX_D4_8} D4-16=${EX_D4_16})"
+    fi  # end skip-guard phase_b
 
+    if _should_skip phase_c; then
+        echo "[SKIP] PHASE-C (ROUND25_RESUME_FROM=${RESUME_FROM})"
+    else
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PHASE-C: D5-V0 (cuda:0) || D5-V1 (cuda:1)"
@@ -225,6 +281,7 @@ else
     run_step_bg "d5_v0_baseline" 0 \
         conda run --no-capture-output -n piano accelerate launch \
             --num_processes 1 --mixed_precision bf16 \
+            --main_process_port 29500 \
             src/piano/training/train_anchordiff.py \
             --config configs/training/anchordiff_v26_d5_v0_baseline_local.yaml &
     PID_V0=$!
@@ -232,26 +289,42 @@ else
     run_step_bg "d5_v1_hand2x_foot2x" 1 \
         conda run --no-capture-output -n piano accelerate launch \
             --num_processes 1 --mixed_precision bf16 \
+            --main_process_port 29501 \
             src/piano/training/train_anchordiff.py \
             --config configs/training/anchordiff_v26_d5_v1_hand2x_foot2x_local.yaml &
     PID_V1=$!
 
     echo "    PID V0=${PID_V0}  V1=${PID_V1}"
-    wait $PID_V0 $PID_V1
-    echo "[$(date '+%F %T')] PHASE-C DONE"
+    EX_V0=0; EX_V1=0
+    wait $PID_V0 || EX_V0=$?
+    wait $PID_V1 || EX_V1=$?
+    if [[ $EX_V0 -ne 0 || $EX_V1 -ne 0 ]]; then
+        echo "WARN: PHASE-C failures (V0=${EX_V0} V1=${EX_V1}); continuing to PHASE-D anyway."
+    fi
+    echo "[$(date '+%F %T')] PHASE-C DONE (V0=${EX_V0} V1=${EX_V1})"
+    fi  # end skip-guard phase_c
 
+    if _should_skip phase_d; then
+        echo "[SKIP] PHASE-D (ROUND25_RESUME_FROM=${RESUME_FROM})"
+    else
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PHASE-D: D5-V2 (cuda:0) solo"
     echo "================================================================"
-    # Could be split V2 (cuda:0) || (next thing on cuda:1) but there's
-    # no D5-V3 — V2 runs solo. Foreground tee here since nothing else
-    # is on cuda:1 to occupy the terminal.
+    # V2 solo on cuda:0; default port 29500 is fine since nothing else
+    # is running. Foreground tee here.
+    EX_V2=0
     run_step "d5_v2_hand5x_foot5x" \
         conda run --no-capture-output -n piano accelerate launch \
             --num_processes 1 --mixed_precision bf16 \
+            --main_process_port 29500 \
             src/piano/training/train_anchordiff.py \
-            --config configs/training/anchordiff_v26_d5_v2_hand5x_foot5x_local.yaml
+            --config configs/training/anchordiff_v26_d5_v2_hand5x_foot5x_local.yaml \
+        || EX_V2=$?
+    if [[ $EX_V2 -ne 0 ]]; then
+        echo "WARN: PHASE-D failed (V2=${EX_V2})."
+    fi
+    fi  # end skip-guard phase_d
 fi
 
 echo
