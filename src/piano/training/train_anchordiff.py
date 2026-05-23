@@ -271,6 +271,13 @@ def build_anchordiff_step_fn(
     object_traj_dim: int = 9,
     fk_consistency_weight: float = 0.0,
     pos_loss_weight: float = 0.0,
+    # Round-25 D5: per-joint weighting of the dense FK position loss.
+    # Default 1.0 = back-compat (uniform 22-joint MSE). Set > 1 to
+    # emphasize wrist (joints 20/21) and ankle (joints 10/11)
+    # endpoints. Used to test H2 (loss imbalance) — see
+    # analyses/2026-05-23_round25_diagnostic_bundle_design.md §D5.
+    hand_endpoint_weight: float = 1.0,
+    foot_endpoint_weight: float = 1.0,
     cond_motion_keyframe_weight: float = 0.0,
     diffusion_unobserved_only: bool = False,
     use_interaction_plan: bool = False,
@@ -904,7 +911,24 @@ def build_anchordiff_step_fn(
         ):
             joints_gt = joints.float()                                    # (B, T, 22, 3)
             err = (jpos_pred.float() - joints_gt).pow(2).sum(-1)          # (B, T, 22)
-            denom = (seq_mask.sum() * 22).clamp_min(1.0)
+            # Round-25 D5: optional per-joint weighting for hand+foot
+            # endpoints. Default 1.0 each → joint_weights is all-ones
+            # and denom = seq_mask.sum() * 22 (back-compat). When
+            # hand_endpoint_weight or foot_endpoint_weight > 1, the
+            # wrist (20, 21) / ankle (10, 11) joints get amplified
+            # squared-error before averaging, and the denom uses the
+            # weight-sum so the loss scale stays comparable.
+            if hand_endpoint_weight != 1.0 or foot_endpoint_weight != 1.0:
+                jw = torch.ones(22, device=err.device, dtype=err.dtype)
+                jw[20] = hand_endpoint_weight
+                jw[21] = hand_endpoint_weight
+                jw[10] = foot_endpoint_weight
+                jw[11] = foot_endpoint_weight
+                err = err * jw                                            # (B, T, 22)
+                weight_sum = jw.sum()
+            else:
+                weight_sum = err.new_tensor(22.0)
+            denom = (seq_mask.sum() * weight_sum).clamp_min(1.0)
             loss_pos_full = (err * seq_mask.unsqueeze(-1).float()).sum() / denom
             # v9_4 §8.2: per-segment monitor (obs vs unobs frames). When
             # cond_motion_output_skip is on, observed-frame pos_full should
@@ -1922,12 +1946,17 @@ def main() -> None:
     )
     fk_consistency_weight = float(cfg.loss.get("fk_consistency_weight", 0.0))
     pos_loss_weight = float(cfg.loss.get("pos_loss_weight", 0.0))
+    # Round-25 D5: per-joint endpoint weighting for the FK pos loss.
+    hand_endpoint_weight = float(cfg.loss.get("hand_endpoint_weight", 1.0))
+    foot_endpoint_weight = float(cfg.loss.get("foot_endpoint_weight", 1.0))
     accelerator.print(
         "Motion representation: "
         f"{motion_representation} "
         f"(world_joint_velocity_weight={world_joint_velocity_weight} "
         f"fk_consistency_weight={fk_consistency_weight} "
-        f"pos_loss_weight={pos_loss_weight})",
+        f"pos_loss_weight={pos_loss_weight} "
+        f"hand_endpoint_weight={hand_endpoint_weight} "
+        f"foot_endpoint_weight={foot_endpoint_weight})",
     )
     # v10 FK-loss guardrail (per claude_code_v10_plan_tokens_next_steps.md §3.3):
     # confirm dense FK L_pos branch is wired for the active representation.
@@ -2195,6 +2224,8 @@ def main() -> None:
         object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
         fk_consistency_weight=fk_consistency_weight,
         pos_loss_weight=pos_loss_weight,
+        hand_endpoint_weight=hand_endpoint_weight,
+        foot_endpoint_weight=foot_endpoint_weight,
         cond_motion_keyframe_weight=cond_motion_keyframe_weight,
         diffusion_unobserved_only=diffusion_unobserved_only,
         use_interaction_plan=use_interaction_plan,
