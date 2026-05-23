@@ -131,7 +131,10 @@ data:
 training:
   init_checkpoint: "runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt"
   batch_size: 16
-  num_epochs: 40
+  # 80 ep ≈ 10,500 grad steps (matches R23's training length). Best-val
+  # checkpoint by `val_best_key` + periodic epoch_N.pt give post-hoc
+  # ckpt-selection safety against overfitting late in the schedule.
+  num_epochs: 80
   num_workers: 4
   seed: 42
   # Normalized Coarse-v1 noise is a conservative first robustness step.
@@ -220,6 +223,7 @@ logging:
   project: "piano"
   run_name: "stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA"
   log_every_n_steps: 50
-  save_every_n_epochs: 5
+  # 80 ep / save_every_n_epochs=10 → 8 epoch_N.pt × ~600 MB = ~5 GB (server-only).
+  save_every_n_epochs: 10
 
 output_dir: "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA"

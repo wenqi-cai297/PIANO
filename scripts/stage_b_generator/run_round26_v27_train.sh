@@ -7,10 +7,10 @@
 #
 # Wall-clock budget on 2× A6000 (DDP):
 #   PREP    ~1 min   (translate config paths)
-#   TRAIN   ~1.5–2 h (40 epochs, fine-tune from R23 ckpt, DDP 2-GPU,
+#   TRAIN   ~3–4 h   (80 epochs, fine-tune from R23 ckpt, DDP 2-GPU,
 #                     effective bs = 16 × 2 × 4 = 128)
-#   EVAL    ~50 min  (D2 + D3 on best_val.pt cuda:0 || best_val final.pt cuda:1)
-#   TOTAL   ~3 h
+#   EVAL    ~50 min  (D2 + D3 on best_val.pt cuda:0 || final.pt cuda:1)
+#   TOTAL   ~4.5–5 h
 #
 # Prerequisites on the Linux server:
 #   1. git pull (must include the Round-26 commits)
