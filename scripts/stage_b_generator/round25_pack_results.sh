@@ -41,7 +41,9 @@ for f in \
     analyses/round25_d2_diversity_stats.md \
     analyses/round25_d3_oracle_vs_sampled.json \
     analyses/round25_d3_oracle_vs_sampled.md \
-    analyses/round25_curation_summary.md ; do
+    analyses/round25_curation_summary.md \
+    analyses/round25_p11_stage1_sampler_audit.json \
+    analyses/round25_p11_stage1_sampler_audit.md ; do
     [[ -e "$f" ]] && ITEMS+=("$f") || echo "  [skip] missing: $f"
 done
 
@@ -56,7 +58,10 @@ for run_dir in \
     runs/training/stageB_anchordiff_v26_d4_overfit16 \
     runs/training/stageB_anchordiff_v26_d5_v0_baseline \
     runs/training/stageB_anchordiff_v26_d5_v1_hand2x_foot2x \
-    runs/training/stageB_anchordiff_v26_d5_v2_hand5x_foot5x ; do
+    runs/training/stageB_anchordiff_v26_d5_v2_hand5x_foot5x \
+    runs/training/stageB_anchordiff_v26_d5_v0_baseline_30ep \
+    runs/training/stageB_anchordiff_v26_d5_v1_hand2x_foot2x_30ep \
+    runs/training/stageB_anchordiff_v26_d5_v2_hand5x_foot5x_30ep ; do
     if [[ -d "$run_dir" ]]; then
         # Add metrics.jsonl + any non-pt files (config snapshot, train log
         # if separately written). Exclude wandb/ and *.pt.

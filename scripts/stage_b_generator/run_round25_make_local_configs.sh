@@ -31,6 +31,11 @@ CONFIGS=(
     "anchordiff_v26_d5_v0_baseline"
     "anchordiff_v26_d5_v1_hand2x_foot2x"
     "anchordiff_v26_d5_v2_hand5x_foot5x"
+    # Round-25 P1.2 — D5 30-epoch redo variants (5-ep originals had
+    # only 40 grad steps, too short to test H2).
+    "anchordiff_v26_d5_v0_baseline_30ep"
+    "anchordiff_v26_d5_v1_hand2x_foot2x_30ep"
+    "anchordiff_v26_d5_v2_hand5x_foot5x_30ep"
 )
 
 for NAME in "${CONFIGS[@]}"; do
