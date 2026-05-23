@@ -10,6 +10,8 @@ checkpoints/
 *.pt
 *.pth
 *.tar
+*.tar.gz
+*.tgz
 wandb/
 .DS_Store
 .claude/

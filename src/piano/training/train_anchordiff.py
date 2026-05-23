@@ -48,6 +48,7 @@ from piano.models.motion_anchordiff import (
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
     AnchorConsistencyConfig,
+    PART_TO_JOINT,
     anchor_consistency_loss,
     anchor_consistency_loss_world_joints,
     lift_object_local_to_world,
@@ -278,6 +279,12 @@ def build_anchordiff_step_fn(
     # analyses/2026-05-23_round25_diagnostic_bundle_design.md §D5.
     hand_endpoint_weight: float = 1.0,
     foot_endpoint_weight: float = 1.0,
+    # Round-26: sparse fine-limb supervision at active contact/anchor parts.
+    # Unlike dense FK L_pos, this is not averaged over all joints and all
+    # frames; it directly matches the D2/D3 endpoint-error diagnostic.
+    anchor_joint_pos_weight: float = 0.0,
+    anchor_joint_vel_weight: float = 0.0,
+    anchor_joint_part_weights: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0),
     cond_motion_keyframe_weight: float = 0.0,
     diffusion_unobserved_only: bool = False,
     use_interaction_plan: bool = False,
@@ -340,6 +347,7 @@ def build_anchordiff_step_fn(
     stage1_coarse_dim: int = 0,
     stage1_coarse_norm_mean: np.ndarray | None = None,
     stage1_coarse_norm_std: np.ndarray | None = None,
+    stage1_coarse_noise_std: float = 0.0,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -369,6 +377,17 @@ def build_anchordiff_step_fn(
     else:
         stage1_coarse_mean_t = None
         stage1_coarse_std_t = None
+    if len(anchor_joint_part_weights) != len(PART_TO_JOINT):
+        raise ValueError(
+            "anchor_joint_part_weights must have 5 entries "
+            "(left_hand, right_hand, left_foot, right_foot, pelvis)"
+        )
+    anchor_joint_part_weights_t = torch.tensor(
+        anchor_joint_part_weights, device=device, dtype=torch.float32,
+    ).view(1, 1, -1)
+    anchor_joint_part_to_joint_t = torch.tensor(
+        PART_TO_JOINT, device=device, dtype=torch.long,
+    )
 
     class _WeightCache:
         def __init__(self) -> None:
@@ -594,6 +613,10 @@ def build_anchordiff_step_fn(
                     f"stage1_coarse_dim={stage1_coarse_dim} from config."
                 )
             coarse_v1_norm = (coarse_v1_raw - stage1_coarse_mean_t) / stage1_coarse_std_t
+            if _model.training and stage1_coarse_noise_std > 0.0:
+                coarse_v1_norm = coarse_v1_norm + (
+                    torch.randn_like(coarse_v1_norm) * float(stage1_coarse_noise_std)
+                )
             cond["stage1_coarse"] = coarse_v1_norm
 
         # --- v10 InteractionPlan: thread the compiled plan through cond ---
@@ -943,6 +966,59 @@ def build_anchordiff_step_fn(
                     loss_pos_full_obs_monitor = err_per_frame[obs_eff_p].mean()
                 if unobs_eff_p.any():
                     loss_pos_full_unobs_monitor = err_per_frame[unobs_eff_p].mean()
+
+        # Sparse active-part endpoint supervision (Round-26 strategy fix).
+        # Dense FK L_pos averages over all joints and frames, which lets
+        # hands/feet stay poor while the global loss looks acceptable. This
+        # term uses the same 5 body parts as the interaction/contact labels
+        # and supervises only active contact/anchor slots against GT joints.
+        loss_anchor_joint_pos = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_anchor_joint_vel = torch.zeros((), device=device, dtype=motion.dtype)
+        anchor_joint_active_ratio = torch.zeros((), device=device)
+        if (
+            motion_representation in {
+                "smpl_pose_135",
+                "smpl_pose_135_keyframed",
+                "smpl_pose_135_condmdi",
+                "smpl_pose_135_plan",
+            }
+            and (anchor_joint_pos_weight > 0.0 or anchor_joint_vel_weight > 0.0)
+        ):
+            pred_part = jpos_pred.float().index_select(
+                2, anchor_joint_part_to_joint_t,
+            )                                                           # (B, T, P, 3)
+            gt_part = joints.float().index_select(
+                2, anchor_joint_part_to_joint_t,
+            )
+            active_part = (
+                (contact_state >= anchor_cfg.contact_threshold)
+                & seq_mask.bool().unsqueeze(-1)
+            )                                                           # (B, T, P)
+            active_f = active_part.float()
+            part_w = anchor_joint_part_weights_t.to(
+                device=device, dtype=pred_part.dtype,
+            )
+            weighted_active = active_f * part_w
+            anchor_joint_active_ratio = (
+                active_f.sum()
+                / (seq_mask.float().sum() * len(PART_TO_JOINT)).clamp_min(1.0)
+            )
+            if anchor_joint_pos_weight > 0.0:
+                err_p = (pred_part - gt_part).pow(2).sum(-1)             # (B, T, P)
+                loss_anchor_joint_pos = (
+                    (err_p * weighted_active).sum()
+                    / weighted_active.sum().clamp_min(1.0)
+                )
+            if anchor_joint_vel_weight > 0.0 and T >= 2:
+                vel_pred_part = pred_part[:, 1:] - pred_part[:, :-1]
+                vel_gt_part = gt_part[:, 1:] - gt_part[:, :-1]
+                active_pair = active_part[:, 1:] & active_part[:, :-1]
+                weighted_pair = active_pair.float() * part_w
+                err_vp = (vel_pred_part - vel_gt_part).pow(2).sum(-1)
+                loss_anchor_joint_vel = (
+                    (err_vp * weighted_pair).sum()
+                    / weighted_pair.sum().clamp_min(1.0)
+                )
 
         # --- v10 plan-aware losses ---
         # Active only when the trainer was built with use_interaction_plan
@@ -1452,6 +1528,8 @@ def build_anchordiff_step_fn(
             + geom["loss_geometric"]
             + fk_consistency_weight * loss_fk
             + pos_loss_weight * loss_pos_full
+            + anchor_joint_pos_weight * loss_anchor_joint_pos
+            + anchor_joint_vel_weight * loss_anchor_joint_vel
             + plan_anchor_weight * loss_plan_anchor
             + plan_segment_weight * loss_plan_segment
             + plan_transition_vel_weight * loss_plan_trans_vel
@@ -1484,6 +1562,15 @@ def build_anchordiff_step_fn(
             "loss_pos_full": loss_pos_full.detach(),
             "loss_pos_full_obs": loss_pos_full_obs_monitor.detach(),
             "loss_pos_full_unobs": loss_pos_full_unobs_monitor.detach(),
+            "loss_anchor_joint_pos": loss_anchor_joint_pos.detach(),
+            "loss_anchor_joint_vel": loss_anchor_joint_vel.detach(),
+            "weighted_anchor_joint_pos": (
+                anchor_joint_pos_weight * loss_anchor_joint_pos
+            ).detach(),
+            "weighted_anchor_joint_vel": (
+                anchor_joint_vel_weight * loss_anchor_joint_vel
+            ).detach(),
+            "anchor_joint_active_ratio": anchor_joint_active_ratio.detach(),
             "loss_plan_anchor": loss_plan_anchor.detach(),
             "loss_plan_segment": loss_plan_segment.detach(),
             "loss_plan_trans_vel": loss_plan_trans_vel.detach(),
@@ -1523,6 +1610,8 @@ def build_anchordiff_step_fn(
             "_raw_mse_x0": mse,
             "_raw_anchor": anchor,
             "_raw_loss_pos_full": loss_pos_full,
+            "_raw_loss_anchor_joint_pos": loss_anchor_joint_pos,
+            "_raw_loss_anchor_joint_vel": loss_anchor_joint_vel,
             "_raw_loss_plan_anchor": loss_plan_anchor,
             "_raw_loss_stable_root_vel": loss_stable_root_vel,
             "_raw_loss_stable_local_vel_cm": loss_stable_local_vel_cm,
@@ -1949,6 +2038,20 @@ def main() -> None:
     # Round-25 D5: per-joint endpoint weighting for the FK pos loss.
     hand_endpoint_weight = float(cfg.loss.get("hand_endpoint_weight", 1.0))
     foot_endpoint_weight = float(cfg.loss.get("foot_endpoint_weight", 1.0))
+    anchor_joint_pos_weight = float(cfg.loss.get("anchor_joint_pos_weight", 0.0))
+    anchor_joint_vel_weight = float(cfg.loss.get("anchor_joint_vel_weight", 0.0))
+    anchor_joint_part_weights = tuple(
+        float(v)
+        for v in cfg.loss.get(
+            "anchor_joint_part_weights",
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+        )
+    )
+    if len(anchor_joint_part_weights) != 5:
+        raise ValueError(
+            "loss.anchor_joint_part_weights must have 5 entries "
+            "(left_hand, right_hand, left_foot, right_foot, pelvis)"
+        )
     accelerator.print(
         "Motion representation: "
         f"{motion_representation} "
@@ -1956,7 +2059,9 @@ def main() -> None:
         f"fk_consistency_weight={fk_consistency_weight} "
         f"pos_loss_weight={pos_loss_weight} "
         f"hand_endpoint_weight={hand_endpoint_weight} "
-        f"foot_endpoint_weight={foot_endpoint_weight})",
+        f"foot_endpoint_weight={foot_endpoint_weight} "
+        f"anchor_joint_pos_weight={anchor_joint_pos_weight} "
+        f"anchor_joint_vel_weight={anchor_joint_vel_weight})",
     )
     # v10 FK-loss guardrail (per claude_code_v10_plan_tokens_next_steps.md §3.3):
     # confirm dense FK L_pos branch is wired for the active representation.
@@ -1976,6 +2081,13 @@ def main() -> None:
         f"[AnchorDiff] dense FK L_pos enabled for {motion_representation}: "
         f"{_fk_pos_enabled} (weight={pos_loss_weight})"
     )
+    if (
+        anchor_joint_pos_weight > 0.0 or anchor_joint_vel_weight > 0.0
+    ) and motion_representation not in _fk_pos_active_reps:
+        raise ValueError(
+            "anchor_joint_* losses require an FK-backed SMPL representation "
+            f"(got {motion_representation!r})"
+        )
     if motion_representation == "smpl_pose_135_plan" and pos_loss_weight > 0.0:
         assert _fk_pos_enabled, (
             "smpl_pose_135_plan with pos_loss_weight>0 must have dense FK L_pos branch enabled"
@@ -2061,7 +2173,7 @@ def main() -> None:
         accelerator.print(
             f"FeatureWeightState DYNAMIC mode: update every "
             f"{feature_weight_state.update_every_epochs} epochs "
-            f"(β={feature_weight_state.ema_beta}, α={feature_weight_state.residual_alpha})"
+            f"(beta={feature_weight_state.ema_beta}, alpha={feature_weight_state.residual_alpha})"
         )
     else:
         feature_weight_state = FeatureWeightState.static_from_config(static_w_cfg)
@@ -2144,6 +2256,9 @@ def main() -> None:
 
     # Round-22: Stage-1 Coarse-v1 oracle condition wiring.
     stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
+    stage1_coarse_noise_std = float(
+        cfg.training.get("stage1_coarse_noise_std", 0.0)
+    )
     if stage1_coarse_dim > 0:
         s1_cache_root = cfg.data.get("stage1_coarse_cache_root", None)
         if s1_cache_root is None:
@@ -2156,8 +2271,9 @@ def main() -> None:
             str(s1_cache_root)
         )
         accelerator.print(
-            f"[StageB Round-22] Stage-1 coarse oracle conditioning ENABLED — "
+            f"[StageB Round-22] Stage-1 coarse oracle conditioning ENABLED - "
             f"cache_root={s1_cache_root}  dim={stage1_coarse_dim}  "
+            f"train_noise_std={stage1_coarse_noise_std}  "
             f"mean[:3]={stage1_coarse_norm_mean[:3].tolist()}"
         )
     else:
@@ -2189,10 +2305,14 @@ def main() -> None:
         f"  zero_dense_contact_target_for_stageB: {zero_dense_contact_target_for_stageB}\n"
         f"  zero_plan_target_for_stageB: {zero_plan_target_for_stageB}\n"
         f"  dense FK L_pos enabled: {_fk_pos_enabled}\n"
+        f"  active-part endpoint losses: "
+        f"{anchor_joint_pos_weight > 0 or anchor_joint_vel_weight > 0}"
+        f"  (pos={anchor_joint_pos_weight}, vel={anchor_joint_vel_weight}, "
+        f"part_weights={list(anchor_joint_part_weights)})\n"
         f"  stable-support root loss enabled: "
         f"{stable_root_vel_weight > 0 or stable_root_acc_weight > 0}"
         f"  (root_vel={stable_root_vel_weight}, root_acc={stable_root_acc_weight}, erode={stable_support_erode})\n"
-        f"  stable-support local loss (m²-MSE, legacy): "
+        f"  stable-support local loss (m^2-MSE, legacy): "
         f"{stable_local_vel_weight > 0 or stable_local_acc_weight > 0}"
         f"  (local_vel={stable_local_vel_weight}, local_acc={stable_local_acc_weight})\n"
         f"  stable-support local loss (cm-scale): "
@@ -2226,6 +2346,9 @@ def main() -> None:
         pos_loss_weight=pos_loss_weight,
         hand_endpoint_weight=hand_endpoint_weight,
         foot_endpoint_weight=foot_endpoint_weight,
+        anchor_joint_pos_weight=anchor_joint_pos_weight,
+        anchor_joint_vel_weight=anchor_joint_vel_weight,
+        anchor_joint_part_weights=anchor_joint_part_weights,
         cond_motion_keyframe_weight=cond_motion_keyframe_weight,
         diffusion_unobserved_only=diffusion_unobserved_only,
         use_interaction_plan=use_interaction_plan,
@@ -2262,6 +2385,7 @@ def main() -> None:
         stage1_coarse_dim=stage1_coarse_dim,
         stage1_coarse_norm_mean=stage1_coarse_norm_mean,
         stage1_coarse_norm_std=stage1_coarse_norm_std,
+        stage1_coarse_noise_std=stage1_coarse_noise_std,
     )
 
     # --- Smoke test: one batch through forward + backward ---
@@ -2278,7 +2402,9 @@ def main() -> None:
             f"vel={out['loss_vel'].item():.4f}  "
             f"foot={out['loss_foot'].item():.4f}  "
             f"fk={out.get('loss_fk', torch.zeros(())).item():.4f}  "
-            f"pos_full={out.get('loss_pos_full', torch.zeros(())).item():.4f}"
+            f"pos_full={out.get('loss_pos_full', torch.zeros(())).item():.4f}  "
+            f"anchor_joint_pos={out.get('loss_anchor_joint_pos', torch.zeros(())).item():.4f}  "
+            f"anchor_joint_vel={out.get('loss_anchor_joint_vel', torch.zeros(())).item():.4f}"
         )
         if "fix_v_loss_mse_root" in out:
             accelerator.print(
@@ -2349,6 +2475,8 @@ def main() -> None:
             audit_terms = [
                 ("mse_x0",                       out.get("_raw_mse_x0")),
                 ("loss_pos_full",                out.get("_raw_loss_pos_full")),
+                ("loss_anchor_joint_pos",        out.get("_raw_loss_anchor_joint_pos")),
+                ("loss_anchor_joint_vel",        out.get("_raw_loss_anchor_joint_vel")),
                 ("loss_plan_anchor",             out.get("_raw_loss_plan_anchor")),
                 ("loss_stable_root_vel",         out.get("_raw_loss_stable_root_vel")),
                 ("loss_stable_local_vel_cm",     out.get("_raw_loss_stable_local_vel_cm")),
@@ -2357,7 +2485,7 @@ def main() -> None:
             ]
             for i, (name, term) in enumerate(audit_terms):
                 if term is None or not term.requires_grad:
-                    accelerator.print(f"  {name:30s}  (skipped — no grad)")
+                    accelerator.print(f"  {name:30s}  (skipped - no grad)")
                     continue
                 if in_proj.grad is not None:
                     in_proj.grad.zero_()
