@@ -113,8 +113,6 @@ def main() -> int:
     print(f"[p11] Stage-1 obj_traj_dim = {s1_obj_traj_dim}")
 
     # Check if model supports configurable num_steps at inference.
-    has_num_steps_arg = "num_inference_steps" in stage1_model.sample.__doc__ if stage1_model.sample.__doc__ else False
-    # Fall back: introspect via inspect.
     import inspect
     sample_sig = inspect.signature(stage1_model.sample)
     sample_params = list(sample_sig.parameters.keys())
@@ -122,6 +120,19 @@ def main() -> int:
                              ("num_inference_steps", "num_steps", "n_steps"))
     print(f"[p11] Stage-1 sample() supports configurable num_steps: {has_num_steps_arg}")
     print(f"[p11] sample() params: {sample_params}")
+
+    # If sample() does NOT support num_steps, collapse the nstep_grid
+    # to a single dummy value to avoid 4× redundant default-step sampling.
+    # (Initial Round-25 P1.1 run hit this: 2304 evals × ~25s = ~17h
+    # because nstep grid was ignored. Detect + auto-collapse.)
+    if not has_num_steps_arg and len(nstep_grid) > 1:
+        print(f"[p11] WARN: num_steps not configurable → collapsing nstep_grid "
+              f"{nstep_grid} → [default] (dummy; runs default num_steps once). "
+              f"Saves {len(nstep_grid)-1}× of redundant evals.")
+        nstep_grid = [0]                                        # 0 sentinel = use default
+        n_combos = len(cfg_scales) * len(nstep_grid) * len(seeds)
+        print(f"[p11] Adjusted plan: {len(cfg_scales)} cfg × {len(nstep_grid)} step × "
+              f"{len(seeds)} seeds = {n_combos} combos per clip.")
 
     s1_cache = _load_stage1_cache(args.stage1_cache_root, split=args.bucket)
     s1_mean = s1_cache["s1_mean"]
