@@ -1,0 +1,213 @@
+# Round-27 Tier-0A3 — full hand+foot oracle interaction hint, 48-clip overfit.
+#
+# Per piano_stage2_full_architecture_roadmap.md §6 / §8.2 / §10.2:
+#   "Combined hand+foot upper bound. If full works, the compact interaction\n#    bottleneck is viable; if hand-only and foot-only each work but full\n#    fails, condition interference (roadmap §10.2 case 4)."
+#
+# Configuration choices (vs v27):
+#   - data.use_oracle_interaction_hint: true / oracle_hint_variant: full (D=13)
+#   - model.denoiser.use_oracle_interaction_hint: true / oracle_hint_dim: 13
+#   - training.init_checkpoint: v27 final.pt (warm-start from the last
+#       motion-faithful checkpoint; oracle_hint_proj is zero-init so the
+#       step-0 forward is bit-exact equal to v27 baseline — verified by
+#       tests/test_oracle_hint_injection.py::test_oracle_hint_zero_init_invariant)
+#   - data.subset_indices_file: analyses/round27_tier0_train_indices_48.json
+#       (48 train-bucket clips spanning circular_direction / crossed_legs /
+#        hand_choice / mirror_swing / sit_pose — built by
+#        round25_d4_build_subset_indices.py with --match-by-category)
+#   - training.num_epochs: 300 (small subset; 300 ep × 48 clips / bs 8 / accum 4
+#       ≈ 450 grad steps; ~15-20 min on dual-A6000)
+#   - training.lr: 5e-5 (same as v27 — fine-tune lr, not warmup-from-scratch)
+#   - training.batch_size: 8 (bs 8 × num_proc 1 or 2 × accum 4 = effective 32 or 64)
+#   - logging.save_every_n_epochs: 50 (300 ep / 50 = 6 ckpts × ~600 MB)
+#
+# Evaluation: after training, run round26_sustained_contact_diag.py +
+# round26_gait_diag.py on best_val.pt and final.pt on these same 48 clips
+# (since this is a deliberate overfit diagnostic — see roadmap §10).
+
+model:
+  cfg_drop_prob: 0.15
+
+  diffusion:
+    num_steps: 1000
+    schedule: "cosine"
+    prediction_target: "x0"
+
+  z_int:
+    num_parts: 5
+    phase_classes: 3
+    support_classes: 3
+
+  zero_z_int_for_stageB: true
+  zero_dense_contact_target_for_stageB: true
+  zero_contact_state_for_stageB: true
+  zero_contact_target_for_stageB: true
+  zero_phase_for_stageB: true
+  zero_support_for_stageB: true
+  zero_plan_target_for_stageB: false
+
+  denoiser:
+    motion_dim: 135
+    object_traj_dim: 9
+    cond_motion_dim: 0
+    init_pose_dim: 66
+    text_dim: 512
+    object_token_dim: 256
+    object_num_tokens: 128
+    use_interaction_plan: true
+    plan_k_max: 12
+    plan_s_max: 12
+    plan_num_anchor_types: 5
+    plan_num_parts: 5
+    plan_use_segment_tokens: false
+    plan_use_context_hint: true
+    plan_d_hint: 32
+    plan_d_time_embed: 64
+    cfg_drop_plan: false
+    plan_per_part_tokens: true
+    plan_context_hint_mode: "target_aware"
+    use_dit_block: true
+    dit_block_use_plan_pool_in_cond: false
+    use_v13_dynhead: false
+    use_v13_temporal_conv: false
+    d_model: 512
+    n_layers: 8
+    n_heads: 4
+    ff_mult: 4
+    dropout: 0.1
+    stage1_coarse_dim: 23
+    cfg_drop_stage1_coarse: false
+    plan_xattn_relative_time_bias: true
+    plan_xattn_time_bias_init: 0.5
+    plan_tokens_force_null: true
+    # Tier-0A3: full hint, D=13.
+    use_oracle_interaction_hint: true
+    oracle_hint_dim: 13
+
+  object_encoder:
+    num_input_points: 1024
+    num_output_tokens: 128
+    feature_dim: 256
+
+  text_encoder:
+    clip_version: "ViT-B/32"
+    download_root: "cache/clip"
+
+data:
+  datasets:
+    - name: "chairs"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
+    - name: "imhd"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
+    - name: "neuraldome"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
+    - name: "omomo_correct_v2"
+      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+  pseudo_label_dir: null
+  pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
+  max_seq_length: 196
+  support_collapse_hand_support: true
+  motion_representation: "smpl_pose_135_plan"
+  force_world_frame: true
+  subsample_n_per_object: null
+  overfit_n_clips: 0
+  stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
+  # Tier-0A: explicit 48 train-bucket indices (built by
+  # round25_d4_build_subset_indices.py --match-by-category).
+  subset_indices_file: "analyses/round27_tier0_train_indices_48.json"
+  # Tier-0A3: full hint (D=13).
+  use_oracle_interaction_hint: true
+  oracle_hint_variant: "full"
+  oracle_hint_fps: 20.0
+
+  subject_split:
+    enabled: true
+    train_pct: 85
+    val_pct: 15
+    seed: 42
+
+  augmentation:
+    enabled: false
+    mirror_prob: 0.0
+    rotate_around_y_prob: 0.0
+    pc_jitter_std: 0.0
+
+training:
+  # Warm-start from v27 final.pt. oracle_hint_proj is zero-init so the
+  # step-0 forward is bit-exact equal to v27 baseline.
+  init_checkpoint: "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
+  batch_size: 8
+  # 48 clips overfit, 300 ep ~ 450 grad steps. Aggressive enough to learn
+  # the hint signal; small enough to fit in ~15-20 min on dual-A6000.
+  num_epochs: 300
+  num_workers: 4
+  seed: 42
+  # Coarse-v1 noise OFF — Tier-0 isolates the Stage-2 hint signal under
+  # oracle Coarse-v1 (roadmap §16-8).
+  stage1_coarse_noise_std: 0.0
+  optimizer:
+    name: "adamw"
+    lr: 5.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_steps: 50
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  val_every_epochs: 50
+  val_best_key: "loss_anchor_joint_pos"
+
+loss:
+  # Same loss configuration as v27 (motion-faithful patch) — we are
+  # changing CONDITIONING, not the loss.
+  anchor_weight: 0.0
+  contact_threshold: 0.5
+
+  plan_anchor_weight: 0.0
+  plan_segment_weight: 0.0
+  plan_transition_vel_weight: 0.0
+  plan_transition_acc_weight: 0.0
+  plan_transition_window: 3
+
+  stable_root_vel_weight: 0.5
+  stable_root_acc_weight: 0.25
+  stable_support_erode: 4
+  stable_local_vel_weight: 0.0
+  stable_local_acc_weight: 0.0
+  stable_local_vel_cm_weight: 0.05
+  stable_local_speed_moment_weight: 0.02
+  stable_local_acc_cm_weight: 0.0
+
+  hand_endpoint_weight: 2.0
+  foot_endpoint_weight: 2.0
+  pos_loss_weight: 5.0
+
+  anchor_joint_pos_weight: 10.0
+  anchor_joint_vel_weight: 2.0
+  anchor_joint_part_weights: [2.0, 2.0, 0.0, 0.0, 0.5]
+
+  use_min_snr_weighting: true
+  min_snr_gamma: 5.0
+  motion_feature_weights:
+    root_rot_vel: 1.0
+    root_lin_vel: 1.0
+    root_height_y: 1.0
+    joint_pos_local: 1.0
+    joint_rot_6d: 1.0
+    joint_velocity: 1.0
+    foot_contact: 1.0
+  dynamic_metric:
+    enabled: false
+  motion_geometric:
+    enabled: false
+  world_joint_velocity_weight: 1.0
+  fk_consistency_weight: 0.0
+
+logging:
+  project: "piano"
+  run_name: "stageB_anchordiff_t0a3_full_oracle_hint_48clip"
+  log_every_n_steps: 10
+  save_every_n_epochs: 50
+
+output_dir: "runs/training/stageB_anchordiff_t0a3_full_oracle_hint_48clip"
