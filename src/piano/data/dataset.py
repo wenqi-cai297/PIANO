@@ -193,6 +193,13 @@ class HOIDataset(Dataset):
         use_oracle_interaction_hint: bool = False,
         oracle_hint_variant: str = "full",
         oracle_hint_fps: float = 20.0,
+        # Round-27 Tier-0B aux fields: ``walking_mask`` (B, T, 1) and
+        # ``foot_stance_gt`` (B, T, 2) — both derived from GT joints
+        # exactly like the hint's foot sub-vector. The temporal
+        # interaction losses (temporal_interaction_losses.py) need
+        # these as masks; they are independent of whether the model
+        # also receives the oracle hint as a CONDITION.
+        surface_temporal_aux_fields: bool = False,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
@@ -223,6 +230,7 @@ class HOIDataset(Dataset):
             self.oracle_hint_variant = str(oracle_hint_variant)
             self.oracle_hint_dim = 0
             self.oracle_hint_fps = float(oracle_hint_fps)
+        self.surface_temporal_aux_fields = bool(surface_temporal_aux_fields)
         # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
         # True, the obj-pose channels are returned in WORLD frame instead
         # of body-canonical frame. Tests Hypothesis E (frame-choice
@@ -788,6 +796,27 @@ class HOIDataset(Dataset):
                 f"expected ({self.max_seq_length}, {self.oracle_hint_dim})"
             )
             result["oracle_interaction_hint"] = torch.from_numpy(hint)
+
+        # ---------------------------------------------------------------
+        # Tier-0B aux fields: walking_mask + foot_stance_gt
+        # ---------------------------------------------------------------
+        # Same GT-derived quantities the hint uses internally, but
+        # exposed independently so the temporal interaction LOSSES can
+        # consume them without requiring the model to also consume the
+        # oracle hint as a condition.
+        if self.surface_temporal_aux_fields:
+            from piano.data.interaction_hint import (
+                derive_foot_stance_from_gt,
+                derive_walking_mask_from_gt,
+            )
+            walking = derive_walking_mask_from_gt(
+                joints.astype(np.float32), fps=self.oracle_hint_fps,
+            )
+            foot_stance, _ = derive_foot_stance_from_gt(
+                joints.astype(np.float32), fps=self.oracle_hint_fps,
+            )
+            result["walking_mask"] = torch.from_numpy(walking)             # (T, 1)
+            result["foot_stance_gt"] = torch.from_numpy(foot_stance)       # (T, 2)
 
         return result
 

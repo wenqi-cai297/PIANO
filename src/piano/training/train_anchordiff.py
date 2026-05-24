@@ -160,6 +160,9 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
                 cfg.data.get("oracle_hint_variant", "full")
             ),
             oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
+            surface_temporal_aux_fields=bool(
+                cfg.data.get("surface_temporal_aux_fields", False)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -355,6 +358,13 @@ def build_anchordiff_step_fn(
     stage1_coarse_norm_mean: np.ndarray | None = None,
     stage1_coarse_norm_std: np.ndarray | None = None,
     stage1_coarse_noise_std: float = 0.0,
+    # Round-27 Tier-0B: temporal interaction loss config + per-term weights
+    # (per src/piano/training/temporal_interaction_losses.py + roadmap §7).
+    # All zero by default → no behaviour change for v27 / earlier configs.
+    # Requires data.surface_temporal_aux_fields=true so the trainer can
+    # read walking_mask + foot_stance_gt from each batch.
+    temporal_loss_cfg: object | None = None,
+    fps: float = 20.0,
 ):
     """Build the AnchorDiff step_fn closure.
 
@@ -1050,6 +1060,82 @@ def build_anchordiff_step_fn(
                     / weighted_pair.sum().clamp_min(1.0)
                 )
 
+        # --- Round-27 Tier-0B / v28 temporal interaction losses ---
+        # Per src/piano/training/temporal_interaction_losses.py and
+        # piano_stage2_full_architecture_roadmap.md §7. Five losses:
+        #   - contact_rel_offset (object-local SmoothL1)
+        #   - contact_drift      (segment-level drift in object-local)
+        #   - contact_tracking   (asymmetric projection along obj disp)
+        #   - gait_both_airborne (pred ankle height vs sample floor)
+        #   - gait_stance_vel    (stance foot xz velocity penalty)
+        # All zero by default → no behaviour change for v27 / earlier.
+        loss_contact_rel = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_contact_drift = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_contact_track = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_gait_air = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_gait_stance_vel = torch.zeros((), device=device, dtype=motion.dtype)
+        if temporal_loss_cfg is not None and (
+            float(getattr(temporal_loss_cfg, "contact_rel_offset_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "contact_drift_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "contact_tracking_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "gait_both_airborne_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "gait_stance_velocity_weight", 0.0)) > 0.0
+        ):
+            from piano.training.temporal_interaction_losses import (
+                loss_contact_drift_smoothl1,
+                loss_contact_rel_offset_smoothl1,
+                loss_contact_tracking_projection,
+                loss_gait_both_airborne,
+                loss_gait_stance_velocity,
+            )
+
+            if "walking_mask" not in batch or "foot_stance_gt" not in batch:
+                raise KeyError(
+                    "temporal interaction losses are enabled but the batch "
+                    "is missing walking_mask / foot_stance_gt — set "
+                    "data.surface_temporal_aux_fields=true in the config."
+                )
+            walking_mask_b = batch["walking_mask"].to(device).float()        # (B, T, 1)
+            foot_stance_b = batch["foot_stance_gt"].to(device).float()       # (B, T, 2)
+
+            jpf = jpos_pred.float()
+            jgf = joints.float()
+            cs_f = contact_state.float()
+            op_f = obj_pos_world.float()
+            or_f = obj_rot_world.float()
+            sm_f = seq_mask.float()
+
+            if float(temporal_loss_cfg.contact_rel_offset_weight) > 0.0:
+                loss_contact_rel = loss_contact_rel_offset_smoothl1(
+                    pred_joints=jpf, gt_joints=jgf,
+                    object_positions=op_f, object_rotations=or_f,
+                    contact_state=cs_f, cfg=temporal_loss_cfg, seq_mask=sm_f,
+                )
+            if float(temporal_loss_cfg.contact_drift_weight) > 0.0:
+                loss_contact_drift = loss_contact_drift_smoothl1(
+                    pred_joints=jpf, gt_joints=jgf,
+                    object_positions=op_f, object_rotations=or_f,
+                    contact_state=cs_f, cfg=temporal_loss_cfg, seq_mask=sm_f,
+                )
+            if float(temporal_loss_cfg.contact_tracking_weight) > 0.0:
+                loss_contact_track = loss_contact_tracking_projection(
+                    pred_joints=jpf, gt_joints=jgf,
+                    object_positions=op_f, object_rotations=or_f,
+                    contact_state=cs_f, cfg=temporal_loss_cfg, seq_mask=sm_f,
+                )
+            if float(temporal_loss_cfg.gait_both_airborne_weight) > 0.0:
+                loss_gait_air = loss_gait_both_airborne(
+                    pred_joints=jpf, gt_joints=jgf,
+                    walking_mask=walking_mask_b, cfg=temporal_loss_cfg,
+                    seq_mask=sm_f,
+                )
+            if float(temporal_loss_cfg.gait_stance_velocity_weight) > 0.0:
+                loss_gait_stance_vel = loss_gait_stance_velocity(
+                    pred_joints=jpf, foot_stance_gt=foot_stance_b,
+                    walking_mask=walking_mask_b, fps=float(fps),
+                    seq_mask=sm_f,
+                )
+
         # --- v10 plan-aware losses ---
         # Active only when the trainer was built with use_interaction_plan
         # and the rep is smpl_pose_135_plan. Three sub-losses (per
@@ -1576,6 +1662,15 @@ def build_anchordiff_step_fn(
             + (fix_v_joint_acc_weight * loss_joint_acc if use_fix_v_loss else 0.0)
             + (fix_v_hpf_weight * loss_hpf if use_fix_v_loss else 0.0)
             + (fix_v_obj_rel_vel_weight * loss_obj_rel_vel if use_fix_v_loss else 0.0)
+            # Round-27 Tier-0B temporal interaction losses (zero by default).
+            + (
+                float(temporal_loss_cfg.contact_rel_offset_weight) * loss_contact_rel
+                + float(temporal_loss_cfg.contact_drift_weight) * loss_contact_drift
+                + float(temporal_loss_cfg.contact_tracking_weight) * loss_contact_track
+                + float(temporal_loss_cfg.gait_both_airborne_weight) * loss_gait_air
+                + float(temporal_loss_cfg.gait_stance_velocity_weight) * loss_gait_stance_vel
+                if temporal_loss_cfg is not None else 0.0
+            )
         )
         out = {
             "loss": total,
@@ -1612,6 +1707,12 @@ def build_anchordiff_step_fn(
             "loss_stable_local_vel_cm": loss_stable_local_vel_cm.detach(),
             "loss_stable_local_acc_cm": loss_stable_local_acc_cm.detach(),
             "loss_stable_local_speed_moment": loss_stable_local_speed_moment.detach(),
+            # Round-27 Tier-0B temporal interaction loss components.
+            "loss_contact_rel": loss_contact_rel.detach(),
+            "loss_contact_drift_t": loss_contact_drift.detach(),
+            "loss_contact_track": loss_contact_track.detach(),
+            "loss_gait_air": loss_gait_air.detach(),
+            "loss_gait_stance_vel": loss_gait_stance_vel.detach(),
             "weighted_stable_local_vel_cm": (
                 stable_local_vel_cm_weight * loss_stable_local_vel_cm
             ).detach(),
@@ -2263,6 +2364,39 @@ def main() -> None:
     # analyses/stageB_updated_training_strategy_and_diagnostics_plan.md §4.
     use_min_snr_weighting = bool(cfg.loss.get("use_min_snr_weighting", False))
     min_snr_gamma = float(cfg.loss.get("min_snr_gamma", 5.0))
+
+    # Round-27 Tier-0B: per-term weights for the 5 temporal interaction
+    # losses (src/piano/training/temporal_interaction_losses.py). Built
+    # whenever ANY weight is positive; defaults preserve back-compat for
+    # v27 / earlier configs.
+    temporal_loss_cfg = None
+    _tloss = cfg.loss.get("temporal_interaction", None)
+    if _tloss is not None:
+        from piano.training.temporal_interaction_losses import (
+            TemporalInteractionLossConfig,
+        )
+        temporal_loss_cfg = TemporalInteractionLossConfig(
+            contact_rel_offset_weight=float(
+                _tloss.get("contact_rel_offset_weight", 0.0)
+            ),
+            contact_drift_weight=float(_tloss.get("contact_drift_weight", 0.0)),
+            contact_tracking_weight=float(_tloss.get("contact_tracking_weight", 0.0)),
+            gait_both_airborne_weight=float(
+                _tloss.get("gait_both_airborne_weight", 0.0)
+            ),
+            gait_stance_velocity_weight=float(
+                _tloss.get("gait_stance_velocity_weight", 0.0)
+            ),
+            contact_threshold=float(_tloss.get("contact_threshold", 0.5)),
+            contact_rel_clamp_m=float(_tloss.get("contact_rel_clamp_m", 2.0)),
+            tracking_margin_m=float(_tloss.get("tracking_margin_m", 0.03)),
+            tracking_min_obj_disp_m=float(_tloss.get("tracking_min_obj_disp_m", 0.05)),
+            floor_quantile=float(_tloss.get("floor_quantile", 0.05)),
+            grounded_threshold_above_floor_m=float(
+                _tloss.get("grounded_threshold_above_floor_m", 0.10)
+            ),
+            grounded_softness_m=float(_tloss.get("grounded_softness_m", 0.03)),
+        )
     zero_z_int_for_stageB = bool(
         cfg.model.get("zero_z_int_for_stageB", False)
     )
@@ -2427,6 +2561,8 @@ def main() -> None:
         stage1_coarse_norm_mean=stage1_coarse_norm_mean,
         stage1_coarse_norm_std=stage1_coarse_norm_std,
         stage1_coarse_noise_std=stage1_coarse_noise_std,
+        temporal_loss_cfg=temporal_loss_cfg,
+        fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
     )
 
     # --- Smoke test: one batch through forward + backward ---
