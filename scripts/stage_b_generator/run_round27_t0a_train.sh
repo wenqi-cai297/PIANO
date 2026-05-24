@@ -24,13 +24,13 @@
 #   1. git pull (must include the Round-27 Commit 1 + 2 commits)
 #   2. v27 ckpt at:
 #         runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt
-#   3. 48-clip train indices file:
-#         analyses/round27_tier0_train_indices_48.json
+#   3. 48-clip balanced train indices file:
+#         analyses/round27_tier0_train_indices_48_balanced.json
 #   4. Stage-1 oracle Coarse-v1 cache:
 #         cache/stage1_coarse_v1_full
 #
 # Usage:
-#   bash scripts/stage_b_generator/run_round27_t0a_train.sh                         # all 3 variants
+#   bash scripts/stage_b_generator/run_round27_t0a_train.sh                         # all 6 variants
 #   bash scripts/stage_b_generator/run_round27_t0a_train.sh t0a1                    # one variant only
 #   bash scripts/stage_b_generator/run_round27_t0a_train.sh t0a1 t0a2               # subset
 #
@@ -49,7 +49,10 @@ mkdir -p "${LOG_DIR}"
 
 V27_CKPT="runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
 R23_CKPT="runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt"
-TRAIN_INDICES="analyses/round27_tier0_train_indices_48.json"
+V27_CFG_LOCAL="configs/training/anchordiff_v27_stage2_anchoraware_FULL_DATA_local.yaml"
+R23_CFG_LOCAL="configs/training/anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA_local.yaml"
+TRAIN_INDICES="${ROUND27_TRAIN_INDICES:-analyses/round27_tier0_train_indices_48_balanced.json}"
+MAX_CANDIDATES_PER_SUBSET="${ROUND27_MAX_CANDIDATES_PER_SUBSET:-600}"
 
 SINGLE_GPU="${ROUND27_SINGLE_GPU:-0}"
 RESUME_FROM="${ROUND27_RESUME_FROM:-}"
@@ -139,12 +142,12 @@ else
 fi
 
 # ---------- build train indices file if missing ----------
-# analyses/ is gitignored, so the 48-clip indices file is not in the repo.
-# Re-generate it on demand using the canonical Round-25 D4 builder so the
-# server can run end-to-end after a fresh git pull.
+# analyses/ is gitignored, so the 48-clip indices file may be absent on
+# the server. Re-generate it with the balanced Round-27 builder; the old
+# Round-25 category builder produced all-chair clips.
 if [[ ! -f "${TRAIN_INDICES}" ]]; then
     echo "[$(date '+%F %T')] Building train indices: ${TRAIN_INDICES}"
-    if [[ ! -f "configs/training/anchordiff_v27_stage2_anchoraware_FULL_DATA_local.yaml" ]]; then
+    if [[ ! -f "${V27_CFG_LOCAL}" ]]; then
         # The builder reads the dataset roots from a *local* config so paths
         # are resolved on this machine. Use the v27 local config (PREP just
         # generated it from the Tier-0A PREP step's sed call — round27 prep
@@ -155,12 +158,11 @@ if [[ ! -f "${TRAIN_INDICES}" ]]; then
     fi
     run_step "build_train_indices" \
         conda run --no-capture-output -n piano python -u \
-            scripts/stage_b_generator/round25_d4_build_subset_indices.py \
-            --config configs/training/anchordiff_v27_stage2_anchoraware_FULL_DATA_local.yaml \
-            --selection-json analyses/round25_multimodal_eval_subset.json \
+            scripts/stage_b_generator/round27_build_tier0_train_indices.py \
+            --config "${V27_CFG_LOCAL}" \
             --n-clips 48 \
             --output "${TRAIN_INDICES}" \
-            --match-by-category
+            --max-candidates-per-subset "${MAX_CANDIDATES_PER_SUBSET}"
 fi
 
 # ---------- preflight ----------
@@ -180,6 +182,8 @@ fi
 if [[ $_needs_r23 -eq 1 && ! -f "${R23_CKPT}" ]]; then
     echo "ERROR: missing R23 ckpt (needed by t0b2): ${R23_CKPT}"; exit 1
 fi
+[[ -f "${V27_CKPT}" ]] || { echo "ERROR: missing v27 baseline ckpt: ${V27_CKPT}"; exit 1; }
+[[ -f "${R23_CKPT}" ]] || { echo "ERROR: missing R23 baseline ckpt: ${R23_CKPT}"; exit 1; }
 [[ -f "${TRAIN_INDICES}" ]] || { echo "ERROR: missing train indices: ${TRAIN_INDICES}"; exit 1; }
 [[ -d "cache/stage1_coarse_v1_full" ]] || { echo "ERROR: missing Stage-1 cache"; exit 1; }
 
@@ -200,7 +204,7 @@ else
 
         if [[ "${SINGLE_GPU}" == "1" ]]; then
             run_step "${V}_train_single_gpu" \
-                CUDA_VISIBLE_DEVICES=0 \
+                env CUDA_VISIBLE_DEVICES=0 \
                 conda run --no-capture-output -n piano accelerate launch \
                     --num_processes 1 --mixed_precision bf16 \
                     --main_process_port 29500 \
@@ -225,7 +229,7 @@ fi
 # Since the indices file is train-indices (not val), we re-generate a
 # selection-json with the (subset, seq_id) of the 48 train clips so the
 # diag scripts can resolve them via their standard selection-json reader.
-EVAL_SUBSET="${EVAL_SUBSET:-analyses/round27_tier0_eval_selection.json}"
+EVAL_SUBSET="${EVAL_SUBSET:-analyses/round27_tier0_eval_selection_balanced.json}"
 
 if _should_skip eval; then
     echo "[SKIP] EVAL (ROUND27_RESUME_FROM=${RESUME_FROM})"
@@ -256,6 +260,51 @@ print(f'wrote {len(clips)} clips to ${EVAL_SUBSET}')
 "
     fi
 
+    if [[ ! -f "${V27_CFG_LOCAL}" ]]; then
+        run_step "prep_v27_local_for_eval_baseline" \
+            bash scripts/stage_b_generator/run_round26_make_local_configs.sh
+    fi
+    if [[ ! -f "${R23_CFG_LOCAL}" ]]; then
+        run_step "prep_r23_local_for_eval_baseline" \
+            bash scripts/stage_b_generator/run_round23_make_local_configs.sh
+    fi
+
+    run_diagnostics() {
+        local NAME="$1"; shift
+        local CFG_LOCAL="$1"; shift
+        local CKPT="$1"; shift
+        local OUT_DIR="$1"; shift
+        mkdir -p "${OUT_DIR}"
+
+        run_step "${NAME}_sustained" \
+            conda run --no-capture-output -n piano python -u \
+                scripts/stage_b_generator/round26_sustained_contact_diag.py \
+                --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
+                --selection-json "${EVAL_SUBSET}" \
+                --output-dir "${OUT_DIR}" \
+                --bucket train --cfg-scale 1.0 --seed 42 "$@"
+
+        run_step "${NAME}_gait" \
+            conda run --no-capture-output -n piano python -u \
+                scripts/stage_b_generator/round26_gait_diag.py \
+                --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
+                --selection-json "${EVAL_SUBSET}" \
+                --output-dir "${OUT_DIR}" \
+                --bucket train --cfg-scale 1.0 --seed 42 "$@"
+    }
+
+    # Same-subset references: no-finetune baselines and GT-as-pred sanity.
+    run_diagnostics "baseline_v27_final" \
+        "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+        "analyses/round27_baseline_v27_diag_final"
+    run_diagnostics "baseline_r23_final" \
+        "${R23_CFG_LOCAL}" "${R23_CKPT}" \
+        "analyses/round27_baseline_r23_diag_final"
+    run_diagnostics "gt_reference" \
+        "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+        "analyses/round27_gt_reference_diag" \
+        --use-gt-as-pred
+
     for V in "${VARIANTS[@]}"; do
         CFG_LOCAL="$(_variant_config_local "$V")"
         RUN_DIR="$(_variant_run_dir "$V")"
@@ -268,23 +317,7 @@ print(f'wrote {len(clips)} clips to ${EVAL_SUBSET}')
             fi
 
             OUT_DIR="analyses/round27_${V}_diag_${TAG}"
-            mkdir -p "${OUT_DIR}"
-
-            run_step "${V}_sustained_${TAG}" \
-                conda run --no-capture-output -n piano python -u \
-                    scripts/stage_b_generator/round26_sustained_contact_diag.py \
-                    --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
-                    --selection-json "${EVAL_SUBSET}" \
-                    --output-dir "${OUT_DIR}" \
-                    --bucket train --cfg-scale 1.0 --seed 42
-
-            run_step "${V}_gait_${TAG}" \
-                conda run --no-capture-output -n piano python -u \
-                    scripts/stage_b_generator/round26_gait_diag.py \
-                    --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
-                    --selection-json "${EVAL_SUBSET}" \
-                    --output-dir "${OUT_DIR}" \
-                    --bucket train --cfg-scale 1.0 --seed 42
+            run_diagnostics "${V}_${TAG}" "${CFG_LOCAL}" "${CKPT}" "${OUT_DIR}"
         done
     done
 fi
@@ -303,7 +336,7 @@ echo
 echo "================================================================"
 echo "Round-27 Tier-0A train+eval complete."
 echo "  variants run: ${VARIANTS[*]}"
-echo "  Diagnostic outputs: analyses/round27_t0a*/*"
+echo "  Diagnostic outputs: analyses/round27_*_diag_*"
 echo "  Logs:               ${LOG_DIR}/*.log"
 echo "  Tarball:            round27_t0a_results_*.tar.gz at project root"
 echo "================================================================"

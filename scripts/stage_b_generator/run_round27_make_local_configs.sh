@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Round-27 Tier-0A server-path config translator. Rewrites Windows
 # dataset paths to the Linux server layout, producing gitignored
-# _local.yaml variants for the 3 Tier-0A configs.
+# _local.yaml variants for the six Tier-0 configs.
 #
 # Usage (on the Linux server):
 #   bash scripts/stage_b_generator/run_round27_make_local_configs.sh

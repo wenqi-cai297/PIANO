@@ -405,11 +405,15 @@ def _build_dataset(cfg, bucket: str, augment: bool) -> Subset | torch.utils.data
         )
         subj_filter = splits[bucket]
     pseudo_label_subdir = cfg.data.get("pseudo_label_subdir", None)
+    pseudo_label_dir = cfg.data.get("pseudo_label_dir", None)
     datasets = []
     for entry in cfg.data.datasets:
-        sub_dir = (
-            str(Path(entry.root) / pseudo_label_subdir) if pseudo_label_subdir else None
-        )
+        if pseudo_label_dir is not None:
+            sub_dir = pseudo_label_dir
+        elif pseudo_label_subdir:
+            sub_dir = str(Path(entry.root) / pseudo_label_subdir)
+        else:
+            sub_dir = None
         ds = HOIDataset(
             root=entry.root,
             pseudo_label_dir=sub_dir,
@@ -423,6 +427,14 @@ def _build_dataset(cfg, bucket: str, augment: bool) -> Subset | torch.utils.data
             surface_obj_pose=True,
             force_world_frame=bool(cfg.data.get("force_world_frame", False)),
             motion_representation=str(cfg.data.get("motion_representation", "motion_263")),
+            use_oracle_interaction_hint=bool(
+                cfg.data.get("use_oracle_interaction_hint", False)
+            ),
+            oracle_hint_variant=str(cfg.data.get("oracle_hint_variant", "full")),
+            oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
+            surface_temporal_aux_fields=bool(
+                cfg.data.get("surface_temporal_aux_fields", False)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -489,6 +501,10 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         plan_tokens_force_null=bool(
             cfg.model.denoiser.get("plan_tokens_force_null", False)
         ),
+        use_oracle_interaction_hint=bool(
+            cfg.model.denoiser.get("use_oracle_interaction_hint", False)
+        ),
+        oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -642,6 +658,19 @@ def _build_cond(
         "text": text_features.float(),
         "object_tokens": obj_tokens,
     }
+    if "oracle_interaction_hint" in batch:
+        cond["oracle_interaction_hint"] = (
+            batch["oracle_interaction_hint"].to(device).float()
+        )
+    elif (
+        model is not None
+        and getattr(model.denoiser, "oracle_hint_proj", None) is not None
+    ):
+        raise KeyError(
+            "Model was built with use_oracle_interaction_hint=True, but "
+            "batch['oracle_interaction_hint'] is missing. Set "
+            "data.use_oracle_interaction_hint=true in the diagnostic config."
+        )
     stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
     if stage1_coarse_dim > 0:
         if str(cfg.data.get("motion_representation", "motion_263")) != "smpl_pose_135_plan":

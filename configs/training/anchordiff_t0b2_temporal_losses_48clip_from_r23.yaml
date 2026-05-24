@@ -21,8 +21,8 @@
 #   - data.use_oracle_interaction_hint: false
 #   - data.surface_temporal_aux_fields: true (need walking_mask + foot_stance_gt)
 #   - loss.temporal_interaction.*: per-term weights from roadmap §7.11
-#   - training.init_checkpoint: v27 final.pt (warm-start)
-#   - data.subset_indices_file: analyses/round27_tier0_train_indices_48.json
+#   - training.init_checkpoint: R23 final.pt (warm-start)
+#   - data.subset_indices_file: analyses/round27_tier0_train_indices_48_balanced.json
 #   - training.num_epochs: 300
 
 model:
@@ -112,7 +112,7 @@ data:
   subsample_n_per_object: null
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
-  subset_indices_file: "analyses/round27_tier0_train_indices_48.json"
+  subset_indices_file: "analyses/round27_tier0_train_indices_48_balanced.json"
   # T0-B: no oracle hint, but DO surface walking_mask + foot_stance_gt
   # in the batch so the temporal losses can run.
   use_oracle_interaction_hint: false
@@ -150,6 +150,7 @@ training:
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   mixed_precision: "bf16"
+  val_on_train_subset: true
   val_every_epochs: 50
   val_best_key: "loss_contact_rel"
 

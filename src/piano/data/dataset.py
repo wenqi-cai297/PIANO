@@ -773,9 +773,9 @@ class HOIDataset(Dataset):
         # ---------------------------------------------------------------
         # Tier-0A oracle interaction hint (roadmap §6.11)
         # ---------------------------------------------------------------
-        # Computed over the padded length so the trainer keeps a single
-        # fixed-shape tensor; the trainer is responsible for masking
-        # via ``seq_len`` if it cares about padded frames.
+        # Compute on the valid prefix, then pad. The stance helper
+        # estimates a sample-specific floor via a height quantile, so
+        # zero-padded frames must not enter that estimate.
         if (
             self.use_oracle_interaction_hint
             and object_positions is not None
@@ -783,14 +783,16 @@ class HOIDataset(Dataset):
             and padded_labels.get("contact_state") is not None
         ):
             from piano.data.interaction_hint import build_oracle_interaction_hint
-            hint = build_oracle_interaction_hint(
-                joints_22=joints.astype(np.float32),
-                object_positions=object_positions.astype(np.float32),
-                object_rotations=object_rotations.astype(np.float32),
-                contact_state=padded_labels["contact_state"].astype(np.float32),
+            valid_T = int(min(seq_len, self.max_seq_length))
+            hint_valid = build_oracle_interaction_hint(
+                joints_22=joints[:valid_T].astype(np.float32),
+                object_positions=object_positions[:valid_T].astype(np.float32),
+                object_rotations=object_rotations[:valid_T].astype(np.float32),
+                contact_state=padded_labels["contact_state"][:valid_T].astype(np.float32),
                 variant=self.oracle_hint_variant,
                 fps=self.oracle_hint_fps,
             )
+            hint = self._pad_or_truncate(hint_valid, self.max_seq_length)
             assert hint.shape == (self.max_seq_length, self.oracle_hint_dim), (
                 f"oracle_interaction_hint shape {hint.shape!r} != "
                 f"expected ({self.max_seq_length}, {self.oracle_hint_dim})"
@@ -809,12 +811,15 @@ class HOIDataset(Dataset):
                 derive_foot_stance_from_gt,
                 derive_walking_mask_from_gt,
             )
-            walking = derive_walking_mask_from_gt(
-                joints.astype(np.float32), fps=self.oracle_hint_fps,
+            valid_T = int(min(seq_len, self.max_seq_length))
+            walking_valid = derive_walking_mask_from_gt(
+                joints[:valid_T].astype(np.float32), fps=self.oracle_hint_fps,
             )
-            foot_stance, _ = derive_foot_stance_from_gt(
-                joints.astype(np.float32), fps=self.oracle_hint_fps,
+            foot_stance_valid, _ = derive_foot_stance_from_gt(
+                joints[:valid_T].astype(np.float32), fps=self.oracle_hint_fps,
             )
+            walking = self._pad_or_truncate(walking_valid, self.max_seq_length)
+            foot_stance = self._pad_or_truncate(foot_stance_valid, self.max_seq_length)
             result["walking_mask"] = torch.from_numpy(walking)             # (T, 1)
             result["foot_stance_gt"] = torch.from_numpy(foot_stance)       # (T, 2)
 

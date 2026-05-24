@@ -72,8 +72,8 @@ from piano.utils.clip_utils import load_clip_text_encoder  # noqa: E402
 
 # SMPL-22 joint indices
 J_PELVIS = 0
-J_L_FOOT = 10  # left ankle
-J_R_FOOT = 11  # right ankle
+J_L_FOOT = 7   # left ankle; keep gait metric aligned with Tier-0B loss/hint
+J_R_FOOT = 8   # right ankle; SMPL 10/11 are mid-foot contact proxies
 
 # Thresholds (tunable via CLI)
 ROOT_WALK_SPEED_M_PER_FRAME_DEFAULT = 0.005   # ~10 cm/sec at 20fps

@@ -1,11 +1,9 @@
 # Round-27 Tier-0AB - full oracle interaction hint + temporal interaction losses, 48-clip overfit, warm-started from v27 final.pt. Combined upper bound (roadmap S8.7 / S10.2): if even this fails, current Stage-2 architecture is likely inadequate -> Tier 3 pivot.
 #
 # Per piano_stage2_full_architecture_roadmap.md §7 / §8.5 / §10.2:
-#   "Can stronger temporal/contact/gait losses ALONE repair the
-#    observed failures, without adding oracle interaction hints?
-#    If B1 succeeds, Tier-2 (full v28-style training) is justified.
-#    If B1 fails but T0-B2 (same losses from R23 init) succeeds, the
-#    v27 fine-tune basin is too rigid."
+#   Combined upper bound: explicit full oracle interaction hint plus
+#   temporal/contact/gait losses. If T0-AB fails on the overfit set,
+#   the current Stage-2 architecture is likely inadequate.
 #
 # Loss weights from roadmap §7.11 (aggressive overfit weights — point
 # is to test whether the model can be steered at all):
@@ -16,12 +14,12 @@
 #   gait_stance_velocity_weight =  5.0
 #
 # Configuration choices (vs v27):
-#   - model.denoiser.use_oracle_interaction_hint: false (T0-B is loss-only)
-#   - data.use_oracle_interaction_hint: false
+#   - model.denoiser.use_oracle_interaction_hint: true / oracle_hint_dim: 13
+#   - data.use_oracle_interaction_hint: true / oracle_hint_variant: full
 #   - data.surface_temporal_aux_fields: true (need walking_mask + foot_stance_gt)
 #   - loss.temporal_interaction.*: per-term weights from roadmap §7.11
 #   - training.init_checkpoint: v27 final.pt (warm-start)
-#   - data.subset_indices_file: analyses/round27_tier0_train_indices_48.json
+#   - data.subset_indices_file: analyses/round27_tier0_train_indices_48_balanced.json
 #   - training.num_epochs: 300
 
 model:
@@ -79,7 +77,7 @@ model:
     plan_xattn_relative_time_bias: true
     plan_xattn_time_bias_init: 0.5
     plan_tokens_force_null: true
-    # T0-AB: full oracle hint (D=13) + temporal losses (loss-only diagnostic).
+    # T0-AB: full oracle hint (D=13) + temporal losses.
     use_oracle_interaction_hint: true
     oracle_hint_dim: 13
 
@@ -111,9 +109,8 @@ data:
   subsample_n_per_object: null
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
-  subset_indices_file: "analyses/round27_tier0_train_indices_48.json"
-  # T0-B: no oracle hint, but DO surface walking_mask + foot_stance_gt
-  # in the batch so the temporal losses can run.
+  subset_indices_file: "analyses/round27_tier0_train_indices_48_balanced.json"
+  # T0-AB: full oracle hint plus temporal-loss aux fields.
   use_oracle_interaction_hint: true
   oracle_hint_variant: "full"
   oracle_hint_fps: 20.0
@@ -133,6 +130,7 @@ data:
 
 training:
   init_checkpoint: "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
+  partial_init_allow_shape_mismatch: true
   batch_size: 8
   num_epochs: 300
   num_workers: 4
@@ -149,6 +147,7 @@ training:
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   mixed_precision: "bf16"
+  val_on_train_subset: true
   val_every_epochs: 50
   val_best_key: "loss_contact_rel"
 

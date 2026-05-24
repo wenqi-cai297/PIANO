@@ -35,10 +35,19 @@ for V in t0a1 t0a2 t0a3 t0b1 t0b2 t0ab; do
         [[ -d "${DIR}" ]] && ITEMS+=("${DIR}")
     done
 done
+for DIR in \
+    analyses/round27_baseline_v27_diag_final \
+    analyses/round27_baseline_r23_diag_final \
+    analyses/round27_gt_reference_diag
+do
+    [[ -d "${DIR}" ]] && ITEMS+=("${DIR}")
+done
 
 # Reference selections + train indices.
 for f in \
+    analyses/round27_tier0_train_indices_48_balanced.json \
     analyses/round27_tier0_train_indices_48.json \
+    analyses/round27_tier0_eval_selection_balanced.json \
     analyses/round27_tier0_eval_selection.json
 do
     [[ -f "${f}" ]] && ITEMS+=("${f}")

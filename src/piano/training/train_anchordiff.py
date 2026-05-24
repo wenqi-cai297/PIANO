@@ -24,7 +24,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch import Tensor
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from piano.data.dataset import (
     AugmentConfig,
@@ -1918,6 +1918,7 @@ def main() -> None:
 
     # --- Build dataset ---
     train_dataset = _build_dataset(cfg, bucket="train", augment=True)
+    train_subset_indices: list[int] | None = None
     overfit_n = int(cfg.data.get("overfit_n_clips", 0))
     # Scale curve diagnostic (per analyses/stageB_root_cause_analysis_v2_and_next_strategy.md §5):
     # when scale_subset_seed is set, shuffle the train_dataset indices with that
@@ -1932,20 +1933,18 @@ def main() -> None:
     scale_subset_seed = cfg.data.get("scale_subset_seed", None)
     subset_indices_file = cfg.data.get("subset_indices_file", None)
     if subset_indices_file is not None:
-        import json as _json
-        from torch.utils.data import Subset
         with open(str(subset_indices_file), encoding="utf-8") as _f:
-            _meta = _json.load(_f)
+            _meta = json.load(_f)
         indices = list(_meta["indices"])
         n_avail = len(train_dataset)
         indices = [i for i in indices if 0 <= i < n_avail]
+        train_subset_indices = indices
         train_dataset = Subset(train_dataset, indices)
         accelerator.print(
             f"Train dataset (SUBSET file {subset_indices_file}): "
             f"{len(train_dataset)} clips"
         )
     elif overfit_n > 0:
-        from torch.utils.data import Subset
         n_avail = len(train_dataset)
         indices = list(range(n_avail))
         if scale_subset_seed is not None:
@@ -1953,6 +1952,7 @@ def main() -> None:
             _rng = _random.Random(int(scale_subset_seed))
             _rng.shuffle(indices)
         indices = indices[:min(overfit_n, n_avail)]
+        train_subset_indices = indices
         train_dataset = Subset(train_dataset, indices)
         accelerator.print(
             f"Train dataset (OVERFIT): {len(train_dataset)} clips "
@@ -1963,18 +1963,32 @@ def main() -> None:
 
     val_dataset = None
     if int(cfg.training.get("val_every_epochs", 0)) > 0:
-        val_dataset = _build_dataset(cfg, bucket="val", augment=False)
-        if overfit_n > 0:
-            from torch.utils.data import Subset
-            n_avail_val = len(val_dataset)
-            v_indices = list(range(n_avail_val))
-            if scale_subset_seed is not None:
-                import random as _random
-                _rng_v = _random.Random(int(scale_subset_seed))
-                _rng_v.shuffle(v_indices)
-            v_indices = v_indices[:min(overfit_n, n_avail_val)]
-            val_dataset = Subset(val_dataset, v_indices)
-        accelerator.print(f"Val dataset:   {len(val_dataset)} clips")
+        if bool(cfg.training.get("val_on_train_subset", False)):
+            val_base = _build_dataset(cfg, bucket="train", augment=False)
+            if train_subset_indices is not None:
+                val_dataset = Subset(val_base, train_subset_indices)
+                accelerator.print(
+                    "Val dataset (TRAIN SUBSET, no augment): "
+                    f"{len(val_dataset)} clips"
+                )
+            else:
+                val_dataset = val_base
+                accelerator.print(
+                    "Val dataset (FULL TRAIN, no augment): "
+                    f"{len(val_dataset)} clips"
+                )
+        else:
+            val_dataset = _build_dataset(cfg, bucket="val", augment=False)
+            if overfit_n > 0:
+                n_avail_val = len(val_dataset)
+                v_indices = list(range(n_avail_val))
+                if scale_subset_seed is not None:
+                    import random as _random
+                    _rng_v = _random.Random(int(scale_subset_seed))
+                    _rng_v.shuffle(v_indices)
+                v_indices = v_indices[:min(overfit_n, n_avail_val)]
+                val_dataset = Subset(val_dataset, v_indices)
+            accelerator.print(f"Val dataset:   {len(val_dataset)} clips")
 
     train_loader = DataLoader(
         train_dataset,
