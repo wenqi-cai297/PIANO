@@ -732,6 +732,19 @@ class AnchorDenoiserConfig:
     plan_xattn_relative_time_bias: bool = False
     plan_xattn_time_bias_init: float = 0.5
 
+    # Round-27 Tier-0A: per-frame oracle interaction-hint branch
+    # (roadmap §6.12). When ``use_oracle_interaction_hint=True``,
+    # ``cond["oracle_interaction_hint"]`` of shape (B, T,
+    # oracle_hint_dim) is projected via a 2-layer MLP and ADDED into the
+    # per-frame motion-token embedding ``h`` right after
+    # ``v12_input_proj``. The hint is intentionally injected directly
+    # (not via cross-attention, not via plan tokens) to give Stage-2 an
+    # upper-bound diagnostic on whether explicit per-frame interaction
+    # state helps sustained contact / gait. v12-only — v11 legacy path
+    # does not support this branch.
+    use_oracle_interaction_hint: bool = False
+    oracle_hint_dim: int = 0
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -1018,6 +1031,29 @@ class AnchorDenoiser(nn.Module):
                 )
             else:
                 self.register_parameter("plan_xattn_time_bias_slopes", None)
+
+            # Round-27 Tier-0A: oracle interaction-hint projection
+            # (roadmap §6.12). 2-layer MLP, hidden = d_model. Second
+            # Linear is zero-initialized so the step-0 forward is
+            # bit-exact equal to the no-hint baseline (matches the
+            # zero-init pattern used by self_conditioning / stage1_coarse
+            # branches in V12InputProjection).
+            if cfg.use_oracle_interaction_hint:
+                if cfg.oracle_hint_dim <= 0:
+                    raise ValueError(
+                        "use_oracle_interaction_hint=True requires "
+                        "oracle_hint_dim > 0; got "
+                        f"{cfg.oracle_hint_dim}"
+                    )
+                self.oracle_hint_proj = nn.Sequential(
+                    nn.Linear(cfg.oracle_hint_dim, cfg.d_model),
+                    nn.SiLU(),
+                    nn.Linear(cfg.d_model, cfg.d_model),
+                )
+                nn.init.zeros_(self.oracle_hint_proj[-1].weight)
+                nn.init.zeros_(self.oracle_hint_proj[-1].bias)
+            else:
+                self.oracle_hint_proj = None
 
     def _compute_plan_xattn_dist_norm(
         self,
@@ -1307,6 +1343,23 @@ class AnchorDenoiser(nn.Module):
             self_cond=self_cond,
             stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)
+
+        # ─── Round-27 Tier-0A: oracle interaction-hint addition ───
+        # Direct addition into per-frame motion-token embedding
+        # (roadmap §6.12). The hint MLP is zero-initialized at its last
+        # layer so this contributes zero at step 0 — equivalent to no
+        # hint until the gradient updates the projection.
+        if self.oracle_hint_proj is not None:
+            if "oracle_interaction_hint" not in cond:
+                raise KeyError(
+                    "use_oracle_interaction_hint=True but "
+                    "cond['oracle_interaction_hint'] is missing. The "
+                    "trainer must populate this from "
+                    "batch['oracle_interaction_hint'] (set "
+                    "data.use_oracle_interaction_hint=true in the config)."
+                )
+            oracle_hint = cond["oracle_interaction_hint"]                # (B, T, D_hint)
+            h = h + self.oracle_hint_proj(oracle_hint)                   # (B, T, D)
 
         # ─── §4.4 Global condition vector for AdaLN (per-sample) ───
         # c = t_emb + plan_pool_emb. Drives AdaLN modulation in every block

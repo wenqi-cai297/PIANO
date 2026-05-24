@@ -636,6 +636,16 @@ def build_anchordiff_step_fn(
                 )
             cond["stage1_coarse"] = coarse_v1_norm
 
+        # ── Round-27 Tier-0A: oracle interaction hint condition ──
+        # Per roadmap §6.11 / §6.12. The dataset builds the (T, D) hint
+        # tensor in __getitem__ when data.use_oracle_interaction_hint=true;
+        # the denoiser's oracle_hint_proj (zero-init) consumes it via a
+        # direct addition into the per-frame motion-token embedding.
+        if "oracle_interaction_hint" in batch:
+            cond["oracle_interaction_hint"] = (
+                batch["oracle_interaction_hint"].to(device).float()
+            )
+
         # --- v10 InteractionPlan: thread the compiled plan through cond ---
         # The dataset compiles the plan in __getitem__ for the
         # smpl_pose_135_plan motion_representation; we just collect the
@@ -1947,6 +1957,10 @@ def main() -> None:
         plan_tokens_force_null=bool(
             cfg.model.denoiser.get("plan_tokens_force_null", False)
         ),
+        use_oracle_interaction_hint=bool(
+            cfg.model.denoiser.get("use_oracle_interaction_hint", False)
+        ),
+        oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
