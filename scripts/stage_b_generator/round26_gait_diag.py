@@ -268,7 +268,9 @@ def write_summary_md(stats_pred: dict, stats_gt: dict, out_path: Path,
     L.append("|---|---:|---:|")
     L.append(f"| segments with detected period | {100*sg['step_period_frames']['rate_with_period']:.1f}% | {100*sp['step_period_frames']['rate_with_period']:.1f}% |")
     if sg['step_period_frames']['mean']:
-        L.append(f"| mean period (frames) | {sg['step_period_frames']['mean']:.1f} | {sp['step_period_frames']['mean']:.1f if sp['step_period_frames']['mean'] else 'n/a'} |")
+        sp_mean = sp['step_period_frames']['mean']
+        sp_str = f"{sp_mean:.1f}" if sp_mean is not None else "n/a"
+        L.append(f"| mean period (frames) | {sg['step_period_frames']['mean']:.1f} | {sp_str} |")
     L.append("")
     L.append("## Headline finding")
     L.append("")
