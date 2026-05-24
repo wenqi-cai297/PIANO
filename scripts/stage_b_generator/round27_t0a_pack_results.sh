@@ -28,8 +28,8 @@ OUT="round27_t0a_results_${STAMP}.tar.gz"
 
 ITEMS=()
 
-# Per-variant diagnostic outputs.
-for V in t0a1 t0a2 t0a3; do
+# Per-variant diagnostic outputs (all 6 Tier-0 variants).
+for V in t0a1 t0a2 t0a3 t0b1 t0b2 t0ab; do
     for TAG in best_val final; do
         DIR="analyses/round27_${V}_diag_${TAG}"
         [[ -d "${DIR}" ]] && ITEMS+=("${DIR}")
@@ -57,8 +57,16 @@ done
 
 # Per-variant training metadata (NOT ckpts).
 shopt -s nullglob
-for V in t0a1 t0a2 t0a3; do
-    RUN_DIR="runs/training/stageB_anchordiff_${V}_oracle_hint_48clip"
+declare -A RUN_DIR_BY_VARIANT=(
+    [t0a1]="runs/training/stageB_anchordiff_t0a1_hand_oracle_hint_48clip"
+    [t0a2]="runs/training/stageB_anchordiff_t0a2_foot_oracle_hint_48clip"
+    [t0a3]="runs/training/stageB_anchordiff_t0a3_full_oracle_hint_48clip"
+    [t0b1]="runs/training/stageB_anchordiff_t0b1_temporal_losses_48clip_from_v27"
+    [t0b2]="runs/training/stageB_anchordiff_t0b2_temporal_losses_48clip_from_r23"
+    [t0ab]="runs/training/stageB_anchordiff_t0ab_full_oracle_hint_temporal_losses_48clip"
+)
+for V in t0a1 t0a2 t0a3 t0b1 t0b2 t0ab; do
+    RUN_DIR="${RUN_DIR_BY_VARIANT[$V]}"
     [[ -d "${RUN_DIR}" ]] || continue
     # Use --append style: include only non-ckpt files via tar --exclude.
     for ext in jsonl log txt yaml; do

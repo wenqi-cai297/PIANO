@@ -48,16 +48,19 @@ LOG_DIR="runs/round27_t0a_train"
 mkdir -p "${LOG_DIR}"
 
 V27_CKPT="runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
+R23_CKPT="runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt"
 TRAIN_INDICES="analyses/round27_tier0_train_indices_48.json"
 
 SINGLE_GPU="${ROUND27_SINGLE_GPU:-0}"
 RESUME_FROM="${ROUND27_RESUME_FROM:-}"
 
-# Default: run all three. CLI args narrow it down.
+# Default: run all six Tier-0 variants. CLI args narrow it down.
+# Variants: t0a1 (hand) t0a2 (foot) t0a3 (full) t0b1 (temporal-from-v27)
+#           t0b2 (temporal-from-R23) t0ab (full+temporal upper bound)
 if [[ $# -gt 0 ]]; then
     VARIANTS=("$@")
 else
-    VARIANTS=(t0a1 t0a2 t0a3)
+    VARIANTS=(t0a1 t0a2 t0a3 t0b1 t0b2 t0ab)
 fi
 
 _should_skip() {
@@ -91,9 +94,12 @@ run_step() {
 # Per-variant lookup table.
 _variant_label() {
     case "$1" in
-        t0a1) echo "hand-only (D=8)" ;;
-        t0a2) echo "foot-only (D=5)" ;;
-        t0a3) echo "full hand+foot (D=13)" ;;
+        t0a1) echo "hand-only oracle hint (D=8)" ;;
+        t0a2) echo "foot-only oracle hint (D=5)" ;;
+        t0a3) echo "full oracle hint (D=13)" ;;
+        t0b1) echo "temporal losses only, from v27" ;;
+        t0b2) echo "temporal losses only, from R23" ;;
+        t0ab) echo "full hint + temporal losses (upper bound)" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -103,6 +109,9 @@ _variant_config_local() {
         t0a1) echo "configs/training/anchordiff_t0a1_hand_oracle_hint_48clip_local.yaml" ;;
         t0a2) echo "configs/training/anchordiff_t0a2_foot_oracle_hint_48clip_local.yaml" ;;
         t0a3) echo "configs/training/anchordiff_t0a3_full_oracle_hint_48clip_local.yaml" ;;
+        t0b1) echo "configs/training/anchordiff_t0b1_temporal_losses_48clip_from_v27_local.yaml" ;;
+        t0b2) echo "configs/training/anchordiff_t0b2_temporal_losses_48clip_from_r23_local.yaml" ;;
+        t0ab) echo "configs/training/anchordiff_t0ab_full_oracle_hint_temporal_losses_48clip_local.yaml" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -112,6 +121,9 @@ _variant_run_dir() {
         t0a1) echo "runs/training/stageB_anchordiff_t0a1_hand_oracle_hint_48clip" ;;
         t0a2) echo "runs/training/stageB_anchordiff_t0a2_foot_oracle_hint_48clip" ;;
         t0a3) echo "runs/training/stageB_anchordiff_t0a3_full_oracle_hint_48clip" ;;
+        t0b1) echo "runs/training/stageB_anchordiff_t0b1_temporal_losses_48clip_from_v27" ;;
+        t0b2) echo "runs/training/stageB_anchordiff_t0b2_temporal_losses_48clip_from_r23" ;;
+        t0ab) echo "runs/training/stageB_anchordiff_t0ab_full_oracle_hint_temporal_losses_48clip" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -156,7 +168,18 @@ for V in "${VARIANTS[@]}"; do
     CFG_LOCAL="$(_variant_config_local "$V")"
     [[ -f "${CFG_LOCAL}" ]] || { echo "ERROR: missing config: ${CFG_LOCAL}"; exit 1; }
 done
-[[ -f "${V27_CKPT}"     ]] || { echo "ERROR: missing v27 ckpt: ${V27_CKPT}";     exit 1; }
+
+# Init ckpts: every variant except t0b2 starts from v27; t0b2 starts from R23.
+_needs_v27=0; _needs_r23=0
+for V in "${VARIANTS[@]}"; do
+    if [[ "${V}" == "t0b2" ]]; then _needs_r23=1; else _needs_v27=1; fi
+done
+if [[ $_needs_v27 -eq 1 && ! -f "${V27_CKPT}" ]]; then
+    echo "ERROR: missing v27 ckpt: ${V27_CKPT}"; exit 1
+fi
+if [[ $_needs_r23 -eq 1 && ! -f "${R23_CKPT}" ]]; then
+    echo "ERROR: missing R23 ckpt (needed by t0b2): ${R23_CKPT}"; exit 1
+fi
 [[ -f "${TRAIN_INDICES}" ]] || { echo "ERROR: missing train indices: ${TRAIN_INDICES}"; exit 1; }
 [[ -d "cache/stage1_coarse_v1_full" ]] || { echo "ERROR: missing Stage-1 cache"; exit 1; }
 

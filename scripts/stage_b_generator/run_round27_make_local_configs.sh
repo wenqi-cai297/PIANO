@@ -26,6 +26,9 @@ CONFIGS=(
     "anchordiff_t0a1_hand_oracle_hint_48clip"
     "anchordiff_t0a2_foot_oracle_hint_48clip"
     "anchordiff_t0a3_full_oracle_hint_48clip"
+    "anchordiff_t0b1_temporal_losses_48clip_from_v27"
+    "anchordiff_t0b2_temporal_losses_48clip_from_r23"
+    "anchordiff_t0ab_full_oracle_hint_temporal_losses_48clip"
 )
 
 for NAME in "${CONFIGS[@]}"; do

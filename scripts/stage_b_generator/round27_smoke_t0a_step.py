@@ -62,19 +62,22 @@ def main() -> int:
 
     cfg = OmegaConf.load(args.config)
     print(f"[smoke] config: {args.config}")
-    print(f"[smoke] data.use_oracle_interaction_hint = "
-          f"{cfg.data.use_oracle_interaction_hint}")
+    hint_on = bool(cfg.data.get("use_oracle_interaction_hint", False))
+    aux_on = bool(cfg.data.get("surface_temporal_aux_fields", False))
+    print(f"[smoke] data.use_oracle_interaction_hint = {hint_on}")
+    print(f"[smoke] data.surface_temporal_aux_fields = {aux_on}")
     print(f"[smoke] data.oracle_hint_variant         = "
           f"{cfg.data.oracle_hint_variant}")
     print(f"[smoke] model.denoiser.oracle_hint_dim   = "
           f"{cfg.model.denoiser.oracle_hint_dim}")
 
-    expected_dim = hint_dim(str(cfg.data.oracle_hint_variant))
-    if int(cfg.model.denoiser.oracle_hint_dim) != expected_dim:
-        raise SystemExit(
-            f"[smoke] FAIL: oracle_hint_dim {cfg.model.denoiser.oracle_hint_dim} "
-            f"!= hint_dim('{cfg.data.oracle_hint_variant}') = {expected_dim}"
-        )
+    if hint_on:
+        expected_dim = hint_dim(str(cfg.data.oracle_hint_variant))
+        if int(cfg.model.denoiser.oracle_hint_dim) != expected_dim:
+            raise SystemExit(
+                f"[smoke] FAIL: oracle_hint_dim {cfg.model.denoiser.oracle_hint_dim} "
+                f"!= hint_dim('{cfg.data.oracle_hint_variant}') = {expected_dim}"
+            )
 
     # ── (1) Dataset surfaces the hint ─────────────────────────────────
     # Use the first dataset root from the YAML (chairs).
@@ -93,22 +96,46 @@ def main() -> int:
         support_collapse_hand_support=bool(
             cfg.data.get("support_collapse_hand_support", True)
         ),
-        use_oracle_interaction_hint=bool(cfg.data.use_oracle_interaction_hint),
+        use_oracle_interaction_hint=hint_on,
         oracle_hint_variant=str(cfg.data.oracle_hint_variant),
         oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
+        surface_temporal_aux_fields=aux_on,
     )
     sample = ds[0]
-    if "oracle_interaction_hint" not in sample:
-        raise SystemExit(
-            "[smoke] FAIL: dataset sample missing 'oracle_interaction_hint'"
+    if hint_on:
+        if "oracle_interaction_hint" not in sample:
+            raise SystemExit(
+                "[smoke] FAIL: dataset sample missing 'oracle_interaction_hint'"
+            )
+        hint = sample["oracle_interaction_hint"]
+        assert hint.shape == (int(cfg.data.max_seq_length), expected_dim), hint.shape
+        print(
+            f"[smoke] (1a) dataset hint OK: shape={tuple(hint.shape)}  "
+            f"mean={hint.mean().item():.4f}  std={hint.std().item():.4f}  "
+            f"finite={torch.isfinite(hint).all().item()}"
         )
-    hint = sample["oracle_interaction_hint"]
-    assert hint.shape == (int(cfg.data.max_seq_length), expected_dim), hint.shape
-    print(
-        f"[smoke] (1) dataset hint OK: shape={tuple(hint.shape)}  "
-        f"mean={hint.mean().item():.4f}  std={hint.std().item():.4f}  "
-        f"finite={torch.isfinite(hint).all().item()}"
-    )
+    if aux_on:
+        for k in ("walking_mask", "foot_stance_gt"):
+            if k not in sample:
+                raise SystemExit(
+                    f"[smoke] FAIL: dataset sample missing '{k}' (aux fields "
+                    "requested but not surfaced)"
+                )
+        wm = sample["walking_mask"]
+        fs = sample["foot_stance_gt"]
+        print(
+            f"[smoke] (1b) aux fields OK: walking_mask shape={tuple(wm.shape)}  "
+            f"mean={wm.mean().item():.3f}; foot_stance_gt shape={tuple(fs.shape)}  "
+            f"mean={fs.mean().item():.3f}"
+        )
+
+    if not hint_on:
+        # T0-B variant: nothing to verify on the model side here. The
+        # temporal loss path is covered by
+        # tests/test_temporal_interaction_losses.py.
+        print("[smoke] (2-4) skipped (no oracle hint; T0-B variant)")
+        print("[smoke] ALL CHECKS PASSED")
+        return 0
 
     # ── (2) Build a denoiser whose oracle_hint_proj must be wired ─────
     # We bypass stage1_coarse (cache is server-only) by setting
