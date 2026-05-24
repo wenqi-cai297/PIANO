@@ -153,6 +153,13 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
             motion_representation=str(
                 cfg.data.get("motion_representation", "motion_263")
             ),
+            use_oracle_interaction_hint=bool(
+                cfg.data.get("use_oracle_interaction_hint", False)
+            ),
+            oracle_hint_variant=str(
+                cfg.data.get("oracle_hint_variant", "full")
+            ),
+            oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)

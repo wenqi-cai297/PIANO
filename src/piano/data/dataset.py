@@ -183,6 +183,16 @@ class HOIDataset(Dataset):
         # config and SUPPORT_NAMES is implicitly truncated to the
         # first 3 names.
         support_collapse_hand_support: bool = False,
+        # Tier-0A oracle interaction-hint (roadmap §6.11). When enabled,
+        # __getitem__ surfaces a per-frame ``oracle_interaction_hint``
+        # tensor of shape (T, D) where D = hint_dim(oracle_hint_variant)
+        # (hand=8 / foot=5 / full=13). Computed from joints + object pose
+        # + contact_state at load time. Requires
+        # ``object_positions``, ``object_rotations`` and the
+        # ``contact_state`` pseudo-label to be present.
+        use_oracle_interaction_hint: bool = False,
+        oracle_hint_variant: str = "full",
+        oracle_hint_fps: float = 20.0,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
@@ -197,6 +207,22 @@ class HOIDataset(Dataset):
         # need them) doesn't pay the MoMask-recovery import cost.
         self.surface_obj_pose = surface_obj_pose
         self.support_collapse_hand_support = bool(support_collapse_hand_support)
+        # Tier-0A oracle interaction-hint (roadmap §6.11).
+        self.use_oracle_interaction_hint = bool(use_oracle_interaction_hint)
+        if self.use_oracle_interaction_hint:
+            from piano.data.interaction_hint import hint_dim as _hint_dim
+            if oracle_hint_variant not in {"hand", "foot", "full"}:
+                raise ValueError(
+                    "oracle_hint_variant must be one of "
+                    f"{{'hand', 'foot', 'full'}}, got {oracle_hint_variant!r}"
+                )
+            self.oracle_hint_variant = str(oracle_hint_variant)
+            self.oracle_hint_dim = int(_hint_dim(self.oracle_hint_variant))
+            self.oracle_hint_fps = float(oracle_hint_fps)
+        else:
+            self.oracle_hint_variant = str(oracle_hint_variant)
+            self.oracle_hint_dim = 0
+            self.oracle_hint_fps = float(oracle_hint_fps)
         # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
         # True, the obj-pose channels are returned in WORLD frame instead
         # of body-canonical frame. Tests Hypothesis E (frame-choice
@@ -735,6 +761,33 @@ class HOIDataset(Dataset):
             result["obj_rot6d_canonical"] = torch.from_numpy(obj_rot6d_canonical)
         for key, arr in padded_labels.items():
             result[key] = torch.from_numpy(arr)
+
+        # ---------------------------------------------------------------
+        # Tier-0A oracle interaction hint (roadmap §6.11)
+        # ---------------------------------------------------------------
+        # Computed over the padded length so the trainer keeps a single
+        # fixed-shape tensor; the trainer is responsible for masking
+        # via ``seq_len`` if it cares about padded frames.
+        if (
+            self.use_oracle_interaction_hint
+            and object_positions is not None
+            and object_rotations is not None
+            and padded_labels.get("contact_state") is not None
+        ):
+            from piano.data.interaction_hint import build_oracle_interaction_hint
+            hint = build_oracle_interaction_hint(
+                joints_22=joints.astype(np.float32),
+                object_positions=object_positions.astype(np.float32),
+                object_rotations=object_rotations.astype(np.float32),
+                contact_state=padded_labels["contact_state"].astype(np.float32),
+                variant=self.oracle_hint_variant,
+                fps=self.oracle_hint_fps,
+            )
+            assert hint.shape == (self.max_seq_length, self.oracle_hint_dim), (
+                f"oracle_interaction_hint shape {hint.shape!r} != "
+                f"expected ({self.max_seq_length}, {self.oracle_hint_dim})"
+            )
+            result["oracle_interaction_hint"] = torch.from_numpy(hint)
 
         return result
 
