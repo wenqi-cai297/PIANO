@@ -5,18 +5,18 @@
 # Round-26 motion-faithful loss patch
 # (see analyses/2026-05-24_round26_v27_motion_faithful_patch.md).
 #
-# Wall-clock budget:
+# Wall-clock budget on 2× A6000 (DDP):
 #   PREP    ~1 min   (translate config paths)
-#   TRAIN   ~3–4 h   (80 epochs, fine-tune from R23 ckpt, SINGLE-GPU cuda:0,
-#                     effective bs = 16 × 1 × 4 = 64; matches R23/v25 setting)
+#   TRAIN   ~1.5–2 h (80 epochs, fine-tune from R23 ckpt, DDP 2-GPU,
+#                     effective bs = 8 × 2 × 4 = 64; matches R23/v25 setting)
 #   EVAL    ~50 min  (D2 + D3 on best_val.pt cuda:0 || final.pt cuda:1; dual-GPU)
-#   TOTAL   ~4–5 h
+#   TOTAL   ~3 h
 #
-# Note: training stage uses single GPU because PIANO's step_fn invokes
-# `model.training_step(...)` (train_anchordiff.py:677) which under DDP
-# bypasses gradient sync — DDP wrapping was never validated end-to-end in
-# this repo. Eval scripts run as plain single-process Python and freely use
-# either GPU via CUDA_VISIBLE_DEVICES, so eval-time dual-GPU is safe.
+# DDP compatibility (Round-26 fix): MotionAnchorDiff now defines
+# .forward(x_start, cond) -> training_step(...), and step_fn invokes the
+# model via __call__ (not .training_step directly). Accelerator is built
+# with DistributedDataParallelKwargs(find_unused_parameters=True) so
+# branches like plan_tokens_force_null=true don't hang the reducer.
 #
 # Prerequisites on the Linux server:
 #   1. git pull (must include the Round-26 commits)
@@ -134,19 +134,34 @@ fi
 if _should_skip train; then
     echo "[SKIP] TRAIN (ROUND26_RESUME_FROM=${RESUME_FROM})"
 else
-    # Training is single-GPU regardless of SINGLE_GPU env (see header note).
-    # SINGLE_GPU only affects the EVAL stage (parallel vs sequential).
-    echo "================================================================"
-    echo "[$(date '+%F %T')] TRAIN v27 (SINGLE-GPU cuda:0, --num_processes 1)"
-    echo "  effective batch size = bs(16) × num_proc(1) × accum(4) = 64"
-    echo "================================================================"
-    run_step "v27_train" \
-        CUDA_VISIBLE_DEVICES=0 \
-        conda run --no-capture-output -n piano accelerate launch \
-            --num_processes 1 --mixed_precision bf16 \
-            --main_process_port 29500 \
-            src/piano/training/train_anchordiff.py \
-            --config "${V27_CFG_LOCAL}"
+    if [[ "${SINGLE_GPU}" == "1" ]]; then
+        # Single-GPU fallback: bs=8 in config × accum 4 = effective 32, smaller
+        # than the DDP run's 64. If you need exact R23/v25 effective bs (64),
+        # override --config to a yaml with batch_size: 16.
+        echo "================================================================"
+        echo "[$(date '+%F %T')] TRAIN v27 (SINGLE-GPU cuda:0, --num_processes 1)"
+        echo "  effective batch size = bs(8) × num_proc(1) × accum(4) = 32"
+        echo "  NOTE: config bs=8 is tuned for DDP 2-GPU; single-GPU has half eff bs."
+        echo "================================================================"
+        run_step "v27_train" \
+            CUDA_VISIBLE_DEVICES=0 \
+            conda run --no-capture-output -n piano accelerate launch \
+                --num_processes 1 --mixed_precision bf16 \
+                --main_process_port 29500 \
+                src/piano/training/train_anchordiff.py \
+                --config "${V27_CFG_LOCAL}"
+    else
+        echo "================================================================"
+        echo "[$(date '+%F %T')] TRAIN v27 (DUAL-GPU DDP, --num_processes 2 --gpu_ids 0,1)"
+        echo "  effective batch size = bs(8) × num_proc(2) × accum(4) = 64"
+        echo "================================================================"
+        run_step "v27_train_ddp" \
+            conda run --no-capture-output -n piano accelerate launch \
+                --num_processes 2 --gpu_ids 0,1 --mixed_precision bf16 \
+                --main_process_port 29500 \
+                src/piano/training/train_anchordiff.py \
+                --config "${V27_CFG_LOCAL}"
+    fi
 fi
 
 # Locate the trained ckpts.

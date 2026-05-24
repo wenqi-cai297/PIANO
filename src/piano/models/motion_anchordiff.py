@@ -1405,6 +1405,27 @@ class MotionAnchorDiff(nn.Module):
         self.diffusion = GaussianDiffusion(cfg.diffusion)
         self.denoiser = AnchorDenoiser(cfg.denoiser)
 
+    def forward(self, x_start: Tensor, cond: dict) -> dict:
+        """DDP-compatible entry point that delegates to ``training_step``.
+
+        PyTorch DistributedDataParallel intercepts gradient sync via
+        ``Module.__call__`` (the path Python takes when you write
+        ``model(x_start, cond)``). Calling a custom method like
+        ``training_step`` directly bypasses ``__call__`` so DDP never
+        gets a chance to reset its per-iteration reducer — under
+        multi-process training this manifests as either AttributeError
+        on the DDP wrapper (it does not forward arbitrary attribute
+        lookups to ``.module``) or as stale reducer state on iteration
+        boundaries.
+
+        Trainers (``train_anchordiff.py::step_fn``) should call
+        ``out = model(motion, cond)`` so DDP's ``__call__`` runs.
+        ``training_step`` remains the canonical implementation and is
+        still callable directly on the unwrapped model for inference /
+        debugging utilities.
+        """
+        return self.training_step(x_start, cond)
+
     def training_step(self, x_start: Tensor, cond: dict) -> dict:
         """One forward pass: sample t, sample noise, run denoiser,
         return prediction + targets in BOTH x_0-space and the network's

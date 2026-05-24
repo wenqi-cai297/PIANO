@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.utils.data import ConcatDataset, DataLoader
@@ -389,6 +389,16 @@ def build_anchordiff_step_fn(
         PART_TO_JOINT, device=device, dtype=torch.long,
     )
 
+    # DDP compatibility: when `model` has been wrapped by
+    # `accelerator.prepare(model)` under multi-process training it becomes
+    # a `DistributedDataParallel` whose `__getattr__` does NOT forward
+    # arbitrary attribute lookups to the underlying module. Save a
+    # reference to the underlying module for read-only access to
+    # `model.diffusion.{alphas_cumprod, prediction_target}` below. Forward
+    # training passes still go through the wrapped `model(...)` to keep
+    # DDP gradient sync intact.
+    _unwrapped_model_for_diff = model.module if hasattr(model, "module") else model
+
     class _WeightCache:
         def __init__(self) -> None:
             self._t: Tensor | None = None
@@ -674,7 +684,10 @@ def build_anchordiff_step_fn(
             )                                                        # (B, T, motion_dim+1)
 
         # --- Diffusion training step (x₀-prediction or v-prediction) ---
-        out = model.training_step(motion, cond)
+        # NOTE: call via __call__ (not .training_step directly) so DDP can
+        # intercept and reset its per-iteration reducer. MotionAnchorDiff
+        # .forward delegates to .training_step.
+        out = model(motion, cond)
         x0_pred = out["x0_pred"]
         x0_target = out["x0_target"]
         diff_pred = out["diff_pred"]
@@ -745,10 +758,10 @@ def build_anchordiff_step_fn(
             min_snr_weight_min = torch.zeros((), device=device, dtype=weighted.dtype)
             if use_min_snr_weighting and "t" in out:
                 t_b = out["t"]                                                 # (B,) long
-                alpha_bar = model.diffusion.alphas_cumprod.gather(0, t_b)      # (B,)
+                alpha_bar = _unwrapped_model_for_diff.diffusion.alphas_cumprod.gather(0, t_b)  # (B,)
                 snr = alpha_bar / (1.0 - alpha_bar + 1e-8)                     # (B,)
                 snr_clamped = torch.clamp_max(snr, float(min_snr_gamma))       # (B,)
-                pred_target = model.diffusion.prediction_target
+                pred_target = _unwrapped_model_for_diff.diffusion.prediction_target
                 if pred_target == "x0":
                     w_b = snr_clamped                                          # (B,)
                 elif pred_target == "v":
@@ -1767,9 +1780,16 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config)
 
+    # find_unused_parameters=True is defensive for v27-style configs where
+    # `plan_tokens_force_null: true` etc. zero out branches whose parameters
+    # may never receive gradient — DDP would otherwise hang on the per-iter
+    # all-reduce waiting for those params. Small overhead (extra bookkeeping
+    # of the autograd graph), no correctness impact.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.get("gradient_accumulation_steps", 1),
         mixed_precision=cfg.training.get("mixed_precision", "bf16"),
+        kwargs_handlers=[ddp_kwargs],
     )
     set_seed(int(cfg.training.get("seed", 42)))
     device = accelerator.device

@@ -130,7 +130,9 @@ data:
 
 training:
   init_checkpoint: "runs/training/stageB_anchordiff_v25_round23_noplan_clean_alibi_FULL_DATA/final.pt"
-  batch_size: 16
+  # bs=8 per GPU × 2 GPU (DDP) × accum 4 = effective 64, matches R23/v25.
+  # If you launch single-GPU, increase to 16 to keep effective bs unchanged.
+  batch_size: 8
   # 80 ep ≈ 10,500 grad steps (matches R23's training length). Best-val
   # checkpoint by `val_best_key` + periodic epoch_N.pt give post-hoc
   # ckpt-selection safety against overfitting late in the schedule.
