@@ -657,26 +657,3 @@ def _save_checkpoint(
     accelerator.print(f"  Saved checkpoint: {ckpt_path}")
 
 
-def main() -> None:
-    """CLI entrypoint for ``piano-train``. Dispatches to stage-specific scripts."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="PIANO training dispatcher")
-    parser.add_argument("stage", choices=["predictor", "generator", "joint"],
-                        help="Training stage to run")
-    parser.add_argument("--config", type=str, required=True, help="Config yaml path")
-    args = parser.parse_args()
-
-    if args.stage == "predictor":
-        from piano.training.train_predictor import run as run_predictor
-        run_predictor(args.config)
-    elif args.stage == "generator":
-        from piano.training.train_generator import run as run_generator
-        run_generator(args.config)
-    elif args.stage == "joint":
-        from piano.training.train_joint import run as run_joint
-        run_joint(args.config)
-
-
-if __name__ == "__main__":
-    main()

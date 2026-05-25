@@ -954,21 +954,9 @@ def build_anchordiff_step_fn(
         # predicted jpos. Forces the redundant 198-D representation to be
         # internally self-consistent — eliminates the v4 'arm stretches
         # to satisfy anchor target' failure mode.
+        # Round-28 cleanup: v5 (joints22_world_with_rot6d) FK-consistency
+        # loss removed. Active configs use smpl_pose_135_plan, no v5 path.
         loss_fk = torch.zeros((), device=device, dtype=x0_pred.dtype)
-        if (
-            motion_representation == "joints22_world_with_rot6d"
-            and fk_consistency_weight > 0.0
-        ):
-            from piano.training.anchordiff_v5_losses import fk_consistency_loss
-            jpos_pred_v5 = x0_pred[..., :66].view(B, T, 22, 3).float()
-            rot_6d_pred = x0_pred[..., 66:].view(B, T, 22, 6).float()
-            rest_offsets = batch["rest_offsets"].to(device).float()        # (B, 22, 3)
-            loss_fk = fk_consistency_loss(
-                jpos_pred=jpos_pred_v5,
-                rot_6d_pred=rot_6d_pred,
-                rest_offsets=rest_offsets,
-                seq_mask=seq_mask,
-            )
 
         # Full-body L_pos (v7+): MSE between FK-derived predicted joints
         # and GT joints_22, all 22 joints × all valid frames. Dense
