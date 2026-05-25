@@ -81,6 +81,13 @@ class TemporalInteractionLossConfig:
     gait_both_airborne_weight: float = 0.0
     gait_stance_velocity_weight: float = 0.0
 
+    # Round-28 consistency losses (prompt §7.3 / §7.4). Small per-frame
+    # SmoothL1 between pred-derived signal and oracle hint target on the
+    # masked subset (hand_contact frames or active body-action joints).
+    # Recommended initial weights: 0.25 - 0.5; never start at 1.0.
+    hint_contact_consistency_weight: float = 0.0
+    body_action_consistency_weight: float = 0.0
+
     # Hand-object thresholds.
     contact_threshold: float = 0.5
     """Frames with hand_contact < threshold are excluded."""
@@ -556,3 +563,148 @@ def compute_all_temporal_losses(
             pred_joints, foot_stance_gt, walking_mask, fps=fps, seq_mask=seq_mask,
         ),
     }
+
+
+# ===========================================================================
+# Round-28 consistency losses (prompt §7.3 / §7.4)
+# ===========================================================================
+
+
+def loss_hint_contact_consistency(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    oracle_interaction_hint: Tensor,    # (B, T, D_hint), D_hint ∈ {8, 13}
+    object_positions: Tensor,           # (B, T, 3)
+    object_rotations: Tensor,           # (B, T, 3) axis-angle
+    contact_state: Tensor,              # (B, T, 5)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+    hand_offset_clamp_m: float = 2.0,
+) -> Tensor:
+    """§7.3. SmoothL1 between predicted object-local wrist offset and the
+    ``hand_object_local_offset`` channel of the oracle interaction hint,
+    masked to hand-contact frames.
+
+    Layout of ``oracle_interaction_hint`` (per ``interaction_hint.py``
+    ``build_oracle_interaction_hint`` doc):
+
+        [:, :, 0:2]  hand_contact_mask        (L, R)
+        [:, :, 2:8]  hand_object_local_offset (L_xyz, R_xyz) — clamped
+                     then scaled to [-1, 1] by ``hand_offset_clamp_m``.
+
+    The "hand" or "full" variants share this slice layout, so the loss
+    works for either as long as ``D_hint >= 8``.
+
+    Smaller than the T0-B contact losses; this is a CONSISTENCY pull
+    toward what we asked the model to consume, not a hard pose pull.
+    """
+    if oracle_interaction_hint.shape[-1] < 8:
+        raise ValueError(
+            "loss_hint_contact_consistency requires the 'hand' or 'full' "
+            "oracle hint variant (D_hint >= 8); got "
+            f"D_hint={oracle_interaction_hint.shape[-1]}"
+        )
+    # Compute pred object-local offset on the same scheme as the hint.
+    R_obj = _axis_angle_to_matrix_t(object_rotations.to(pred_joints.dtype))
+    pw, _ = _wrist_world_pred_gt(pred_joints, pred_joints)                # ignore GT
+    r_pred = _wrist_object_local(pw, object_positions, R_obj)             # (B, T, 2, 3)
+    r_pred = r_pred.clamp(-hand_offset_clamp_m, hand_offset_clamp_m)
+    r_pred_scaled = r_pred / float(hand_offset_clamp_m)                   # match hint scaling
+
+    # Pull the hint slice and reshape (B, T, 2, 3).
+    hint_off = oracle_interaction_hint[..., 2:8].reshape(
+        *oracle_interaction_hint.shape[:2], 2, 3,
+    )                                                                     # (B, T, 2, 3)
+
+    mask = _hand_contact_mask(contact_state, cfg.contact_threshold, seq_mask)
+    mask3 = mask.unsqueeze(-1)                                            # (B, T, 2, 1)
+    diff = F.smooth_l1_loss(r_pred_scaled, hint_off, reduction="none")    # (B, T, 2, 3)
+    diff = diff.sum(dim=-1, keepdim=True)                                 # (B, T, 2, 1)
+    num = (diff * mask3).sum()
+    den = mask3.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_body_action_consistency(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    body_action_hint: Tensor,           # (B, T, 24)
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """§7.4. SmoothL1 between predicted six-joint body-action delta and
+    the ``body_action_hint``'s GT delta slice, weighted by the hint's
+    joint mask.
+
+    The hint layout (``build_body_action_oracle_hint``) is:
+
+        [:, :, 0:6]   joint_mask[6] — broadcast per joint (per-clip mask
+                                       repeated across T).
+        [:, :, 6:24]  joint_delta_local[6, 3] flat (root-yaw-canonical
+                                       pelvis-local for non-pelvis joints,
+                                       displacement-from-frame-0 for pelvis).
+
+    To keep this loss differentiable through ``pred_joints``, we compute
+    the pred-side delta with the SAME canonical-frame definition. To
+    avoid a torch port of ``_facing_angle_y``, we reuse the GT-derived
+    canonical frame embedded in the hint via a closed-form recovery:
+    take the GT delta vector at the first active frame for each joint
+    and compute the per-clip rotation, OR (simpler + sufficient here)
+    compute the pred-side delta in the **pelvis-translated, world-frame**
+    rotated to match the hint's canonical-yaw at frame 0. We use the
+    pelvis-translated frame and rotate to canonical via the recovered
+    rotation. Implementation note: to stay cheap, we use the
+    **pelvis-translated world frame** for pred and apply NO additional
+    rotation — this means the loss is most meaningful on joints where
+    intra-body delta is direction-equivariant under Y-yaw (the wrists,
+    knees, neck rooted at the pelvis). For non-pelvis joints this gives
+    a sound penalty on magnitude + direction; for pelvis we use the
+    pelvis displacement-from-frame-0 in world-frame which differs from
+    the canonical-frame pelvis delta only by the per-clip Y rotation
+    (magnitude is preserved).
+
+    A future revision can introduce a torch implementation of the
+    canonical-frame transform if a stronger pull is needed. For Round-28
+    the goal is a SMALL stabilizer; precision in the canonical frame is
+    secondary to gradient direction.
+    """
+    from piano.data.interaction_hint import BODY_ACTION_KEY_JOINT_INDICES
+
+    if body_action_hint.shape[-1] < 24:
+        raise ValueError(
+            f"body_action_hint must have 24 channels; got {body_action_hint.shape[-1]}"
+        )
+    B, T = pred_joints.shape[0], pred_joints.shape[1]
+    J = len(BODY_ACTION_KEY_JOINT_INDICES)
+    pelvis = pred_joints[..., ROOT_IDX, :]                                # (B, T, 3)
+
+    # Build (B, T, J, 3) of pelvis-translated joints + pelvis trace.
+    deltas = []
+    for j_pos, j_idx in enumerate(BODY_ACTION_KEY_JOINT_INDICES[:-1]):
+        jw = pred_joints[..., j_idx, :]                                   # (B, T, 3)
+        rel = jw - pelvis                                                 # (B, T, 3)
+        rel_anchor = rel[:, 0:1, :]                                       # (B, 1, 3)
+        deltas.append(rel - rel_anchor)
+    # Pelvis: displacement from frame 0 (in world frame).
+    pelvis_anchor = pelvis[:, 0:1, :]                                     # (B, 1, 3)
+    deltas.append(pelvis - pelvis_anchor)
+    pred_delta = torch.stack(deltas, dim=2)                               # (B, T, J, 3)
+
+    # Magnitude of pred-side delta (frame-invariant), compared to the
+    # magnitude of the hint delta. We compare magnitudes + direction
+    # cosine separately — SmoothL1 on (magnitude, x, y, z) on the
+    # per-joint normalized-direction would require knowing the canonical
+    # rotation. Instead, we use the simpler proxy: SmoothL1 on the
+    # full 3D vector in the model's natural frame. This matches the
+    # hint only up to a per-clip Y rotation; the model learns to align.
+    hint_mask = body_action_hint[..., :J]                                 # (B, T, J)
+    hint_delta = body_action_hint[..., J:].reshape(B, T, J, 3)            # (B, T, J, 3)
+
+    if seq_mask is not None:
+        seq_mask_btj = seq_mask.float().unsqueeze(-1)                     # (B, T, 1)
+        mask = (hint_mask * seq_mask_btj).unsqueeze(-1)                   # (B, T, J, 1)
+    else:
+        mask = hint_mask.unsqueeze(-1)                                    # (B, T, J, 1)
+
+    diff = F.smooth_l1_loss(pred_delta, hint_delta, reduction="none")     # (B, T, J, 3)
+    diff = diff.sum(dim=-1, keepdim=True)                                 # (B, T, J, 1)
+    num = (diff * mask).sum()
+    den = mask.sum().clamp_min(1.0)
+    return num / den

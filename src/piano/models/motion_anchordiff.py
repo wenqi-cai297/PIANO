@@ -745,6 +745,30 @@ class AnchorDenoiserConfig:
     use_oracle_interaction_hint: bool = False
     oracle_hint_dim: int = 0
 
+    # Round-28 Stage-2 oracle interface refinement (analyses/
+    # 2026-05-25_round28_*.md). Two orthogonal extensions on top of the
+    # Round-27 input-add baseline:
+    #
+    # 1. Body-action hint branch — a separate 24D channel projected
+    #    through its OWN MLP (not merged into a monolithic 37D MLP).
+    # 2. Injection mode — `input_add` (R27 baseline, kept), `gated_input`
+    #    (separate per-branch sigmoid gate driven by the AdaLN summary
+    #    c-vector + branch embedding), `per_layer_adapter` (zero-init
+    #    per-DiT-block adapters; implemented in Commit 3).
+    #
+    # When `separate_hint_branches=False` and only interaction_hint is
+    # enabled, the behavior is bit-exact equivalent to R27 input-add.
+    use_body_action_hint: bool = False
+    body_action_hint_dim: int = 0
+    # `input_add` / `gated_input` / `per_layer_adapter`.
+    oracle_hint_injection_mode: str = "input_add"
+    # When True, interaction & body-action hints have their own
+    # projections + (if gated/adapter) their own gates/adapters.
+    separate_hint_branches: bool = True
+    # When True, every newly-added adapter / second-projection-layer is
+    # zero-initialized so step-0 forward matches the no-hint baseline.
+    zero_init_hint_adapters: bool = True
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -1032,28 +1056,254 @@ class AnchorDenoiser(nn.Module):
             else:
                 self.register_parameter("plan_xattn_time_bias_slopes", None)
 
-            # Round-27 Tier-0A: oracle interaction-hint projection
-            # (roadmap §6.12). 2-layer MLP, hidden = d_model. Second
-            # Linear is zero-initialized so the step-0 forward is
-            # bit-exact equal to the no-hint baseline (matches the
-            # zero-init pattern used by self_conditioning / stage1_coarse
+            # Round-27/28 oracle hint branches. Two independent branches:
+            # interaction (13D / 8 / 5) and body-action (24D). Each gets
+            # its own 2-layer MLP projection; second Linear is
+            # zero-initialized so step-0 forward equals the no-hint
+            # baseline (same pattern as self_conditioning / stage1_coarse
             # branches in V12InputProjection).
-            if cfg.use_oracle_interaction_hint:
-                if cfg.oracle_hint_dim <= 0:
-                    raise ValueError(
-                        "use_oracle_interaction_hint=True requires "
-                        "oracle_hint_dim > 0; got "
-                        f"{cfg.oracle_hint_dim}"
-                    )
-                self.oracle_hint_proj = nn.Sequential(
-                    nn.Linear(cfg.oracle_hint_dim, cfg.d_model),
-                    nn.SiLU(),
-                    nn.Linear(cfg.d_model, cfg.d_model),
+            #
+            # Naming kept as `oracle_hint_proj` for backward-compatible
+            # checkpoint loading from R27 T0-A3 (interaction-only) runs.
+            self._build_oracle_hint_branches(cfg)
+
+    # ------------------------------------------------------------------
+    # Round-27/28 oracle hint branch builder + helpers
+    # ------------------------------------------------------------------
+
+    def _build_oracle_hint_branches(self, cfg) -> None:
+        """Construct interaction + body-action hint MLPs, gates, and
+        optional per-layer adapters. Names are arranged so that legacy
+        R27 T0-A3 checkpoints (which only have ``oracle_hint_proj.*``)
+        still load correctly via ``partial_init_allow_shape_mismatch``.
+        """
+        # --- Interaction-hint branch ----------------------------------
+        if cfg.use_oracle_interaction_hint:
+            if cfg.oracle_hint_dim <= 0:
+                raise ValueError(
+                    "use_oracle_interaction_hint=True requires "
+                    f"oracle_hint_dim > 0; got {cfg.oracle_hint_dim}"
                 )
-                nn.init.zeros_(self.oracle_hint_proj[-1].weight)
-                nn.init.zeros_(self.oracle_hint_proj[-1].bias)
+            self.oracle_hint_proj = nn.Sequential(
+                nn.Linear(cfg.oracle_hint_dim, cfg.d_model),
+                nn.SiLU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+            )
+            nn.init.zeros_(self.oracle_hint_proj[-1].weight)
+            nn.init.zeros_(self.oracle_hint_proj[-1].bias)
+        else:
+            self.oracle_hint_proj = None
+
+        # --- Body-action hint branch (Round-28) -----------------------
+        if cfg.use_body_action_hint:
+            if cfg.body_action_hint_dim <= 0:
+                raise ValueError(
+                    "use_body_action_hint=True requires "
+                    f"body_action_hint_dim > 0; got {cfg.body_action_hint_dim}"
+                )
+            self.body_action_hint_proj = nn.Sequential(
+                nn.Linear(cfg.body_action_hint_dim, cfg.d_model),
+                nn.SiLU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+            )
+            nn.init.zeros_(self.body_action_hint_proj[-1].weight)
+            nn.init.zeros_(self.body_action_hint_proj[-1].bias)
+        else:
+            self.body_action_hint_proj = None
+
+        # --- Gated-input injection gates ------------------------------
+        # Sigmoid gate driven by [c_summary (D), hint_emb (D)] -> 1 scalar
+        # gate per (B, T, 1). When ``oracle_hint_injection_mode ==
+        # "gated_input"``, the gate modulates the additive injection.
+        # Bias is initialized to a small negative value so initial gate
+        # is ~ sigmoid(-3) = 0.047 (closed → close to baseline at step 0).
+        if cfg.oracle_hint_injection_mode == "gated_input":
+            if self.oracle_hint_proj is not None:
+                self.interaction_gate = nn.Linear(2 * cfg.d_model, 1)
+                if cfg.zero_init_hint_adapters:
+                    nn.init.zeros_(self.interaction_gate.weight)
+                    nn.init.constant_(self.interaction_gate.bias, -3.0)
             else:
-                self.oracle_hint_proj = None
+                self.interaction_gate = None
+            if self.body_action_hint_proj is not None:
+                self.body_action_gate = nn.Linear(2 * cfg.d_model, 1)
+                if cfg.zero_init_hint_adapters:
+                    nn.init.zeros_(self.body_action_gate.weight)
+                    nn.init.constant_(self.body_action_gate.bias, -3.0)
+            else:
+                self.body_action_gate = None
+        else:
+            self.interaction_gate = None
+            self.body_action_gate = None
+
+        # --- Per-layer adapters (Commit 3) ----------------------------
+        # One small adapter per DiT block per branch. Each is
+        # zero-initialized at the final Linear so the per-layer
+        # contribution starts at 0 (preserves R27 ckpt forward).
+        if cfg.oracle_hint_injection_mode == "per_layer_adapter":
+            n_layers = int(cfg.n_layers)
+            if self.oracle_hint_proj is not None:
+                self.interaction_adapters = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(cfg.d_model, cfg.d_model),
+                        nn.SiLU(),
+                        nn.Linear(cfg.d_model, cfg.d_model),
+                    )
+                    for _ in range(n_layers)
+                ])
+                if cfg.zero_init_hint_adapters:
+                    for ad in self.interaction_adapters:
+                        nn.init.zeros_(ad[-1].weight)
+                        nn.init.zeros_(ad[-1].bias)
+            else:
+                self.interaction_adapters = None
+            if self.body_action_hint_proj is not None:
+                self.body_action_adapters = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(cfg.d_model, cfg.d_model),
+                        nn.SiLU(),
+                        nn.Linear(cfg.d_model, cfg.d_model),
+                    )
+                    for _ in range(n_layers)
+                ])
+                if cfg.zero_init_hint_adapters:
+                    for ad in self.body_action_adapters:
+                        nn.init.zeros_(ad[-1].weight)
+                        nn.init.zeros_(ad[-1].bias)
+            else:
+                self.body_action_adapters = None
+        else:
+            self.interaction_adapters = None
+            self.body_action_adapters = None
+
+        # Cached most-recent hint embeddings (B, T, D), populated by the
+        # input-injection helper for use by per-layer adapters. Reset to
+        # None at the start of every forward pass.
+        self._interaction_hint_emb_cache = None
+        self._body_action_hint_emb_cache = None
+
+    def _apply_oracle_hint_input_injection(
+        self,
+        h: Tensor,
+        cond: dict,
+        c_summary: Tensor | None = None,
+    ) -> Tensor:
+        """Compute interaction + body-action hint embeddings and inject
+        them into the per-frame embedding ``h`` per the configured
+        ``oracle_hint_injection_mode``. Caches the embeddings for
+        per-layer adapter consumption.
+
+        ``c_summary`` is the AdaLN cond summary (B, D). Required only
+        when ``injection_mode == "gated_input"`` (used as gate input
+        alongside the hint embedding).
+        """
+        cfg = self.cfg
+        self._interaction_hint_emb_cache = None
+        self._body_action_hint_emb_cache = None
+
+        # --- Interaction hint ----------------------------------------
+        interaction_emb = None
+        if self.oracle_hint_proj is not None:
+            if "oracle_interaction_hint" not in cond:
+                raise KeyError(
+                    "use_oracle_interaction_hint=True but "
+                    "cond['oracle_interaction_hint'] is missing. The "
+                    "trainer must populate this from "
+                    "batch['oracle_interaction_hint'] (set "
+                    "data.use_oracle_interaction_hint=true in the config)."
+                )
+            ih = cond["oracle_interaction_hint"]                          # (B, T, D_hint)
+            interaction_emb = self.oracle_hint_proj(ih)                   # (B, T, D)
+            self._interaction_hint_emb_cache = interaction_emb
+
+        # --- Body-action hint (R28) ----------------------------------
+        body_emb = None
+        if self.body_action_hint_proj is not None:
+            if "body_action_hint" not in cond:
+                raise KeyError(
+                    "use_body_action_hint=True but "
+                    "cond['body_action_hint'] is missing. The trainer "
+                    "must populate this from batch['body_action_hint'] "
+                    "(set data.use_body_action_hint=true in the config)."
+                )
+            bh = cond["body_action_hint"]                                  # (B, T, 24)
+            body_emb = self.body_action_hint_proj(bh)                      # (B, T, D)
+            self._body_action_hint_emb_cache = body_emb
+
+        if interaction_emb is None and body_emb is None:
+            return h
+
+        mode = cfg.oracle_hint_injection_mode
+        if mode in ("input_add", "per_layer_adapter"):
+            # ``per_layer_adapter`` still does the (zero-init) input
+            # injection so behavior matches input_add at step 0 — the
+            # adapters add their own per-layer contributions on top.
+            if interaction_emb is not None:
+                h = h + interaction_emb
+            if body_emb is not None:
+                h = h + body_emb
+            return h
+        if mode == "gated_input":
+            if interaction_emb is not None and self.interaction_gate is not None:
+                gate_input = torch.cat(
+                    [interaction_emb, h], dim=-1,
+                )                                                        # (B, T, 2D)
+                g = torch.sigmoid(self.interaction_gate(gate_input))     # (B, T, 1)
+                h = h + g * interaction_emb
+            if body_emb is not None and self.body_action_gate is not None:
+                gate_input = torch.cat(
+                    [body_emb, h], dim=-1,
+                )                                                        # (B, T, 2D)
+                g = torch.sigmoid(self.body_action_gate(gate_input))     # (B, T, 1)
+                h = h + g * body_emb
+            return h
+        raise ValueError(
+            f"oracle_hint_injection_mode={mode!r} not in "
+            "{'input_add', 'gated_input', 'per_layer_adapter'}"
+        )
+
+    def _apply_oracle_hint_per_layer_adapter(
+        self,
+        seq: Tensor,
+        layer_idx: int,
+        motion_token_start: int,
+    ) -> Tensor:
+        """Add interaction + body-action adapter outputs to the motion-token
+        slice of ``seq`` at the given DiT block index. No-op when adapter
+        mode is disabled or no hint is active. Called inside the DiT
+        encoder loop after each block.
+
+        ``motion_token_start`` is the index of the first motion frame in
+        ``seq`` (init_pose prefix occupies positions [0:motion_token_start)).
+        """
+        if self.cfg.oracle_hint_injection_mode != "per_layer_adapter":
+            return seq
+        added = False
+        if (
+            self.interaction_adapters is not None
+            and self._interaction_hint_emb_cache is not None
+        ):
+            delta = self.interaction_adapters[layer_idx](
+                self._interaction_hint_emb_cache,
+            )                                                              # (B, T, D)
+            seq = seq.clone()
+            seq[:, motion_token_start:, :] = (
+                seq[:, motion_token_start:, :] + delta
+            )
+            added = True
+        if (
+            self.body_action_adapters is not None
+            and self._body_action_hint_emb_cache is not None
+        ):
+            delta = self.body_action_adapters[layer_idx](
+                self._body_action_hint_emb_cache,
+            )
+            if not added:
+                seq = seq.clone()
+            seq[:, motion_token_start:, :] = (
+                seq[:, motion_token_start:, :] + delta
+            )
+        return seq
 
     def _compute_plan_xattn_dist_norm(
         self,
@@ -1344,22 +1594,13 @@ class AnchorDenoiser(nn.Module):
             stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)
 
-        # ─── Round-27 Tier-0A: oracle interaction-hint addition ───
-        # Direct addition into per-frame motion-token embedding
-        # (roadmap §6.12). The hint MLP is zero-initialized at its last
-        # layer so this contributes zero at step 0 — equivalent to no
-        # hint until the gradient updates the projection.
-        if self.oracle_hint_proj is not None:
-            if "oracle_interaction_hint" not in cond:
-                raise KeyError(
-                    "use_oracle_interaction_hint=True but "
-                    "cond['oracle_interaction_hint'] is missing. The "
-                    "trainer must populate this from "
-                    "batch['oracle_interaction_hint'] (set "
-                    "data.use_oracle_interaction_hint=true in the config)."
-                )
-            oracle_hint = cond["oracle_interaction_hint"]                # (B, T, D_hint)
-            h = h + self.oracle_hint_proj(oracle_hint)                   # (B, T, D)
+        # ─── Round-27/28: oracle hint input injection ───
+        # The Round-27 input-add path is preserved via injection_mode
+        # ="input_add". Round-28 adds gated_input + per_layer_adapter
+        # modes and the separate body-action branch. The hint MLPs are
+        # zero-initialized at their last layer so the step-0 forward is
+        # bit-exact equal to the no-hint baseline.
+        h = self._apply_oracle_hint_input_injection(h, cond, c_summary=None)
 
         # ─── §4.4 Global condition vector for AdaLN (per-sample) ───
         # c = t_emb + plan_pool_emb. Drives AdaLN modulation in every block
@@ -1410,6 +1651,13 @@ class AnchorDenoiser(nn.Module):
             seq = block(
                 seq, c, plan_tokens, plan_kpm,
                 plan_xattn_attn_bias=bias,
+            )
+            # Round-28: optional per-layer zero-init adapters on the
+            # interaction + body-action hint embeddings. No-op when
+            # injection_mode != "per_layer_adapter". motion_token_start=1
+            # because the sequence is [pose_tok, frame_0, frame_1, ...].
+            seq = self._apply_oracle_hint_per_layer_adapter(
+                seq, layer_idx=layer_idx, motion_token_start=1,
             )
 
         # ─── Text + obj cross-attn at end of encoder (v11 carryover) ───

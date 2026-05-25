@@ -163,6 +163,15 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
             surface_temporal_aux_fields=bool(
                 cfg.data.get("surface_temporal_aux_fields", False)
             ),
+            use_body_action_hint=bool(
+                cfg.data.get("use_body_action_hint", False)
+            ),
+            body_action_hint_mask_mode=str(
+                cfg.data.get("body_action_hint_mask_mode", "all_on")
+            ),
+            body_action_energy_threshold=float(
+                cfg.data.get("body_action_energy_threshold", 0.05)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -655,6 +664,15 @@ def build_anchordiff_step_fn(
             cond["oracle_interaction_hint"] = (
                 batch["oracle_interaction_hint"].to(device).float()
             )
+        # ── Round-28: body-action oracle hint condition (24D) ──
+        # When data.use_body_action_hint=true, the dataset surfaces a
+        # per-frame 24D channel; the denoiser's body_action_hint_proj
+        # consumes it through a separate branch (gated / per-layer
+        # adapter / input-add depending on injection_mode).
+        if "body_action_hint" in batch:
+            cond["body_action_hint"] = (
+                batch["body_action_hint"].to(device).float()
+            )
 
         # --- v10 InteractionPlan: thread the compiled plan through cond ---
         # The dataset compiles the plan in __getitem__ for the
@@ -1074,29 +1092,50 @@ def build_anchordiff_step_fn(
         loss_contact_track = torch.zeros((), device=device, dtype=motion.dtype)
         loss_gait_air = torch.zeros((), device=device, dtype=motion.dtype)
         loss_gait_stance_vel = torch.zeros((), device=device, dtype=motion.dtype)
+        # Round-28 consistency losses (prompt §7.3 / §7.4).
+        loss_hint_contact_cons = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_body_action_cons = torch.zeros((), device=device, dtype=motion.dtype)
         if temporal_loss_cfg is not None and (
             float(getattr(temporal_loss_cfg, "contact_rel_offset_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "contact_drift_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "contact_tracking_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "gait_both_airborne_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "gait_stance_velocity_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) > 0.0
         ):
             from piano.training.temporal_interaction_losses import (
+                loss_body_action_consistency,
                 loss_contact_drift_smoothl1,
                 loss_contact_rel_offset_smoothl1,
                 loss_contact_tracking_projection,
                 loss_gait_both_airborne,
                 loss_gait_stance_velocity,
+                loss_hint_contact_consistency,
             )
 
-            if "walking_mask" not in batch or "foot_stance_gt" not in batch:
+            # Aux walking/foot_stance fields are required only for the
+            # T0-B gait losses; the consistency losses don't need them.
+            gait_terms_active = (
+                float(getattr(temporal_loss_cfg, "gait_both_airborne_weight", 0.0)) > 0.0
+                or float(getattr(temporal_loss_cfg, "gait_stance_velocity_weight", 0.0)) > 0.0
+            )
+            if gait_terms_active and (
+                "walking_mask" not in batch or "foot_stance_gt" not in batch
+            ):
                 raise KeyError(
-                    "temporal interaction losses are enabled but the batch "
-                    "is missing walking_mask / foot_stance_gt — set "
+                    "gait temporal losses are enabled but the batch is "
+                    "missing walking_mask / foot_stance_gt — set "
                     "data.surface_temporal_aux_fields=true in the config."
                 )
-            walking_mask_b = batch["walking_mask"].to(device).float()        # (B, T, 1)
-            foot_stance_b = batch["foot_stance_gt"].to(device).float()       # (B, T, 2)
+            walking_mask_b = (
+                batch["walking_mask"].to(device).float()                       # (B, T, 1)
+                if "walking_mask" in batch else None
+            )
+            foot_stance_b = (
+                batch["foot_stance_gt"].to(device).float()                     # (B, T, 2)
+                if "foot_stance_gt" in batch else None
+            )
 
             jpf = jpos_pred.float()
             jgf = joints.float()
@@ -1133,6 +1172,34 @@ def build_anchordiff_step_fn(
                 loss_gait_stance_vel = loss_gait_stance_velocity(
                     pred_joints=jpf, foot_stance_gt=foot_stance_b,
                     walking_mask=walking_mask_b, fps=float(fps),
+                    seq_mask=sm_f,
+                )
+            # Round-28 §7.3 — hint-contact consistency. Pull pred wrist
+            # toward the oracle's hand_object_local_offset only on
+            # contact frames. Small weight (start at 0.25-0.5).
+            if (
+                float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) > 0.0
+                and "oracle_interaction_hint" in batch
+            ):
+                loss_hint_contact_cons = loss_hint_contact_consistency(
+                    pred_joints=jpf,
+                    oracle_interaction_hint=batch["oracle_interaction_hint"]
+                    .to(device).float(),
+                    object_positions=op_f, object_rotations=or_f,
+                    contact_state=cs_f, cfg=temporal_loss_cfg,
+                    seq_mask=sm_f,
+                )
+            # Round-28 §7.4 — body-action consistency. Pull pred
+            # six-joint deltas toward the oracle body_action_hint,
+            # masked by the hint's joint mask.
+            if (
+                float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) > 0.0
+                and "body_action_hint" in batch
+            ):
+                loss_body_action_cons = loss_body_action_consistency(
+                    pred_joints=jpf,
+                    body_action_hint=batch["body_action_hint"]
+                    .to(device).float(),
                     seq_mask=sm_f,
                 )
 
@@ -1663,12 +1730,15 @@ def build_anchordiff_step_fn(
             + (fix_v_hpf_weight * loss_hpf if use_fix_v_loss else 0.0)
             + (fix_v_obj_rel_vel_weight * loss_obj_rel_vel if use_fix_v_loss else 0.0)
             # Round-27 Tier-0B temporal interaction losses (zero by default).
+            # Round-28 adds two consistency terms (also zero by default).
             + (
                 float(temporal_loss_cfg.contact_rel_offset_weight) * loss_contact_rel
                 + float(temporal_loss_cfg.contact_drift_weight) * loss_contact_drift
                 + float(temporal_loss_cfg.contact_tracking_weight) * loss_contact_track
                 + float(temporal_loss_cfg.gait_both_airborne_weight) * loss_gait_air
                 + float(temporal_loss_cfg.gait_stance_velocity_weight) * loss_gait_stance_vel
+                + float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) * loss_hint_contact_cons
+                + float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) * loss_body_action_cons
                 if temporal_loss_cfg is not None else 0.0
             )
         )
@@ -1713,6 +1783,9 @@ def build_anchordiff_step_fn(
             "loss_contact_track": loss_contact_track.detach(),
             "loss_gait_air": loss_gait_air.detach(),
             "loss_gait_stance_vel": loss_gait_stance_vel.detach(),
+            # Round-28 consistency loss components.
+            "loss_hint_contact_cons": loss_hint_contact_cons.detach(),
+            "loss_body_action_cons": loss_body_action_cons.detach(),
             "weighted_stable_local_vel_cm": (
                 stable_local_vel_cm_weight * loss_stable_local_vel_cm
             ).detach(),
@@ -2076,6 +2149,21 @@ def main() -> None:
             cfg.model.denoiser.get("use_oracle_interaction_hint", False)
         ),
         oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
+        use_body_action_hint=bool(
+            cfg.model.denoiser.get("use_body_action_hint", False)
+        ),
+        body_action_hint_dim=int(
+            cfg.model.denoiser.get("body_action_hint_dim", 0)
+        ),
+        oracle_hint_injection_mode=str(
+            cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
+        ),
+        separate_hint_branches=bool(
+            cfg.model.denoiser.get("separate_hint_branches", True)
+        ),
+        zero_init_hint_adapters=bool(
+            cfg.model.denoiser.get("zero_init_hint_adapters", True)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -2400,6 +2488,12 @@ def main() -> None:
             ),
             gait_stance_velocity_weight=float(
                 _tloss.get("gait_stance_velocity_weight", 0.0)
+            ),
+            hint_contact_consistency_weight=float(
+                _tloss.get("hint_contact_consistency_weight", 0.0)
+            ),
+            body_action_consistency_weight=float(
+                _tloss.get("body_action_consistency_weight", 0.0)
             ),
             contact_threshold=float(_tloss.get("contact_threshold", 0.5)),
             contact_rel_clamp_m=float(_tloss.get("contact_rel_clamp_m", 2.0)),

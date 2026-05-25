@@ -48,7 +48,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from piano.utils.canonical_frame import axis_angle_to_matrix_np
+from piano.utils.canonical_frame import (
+    _facing_angle_y,
+    axis_angle_to_matrix_np,
+    y_rotation_matrix,
+)
 
 
 # SMPL-22 joint indices used by this module. Verified against
@@ -58,6 +62,29 @@ RIGHT_WRIST_IDX: int = 21
 LEFT_ANKLE_IDX: int = 7
 RIGHT_ANKLE_IDX: int = 8
 ROOT_IDX: int = 0
+
+# Round-28 body-action hint key joints (roadmap §5.2).
+LEFT_KNEE_IDX: int = 4
+RIGHT_KNEE_IDX: int = 5
+NECK_IDX: int = 12
+
+# Body-action key joint order. Pelvis is intentionally LAST so the
+# "non-pelvis" slice [:5] aligns with the pelvis-local delta path and the
+# pelvis index [5] uses the global root-frame delta path. The diagnostic
+# (round28_body_action_diag.py) reads from this constant to keep names +
+# indices in sync.
+BODY_ACTION_KEY_JOINT_INDICES: tuple[int, ...] = (
+    LEFT_WRIST_IDX,
+    RIGHT_WRIST_IDX,
+    LEFT_KNEE_IDX,
+    RIGHT_KNEE_IDX,
+    NECK_IDX,
+    ROOT_IDX,            # pelvis — must be LAST (see comment above)
+)
+BODY_ACTION_KEY_JOINT_NAMES: tuple[str, ...] = (
+    "left_wrist", "right_wrist", "left_knee", "right_knee", "neck", "pelvis",
+)
+NUM_BODY_ACTION_JOINTS: int = len(BODY_ACTION_KEY_JOINT_INDICES)  # 6
 
 # ``contact_state`` column indices (``piano.utils.smpl_utils
 # .INTERACTION_BODY_PARTS`` ordering, surfaced in
@@ -69,6 +96,8 @@ CONTACT_RIGHT_HAND_COL: int = 1
 HINT_DIM_HAND: int = 8
 HINT_DIM_FOOT: int = 5
 HINT_DIM_FULL: int = HINT_DIM_HAND + HINT_DIM_FOOT  # 13
+# Round-28 body-action hint: mask[6] + 6 joints × 3 deltas.
+HINT_DIM_BODY_ACTION: int = NUM_BODY_ACTION_JOINTS + NUM_BODY_ACTION_JOINTS * 3  # 24
 
 # Default project-wide FPS (matches every other ``fps`` default in the
 # repo — see ``contact_eval.py`` / ``visualize_motion.py`` etc.).
@@ -343,3 +372,143 @@ def hint_dim(variant: str) -> int:
     return {"hand": HINT_DIM_HAND, "foot": HINT_DIM_FOOT, "full": HINT_DIM_FULL}[
         variant
     ]
+
+
+# ===========================================================================
+# Round-28: body-action oracle hint
+# ===========================================================================
+#
+# Purpose (Round-28 prompt §5):
+#     The 13D interaction hint covers hand-object and foot-ground state, but
+#     does not represent body-only semantic actions like "stretch neck" /
+#     "stretch left leg". The body-action hint adds a compact 24D per-frame
+#     channel covering six key joints (wrists, knees, neck, pelvis).
+#
+# Coordinate frame (prompt §5.4):
+#     For non-pelvis joints: ``joint_local[t,j] = R_root0.T @ (joint_world[t,j]
+#                                                              - pelvis_world[t])``
+#         then ``joint_delta_local[t,j] = joint_local[t,j] - joint_local[0,j]``.
+#         This is a pelvis-translated, root-yaw-canonical frame; the canonical
+#         yaw at frame 0 (HumanML3D ``_facing_angle_y`` convention) is used so
+#         the hint is invariant to global heading and only encodes per-clip
+#         intra-body deltas.
+#     For pelvis: ``pelvis_delta[t] = R_root0.T @ (pelvis_world[t] - pelvis_world[0])``.
+#         Note: pelvis MUST NOT use the pelvis-translated frame (that would be
+#         identically zero). Instead use displacement from the initial pelvis
+#         in the same root-yaw-canonical frame.
+#
+# Output layout (prompt §5.3):
+#     [0:6]   joint_mask[6]                  (left_wrist, right_wrist, left_knee,
+#                                              right_knee, neck, pelvis)
+#     [6:24]  joint_delta_local[6,3] flat
+#
+# Frame-0 invariant: by construction, joint_delta_local[0, :] == 0.
+
+
+def build_body_action_oracle_hint(
+    joints_22: np.ndarray,
+    mask_mode: str = "all_on",
+    energy_threshold: float = 0.05,
+    joint_indices: tuple[int, ...] = BODY_ACTION_KEY_JOINT_INDICES,
+) -> np.ndarray:
+    """Build the 24D body-action oracle hint of shape ``(T, 24)``.
+
+    Parameters
+    ----------
+    joints_22 : (T, 22, 3) world-frame SMPL-22 joints, metres.
+    mask_mode : {"all_on", "energy"}
+        ``"all_on"``: ``joint_mask[:, :] = 1`` — diagnostic upper-bound.
+        ``"energy"``: per-joint motion energy thresholded at
+            ``energy_threshold`` (m) — sparse realistic control signal.
+            The threshold is applied to the per-clip MEAN of
+            ``||joint_delta_local[t, j]||``, so a joint is "active" if
+            its average displacement from frame-0 exceeds the threshold.
+    energy_threshold : float
+        Motion-energy threshold in metres. Recommended 0.03-0.05.
+    joint_indices : tuple of int (length 6)
+        Override key joints. Must keep pelvis LAST (the implementation
+        treats the final joint as the pelvis displacement special case).
+
+    Returns
+    -------
+    hint : (T, 24) float32
+        ``[:, 0:6]``  per-joint mask (broadcast across T, constant per
+                      clip), and ``[:, 6:24]`` flattened
+                      ``joint_delta_local[T, 6, 3]`` reshaped to ``(T, 18)``.
+
+    Notes
+    -----
+    * Frame-0 invariant: ``hint[0, 6:24] == 0`` by construction.
+    * The frame is the per-clip root-yaw-canonical frame anchored at the
+      frame-0 pelvis (XZ) and frame-0 pelvis Y for pelvis trace.
+    """
+    T = int(joints_22.shape[0])
+    J = len(joint_indices)
+    if J != NUM_BODY_ACTION_JOINTS:
+        raise ValueError(
+            f"joint_indices must have length {NUM_BODY_ACTION_JOINTS}; "
+            f"got {J} ({joint_indices!r})"
+        )
+    if joints_22.shape != (T, 22, 3):
+        raise ValueError(
+            f"joints_22 must be (T, 22, 3); got {joints_22.shape!r}"
+        )
+    if mask_mode not in {"all_on", "energy"}:
+        raise ValueError(
+            f"mask_mode must be 'all_on' or 'energy'; got {mask_mode!r}"
+        )
+
+    joints = joints_22.astype(np.float32)
+
+    # ---- Root-yaw-canonical frame at t=0 (HumanML3D convention). ----
+    yaw0 = _facing_angle_y(joints[0])
+    # ``y_rotation_matrix(yaw0)`` rotates canonical → world. We want
+    # ``world → canonical``, which is the transpose (= y_rotation_matrix(-yaw0)).
+    R_root0_T = y_rotation_matrix(-yaw0)                                 # (3, 3)
+
+    pelvis_world = joints[:, ROOT_IDX, :]                                # (T, 3)
+
+    # Per-joint local coords, both paths share R_root0_T.
+    delta_local = np.zeros((T, J, 3), dtype=np.float32)
+
+    # Non-pelvis joints: pelvis-translated + root0-yaw-canonical, delta vs frame 0.
+    for j_pos, j_idx in enumerate(joint_indices[:-1]):                   # all except pelvis
+        joint_world = joints[:, j_idx, :]                                # (T, 3)
+        # joint_local[t] = R_root0.T @ (joint_world[t] - pelvis_world[t])
+        joint_rel = joint_world - pelvis_world                            # (T, 3)
+        joint_local = joint_rel @ R_root0_T.T                             # right-mul by R^T == R_root0_T @ vec
+        # Equivalently: (R_root0_T @ joint_rel.T).T
+        delta_local[:, j_pos, :] = joint_local - joint_local[0:1, :]
+
+    # Pelvis special case (always last): displacement of pelvis from frame 0,
+    # rotated into the root-yaw-canonical frame.
+    pelvis_disp = pelvis_world - pelvis_world[0:1, :]                     # (T, 3)
+    pelvis_local = pelvis_disp @ R_root0_T.T
+    delta_local[:, -1, :] = pelvis_local
+
+    # ---- Mask (per-joint, broadcast across T). ----
+    if mask_mode == "all_on":
+        joint_mask = np.ones((J,), dtype=np.float32)
+    else:
+        # Per-joint energy = mean over time of ||delta||.
+        energy = np.linalg.norm(delta_local, axis=-1).mean(axis=0)        # (J,)
+        joint_mask = (energy > float(energy_threshold)).astype(np.float32)
+    joint_mask_t = np.broadcast_to(joint_mask[None, :], (T, J)).astype(np.float32)
+
+    # ---- Layout: [mask(6), delta_local(6, 3) flat] -> (T, 24) ----
+    hint = np.concatenate(
+        [joint_mask_t, delta_local.reshape(T, J * 3)],
+        axis=-1,
+    ).astype(np.float32)
+
+    if hint.shape != (T, HINT_DIM_BODY_ACTION):
+        raise AssertionError(
+            f"body_action hint shape {hint.shape!r} != "
+            f"({T}, {HINT_DIM_BODY_ACTION})"
+        )
+    if not np.isfinite(hint).all():
+        raise FloatingPointError(
+            "body_action_oracle_hint contains non-finite values — check "
+            "joints_22 for NaN/Inf."
+        )
+    return hint

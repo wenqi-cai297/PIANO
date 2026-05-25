@@ -193,6 +193,12 @@ class HOIDataset(Dataset):
         use_oracle_interaction_hint: bool = False,
         oracle_hint_variant: str = "full",
         oracle_hint_fps: float = 20.0,
+        # Round-28 body-action oracle hint (prompt §5). When enabled,
+        # __getitem__ surfaces a per-frame ``body_action_hint`` tensor
+        # of shape (T, 24): mask[6] + 6 joints × 3D delta_local.
+        use_body_action_hint: bool = False,
+        body_action_hint_mask_mode: str = "all_on",  # "all_on" | "energy"
+        body_action_energy_threshold: float = 0.05,
         # Round-27 Tier-0B aux fields: ``walking_mask`` (B, T, 1) and
         # ``foot_stance_gt`` (B, T, 2) — both derived from GT joints
         # exactly like the hint's foot sub-vector. The temporal
@@ -231,6 +237,22 @@ class HOIDataset(Dataset):
             self.oracle_hint_dim = 0
             self.oracle_hint_fps = float(oracle_hint_fps)
         self.surface_temporal_aux_fields = bool(surface_temporal_aux_fields)
+        # Round-28 body-action oracle hint (prompt §5).
+        self.use_body_action_hint = bool(use_body_action_hint)
+        if body_action_hint_mask_mode not in {"all_on", "energy"}:
+            raise ValueError(
+                "body_action_hint_mask_mode must be 'all_on' or 'energy'; "
+                f"got {body_action_hint_mask_mode!r}"
+            )
+        self.body_action_hint_mask_mode = str(body_action_hint_mask_mode)
+        self.body_action_energy_threshold = float(body_action_energy_threshold)
+        if self.use_body_action_hint:
+            from piano.data.interaction_hint import (
+                HINT_DIM_BODY_ACTION as _HINT_DIM_BODY_ACTION,
+            )
+            self.body_action_hint_dim = int(_HINT_DIM_BODY_ACTION)
+        else:
+            self.body_action_hint_dim = 0
         # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
         # True, the obj-pose channels are returned in WORLD frame instead
         # of body-canonical frame. Tests Hypothesis E (frame-choice
@@ -822,6 +844,26 @@ class HOIDataset(Dataset):
             foot_stance = self._pad_or_truncate(foot_stance_valid, self.max_seq_length)
             result["walking_mask"] = torch.from_numpy(walking)             # (T, 1)
             result["foot_stance_gt"] = torch.from_numpy(foot_stance)       # (T, 2)
+
+        # ---------------------------------------------------------------
+        # Round-28 body-action oracle hint (prompt §5)
+        # ---------------------------------------------------------------
+        # Compute on the valid prefix so the frame-0 anchor + per-joint
+        # energy stats are not contaminated by zero padding.
+        if self.use_body_action_hint:
+            from piano.data.interaction_hint import build_body_action_oracle_hint
+            valid_T = int(min(seq_len, self.max_seq_length))
+            body_hint_valid = build_body_action_oracle_hint(
+                joints_22=joints[:valid_T].astype(np.float32),
+                mask_mode=self.body_action_hint_mask_mode,
+                energy_threshold=self.body_action_energy_threshold,
+            )
+            body_hint = self._pad_or_truncate(body_hint_valid, self.max_seq_length)
+            assert body_hint.shape == (self.max_seq_length, self.body_action_hint_dim), (
+                f"body_action_hint shape {body_hint.shape!r} != "
+                f"expected ({self.max_seq_length}, {self.body_action_hint_dim})"
+            )
+            result["body_action_hint"] = torch.from_numpy(body_hint)
 
         return result
 

@@ -435,6 +435,15 @@ def _build_dataset(cfg, bucket: str, augment: bool) -> Subset | torch.utils.data
             surface_temporal_aux_fields=bool(
                 cfg.data.get("surface_temporal_aux_fields", False)
             ),
+            use_body_action_hint=bool(
+                cfg.data.get("use_body_action_hint", False)
+            ),
+            body_action_hint_mask_mode=str(
+                cfg.data.get("body_action_hint_mask_mode", "all_on")
+            ),
+            body_action_energy_threshold=float(
+                cfg.data.get("body_action_energy_threshold", 0.05)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -505,6 +514,21 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
             cfg.model.denoiser.get("use_oracle_interaction_hint", False)
         ),
         oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
+        use_body_action_hint=bool(
+            cfg.model.denoiser.get("use_body_action_hint", False)
+        ),
+        body_action_hint_dim=int(
+            cfg.model.denoiser.get("body_action_hint_dim", 0)
+        ),
+        oracle_hint_injection_mode=str(
+            cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
+        ),
+        separate_hint_branches=bool(
+            cfg.model.denoiser.get("separate_hint_branches", True)
+        ),
+        zero_init_hint_adapters=bool(
+            cfg.model.denoiser.get("zero_init_hint_adapters", True)
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
@@ -670,6 +694,19 @@ def _build_cond(
             "Model was built with use_oracle_interaction_hint=True, but "
             "batch['oracle_interaction_hint'] is missing. Set "
             "data.use_oracle_interaction_hint=true in the diagnostic config."
+        )
+    if "body_action_hint" in batch:
+        cond["body_action_hint"] = (
+            batch["body_action_hint"].to(device).float()
+        )
+    elif (
+        model is not None
+        and getattr(model.denoiser, "body_action_hint_proj", None) is not None
+    ):
+        raise KeyError(
+            "Model was built with use_body_action_hint=True, but "
+            "batch['body_action_hint'] is missing. Set "
+            "data.use_body_action_hint=true in the diagnostic config."
         )
     stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
     if stage1_coarse_dim > 0:
