@@ -551,11 +551,12 @@ def main() -> int:
                         help="Print which files would be written without touching disk.")
     parser.add_argument(
         "--best-injection-mode",
-        choices=["gated_input", "per_layer_adapter", "adapter_only"],
+        choices=["input_add", "gated_input", "per_layer_adapter", "adapter_only"],
         default="per_layer_adapter",
         help=(
             "Injection mode to use for A3/B/C configs after A0/A1/A2/A2b "
-            "decide the best Group-A branch."
+            "decide the best Group-A branch. `input_add` is the R27 "
+            "baseline mode and is also valid as the Step-2 choice."
         ),
     )
     parser.add_argument(
