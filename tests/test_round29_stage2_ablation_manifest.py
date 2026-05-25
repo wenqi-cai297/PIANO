@@ -155,3 +155,20 @@ def test_only_groups_filter(tmp_path: Path) -> None:
     # Files for non-A groups must NOT have been written.
     for vid in ("r29_b0_c23_only", "r29_f0_baseline"):
         assert not (cfg_dir / f"anchordiff_{vid}.yaml").exists()
+
+
+def test_data_root_override_propagates_into_configs(tmp_path: Path) -> None:
+    """--data-root must replace the default data root in every YAML's
+    data.datasets block. Caught the bug from the first server run where
+    Windows paths leaked into Linux configs."""
+    fake_root = "/srv/some/path/InterAct/piano_official_process_4"
+    cfg_dir, _, manifest = _run_generator(
+        tmp_path, extra_args=["--data-root", fake_root],
+    )
+    sample = (cfg_dir / "anchordiff_r29_a0_input_add.yaml").read_text("utf-8")
+    for sub in ("chairs", "imhd", "neuraldome", "omomo_correct_v2"):
+        assert f'root: "{fake_root}/{sub}"' in sample
+    # The default Windows path must NOT appear.
+    assert "E:/Project/Datasets" not in sample
+    # Manifest defaults block records the override.
+    assert manifest["defaults"]["data_root"] == fake_root

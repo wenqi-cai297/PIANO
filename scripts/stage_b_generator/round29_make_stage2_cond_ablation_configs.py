@@ -58,6 +58,15 @@ DEFAULT_INIT_CKPT = (
 DEFAULT_SUBSET_FILE = "analyses/round27_tier0_train_indices_48_balanced.json"
 BODY_ACTION_SUBSET_FILE = "analyses/round28_body_action_train_indices_48.json"
 
+# Default dataset root for THIS dev machine (Windows). The Linux server
+# overrides via --data-root or DATASETS_ROOT env so the generated YAML
+# carries the correct on-disk paths and we don't need a separate
+# _local.yaml second-copy. Subset names below are appended to this root.
+DEFAULT_DATA_ROOT = "E:/Project/Datasets/InterAct/piano_official_process_4"
+DATASET_SUBSET_NAMES: tuple[str, ...] = (
+    "chairs", "imhd", "neuraldome", "omomo_correct_v2",
+)
+
 # Default condition for "FULL-DENSE" (prompt §3.5).
 FULL_DENSE = dict(
     coarse_variant="C41-current",
@@ -550,6 +559,16 @@ def _render_per_family_modes_yaml(pfm: dict[str, str] | None) -> str:
     return "\n" + "\n".join(lines)
 
 
+def _render_datasets_block(data_root: str) -> str:
+    """Render the data.datasets YAML list pointing at <data_root>/<subset>."""
+    rstripped = data_root.rstrip("/").rstrip("\\")
+    lines: list[str] = []
+    for sub in DATASET_SUBSET_NAMES:
+        lines.append(f'    - name: "{sub}"')
+        lines.append(f'      root: "{rstripped}/{sub}"')
+    return "\n".join(lines)
+
+
 def _render_yaml(
     v: Variant,
     resolved: dict[str, Any],
@@ -557,6 +576,7 @@ def _render_yaml(
     base_subset_file: str,
     body_action_subset_file: str,
     init_checkpoint: str,
+    data_root: str,
 ) -> str:
     subset_file = (
         body_action_subset_file if v.subset_kind == "body_action" else base_subset_file
@@ -646,14 +666,7 @@ model:
 
 data:
   datasets:
-    - name: "chairs"
-      root: "E:/Project/Datasets/InterAct/piano_official_process_4/chairs"
-    - name: "imhd"
-      root: "E:/Project/Datasets/InterAct/piano_official_process_4/imhd"
-    - name: "neuraldome"
-      root: "E:/Project/Datasets/InterAct/piano_official_process_4/neuraldome"
-    - name: "omomo_correct_v2"
-      root: "E:/Project/Datasets/InterAct/piano_official_process_4/omomo_correct_v2"
+{_render_datasets_block(data_root)}
   pseudo_label_dir: null
   pseudo_label_subdir: "pseudo_labels/v18_h10_f05_pelvis20_official_semantic_marker"
   max_seq_length: 196
@@ -930,6 +943,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--data-root",
+        default=os.environ.get("DATASETS_ROOT", DEFAULT_DATA_ROOT),
+        help=(
+            "Root directory containing the four InterAct subsets "
+            "(chairs/imhd/neuraldome/omomo_correct_v2). Defaults to "
+            "DATASETS_ROOT env var or the dev-machine Windows path. "
+            "On the Linux server pass --data-root "
+            "/media/.../InterAct/piano_official_process_4 (or export "
+            "DATASETS_ROOT=...) so the generated YAML carries the "
+            "correct on-disk paths."
+        ),
+    )
+    parser.add_argument(
         "--config-dir",
         default=str(DEFAULT_CONFIG_DIR),
         help="Directory where generated YAML configs are written.",
@@ -977,6 +1003,7 @@ def main() -> int:
             base_subset_file=base_subset,
             body_action_subset_file=body_subset,
             init_checkpoint=init_ckpt,
+            data_root=args.data_root,
         )
         # The manifest always records the canonical repo-relative
         # config path (configs/training/<name>.yaml), even when
@@ -1021,6 +1048,7 @@ def main() -> int:
                         "init_checkpoint": init_ckpt,
                         "balanced_subset_file": base_subset,
                         "body_action_subset_file": body_subset,
+                        "data_root": args.data_root,
                     },
                 },
                 indent=2,

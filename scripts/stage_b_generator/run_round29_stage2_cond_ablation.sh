@@ -88,6 +88,7 @@ if [[ ! -f "${MANIFEST}" ]]; then
     echo "[R29] Manifest missing — running config generator..."
     GEN_ARGS=()
     [[ -n "${ROUND29_INIT_CKPT:-}" ]] && GEN_ARGS+=(--init-checkpoint "${ROUND29_INIT_CKPT}")
+    [[ -n "${DATASETS_ROOT:-}" ]]     && GEN_ARGS+=(--data-root "${DATASETS_ROOT}")
     "${PY}" scripts/stage_b_generator/round29_make_stage2_cond_ablation_configs.py "${GEN_ARGS[@]}"
 fi
 
@@ -131,6 +132,26 @@ if [[ ${SKIP_PREFLIGHT} -eq 0 && ${DRY_RUN} -eq 0 ]]; then
         if [[ ${SKIP_TRAIN} -eq 0 && -n "${INIT_CKPT}" && ! -e "${INIT_CKPT}" ]]; then
             echo "    [${VID}] init_checkpoint not on disk: ${INIT_CKPT}"
             preflight_fail=1
+        fi
+        # Dataset roots — parse the YAML and verify each root exists.
+        # Skipping this lets training fail later at FileNotFoundError.
+        if [[ ${SKIP_TRAIN} -eq 0 && -e "${CFG}" ]]; then
+            BAD_ROOTS="$("${PY}" -c "
+import sys, yaml
+from pathlib import Path
+cfg = yaml.safe_load(open(sys.argv[1]))
+for ds in (cfg.get('data', {}).get('datasets') or []):
+    root = ds.get('root', '')
+    if root and not Path(root).exists():
+        print(f\"{ds.get('name')}={root}\")
+" "${CFG}")"
+            if [[ -n "${BAD_ROOTS}" ]]; then
+                while IFS= read -r br; do
+                    echo "    [${VID}] dataset root not on disk: ${br}"
+                done <<< "${BAD_ROOTS}"
+                echo "    [${VID}]   -> re-run generator with --data-root <correct path> or export DATASETS_ROOT=..."
+                preflight_fail=1
+            fi
         fi
         if [[ ${SKIP_TRAIN} -eq 1 && ${SKIP_EVAL} -eq 0 ]]; then
             DIAG_CKPT="${OUTDIR}/${DIAG_CKPT_NAME}"

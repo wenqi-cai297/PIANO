@@ -148,10 +148,11 @@ def _preflight_variant(
 ) -> tuple[bool, list[str]]:
     """Return (ok, problems). Problems are human-readable strings.
 
-    Training preflight (config, init_checkpoint) is HARD — failing here
-    means we should not attempt training. Diagnostic preflight (ckpt,
-    selection_json) is soft when `allow_missing_diag_inputs=True`.
+    Training preflight (config, init_checkpoint, dataset roots) is HARD —
+    failing here means we should not attempt training. Diagnostic preflight
+    (ckpt, selection_json) is soft when `allow_missing_diag_inputs=True`.
     """
+    import yaml
     problems: list[str] = []
     config_path = ROOT / v["config_path"]
     if not config_path.exists():
@@ -168,6 +169,23 @@ def _preflight_variant(
                 "override via --init-checkpoint or ROUND29_INIT_CKPT, or "
                 "re-run the generator with the right --init-checkpoint."
             )
+        # Dataset roots — parse the config's data.datasets list and check
+        # each root exists. Skipping this check would let training crash
+        # at metadata-load time after burning preflight + smoke. Reuse
+        # one parsed YAML across the loop body to keep this cheap.
+        if config_path.exists():
+            try:
+                cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                for ds in cfg.get("data", {}).get("datasets", []) or []:
+                    root = ds.get("root", "")
+                    if root and not Path(root).exists():
+                        problems.append(
+                            f"dataset root not on disk: {root} (subset={ds.get('name')}) — "
+                            "re-run the generator with --data-root <correct path> or "
+                            "export DATASETS_ROOT=<...>."
+                        )
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"could not parse config to check dataset roots: {exc}")
 
     if not skip_eval:
         sel_file = v.get("subset_file", "")
