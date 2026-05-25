@@ -59,6 +59,7 @@ DEFAULT_VARIANTS=(
     r28_a0_input_add
     r28_a1_gated_input
     r28_a2_per_layer_adapter
+    r28_a2b_adapter_only
 )
 
 FOLLOWUP_VARIANTS=(
@@ -147,9 +148,9 @@ _any_body_subset_variant() {
 }
 
 if _any_followup_variant && [[ -z "${BEST_INJECTION_MODE}" ]]; then
-    echo "ERROR: A3/B/C variants require ROUND28_BEST_INJECTION_MODE=gated_input or per_layer_adapter."
-    echo "Note: per_layer_adapter means input_add plus per-layer adapters, not adapter-only."
-    echo "Run A0/A1/A2 first, inspect metrics, then rerun follow-up variants with the winner set."
+    echo "ERROR: A3/B/C variants require ROUND28_BEST_INJECTION_MODE=gated_input | per_layer_adapter | adapter_only."
+    echo "Note: per_layer_adapter = input_add + per-layer adapters; adapter_only = pure per-layer adapters (A2b)."
+    echo "Run A0/A1/A2/A2b first, inspect metrics, then rerun follow-up variants with the winner set."
     exit 1
 fi
 

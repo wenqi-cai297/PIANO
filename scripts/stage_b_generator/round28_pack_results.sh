@@ -35,6 +35,7 @@ VARIANTS=(
     r28_a0_input_add
     r28_a1_gated_input
     r28_a2_per_layer_adapter
+    r28_a2b_adapter_only
     r28_a3_best_long
     r28_b0_baseline
     r28_b1_interaction_only

@@ -77,6 +77,24 @@ VARIANTS: list[tuple[str, str, dict]] = [
         },
     ),
     (
+        "r28_a2b_adapter_only",
+        "Interaction hint only, PURE per-layer adapter injection (no input "
+        "add). Isolates the adapter contribution from the input-add baseline "
+        "so A2 vs A2b separates 'adapter helps on top of input_add' from "
+        "'adapter alone is sufficient'.",
+        {
+            "use_oracle_interaction_hint": "true",
+            "oracle_hint_variant": "full",
+            "use_oracle_interaction_hint_model": "true",
+            "oracle_hint_dim": "13",
+            "use_body_action_hint": "false",
+            "use_body_action_hint_model": "false",
+            "body_action_hint_dim": "0",
+            "oracle_hint_injection_mode": "adapter_only",
+            "temporal_weights": "all_zero",
+        },
+    ),
+    (
         "r28_a3_best_long",
         "Best Group A injection (set by --best-injection-mode): 1000 "
         "epoch oracle upper bound.",
@@ -533,11 +551,11 @@ def main() -> int:
                         help="Print which files would be written without touching disk.")
     parser.add_argument(
         "--best-injection-mode",
-        choices=["gated_input", "per_layer_adapter"],
+        choices=["gated_input", "per_layer_adapter", "adapter_only"],
         default="per_layer_adapter",
         help=(
-            "Injection mode to use for A3/B/C configs after A0/A1/A2 decide "
-            "the best Group-A branch."
+            "Injection mode to use for A3/B/C configs after A0/A1/A2/A2b "
+            "decide the best Group-A branch."
         ),
     )
     parser.add_argument(

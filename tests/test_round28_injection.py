@@ -410,3 +410,135 @@ def test_branch_independence_and_shapes():
     # First-layer in-features must match dims.
     assert m.oracle_hint_proj[0].in_features == cfg.oracle_hint_dim
     assert m.body_action_hint_proj[0].in_features == cfg.body_action_hint_dim
+
+
+# ---------------------------------------------------------------------------
+# 7. adapter_only mode (R28 A2b ablation)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_init_invariant_adapter_only():
+    """A2b: pure per-layer adapter injection (no input-add). Zero-init
+    last-layer of every adapter ⇒ step-0 forward equals no-hint baseline."""
+    B, T = 2, 16
+    cfg_ref = _build_cfg(use_interaction=False, use_body_action=False)
+    cfg_new = _build_cfg(
+        use_interaction=True, use_body_action=True,
+        injection_mode="adapter_only",
+    )
+
+    torch.manual_seed(20260525)
+    m_ref = AnchorDenoiser(cfg_ref).eval()
+    torch.manual_seed(123)
+    m_new = AnchorDenoiser(cfg_new).eval()
+    _share_weights(m_ref, m_new)
+
+    cond_ref = _make_cond(B, T, cfg_ref, seed=5)
+    cond_new = _make_cond(B, T, cfg_new, seed=5)
+    x_t = torch.randn(B, T, cfg_ref.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    with torch.no_grad():
+        out_ref = m_ref(x_t, t, cond_ref, cond_drop_mask=None)
+        out_new = m_new(x_t, t, cond_new, cond_drop_mask=None)
+    max_diff = (out_ref - out_new).abs().max().item()
+    assert max_diff < 1e-6, (
+        f"adapter_only zero-init invariant violated; max|Δ|={max_diff:.3e}"
+    )
+
+
+def test_adapter_only_skips_input_injection():
+    """A2b: when projections are NON-zero but adapters are zero, the model
+    must STILL match the no-hint baseline (proves input-add path is off)."""
+    B, T = 2, 16
+    cfg_ref = _build_cfg(use_interaction=False, use_body_action=False)
+    cfg_new = _build_cfg(
+        use_interaction=True, use_body_action=True,
+        injection_mode="adapter_only",
+    )
+
+    torch.manual_seed(20260525)
+    m_ref = AnchorDenoiser(cfg_ref).eval()
+    torch.manual_seed(456)
+    m_new = AnchorDenoiser(cfg_new).eval()
+    _share_weights(m_ref, m_new)
+
+    # Wake up the projection last layers so emb is NON-zero. If A2b
+    # accidentally re-runs input_add, this would now perturb the output.
+    with torch.no_grad():
+        m_new.oracle_hint_proj[-1].weight.normal_(mean=0.0, std=0.1)
+        m_new.oracle_hint_proj[-1].bias.normal_(mean=0.0, std=0.1)
+        m_new.body_action_hint_proj[-1].weight.normal_(mean=0.0, std=0.1)
+        m_new.body_action_hint_proj[-1].bias.normal_(mean=0.0, std=0.1)
+    # Adapters stay zero-init → per-layer contribution is 0.
+
+    # Make V12FinalLayer non-zero so output is sensitive to residual stream.
+    for p in m_ref.v12_final_layer.parameters():
+        with torch.no_grad():
+            p.normal_(mean=0.0, std=0.05)
+    m_new.v12_final_layer.load_state_dict(m_ref.v12_final_layer.state_dict())
+
+    cond_ref = _make_cond(B, T, cfg_ref, seed=7)
+    cond_new = _make_cond(B, T, cfg_new, seed=7)
+    x_t = torch.randn(B, T, cfg_ref.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    with torch.no_grad():
+        out_ref = m_ref(x_t, t, cond_ref, cond_drop_mask=None)
+        out_new = m_new(x_t, t, cond_new, cond_drop_mask=None)
+    max_diff = (out_ref - out_new).abs().max().item()
+    assert max_diff < 1e-5, (
+        "adapter_only mode appears to be running input_add — output diverged "
+        f"from baseline even though adapters are zero-init. max|Δ|={max_diff:.3e}"
+    )
+
+
+def test_gradients_reach_adapter_only_branches():
+    """A2b: gradient must reach the projections (through adapters) AND
+    every per-layer adapter."""
+    B, T = 2, 16
+    cfg = _build_cfg(
+        use_interaction=True, use_body_action=True,
+        injection_mode="adapter_only",
+    )
+    torch.manual_seed(20260525)
+    model = AnchorDenoiser(cfg).train()
+    # Wake up V12FinalLayer + hint projections + every adapter's last linear.
+    for p in model.v12_final_layer.parameters():
+        with torch.no_grad():
+            p.normal_(mean=0.0, std=0.05)
+    for proj in (model.oracle_hint_proj, model.body_action_hint_proj):
+        with torch.no_grad():
+            proj[-1].weight.normal_(mean=0.0, std=0.1)
+            proj[-1].bias.normal_(mean=0.0, std=0.1)
+    for ad_list in (model.interaction_adapters, model.body_action_adapters):
+        for ad in ad_list:
+            with torch.no_grad():
+                ad[-1].weight.normal_(mean=0.0, std=0.1)
+                ad[-1].bias.normal_(mean=0.0, std=0.1)
+
+    cond = _make_cond(B, T, cfg, seed=8)
+    x_t = torch.randn(B, T, cfg.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    out = model(x_t, t, cond, cond_drop_mask=None)
+    loss = (out ** 2).mean()
+    loss.backward()
+
+    # Projections receive gradient via the adapters.
+    for name, p in model.oracle_hint_proj.named_parameters():
+        assert p.grad is not None and p.grad.abs().sum().item() > 0.0, (
+            f"oracle_hint_proj.{name} got no gradient under adapter_only"
+        )
+    for name, p in model.body_action_hint_proj.named_parameters():
+        assert p.grad is not None and p.grad.abs().sum().item() > 0.0, (
+            f"body_action_hint_proj.{name} got no gradient under adapter_only"
+        )
+    # Every adapter gets a gradient.
+    for i, ad in enumerate(model.interaction_adapters):
+        for name, p in ad.named_parameters():
+            assert p.grad is not None and p.grad.abs().sum().item() > 0.0, (
+                f"interaction_adapters[{i}].{name} got no gradient under adapter_only"
+            )
+    for i, ad in enumerate(model.body_action_adapters):
+        for name, p in ad.named_parameters():
+            assert p.grad is not None and p.grad.abs().sum().item() > 0.0, (
+                f"body_action_adapters[{i}].{name} got no gradient under adapter_only"
+            )

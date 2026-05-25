@@ -26,6 +26,7 @@ CONFIGS=(
     "anchordiff_r28_a0_input_add_48clip"
     "anchordiff_r28_a1_gated_input_48clip"
     "anchordiff_r28_a2_per_layer_adapter_48clip"
+    "anchordiff_r28_a2b_adapter_only_48clip"
     "anchordiff_r28_a3_best_long_48clip"
     "anchordiff_r28_b0_baseline_48clip"
     "anchordiff_r28_b1_interaction_only_48clip"

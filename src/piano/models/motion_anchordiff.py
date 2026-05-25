@@ -754,13 +754,15 @@ class AnchorDenoiserConfig:
     # 2. Injection mode — `input_add` (R27 baseline, kept), `gated_input`
     #    (separate per-branch sigmoid gate driven by the AdaLN summary
     #    c-vector + branch embedding), `per_layer_adapter` (zero-init
-    #    per-DiT-block adapters; implemented in Commit 3).
+    #    per-DiT-block adapters added ON TOP of input_add), or
+    #    `adapter_only` (Round-28 A2b ablation: pure per-layer adapters,
+    #    no input-token add — isolates the adapter contribution).
     #
     # When `separate_hint_branches=False` and only interaction_hint is
     # enabled, the behavior is bit-exact equivalent to R27 input-add.
     use_body_action_hint: bool = False
     body_action_hint_dim: int = 0
-    # `input_add` / `gated_input` / `per_layer_adapter`.
+    # `input_add` / `gated_input` / `per_layer_adapter` / `adapter_only`.
     oracle_hint_injection_mode: str = "input_add"
     # When True, interaction & body-action hints have their own
     # projections + (if gated/adapter) their own gates/adapters.
@@ -1140,7 +1142,7 @@ class AnchorDenoiser(nn.Module):
         # One small adapter per DiT block per branch. Each is
         # zero-initialized at the final Linear so the per-layer
         # contribution starts at 0 (preserves R27 ckpt forward).
-        if cfg.oracle_hint_injection_mode == "per_layer_adapter":
+        if cfg.oracle_hint_injection_mode in ("per_layer_adapter", "adapter_only"):
             n_layers = int(cfg.n_layers)
             if self.oracle_hint_proj is not None:
                 self.interaction_adapters = nn.ModuleList([
@@ -1305,6 +1307,14 @@ class AnchorDenoiser(nn.Module):
             if body_emb is not None:
                 h = h + body_emb
             return h
+        if mode == "adapter_only":
+            # Pure per-layer-adapter injection (Round-28 A2b ablation).
+            # NO input-token addition; the hint reaches the residual
+            # stream only via per-layer zero-init adapters. This isolates
+            # the adapter contribution from the input-add baseline so A2
+            # vs A2b separates "adapter helps when added on top of
+            # input_add" from "adapter alone is sufficient".
+            return h
         if mode == "gated_input":
             if interaction_emb is not None and self.interaction_gate is not None:
                 gate_input = torch.cat(
@@ -1362,7 +1372,7 @@ class AnchorDenoiser(nn.Module):
             return h
         raise ValueError(
             f"oracle_hint_injection_mode={mode!r} not in "
-            "{'input_add', 'gated_input', 'per_layer_adapter'}"
+            "{'input_add', 'gated_input', 'per_layer_adapter', 'adapter_only'}"
         )
 
     def _apply_oracle_hint_per_layer_adapter(
@@ -1379,7 +1389,9 @@ class AnchorDenoiser(nn.Module):
         ``motion_token_start`` is the index of the first motion frame in
         ``seq`` (init_pose prefix occupies positions [0:motion_token_start)).
         """
-        if self.cfg.oracle_hint_injection_mode != "per_layer_adapter":
+        if self.cfg.oracle_hint_injection_mode not in (
+            "per_layer_adapter", "adapter_only",
+        ):
             return seq
         added = False
         if (
