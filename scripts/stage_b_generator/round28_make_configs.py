@@ -403,18 +403,9 @@ model:
     phase_classes: 3
     support_classes: 3
 
-  zero_z_int_for_stageB: true
-  zero_dense_contact_target_for_stageB: true
-  zero_contact_state_for_stageB: true
-  zero_contact_target_for_stageB: true
-  zero_phase_for_stageB: true
-  zero_support_for_stageB: true
-  zero_plan_target_for_stageB: false
-
   denoiser:
     motion_dim: 135
     object_traj_dim: 9
-    cond_motion_dim: 0
     init_pose_dim: 66
     text_dim: 512
     object_token_dim: 256
@@ -433,8 +424,6 @@ model:
     plan_context_hint_mode: "target_aware"
     use_dit_block: true
     dit_block_use_plan_pool_in_cond: false
-    use_v13_dynhead: false
-    use_v13_temporal_conv: false
     d_model: 512
     n_layers: 8
     n_heads: 4
@@ -541,11 +530,8 @@ loss:
   stable_root_vel_weight: 0.5
   stable_root_acc_weight: 0.25
   stable_support_erode: 4
-  stable_local_vel_weight: 0.0
-  stable_local_acc_weight: 0.0
   stable_local_vel_cm_weight: 0.05
   stable_local_speed_moment_weight: 0.02
-  stable_local_acc_cm_weight: 0.0
 
   hand_endpoint_weight: 2.0
   foot_endpoint_weight: 2.0

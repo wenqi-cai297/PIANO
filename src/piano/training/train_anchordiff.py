@@ -49,7 +49,6 @@ from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
     AnchorConsistencyConfig,
     PART_TO_JOINT,
-    anchor_consistency_loss,
     anchor_consistency_loss_world_joints,
     lift_object_local_to_world,
 )
@@ -151,7 +150,7 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
             surface_obj_pose=True,
             force_world_frame=bool(cfg.data.get("force_world_frame", False)),
             motion_representation=str(
-                cfg.data.get("motion_representation", "motion_263")
+                cfg.data.get("motion_representation", "smpl_pose_135_plan")
             ),
             use_oracle_interaction_hint=bool(
                 cfg.data.get("use_oracle_interaction_hint", False)
@@ -234,49 +233,6 @@ def _support_to_softmax(support_idx: Tensor, num_classes: int) -> Tensor:
     return _phase_to_softmax(support_idx, num_classes)
 
 
-def _per_clip_canon_transform(
-    joints_world: Tensor,          # (B, T, 22, 3)
-    motion_263: Tensor,            # (B, T, 263)
-    seq_len: Tensor,               # (B,)
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Compute per-clip canonical→world (R_y, T_xz, T_y) on-device.
-
-    Mirrors :func:`piano.utils.canonical_frame.get_canonicalize_transform_from_clip`
-    but in torch and batched. Cheap: one frame-0 reduction per clip.
-    """
-    from piano.training.anchor_consistency_loss import lift_motion263_to_joints
-    canon = lift_motion263_to_joints(motion_263)                   # (B, T, 22, 3)
-    B = joints_world.shape[0]
-    R_y_list, T_xz_list, T_y_list = [], [], []
-    for b in range(B):
-        T_b = max(int(seq_len[b].item()), 1)
-        wt0 = joints_world[b, 0]                                   # (22, 3)
-        ct0 = canon[b, 0]
-        across_w = (wt0[17] - wt0[16]) + (wt0[2] - wt0[1])
-        across_c = (ct0[17] - ct0[16]) + (ct0[2] - ct0[1])
-        fw_w = torch.atan2(across_w[2], -across_w[0])
-        fw_c = torch.atan2(across_c[2], -across_c[0])
-        R_y = fw_w - fw_c
-        # XZ translation: world_pelvis_t0 - R_y(canon_pelvis_t0) on XZ
-        cos_, sin_ = R_y.cos(), R_y.sin()
-        Rmat = torch.stack([
-            torch.stack([cos_, torch.zeros_like(cos_), sin_]),
-            torch.stack([torch.zeros_like(cos_), torch.ones_like(cos_), torch.zeros_like(cos_)]),
-            torch.stack([-sin_, torch.zeros_like(cos_), cos_]),
-        ])
-        rot_pelv = Rmat @ ct0[0]
-        T_xz = torch.stack([wt0[0, 0] - rot_pelv[0], wt0[0, 2] - rot_pelv[2]])
-        T_y = wt0[0, 1] - ct0[0, 1]
-        R_y_list.append(R_y)
-        T_xz_list.append(T_xz)
-        T_y_list.append(T_y)
-    return (
-        torch.stack(R_y_list),                                     # (B,)
-        torch.stack(T_xz_list),                                    # (B, 2)
-        torch.stack(T_y_list),                                     # (B,)
-    )
-
-
 def build_anchordiff_step_fn(
     model: MotionAnchorDiff,
     object_encoder: ObjectEncoder,
@@ -286,7 +242,7 @@ def build_anchordiff_step_fn(
     device: torch.device,
     feature_weight_state: FeatureWeightState | None,
     geometric_cfg: MotionGeometricLossConfig,
-    motion_representation: str = "motion_263",
+    motion_representation: str = "smpl_pose_135_plan",
     world_joint_velocity_weight: float = 0.0,
     object_traj_dim: int = 9,
     fk_consistency_weight: float = 0.0,
@@ -304,8 +260,6 @@ def build_anchordiff_step_fn(
     anchor_joint_pos_weight: float = 0.0,
     anchor_joint_vel_weight: float = 0.0,
     anchor_joint_part_weights: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0),
-    cond_motion_keyframe_weight: float = 0.0,
-    diffusion_unobserved_only: bool = False,
     use_interaction_plan: bool = False,
     plan_anchor_weight: float = 0.0,
     plan_segment_weight: float = 0.0,
@@ -320,24 +274,6 @@ def build_anchordiff_step_fn(
     stable_local_acc_cm_weight: float = 0.0,
     stable_local_speed_moment_weight: float = 0.0,
     stable_support_erode: int = 4,
-    # ── Fix V-modified loss-rebalance (per 2026-05-11 user spec) ──────────
-    # Frequency-band-stratified loss design:
-    # MSE on motion-135 is split by dim into root/global (dims 0:6 +
-    # 132:135 — low-freq) and local (dims 6:132 — per-joint rot, high-
-    # bias-toward-mean) with separate weights. Velocity / acceleration /
-    # high-pass / object-relative-velocity losses are added in FK joint-
-    # position space to provide mid- and high-frequency supervision.
-    # When `use_fix_v_loss=True`: the legacy uniform `mse_x0` term is
-    # excluded from total; split + dynamics losses are active.
-    # When False: legacy behaviour preserved (back-compat).
-    use_fix_v_loss: bool = False,
-    fix_v_mse_root_weight: float = 1.0,
-    fix_v_mse_local_weight: float = 0.1,
-    fix_v_joint_vel_weight: float = 1.0,
-    fix_v_joint_acc_weight: float = 0.2,
-    fix_v_hpf_weight: float = 0.2,
-    fix_v_obj_rel_vel_weight: float = 0.5,
-    fix_v_hpf_smooth_window: int = 5,
     # ── Min-SNR-γ weighting (Hang et al. arXiv:2303.09556, ICCV 2023) ──────
     # Reweights the diffusion mse_x0 loss by min(SNR(t), γ) per sample,
     # where SNR(t) = ᾱ_t / (1 - ᾱ_t). For x_0-prediction this is the
@@ -349,13 +285,6 @@ def build_anchordiff_step_fn(
     # FK pos, plan, stable, fix_v) are untouched per spec §4.3.
     use_min_snr_weighting: bool = False,
     min_snr_gamma: float = 5.0,
-    zero_z_int_for_stageB: bool = False,
-    zero_dense_contact_target_for_stageB: bool = False,
-    zero_contact_state_for_stageB: bool = False,
-    zero_contact_target_for_stageB: bool = False,
-    zero_phase_for_stageB: bool = False,
-    zero_support_for_stageB: bool = False,
-    zero_plan_target_for_stageB: bool = False,
     # Round-22: Stage-1 Coarse-v1 (23-D route) oracle condition. When
     # ``stage1_coarse_dim > 0``: step_fn extracts Coarse-v1 from each batch's
     # ``motion`` + ``rest_offsets`` via ``extract_coarse_v1_batched``, z-scores
@@ -460,13 +389,9 @@ def build_anchordiff_step_fn(
         obj_pos_world: Tensor,
         obj_rot_world: Tensor,
     ) -> Tensor:
-        # Base components (COM 3 + rot6d 6 = 9). Append 5 anchor world
-        # coords (15) when object_traj_dim>=24 (v4b+ models). Final size
-        # check is permissive for v8 path which adds 19 more dims (18
-        # keyjoint pos + 1 indicator) externally.
+        # COM (3) + rot6d (6) = 9 base dims. v4b+ models (object_traj_dim
+        # >= 24) append 5 body-part anchor world targets (5x3=15).
         components = [obj_com, obj_rot6d]
-        # v8 (object_traj_dim=43) and v4b-v7 (24) both want anchor_world.
-        # v1-v3 (object_traj_dim=9) skip it.
         if object_traj_dim >= 24:
             target_world = lift_object_local_to_world(
                 contact_target_xyz,
@@ -475,13 +400,10 @@ def build_anchordiff_step_fn(
             ).reshape(obj_com.shape[0], obj_com.shape[1], -1)
             components.append(target_world)
         out = torch.cat(components, dim=-1)
-        # Strict equality only for non-keyframed reps; v8 adds 19 more
-        # dims externally so its base build returns 24, not 43.
-        if motion_representation != "smpl_pose_135_keyframed":
-            if out.shape[-1] != object_traj_dim:
-                raise ValueError(
-                    f"object_traj_dim={object_traj_dim} but built {out.shape[-1]} dims"
-                )
+        if out.shape[-1] != object_traj_dim:
+            raise ValueError(
+                f"object_traj_dim={object_traj_dim} but built {out.shape[-1]} dims"
+            )
         return out
 
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
@@ -502,61 +424,23 @@ def build_anchordiff_step_fn(
         seq_idx = torch.arange(T, device=device).unsqueeze(0)
         seq_mask = (seq_idx < seq_len.unsqueeze(1)).float()        # (B, T)
 
-        # Per-clip canonical→world transform (cheap; one frame-0 op per clip).
-        if motion_representation == "motion_263":
-            with torch.no_grad():
-                R_y, T_xz_canon, T_y_canon = _per_clip_canon_transform(
-                    joints, motion, seq_len,
-                )
-        elif motion_representation in {
-            "joints22_world",
-            "joints22_world_with_rot6d",
-            "smpl_pose_135",
-            "smpl_pose_135_keyframed",
-            "smpl_pose_135_condmdi",
-            "smpl_pose_135_plan",
-        }:
-            R_y = T_xz_canon = T_y_canon = None
-        else:
-            raise ValueError(
-                f"Unsupported motion_representation={motion_representation!r}"
-            )
-
-        # --- v8 keyframed: zero contact_target_xyz at non-keyframe frames
-        # to drop per-frame spatial conditioning. Semantic z_int channels
-        # (contact_state, phase, support) stay; spatial keyframe info is
-        # appended to object_traj only at keyframe frames below.
+        # Round-28 cleanup: only smpl_pose_135_plan is supported. The
+        # legacy per-clip canonical->world transform (motion_263 path) and
+        # the v8 keyframed contact-zeroing were removed; downstream code
+        # treats R_y / T_xz_canon / T_y_canon as None.
+        R_y = T_xz_canon = T_y_canon = None
         contact_target_xyz_for_z = contact_target_xyz
-        if motion_representation == "smpl_pose_135_keyframed":
-            kf_indices_z = batch["keyframe_indices"].to(device)        # (B, K_MAX)
-            kf_mask_z = batch["keyframe_mask"].to(device).bool()       # (B, K_MAX)
-            kf_frame_mask_z = torch.zeros(B, T, dtype=torch.bool, device=device)
-            valid_kf_z = kf_indices_z.clamp(min=0, max=T-1)
-            kf_frame_mask_z.scatter_(1, valid_kf_z, torch.ones_like(valid_kf_z, dtype=torch.bool) & kf_mask_z)
-            # Zero contact_target_xyz at non-keyframe frames
-            contact_target_xyz_for_z = contact_target_xyz * kf_frame_mask_z.unsqueeze(-1).unsqueeze(-1).float()
 
         # --- Pack z_int (training: GT contact + GT target + GT phase/support) ---
         phase_soft = _phase_to_softmax(phase, z_dims.phase_classes)
         support_soft = _support_to_softmax(support, z_dims.support_classes)
 
-        # --- Fine-grained Stage-B z_int zeroing (per
-        # claude_code_v11_after_full_frozen_fix_handoff.md §C.3).
-        # Zero individual semantic / spatial channels before packing so
-        # the network sees a fixed-shape z_int with only the requested
-        # signals carrying information. Legacy `zero_z_int_for_stageB`
-        # still works as a coarse override (applied after packing).
-        contact_state_for_z = contact_state
-        if zero_contact_state_for_stageB:
-            contact_state_for_z = torch.zeros_like(contact_state_for_z)
-        if zero_contact_target_for_stageB:
-            contact_target_xyz_for_z = torch.zeros_like(contact_target_xyz_for_z)
-        phase_soft_for_z = phase_soft
-        if zero_phase_for_stageB:
-            phase_soft_for_z = torch.zeros_like(phase_soft_for_z)
-        support_soft_for_z = support_soft
-        if zero_support_for_stageB:
-            support_soft_for_z = torch.zeros_like(support_soft_for_z)
+        # Round-28 cleanup: all active configs zero the z_int channels.
+        # Hard-coded since the Stage-1.5 plan supersedes per-frame z_int.
+        contact_state_for_z = torch.zeros_like(contact_state)
+        contact_target_xyz_for_z = torch.zeros_like(contact_target_xyz_for_z)
+        phase_soft_for_z = torch.zeros_like(phase_soft)
+        support_soft_for_z = torch.zeros_like(support_soft)
         z_int = pack_z_int(
             contact_state_for_z, contact_target_xyz_for_z,
             phase_soft_for_z, support_soft_for_z, z_dims,
@@ -576,21 +460,6 @@ def build_anchordiff_step_fn(
             obj_rot_world=obj_rot_world,
         )
 
-        if motion_representation == "smpl_pose_135_keyframed":
-            kf_targets_t = batch["keyframe_targets"].to(device).float() # (B, K_MAX, 6, 3)
-            # Build per-frame keyframe positions: (B, T, 6, 3), zero at
-            # non-keyframe frames, GT keyjoint positions at keyframe frames.
-            kf_per_frame = torch.zeros(B, T, 6, 3, device=device, dtype=kf_targets_t.dtype)
-            # scatter keyframe targets into the right frame indices
-            for b in range(B):
-                for k in range(kf_indices_z.shape[1]):
-                    if kf_mask_z[b, k]:
-                        kf_per_frame[b, kf_indices_z[b, k]] = kf_targets_t[b, k]
-            kf_per_frame_flat = kf_per_frame.view(B, T, 18)             # (B, T, 18)
-            kf_indicator = kf_frame_mask_z.float().unsqueeze(-1)        # (B, T, 1)
-            object_traj = torch.cat([object_traj, kf_per_frame_flat, kf_indicator], dim=-1)
-            # New object_traj dim = 24 + 18 + 1 = 43
-
         # --- Init pose: SMPL-22 frame 0 ---
         init_pose = joints[:, 0, :, :].reshape(B, -1)              # (B, 66)
 
@@ -603,19 +472,12 @@ def build_anchordiff_step_fn(
         obj_tokens = object_encoder(object_pc)                     # (B, N, obj_dim)
 
         # --- Stage B PLAN_ONLY condition mode (per
-        # claude_code_v11_planonly_stability_next_steps.md §B):
-        # zero out dense z_int and/or dense contact-target channels so
-        # the interaction plan tokens are the only path for contact /
-        # part / phase / support information into Stage B. The shapes
-        # stay the same (network was built around 26-D z_int + 24-D
-        # object_traj); we replace the contents with zeros so the model
-        # learns that those channels carry no signal in this run.
-        if zero_z_int_for_stageB:
-            z_int = torch.zeros_like(z_int)
-        if zero_dense_contact_target_for_stageB and object_traj.shape[-1] >= 24:
-            # First 9 dims are object pose (COM 3 + rot6d 6); last 15
-            # are 5 lifted contact targets in world frame. Zero only the
-            # contact-target portion — keep object pose intact.
+        # Round-28 cleanup: PLAN_ONLY condition mode is the only mode now.
+        # Zero z_int and the contact-target portion of object_traj (first 9
+        # dims are object pose; last 15 are 5 lifted contact targets).
+        # Interaction plan tokens carry contact / part / phase / support info.
+        z_int = torch.zeros_like(z_int)
+        if object_traj.shape[-1] >= 24:
             object_traj = object_traj.clone()
             object_traj[..., 9:] = 0.0
 
@@ -633,12 +495,6 @@ def build_anchordiff_step_fn(
         # V12InputProjection.stage1_coarse_proj (zero-init) consumes it.
         # See analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md.
         if stage1_coarse_dim > 0:
-            if motion_representation != "smpl_pose_135_plan":
-                raise ValueError(
-                    "stage1_coarse_dim > 0 requires "
-                    "motion_representation='smpl_pose_135_plan' (motion[..., 132:135]"
-                    " must be root_world for the oracle extractor)."
-                )
             rest_offsets_for_coarse = batch["rest_offsets"].to(device).float()  # (B, 22, 3)
             coarse_v1_raw = extract_coarse_v1_batched(
                 motion=motion, rest_offsets=rest_offsets_for_coarse,
@@ -679,7 +535,7 @@ def build_anchordiff_step_fn(
         # smpl_pose_135_plan motion_representation; we just collect the
         # plan_* tensors back into a single dict the denoiser's
         # InteractionPlanEncoder expects.
-        if use_interaction_plan and motion_representation == "smpl_pose_135_plan":
+        if use_interaction_plan:
             plan_keys = [
                 "anchor_time", "anchor_part", "anchor_target_local",
                 "anchor_target_world", "anchor_type", "anchor_phase",
@@ -691,42 +547,6 @@ def build_anchordiff_step_fn(
             cond["interaction_plan"] = {
                 k: batch[f"plan_{k}"].to(device) for k in plan_keys
             }
-            # Plan-target zeroing (per claude_code_v11_next_localdyn_target_routing.md §C.2).
-            # Drop the plan's target-geometry channels so the encoder + hint
-            # cannot route target coordinates through plan tokens. Keep
-            # timing / event / part / phase / support / masks intact so plan
-            # still describes WHEN and WHICH-PART, just not WHERE. The
-            # target-aware hint computes prev/next target_world from
-            # anchor_target_world below, so zeroing that tensor here
-            # automatically zeros the corresponding hint components.
-            if zero_plan_target_for_stageB:
-                ip = cond["interaction_plan"]
-                ip["anchor_target_local"] = torch.zeros_like(ip["anchor_target_local"])
-                ip["anchor_target_world"] = torch.zeros_like(ip["anchor_target_world"])
-                ip["segment_target_summary_local"] = torch.zeros_like(
-                    ip["segment_target_summary_local"]
-                )
-
-        # --- v9 CondMDI: random keyframe inpainting channel ---
-        # Sample K ∈ [3, 12] random frames per clip from valid range,
-        # build cond_motion = motion at those frames (zero elsewhere)
-        # and obs_mask = 1 at those frames. Concatenated along feature dim
-        # to a (B, T, motion_dim + 1) tensor that the denoiser concats
-        # with x_t before the input projection.
-        if motion_representation == "smpl_pose_135_condmdi":
-            kf_obs_mask = torch.zeros(B, T, device=device, dtype=motion.dtype)
-            for b in range(B):
-                Tb = int(seq_len[b].item())
-                if Tb <= 0:
-                    continue
-                K_b = int(torch.randint(3, 13, (1,)).item())
-                K_b = min(K_b, Tb)
-                idx = torch.randperm(Tb, device=device)[:K_b]
-                kf_obs_mask[b, idx] = 1.0
-            cond_motion = motion * kf_obs_mask.unsqueeze(-1)        # (B, T, motion_dim)
-            cond["cond_motion_input"] = torch.cat(
-                [cond_motion, kf_obs_mask.unsqueeze(-1)], dim=-1,
-            )                                                        # (B, T, motion_dim+1)
 
         # --- Diffusion training step (x₀-prediction or v-prediction) ---
         # NOTE: call via __call__ (not .training_step directly) so DDP can
@@ -745,172 +565,66 @@ def build_anchordiff_step_fn(
         # the network natively predicts.
         mse_per_dim = (diff_pred - diff_target).pow(2)              # (B, T, D)
         weighted = (mse_per_dim * cache.get(motion_dim)).sum(-1)    # (B, T)
-        # Two-term loss for v9_2_obs_loss (per claude_code_v9_condmdi_diagnostic_next_steps.md §7.2):
-        # split MSE on observed vs un-observed frames, scale obs term by λ_obs.
-        # Active only when motion_representation == 'smpl_pose_135_condmdi'
-        # (i.e. cond_motion + obs_mask are in use). λ_obs=0 reproduces v9_1
-        # single-MSE behavior (additive 0 second term). For non-CondMDI
-        # reps and λ_obs<=0 this branch is bypassed entirely, preserving
-        # backward-compatible behavior of v6/v7/v8 trainers.
-        cond_motion_kf_w = float(cond_motion_keyframe_weight)
-        unobs_only = bool(diffusion_unobserved_only)
-        if motion_representation == "smpl_pose_135_condmdi" and (
-            cond_motion_kf_w > 0.0 or unobs_only
-        ):
-            obs_bool = kf_obs_mask.bool()                            # (B, T)
-            valid = seq_mask.bool()
-            obs_eff = valid & obs_bool                               # observed AND valid
-            unobs_eff = valid & ~obs_bool                            # un-observed AND valid
-            if unobs_eff.any():
-                mse_main = weighted[unobs_eff].mean()
-            else:
-                mse_main = torch.zeros((), device=device, dtype=weighted.dtype)
-            if obs_eff.any():
-                mse_kf = weighted[obs_eff].mean()
-            else:
-                mse_kf = torch.zeros((), device=device, dtype=weighted.dtype)
-            if unobs_only:
-                # v9_4 §8.1: with cond_motion_output_skip=True the model is
-                # not asked to learn observed frames (they are hard-injected
-                # at output). Main loss is unobs-only; mse_kf becomes a
-                # monitor and should be near zero.
-                mse = mse_main
-            else:
-                mse = mse_main + cond_motion_kf_w * mse_kf
-            mse_unweighted_main = (
-                mse_per_dim.sum(-1)[unobs_eff].mean()
-                if unobs_eff.any() else
-                torch.zeros((), device=device, dtype=mse_per_dim.dtype)
-            )
-            mse_unweighted_kf = (
-                mse_per_dim.sum(-1)[obs_eff].mean()
-                if obs_eff.any() else
-                torch.zeros((), device=device, dtype=mse_per_dim.dtype)
-            )
-            if unobs_only:
-                mse_unweighted = mse_unweighted_main
-            else:
-                mse_unweighted = (
-                    mse_unweighted_main + cond_motion_kf_w * mse_unweighted_kf
-                )
-        else:
-            # ── Min-SNR-γ per-sample weighting on diffusion mse ────────────
-            # Hang et al. arXiv:2303.09556, x_0-pred form: w_b = min(SNR_{t_b}, γ).
-            # Normalized per-batch so mean(w) = 1, preserving overall mse scale
-            # → other-loss weights are unaffected, only the timestep balance is.
-            min_snr_weight_mean = torch.zeros((), device=device, dtype=weighted.dtype)
-            min_snr_weight_max = torch.zeros((), device=device, dtype=weighted.dtype)
-            min_snr_weight_min = torch.zeros((), device=device, dtype=weighted.dtype)
-            if use_min_snr_weighting and "t" in out:
-                t_b = out["t"]                                                 # (B,) long
-                alpha_bar = _unwrapped_model_for_diff.diffusion.alphas_cumprod.gather(0, t_b)  # (B,)
-                snr = alpha_bar / (1.0 - alpha_bar + 1e-8)                     # (B,)
-                snr_clamped = torch.clamp_max(snr, float(min_snr_gamma))       # (B,)
-                pred_target = _unwrapped_model_for_diff.diffusion.prediction_target
-                if pred_target == "x0":
-                    w_b = snr_clamped                                          # (B,)
-                elif pred_target == "v":
-                    w_b = snr_clamped / (snr + 1.0)
-                else:                                                          # "eps"
-                    w_b = snr_clamped / (snr + 1e-8)
-                # Track raw weights (un-normalized) for diagnostics
-                min_snr_weight_mean = w_b.mean().detach()
-                min_snr_weight_max = w_b.max().detach()
-                min_snr_weight_min = w_b.min().detach()
-                # Normalize: mean across batch becomes 1.
-                w_b_norm = w_b / w_b.mean().clamp_min(1e-8)                    # (B,)
-                weighted = weighted * w_b_norm.view(-1, 1)                     # (B, T)
 
-            mse = (weighted * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
-            mse_unweighted = (
-                mse_per_dim.sum(-1) * seq_mask
-            ).sum() / seq_mask.sum().clamp_min(1.0)
-            mse_main = mse
-            mse_kf = torch.zeros((), device=device, dtype=mse.dtype)
+        # ── Min-SNR-γ per-sample weighting on diffusion mse ────────────
+        # Hang et al. arXiv:2303.09556, x_0-pred form: w_b = min(SNR_{t_b}, γ).
+        # Normalized per-batch so mean(w) = 1, preserving overall mse scale
+        # → other-loss weights are unaffected, only the timestep balance is.
+        min_snr_weight_mean = torch.zeros((), device=device, dtype=weighted.dtype)
+        min_snr_weight_max = torch.zeros((), device=device, dtype=weighted.dtype)
+        min_snr_weight_min = torch.zeros((), device=device, dtype=weighted.dtype)
+        if use_min_snr_weighting and "t" in out:
+            t_b = out["t"]                                                 # (B,) long
+            alpha_bar = _unwrapped_model_for_diff.diffusion.alphas_cumprod.gather(0, t_b)  # (B,)
+            snr = alpha_bar / (1.0 - alpha_bar + 1e-8)                     # (B,)
+            snr_clamped = torch.clamp_max(snr, float(min_snr_gamma))       # (B,)
+            pred_target = _unwrapped_model_for_diff.diffusion.prediction_target
+            if pred_target == "x0":
+                w_b = snr_clamped                                          # (B,)
+            elif pred_target == "v":
+                w_b = snr_clamped / (snr + 1.0)
+            else:                                                          # "eps"
+                w_b = snr_clamped / (snr + 1e-8)
+            min_snr_weight_mean = w_b.mean().detach()
+            min_snr_weight_max = w_b.max().detach()
+            min_snr_weight_min = w_b.min().detach()
+            # Normalize: mean across batch becomes 1.
+            w_b_norm = w_b / w_b.mean().clamp_min(1e-8)                    # (B,)
+            weighted = weighted * w_b_norm.view(-1, 1)                     # (B, T)
 
-        # Anchor consistency in WORLD frame (uniform-skel canonical lifted
-        # to world via per-clip (R_y, T_xz, T_y); see
-        # analyses/2026-05-08_anchordiff_frame_bug_fix.md).
-        if motion_representation == "motion_263":
-            anchor = anchor_consistency_loss(
-                x0_pred=x0_pred,
-                contact_state_gt=contact_state,
-                contact_target_xyz_local=contact_target_xyz,
-                object_positions=obj_pos_world,
-                object_rotations=obj_rot_world,
-                R_y=R_y,
-                T_xz=T_xz_canon,
-                T_y=T_y_canon,
-                cfg=anchor_cfg,
-                seq_mask=seq_mask.bool(),
-            )
-        else:
-            # v4 (joints22_world): full 66-D output is (B, T, 22, 3) jpos.
-            # v5 (joints22_world_with_rot6d): 198-D output, first 66 = jpos.
-            # v6 (smpl_pose_135): 135-D output, first 132 = global_rot_6d,
-            #   last 3 = root world translation. jpos derived by FK from
-            #   rot_6d + per-clip rest_offsets + root_world.
-            if motion_representation in {
-                "smpl_pose_135",
-                "smpl_pose_135_keyframed",
-                "smpl_pose_135_condmdi",
-                "smpl_pose_135_plan",
-            }:
-                from piano.training.smpl_kinematics import (
-                    rotation_6d_to_matrix as _rot6d_to_mat,
-                    fk_from_global_rotations as _fk_from_global,
-                )
-                rot_6d = x0_pred[..., :132].view(B, T, 22, 6).float()
-                root_world_pred = x0_pred[..., 132:135].float()        # (B, T, 3)
-                rot_mat_global = _rot6d_to_mat(rot_6d)                 # (B, T, 22, 3, 3)
-                rest_offsets = batch["rest_offsets"].to(device).float() # (B, 22, 3)
-                rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3)
-                jpos_pred = _fk_from_global(
-                    rot_mat_global, rest_per_frame, root_world_pred,
-                )                                                       # (B, T, 22, 3)
-            else:
-                jpos_pred = x0_pred[..., :66].view(B, T, 22, 3)
+        mse = (weighted * seq_mask).sum() / seq_mask.sum().clamp_min(1.0)
+        mse_unweighted = (
+            mse_per_dim.sum(-1) * seq_mask
+        ).sum() / seq_mask.sum().clamp_min(1.0)
+        mse_main = mse
+        mse_kf = torch.zeros((), device=device, dtype=mse.dtype)
 
-            # v8: anchor loss only at keyframe frames (sparse). Mask
-            # contact_state to 0 outside keyframe set so anchor sums
-            # only at those frames.
-            stability_mask_v8 = None
-            if motion_representation == "smpl_pose_135_keyframed":
-                kf_indices = batch["keyframe_indices"].to(device)      # (B, K_MAX)
-                kf_mask = batch["keyframe_mask"].to(device).bool()     # (B, K_MAX)
-                # Build (B, T) bool: True at keyframe frame indices
-                kf_frame_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-                # scatter kf_indices into the frame-mask wherever kf_mask is valid
-                valid_kf = kf_indices.clamp(min=0, max=T-1)
-                ones = torch.ones_like(valid_kf, dtype=torch.bool)
-                # For each batch element, mark valid keyframe positions
-                kf_frame_mask.scatter_(1, valid_kf, ones & kf_mask)
-                # Combine with seq_mask: only valid keyframes within valid frames
-                anchor_seq_mask = kf_frame_mask & seq_mask.bool()
+        # Anchor consistency in WORLD frame (smpl_pose_135_plan path).
+        # 135-D output: first 132 = global rot_6d, last 3 = root world xyz.
+        # jpos derived by FK from rot_6d + per-clip rest_offsets + root_world.
+        from piano.training.smpl_kinematics import (
+            rotation_6d_to_matrix as _rot6d_to_mat,
+            fk_from_global_rotations as _fk_from_global,
+        )
+        rot_6d = x0_pred[..., :132].view(B, T, 22, 6).float()
+        root_world_pred = x0_pred[..., 132:135].float()                # (B, T, 3)
+        rot_mat_global = _rot6d_to_mat(rot_6d)                         # (B, T, 22, 3, 3)
+        rest_offsets = batch["rest_offsets"].to(device).float()        # (B, 22, 3)
+        rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3)
+        jpos_pred = _fk_from_global(
+            rot_mat_global, rest_per_frame, root_world_pred,
+        )                                                              # (B, T, 22, 3)
 
-                # v8 rule B: per-frame per-bodypart contact stability
-                # factor in [0,1]. Frames where contact_state is
-                # ambiguous (rolling-mean ≈ 0.5) get factor → 0,
-                # downweighting the anchor pull on flickering hands.
-                from piano.data.contact_postprocess import (
-                    compute_contact_stability_mask_torch,
-                )
-                stability_mask_v8 = compute_contact_stability_mask_torch(
-                    contact_state, window=15,
-                )                                                       # (B, T, P)
-            else:
-                anchor_seq_mask = seq_mask.bool()
-
-            anchor = anchor_consistency_loss_world_joints(
-                joints_world_pred=jpos_pred,
-                contact_state_gt=contact_state,
-                contact_target_xyz_local=contact_target_xyz,
-                object_positions=obj_pos_world,
-                object_rotations=obj_rot_world,
-                cfg=anchor_cfg,
-                seq_mask=anchor_seq_mask,
-                stability_mask=stability_mask_v8,
-            )
+        anchor = anchor_consistency_loss_world_joints(
+            joints_world_pred=jpos_pred,
+            contact_state_gt=contact_state,
+            contact_target_xyz_local=contact_target_xyz,
+            object_positions=obj_pos_world,
+            object_rotations=obj_rot_world,
+            cfg=anchor_cfg,
+            seq_mask=seq_mask.bool(),
+            stability_mask=None,
+        )
 
         geom = compute_motion_geometric_losses(
             x0_pred=x0_pred,
@@ -918,29 +632,9 @@ def build_anchordiff_step_fn(
             seq_mask=seq_mask,
             cfg=geometric_cfg,
         )
-        # World-frame velocity loss source:
-        # v4 (joints22_world): full 66-D motion vector (jpos).
-        # v5 (198-D): jpos sub-vector [:66] only (rotations have own continuity).
-        # v6 (smpl_pose_135): full 135-D rep — frame-difference on global rot_6d
-        #   penalises angular jitter, frame-difference on root_world penalises
-        #   root jitter. Both are valid temporal smoothness terms.
-        if (
-            motion_representation
-            in {
-                "joints22_world",
-                "joints22_world_with_rot6d",
-                "smpl_pose_135",
-                "smpl_pose_135_keyframed",
-                "smpl_pose_135_condmdi",
-                "smpl_pose_135_plan",
-            }
-            and world_joint_velocity_weight > 0.0
-        ):
-            if motion_representation == "joints22_world_with_rot6d":
-                wv_pred = x0_pred[..., :66].float()
-                wv_target = x0_target[..., :66].float()
-            else:
-                wv_pred, wv_target = x0_pred.float(), x0_target.float()
+        # World-frame velocity loss on the full 135-D motion vector.
+        if world_joint_velocity_weight > 0.0:
+            wv_pred, wv_target = x0_pred.float(), x0_target.float()
             world_vel = feature_velocity_loss(wv_pred, wv_target, seq_mask.float())
             geom = {
                 **geom,
@@ -949,44 +643,19 @@ def build_anchordiff_step_fn(
                 "loss_vel": world_vel,
             }
 
-        # FK consistency (v5 only): re-derive jpos from predicted global
-        # rot_6d via SMPL-22 FK with per-clip rest_offsets, MSE vs the
-        # predicted jpos. Forces the redundant 198-D representation to be
-        # internally self-consistent — eliminates the v4 'arm stretches
-        # to satisfy anchor target' failure mode.
-        # Round-28 cleanup: v5 (joints22_world_with_rot6d) FK-consistency
-        # loss removed. Active configs use smpl_pose_135_plan, no v5 path.
+        # FK consistency removed in Round-28 cleanup (was v5-only).
         loss_fk = torch.zeros((), device=device, dtype=x0_pred.dtype)
 
-        # Full-body L_pos (v7+): MSE between FK-derived predicted joints
-        # and GT joints_22, all 22 joints × all valid frames. Dense
-        # temporal supervision (MDM Eq. 3, Tevet et al. ICLR 2023).
-        # Active for v7 (smpl_pose_135), v8 (smpl_pose_135_keyframed),
-        # v9_4 (smpl_pose_135_condmdi), and v10 (smpl_pose_135_plan).
-        # The v10 inclusion was missed in the original v10 wiring and
-        # caused visible high-frequency joint jitter in sampled motion
-        # (analyses/claude_code_v10_plan_tokens_next_steps.md §2).
+        # Full-body L_pos: MSE between FK-derived predicted joints and GT
+        # joints_22, all 22 joints x all valid frames. Dense temporal
+        # supervision (MDM Eq. 3, Tevet et al. ICLR 2023).
         loss_pos_full = torch.zeros((), device=device, dtype=x0_pred.dtype)
         loss_pos_full_obs_monitor = torch.zeros((), device=device, dtype=x0_pred.dtype)
         loss_pos_full_unobs_monitor = torch.zeros((), device=device, dtype=x0_pred.dtype)
-        if (
-            motion_representation in {
-                "smpl_pose_135",
-                "smpl_pose_135_keyframed",
-                "smpl_pose_135_condmdi",
-                "smpl_pose_135_plan",
-            }
-            and pos_loss_weight > 0.0
-        ):
+        if pos_loss_weight > 0.0:
             joints_gt = joints.float()                                    # (B, T, 22, 3)
             err = (jpos_pred.float() - joints_gt).pow(2).sum(-1)          # (B, T, 22)
-            # Round-25 D5: optional per-joint weighting for hand+foot
-            # endpoints. Default 1.0 each → joint_weights is all-ones
-            # and denom = seq_mask.sum() * 22 (back-compat). When
-            # hand_endpoint_weight or foot_endpoint_weight > 1, the
-            # wrist (20, 21) / ankle (10, 11) joints get amplified
-            # squared-error before averaging, and the denom uses the
-            # weight-sum so the loss scale stays comparable.
+            # Round-25 D5: per-joint weighting for hand+foot endpoints.
             if hand_endpoint_weight != 1.0 or foot_endpoint_weight != 1.0:
                 jw = torch.ones(22, device=err.device, dtype=err.dtype)
                 jw[20] = hand_endpoint_weight
@@ -999,19 +668,6 @@ def build_anchordiff_step_fn(
                 weight_sum = err.new_tensor(22.0)
             denom = (seq_mask.sum() * weight_sum).clamp_min(1.0)
             loss_pos_full = (err * seq_mask.unsqueeze(-1).float()).sum() / denom
-            # v9_4 §8.2: per-segment monitor (obs vs unobs frames). When
-            # cond_motion_output_skip is on, observed-frame pos_full should
-            # be ≈ 0 by construction; unobserved-frame pos_full is the
-            # interpolation quality signal we actually care about.
-            if motion_representation == "smpl_pose_135_condmdi":
-                obs_bool_p = kf_obs_mask.bool()
-                obs_eff_p = seq_mask.bool() & obs_bool_p
-                unobs_eff_p = seq_mask.bool() & ~obs_bool_p
-                err_per_frame = err.mean(dim=-1)                          # (B, T)
-                if obs_eff_p.any():
-                    loss_pos_full_obs_monitor = err_per_frame[obs_eff_p].mean()
-                if unobs_eff_p.any():
-                    loss_pos_full_unobs_monitor = err_per_frame[unobs_eff_p].mean()
 
         # Sparse active-part endpoint supervision (Round-26 strategy fix).
         # Dense FK L_pos averages over all joints and frames, which lets
@@ -1021,15 +677,7 @@ def build_anchordiff_step_fn(
         loss_anchor_joint_pos = torch.zeros((), device=device, dtype=motion.dtype)
         loss_anchor_joint_vel = torch.zeros((), device=device, dtype=motion.dtype)
         anchor_joint_active_ratio = torch.zeros((), device=device)
-        if (
-            motion_representation in {
-                "smpl_pose_135",
-                "smpl_pose_135_keyframed",
-                "smpl_pose_135_condmdi",
-                "smpl_pose_135_plan",
-            }
-            and (anchor_joint_pos_weight > 0.0 or anchor_joint_vel_weight > 0.0)
-        ):
+        if anchor_joint_pos_weight > 0.0 or anchor_joint_vel_weight > 0.0:
             pred_part = jpos_pred.float().index_select(
                 2, anchor_joint_part_to_joint_t,
             )                                                           # (B, T, P, 3)
@@ -1218,15 +866,11 @@ def build_anchordiff_step_fn(
         loss_plan_segment = torch.zeros((), device=device, dtype=motion.dtype)
         loss_plan_trans_vel = torch.zeros((), device=device, dtype=motion.dtype)
         loss_plan_trans_acc = torch.zeros((), device=device, dtype=motion.dtype)
-        if (
-            use_interaction_plan
-            and motion_representation == "smpl_pose_135_plan"
-            and (
-                plan_anchor_weight > 0.0
-                or plan_segment_weight > 0.0
-                or plan_transition_vel_weight > 0.0
-                or plan_transition_acc_weight > 0.0
-            )
+        if use_interaction_plan and (
+            plan_anchor_weight > 0.0
+            or plan_segment_weight > 0.0
+            or plan_transition_vel_weight > 0.0
+            or plan_transition_acc_weight > 0.0
         ):
             # Body-part → SMPL-22 joint index map (matches
             # piano.utils.smpl_utils.INTERACTION_BODY_PARTS).
@@ -1381,19 +1025,13 @@ def build_anchordiff_step_fn(
         stable_local_speed_std_pred = torch.zeros((), device=device)
         stable_local_speed_std_gt = torch.zeros((), device=device)
         if (
-            motion_representation in {
-                "smpl_pose_135", "smpl_pose_135_keyframed",
-                "smpl_pose_135_condmdi", "smpl_pose_135_plan",
-            }
-            and (
-                stable_root_vel_weight > 0.0
-                or stable_root_acc_weight > 0.0
-                or stable_local_vel_weight > 0.0
-                or stable_local_acc_weight > 0.0
-                or stable_local_vel_cm_weight > 0.0
-                or stable_local_acc_cm_weight > 0.0
-                or stable_local_speed_moment_weight > 0.0
-            )
+            stable_root_vel_weight > 0.0
+            or stable_root_acc_weight > 0.0
+            or stable_local_vel_weight > 0.0
+            or stable_local_acc_weight > 0.0
+            or stable_local_vel_cm_weight > 0.0
+            or stable_local_acc_cm_weight > 0.0
+            or stable_local_speed_moment_weight > 0.0
         ):
             joints_gt_s = joints.float()
             # stable_support[b, t] = (support != 0) | (pelvis_contact > 0.5)
@@ -1535,176 +1173,8 @@ def build_anchordiff_step_fn(
                                 beta=1.0,
                             )
 
-        # ─────────────────────────────────────────────────────────────────
-        # Fix V-modified: frequency-band-stratified loss block
-        # Per 2026-05-11 user spec. Active iff use_fix_v_loss=True.
-        # Computed even when inactive so monitoring metrics are always
-        # available; only the `total` contribution is gated on the flag.
-        # ─────────────────────────────────────────────────────────────────
-        loss_mse_root = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_mse_local = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_joint_vel = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_joint_acc = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_hpf = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_obj_rel_vel = torch.zeros((), device=device, dtype=motion.dtype)
-        # Motion-statistics diagnostics (always populated when motion_135 + plan).
-        vel_magnitude_ratio = torch.zeros((), device=device)
-        acc_magnitude_ratio = torch.zeros((), device=device)
-        hpf_energy_ratio = torch.zeros((), device=device)
-        per_joint_vel_pred_lhand = torch.zeros((), device=device)
-        per_joint_vel_pred_rhand = torch.zeros((), device=device)
-        per_joint_vel_pred_lfoot = torch.zeros((), device=device)
-        per_joint_vel_pred_rfoot = torch.zeros((), device=device)
-        per_joint_vel_pred_pelvis = torch.zeros((), device=device)
-        per_joint_vel_gt_lhand = torch.zeros((), device=device)
-        per_joint_vel_gt_rhand = torch.zeros((), device=device)
-        per_joint_vel_gt_lfoot = torch.zeros((), device=device)
-        per_joint_vel_gt_rfoot = torch.zeros((), device=device)
-        per_joint_vel_gt_pelvis = torch.zeros((), device=device)
-        if motion_representation in {
-            "smpl_pose_135", "smpl_pose_135_keyframed",
-            "smpl_pose_135_condmdi", "smpl_pose_135_plan",
-        }:
-            joints_gt_v = joints.float()                                # (B, T, 22, 3)
-            jpos_pred_v = jpos_pred.float()                              # (B, T, 22, 3)
-            seq_f = seq_mask.float()                                     # (B, T)
-
-            # (1) Split MSE on motion-135 (per spec items 1+2):
-            #     root/global dims = [0:6 root_rot6d, 132:135 root_world_xyz]  (9 dims)
-            #     local dims       = [6:132 21-joint rot6d]                    (126 dims)
-            err_135 = (x0_pred.float() - x0_target.float()).pow(2)       # (B, T, 135)
-            # Build root vs local index masks once.
-            root_idx = torch.cat([
-                torch.arange(0, 6, device=device),
-                torch.arange(132, 135, device=device),
-            ])
-            local_idx = torch.arange(6, 132, device=device)
-            err_root_per_frame = err_135.index_select(-1, root_idx).mean(-1)   # (B, T)
-            err_local_per_frame = err_135.index_select(-1, local_idx).mean(-1)
-            denom_t = seq_f.sum().clamp_min(1.0)
-            loss_mse_root = (err_root_per_frame * seq_f).sum() / denom_t
-            loss_mse_local = (err_local_per_frame * seq_f).sum() / denom_t
-
-            # (3) Local-joint velocity imitation: MSE on (joint world-frame
-            #     velocity), excluding root (joint 0).
-            vel_pred_w = jpos_pred_v[:, 1:] - jpos_pred_v[:, :-1]         # (B, T-1, 22, 3)
-            vel_gt_w = joints_gt_v[:, 1:] - joints_gt_v[:, :-1]
-            seq_vel_mask = (seq_f[:, 1:] * seq_f[:, :-1])                 # (B, T-1)
-            local_joints = slice(1, 22)
-            vel_pred_local = vel_pred_w[:, :, local_joints, :]            # (B, T-1, 21, 3)
-            vel_gt_local = vel_gt_w[:, :, local_joints, :]
-            err_vel = (vel_pred_local - vel_gt_local).pow(2).sum(-1)      # (B, T-1, 21)
-            denom_v = (seq_vel_mask.sum() * 21).clamp_min(1.0)
-            loss_joint_vel = (
-                err_vel * seq_vel_mask.unsqueeze(-1)
-            ).sum() / denom_v
-
-            # (4) Local-joint acceleration imitation
-            if T >= 3:
-                acc_pred_w = vel_pred_w[:, 1:] - vel_pred_w[:, :-1]       # (B, T-2, 22, 3)
-                acc_gt_w = vel_gt_w[:, 1:] - vel_gt_w[:, :-1]
-                seq_acc_mask = (
-                    seq_f[:, 2:] * seq_f[:, 1:-1] * seq_f[:, :-2]
-                )                                                          # (B, T-2)
-                acc_pred_local = acc_pred_w[:, :, local_joints, :]
-                acc_gt_local = acc_gt_w[:, :, local_joints, :]
-                err_acc = (acc_pred_local - acc_gt_local).pow(2).sum(-1)   # (B, T-2, 21)
-                denom_a = (seq_acc_mask.sum() * 21).clamp_min(1.0)
-                loss_joint_acc = (
-                    err_acc * seq_acc_mask.unsqueeze(-1)
-                ).sum() / denom_a
-
-            # (5) High-pass residual: signal − temporal_box_smooth(signal),
-            #     MSE on residual difference (pred vs gt). Window controls
-            #     the cutoff: larger W → lower cutoff → more frequencies in
-            #     the residual.
-            W = max(int(fix_v_hpf_smooth_window), 1)
-            if W >= 3 and T >= W:
-                # Conv1d box smoothing over time, per-joint, per-xyz.
-                # Reshape (B, T, 22, 3) -> (B*22*3, 1, T) for grouped conv.
-                B_, T_, J_, C_ = jpos_pred_v.shape
-                kernel = torch.full(
-                    (1, 1, W), 1.0 / W,
-                    device=device, dtype=jpos_pred_v.dtype,
-                )
-                pad = W // 2
-                jpos_flat = jpos_pred_v.permute(0, 2, 3, 1).reshape(B_ * J_ * C_, 1, T_)
-                jpos_smooth = F.conv1d(
-                    F.pad(jpos_flat, (pad, pad), mode="replicate"),
-                    kernel,
-                )                                                          # (B*J*3, 1, T)
-                jpos_smooth = jpos_smooth.view(B_, J_, C_, T_).permute(0, 3, 1, 2)
-                gt_flat = joints_gt_v.permute(0, 2, 3, 1).reshape(B_ * J_ * C_, 1, T_)
-                gt_smooth = F.conv1d(
-                    F.pad(gt_flat, (pad, pad), mode="replicate"),
-                    kernel,
-                )
-                gt_smooth = gt_smooth.view(B_, J_, C_, T_).permute(0, 3, 1, 2)
-                hpf_pred = jpos_pred_v - jpos_smooth                       # (B, T, 22, 3)
-                hpf_gt = joints_gt_v - gt_smooth
-                hpf_pred_local = hpf_pred[:, :, local_joints, :]           # (B, T, 21, 3)
-                hpf_gt_local = hpf_gt[:, :, local_joints, :]
-                err_hpf = (hpf_pred_local - hpf_gt_local).pow(2).sum(-1)   # (B, T, 21)
-                denom_h = (seq_f.sum() * 21).clamp_min(1.0)
-                loss_hpf = (
-                    err_hpf * seq_f.unsqueeze(-1)
-                ).sum() / denom_h
-                # HPF energy ratio diagnostic
-                hpf_pred_energy = (hpf_pred_local.pow(2).sum(-1) * seq_f.unsqueeze(-1)).sum()
-                hpf_gt_energy = (hpf_gt_local.pow(2).sum(-1) * seq_f.unsqueeze(-1)).sum()
-                hpf_energy_ratio = hpf_pred_energy.sqrt() / hpf_gt_energy.sqrt().clamp_min(1e-9)
-
-            # (6) Object-relative joint velocity imitation (only when
-            #     object_positions is in cond; per spec apply weight 0.5).
-            if "object_positions" in batch:
-                obj_pos = batch["object_positions"].to(device).float()    # (B, T, 3)
-                obj_vel = obj_pos[:, 1:] - obj_pos[:, :-1]                # (B, T-1, 3)
-                rel_vel_pred = vel_pred_local - obj_vel.unsqueeze(2)      # (B, T-1, 21, 3)
-                rel_vel_gt = vel_gt_local - obj_vel.unsqueeze(2)
-                err_rv = (rel_vel_pred - rel_vel_gt).pow(2).sum(-1)        # (B, T-1, 21)
-                denom_rv = (seq_vel_mask.sum() * 21).clamp_min(1.0)
-                loss_obj_rel_vel = (
-                    err_rv * seq_vel_mask.unsqueeze(-1)
-                ).sum() / denom_rv
-
-            # Diagnostics: magnitude ratios + per-joint velocity stats.
-            vel_pred_mag = (vel_pred_local.pow(2).sum(-1).clamp_min(1e-12).sqrt())  # (B, T-1, 21)
-            vel_gt_mag = (vel_gt_local.pow(2).sum(-1).clamp_min(1e-12).sqrt())
-            mask_vd = seq_vel_mask.unsqueeze(-1).float()
-            vel_pred_mean = (vel_pred_mag * mask_vd).sum() / mask_vd.sum().clamp_min(1.0) / 1.0
-            vel_gt_mean = (vel_gt_mag * mask_vd).sum() / mask_vd.sum().clamp_min(1.0) / 1.0
-            vel_magnitude_ratio = vel_pred_mean / vel_gt_mean.clamp_min(1e-9)
-            if T >= 3:
-                acc_pred_mag = (acc_pred_local.pow(2).sum(-1).clamp_min(1e-12).sqrt())
-                acc_gt_mag = (acc_gt_local.pow(2).sum(-1).clamp_min(1e-12).sqrt())
-                mask_ad = seq_acc_mask.unsqueeze(-1).float()
-                acc_pred_mean = (acc_pred_mag * mask_ad).sum() / mask_ad.sum().clamp_min(1.0)
-                acc_gt_mean = (acc_gt_mag * mask_ad).sum() / mask_ad.sum().clamp_min(1.0)
-                acc_magnitude_ratio = acc_pred_mean / acc_gt_mean.clamp_min(1e-9)
-            # Per-joint velocity rms (cm/frame): part-to-joint map per
-            # piano.utils.smpl_utils.INTERACTION_BODY_PARTS:
-            #   L_hand=20, R_hand=21, L_foot=10, R_foot=11, pelvis=0
-            # Note vel_pred_w / vel_gt_w include all 22 joints (root incl).
-            def _rms_at_joint(vel_w_arr: Tensor, j: int) -> Tensor:
-                v = vel_w_arr[:, :, j, :]                                  # (B, T-1, 3)
-                v_mag = v.pow(2).sum(-1).clamp_min(1e-12).sqrt()           # (B, T-1)
-                return (v_mag * seq_vel_mask).sum() / seq_vel_mask.sum().clamp_min(1.0)
-            per_joint_vel_pred_lhand = _rms_at_joint(vel_pred_w, 20) * 100.0
-            per_joint_vel_pred_rhand = _rms_at_joint(vel_pred_w, 21) * 100.0
-            per_joint_vel_pred_lfoot = _rms_at_joint(vel_pred_w, 10) * 100.0
-            per_joint_vel_pred_rfoot = _rms_at_joint(vel_pred_w, 11) * 100.0
-            per_joint_vel_pred_pelvis = _rms_at_joint(vel_pred_w, 0) * 100.0
-            per_joint_vel_gt_lhand = _rms_at_joint(vel_gt_w, 20) * 100.0
-            per_joint_vel_gt_rhand = _rms_at_joint(vel_gt_w, 21) * 100.0
-            per_joint_vel_gt_lfoot = _rms_at_joint(vel_gt_w, 10) * 100.0
-            per_joint_vel_gt_rfoot = _rms_at_joint(vel_gt_w, 11) * 100.0
-            per_joint_vel_gt_pelvis = _rms_at_joint(vel_gt_w, 0) * 100.0
-
         total = (
-            (mse if not use_fix_v_loss else (
-                fix_v_mse_root_weight * loss_mse_root
-                + fix_v_mse_local_weight * loss_mse_local
-            ))
+            mse
             + anchor
             + geom["loss_geometric"]
             + fk_consistency_weight * loss_fk
@@ -1722,11 +1192,6 @@ def build_anchordiff_step_fn(
             + stable_local_vel_cm_weight * loss_stable_local_vel_cm
             + stable_local_acc_cm_weight * loss_stable_local_acc_cm
             + stable_local_speed_moment_weight * loss_stable_local_speed_moment
-            # Fix V-modified dynamics losses (active only when use_fix_v_loss).
-            + (fix_v_joint_vel_weight * loss_joint_vel if use_fix_v_loss else 0.0)
-            + (fix_v_joint_acc_weight * loss_joint_acc if use_fix_v_loss else 0.0)
-            + (fix_v_hpf_weight * loss_hpf if use_fix_v_loss else 0.0)
-            + (fix_v_obj_rel_vel_weight * loss_obj_rel_vel if use_fix_v_loss else 0.0)
             # Round-27 Tier-0B temporal interaction losses (zero by default).
             # Round-28 adds two consistency terms (also zero by default).
             + (
@@ -1819,63 +1284,6 @@ def build_anchordiff_step_fn(
             "_raw_loss_stable_local_vel_cm": loss_stable_local_vel_cm,
             "_raw_loss_stable_local_acc_cm": loss_stable_local_acc_cm,
             "_raw_loss_stable_local_speed_moment": loss_stable_local_speed_moment,
-            "self_conditioning_used_fraction": out.get(
-                "self_conditioning_used_fraction",
-                torch.zeros((), device=device, dtype=motion.dtype),
-            ).detach(),
-            "self_conditioning_allowed_fraction": out.get(
-                "self_conditioning_allowed_fraction",
-                torch.zeros((), device=device, dtype=motion.dtype),
-            ).detach(),
-            # Fix V-modified diagnostics (per 2026-05-11 user spec).
-            # Raw losses (always computed; only active in total when use_fix_v_loss=True):
-            "fix_v_loss_mse_root": loss_mse_root.detach(),
-            "fix_v_loss_mse_local": loss_mse_local.detach(),
-            "fix_v_loss_joint_vel": loss_joint_vel.detach(),
-            "fix_v_loss_joint_acc": loss_joint_acc.detach(),
-            "fix_v_loss_hpf": loss_hpf.detach(),
-            "fix_v_loss_obj_rel_vel": loss_obj_rel_vel.detach(),
-            # Weighted contributions (zero when use_fix_v_loss=False).
-            "fix_v_weighted_mse_root": (
-                (fix_v_mse_root_weight * loss_mse_root) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_mse_root.dtype)
-            ).detach(),
-            "fix_v_weighted_mse_local": (
-                (fix_v_mse_local_weight * loss_mse_local) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_mse_local.dtype)
-            ).detach(),
-            "fix_v_weighted_joint_vel": (
-                (fix_v_joint_vel_weight * loss_joint_vel) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_joint_vel.dtype)
-            ).detach(),
-            "fix_v_weighted_joint_acc": (
-                (fix_v_joint_acc_weight * loss_joint_acc) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_joint_acc.dtype)
-            ).detach(),
-            "fix_v_weighted_hpf": (
-                (fix_v_hpf_weight * loss_hpf) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_hpf.dtype)
-            ).detach(),
-            "fix_v_weighted_obj_rel_vel": (
-                (fix_v_obj_rel_vel_weight * loss_obj_rel_vel) if use_fix_v_loss
-                else torch.zeros((), device=device, dtype=loss_obj_rel_vel.dtype)
-            ).detach(),
-            # Motion-statistic diagnostics (independent of use_fix_v_loss flag).
-            "fix_v_vel_magnitude_ratio": vel_magnitude_ratio.detach(),
-            "fix_v_acc_magnitude_ratio": acc_magnitude_ratio.detach(),
-            "fix_v_hpf_energy_ratio": hpf_energy_ratio.detach(),
-            # Per-joint velocity rms (cm/frame) — predicted.
-            "fix_v_per_joint_vel_pred_lhand_cm": per_joint_vel_pred_lhand.detach(),
-            "fix_v_per_joint_vel_pred_rhand_cm": per_joint_vel_pred_rhand.detach(),
-            "fix_v_per_joint_vel_pred_lfoot_cm": per_joint_vel_pred_lfoot.detach(),
-            "fix_v_per_joint_vel_pred_rfoot_cm": per_joint_vel_pred_rfoot.detach(),
-            "fix_v_per_joint_vel_pred_pelvis_cm": per_joint_vel_pred_pelvis.detach(),
-            # Per-joint velocity rms (cm/frame) — GT (reference for ratio inspection).
-            "fix_v_per_joint_vel_gt_lhand_cm": per_joint_vel_gt_lhand.detach(),
-            "fix_v_per_joint_vel_gt_rhand_cm": per_joint_vel_gt_rhand.detach(),
-            "fix_v_per_joint_vel_gt_lfoot_cm": per_joint_vel_gt_lfoot.detach(),
-            "fix_v_per_joint_vel_gt_rfoot_cm": per_joint_vel_gt_rfoot.detach(),
-            "fix_v_per_joint_vel_gt_pelvis_cm": per_joint_vel_gt_pelvis.detach(),
             # Min-SNR-γ diagnostics (active only when use_min_snr_weighting=True;
             # all-zero tensors otherwise).
             "min_snr_weight_mean": min_snr_weight_mean,
@@ -1916,14 +1324,6 @@ def build_anchordiff_step_fn(
                 out["v12_input_proj_norm_hint"] = (
                     denoiser.v12_input_proj.hint_proj.weight.norm().detach()
                 )
-                if getattr(denoiser.v12_input_proj, "self_cond_proj", None) is not None:
-                    out["v22_self_cond_proj_norm"] = (
-                        denoiser.v12_input_proj.self_cond_proj.weight.norm().detach()
-                    )
-                    if getattr(denoiser.v12_input_proj, "self_cond_gate", None) is not None:
-                        out["v22_self_cond_gate"] = (
-                            denoiser.v12_input_proj.self_cond_gate.detach()
-                        )
                 for i, block in enumerate(denoiser.v12_blocks):
                     out[f"v12_adaLN_norm_layer{i}"] = (
                         block.adaLN_modulation[-1].weight.norm().detach()
@@ -2110,10 +1510,6 @@ def main() -> None:
         text_dim=int(cfg.model.denoiser.text_dim),
         object_token_dim=int(cfg.model.denoiser.object_token_dim),
         object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
-        cond_motion_dim=int(cfg.model.denoiser.get("cond_motion_dim", 0)),
-        cond_motion_output_skip=bool(cfg.model.denoiser.get("cond_motion_output_skip", False)),
-        cfg_drop_cond_motion=bool(cfg.model.denoiser.get("cfg_drop_cond_motion", False)),
-        cond_motion_xt_inject=bool(cfg.model.denoiser.get("cond_motion_xt_inject", False)),
         use_interaction_plan=bool(cfg.model.denoiser.get("use_interaction_plan", False)),
         plan_k_max=int(cfg.model.denoiser.get("plan_k_max", 12)),
         plan_s_max=int(cfg.model.denoiser.get("plan_s_max", 12)),
@@ -2129,20 +1525,6 @@ def main() -> None:
         use_dit_block=bool(cfg.model.denoiser.get("use_dit_block", False)),
         dit_block_use_plan_pool_in_cond=bool(
             cfg.model.denoiser.get("dit_block_use_plan_pool_in_cond", True)
-        ),
-        use_v13_dynhead=bool(cfg.model.denoiser.get("use_v13_dynhead", False)),
-        v13_dynhead_gamma_init=float(cfg.model.denoiser.get("v13_dynhead_gamma_init", 0.1)),
-        v13_dynhead_learnable_gamma=bool(
-            cfg.model.denoiser.get("v13_dynhead_learnable_gamma", True)
-        ),
-        use_v13_temporal_conv=bool(cfg.model.denoiser.get("use_v13_temporal_conv", False)),
-        v13_temporal_conv_kernel=int(cfg.model.denoiser.get("v13_temporal_conv_kernel", 5)),
-        use_self_conditioning=bool(cfg.model.denoiser.get("use_self_conditioning", False)),
-        self_conditioning_prob=float(cfg.model.denoiser.get("self_conditioning_prob", 0.0)),
-        self_conditioning_mode=str(cfg.model.denoiser.get("self_conditioning_mode", "standard")),
-        self_conditioning_t_max=int(cfg.model.denoiser.get("self_conditioning_t_max", 700)),
-        self_conditioning_zero_init=bool(
-            cfg.model.denoiser.get("self_conditioning_zero_init", True)
         ),
         stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
         cfg_drop_stage1_coarse=bool(
@@ -2288,7 +1670,12 @@ def main() -> None:
         f"vel={geometric_cfg.vel_weight} "
         f"foot={geometric_cfg.foot_weight}",
     )
-    motion_representation = str(cfg.data.get("motion_representation", "motion_263"))
+    motion_representation = str(cfg.data.get("motion_representation", "smpl_pose_135_plan"))
+    if motion_representation != "smpl_pose_135_plan":
+        raise ValueError(
+            "Round-28 trainer only supports motion_representation='smpl_pose_135_plan'; "
+            f"got {motion_representation!r}"
+        )
     world_joint_velocity_weight = float(
         cfg.loss.get("world_joint_velocity_weight", 0.0)
     )
@@ -2312,79 +1699,28 @@ def main() -> None:
             "(left_hand, right_hand, left_foot, right_foot, pelvis)"
         )
     accelerator.print(
-        "Motion representation: "
-        f"{motion_representation} "
+        f"Motion representation: smpl_pose_135_plan "
         f"(world_joint_velocity_weight={world_joint_velocity_weight} "
-        f"fk_consistency_weight={fk_consistency_weight} "
         f"pos_loss_weight={pos_loss_weight} "
         f"hand_endpoint_weight={hand_endpoint_weight} "
         f"foot_endpoint_weight={foot_endpoint_weight} "
         f"anchor_joint_pos_weight={anchor_joint_pos_weight} "
         f"anchor_joint_vel_weight={anchor_joint_vel_weight})",
     )
-    # v10 FK-loss guardrail (per claude_code_v10_plan_tokens_next_steps.md §3.3):
-    # confirm dense FK L_pos branch is wired for the active representation.
-    # If pos_loss_weight is set but the branch doesn't fire, training silently
-    # loses the dense supervision and motion looks jittery — this caught the
-    # 2026-05-10 v10 regression.
-    _fk_pos_active_reps = {
-        "smpl_pose_135",
-        "smpl_pose_135_keyframed",
-        "smpl_pose_135_condmdi",
-        "smpl_pose_135_plan",
-    }
-    _fk_pos_enabled = (
-        motion_representation in _fk_pos_active_reps and pos_loss_weight > 0.0
-    )
+    _fk_pos_enabled = pos_loss_weight > 0.0
     accelerator.print(
-        f"[AnchorDiff] dense FK L_pos enabled for {motion_representation}: "
-        f"{_fk_pos_enabled} (weight={pos_loss_weight})"
+        f"[AnchorDiff] dense FK L_pos enabled: {_fk_pos_enabled} "
+        f"(weight={pos_loss_weight})"
     )
-    if (
-        anchor_joint_pos_weight > 0.0 or anchor_joint_vel_weight > 0.0
-    ) and motion_representation not in _fk_pos_active_reps:
+    if int(cfg.model.denoiser.motion_dim) != 135:
         raise ValueError(
-            "anchor_joint_* losses require an FK-backed SMPL representation "
-            f"(got {motion_representation!r})"
+            "smpl_pose_135_plan requires model.denoiser.motion_dim=135 "
+            f"(got {int(cfg.model.denoiser.motion_dim)})"
         )
-    if motion_representation == "smpl_pose_135_plan" and pos_loss_weight > 0.0:
-        assert _fk_pos_enabled, (
-            "smpl_pose_135_plan with pos_loss_weight>0 must have dense FK L_pos branch enabled"
+    if not bool(cfg.model.denoiser.get("use_interaction_plan", False)):
+        raise ValueError(
+            "smpl_pose_135_plan requires model.denoiser.use_interaction_plan=true"
         )
-    if motion_representation == "joints22_world_with_rot6d":
-        if int(cfg.model.denoiser.motion_dim) != 198:
-            raise ValueError(
-                "joints22_world_with_rot6d requires model.denoiser.motion_dim=198 "
-                f"(got {int(cfg.model.denoiser.motion_dim)})"
-            )
-    if motion_representation == "smpl_pose_135":
-        if int(cfg.model.denoiser.motion_dim) != 135:
-            raise ValueError(
-                "smpl_pose_135 requires model.denoiser.motion_dim=135 "
-                f"(got {int(cfg.model.denoiser.motion_dim)})"
-            )
-    if motion_representation == "smpl_pose_135_condmdi":
-        if int(cfg.model.denoiser.motion_dim) != 135:
-            raise ValueError(
-                "smpl_pose_135_condmdi requires model.denoiser.motion_dim=135 "
-                f"(got {int(cfg.model.denoiser.motion_dim)})"
-            )
-        if int(cfg.model.denoiser.get("cond_motion_dim", 0)) != 136:
-            raise ValueError(
-                "smpl_pose_135_condmdi requires model.denoiser.cond_motion_dim=136 "
-                f"(motion_dim 135 + obs_mask 1; got "
-                f"{int(cfg.model.denoiser.get('cond_motion_dim', 0))})"
-            )
-    if motion_representation == "smpl_pose_135_plan":
-        if int(cfg.model.denoiser.motion_dim) != 135:
-            raise ValueError(
-                "smpl_pose_135_plan requires model.denoiser.motion_dim=135 "
-                f"(got {int(cfg.model.denoiser.motion_dim)})"
-            )
-        if not bool(cfg.model.denoiser.get("use_interaction_plan", False)):
-            raise ValueError(
-                "smpl_pose_135_plan requires model.denoiser.use_interaction_plan=true"
-            )
 
     # --- Optimizer + scheduler ---
     accum = int(cfg.training.get("gradient_accumulation_steps", 1))
@@ -2414,36 +1750,13 @@ def main() -> None:
         if "motion_feature_weights" in cfg.loss else None
     )
     dyn_cfg = cfg.loss.get("dynamic_metric", None)
-    if motion_representation != "motion_263" or int(cfg.model.denoiser.motion_dim) != 263:
-        if dyn_cfg is not None and dyn_cfg.get("enabled", False):
-            raise ValueError("dynamic_metric is only supported for motion_263")
-        feature_weight_state = None
-        accelerator.print("FeatureWeightState disabled for non-motion_263 representation")
-    elif dyn_cfg is not None and dyn_cfg.get("enabled", False):
-        feature_weight_state = FeatureWeightState.dynamic_from_config(
-            static_weights_cfg=static_w_cfg,
-            geometry_prior_path=str(dyn_cfg.geometry_prior_path),
-            update_every_epochs=int(dyn_cfg.get("update_every_epochs", 5)),
-            ema_beta=float(dyn_cfg.get("ema_beta", 0.2)),
-            residual_alpha=float(dyn_cfg.get("residual_alpha", 0.5)),
-            clamp_min=float(dyn_cfg.get("clamp_min", 0.25)),
-            clamp_max=float(dyn_cfg.get("clamp_max", 150.0)),
+    if dyn_cfg is not None and dyn_cfg.get("enabled", False):
+        raise ValueError(
+            "dynamic_metric is not supported in Round-28 (was motion_263-only)"
         )
-        accelerator.print(
-            f"FeatureWeightState DYNAMIC mode: update every "
-            f"{feature_weight_state.update_every_epochs} epochs "
-            f"(beta={feature_weight_state.ema_beta}, alpha={feature_weight_state.residual_alpha})"
-        )
-    else:
-        feature_weight_state = FeatureWeightState.static_from_config(static_w_cfg)
-        accelerator.print("FeatureWeightState STATIC mode")
+    feature_weight_state = FeatureWeightState.static_from_config(static_w_cfg)
+    accelerator.print("FeatureWeightState STATIC mode")
 
-    cond_motion_keyframe_weight = float(
-        cfg.loss.get("cond_motion_keyframe_weight", 0.0)
-    )
-    diffusion_unobserved_only = bool(
-        cfg.loss.get("diffusion_unobserved_only", False)
-    )
     use_interaction_plan = bool(
         cfg.model.denoiser.get("use_interaction_plan", False)
     )
@@ -2468,15 +1781,6 @@ def main() -> None:
         cfg.loss.get("stable_local_speed_moment_weight", 0.0)
     )
     stable_support_erode = int(cfg.loss.get("stable_support_erode", 4))
-    # Fix V-modified frequency-stratified loss rebalance (2026-05-11 spec).
-    use_fix_v_loss = bool(cfg.loss.get("use_fix_v_loss", False))
-    fix_v_mse_root_weight = float(cfg.loss.get("fix_v_mse_root_weight", 1.0))
-    fix_v_mse_local_weight = float(cfg.loss.get("fix_v_mse_local_weight", 0.1))
-    fix_v_joint_vel_weight = float(cfg.loss.get("fix_v_joint_vel_weight", 1.0))
-    fix_v_joint_acc_weight = float(cfg.loss.get("fix_v_joint_acc_weight", 0.2))
-    fix_v_hpf_weight = float(cfg.loss.get("fix_v_hpf_weight", 0.2))
-    fix_v_obj_rel_vel_weight = float(cfg.loss.get("fix_v_obj_rel_vel_weight", 0.5))
-    fix_v_hpf_smooth_window = int(cfg.loss.get("fix_v_hpf_smooth_window", 5))
     # Min-SNR-γ (Hang et al. arXiv:2303.09556) — per spec
     # analyses/stageB_updated_training_strategy_and_diagnostics_plan.md §4.
     use_min_snr_weighting = bool(cfg.loss.get("use_min_snr_weighting", False))
@@ -2520,37 +1824,9 @@ def main() -> None:
             ),
             grounded_softness_m=float(_tloss.get("grounded_softness_m", 0.03)),
         )
-    zero_z_int_for_stageB = bool(
-        cfg.model.get("zero_z_int_for_stageB", False)
-    )
-    zero_dense_contact_target_for_stageB = bool(
-        cfg.model.get("zero_dense_contact_target_for_stageB", False)
-    )
-    # Fine-grained per-component z_int zeroing (per
-    # claude_code_v11_after_full_frozen_fix_handoff.md §C.2). Legacy
-    # `zero_z_int_for_stageB` is applied after pack and overrides any
-    # mixed setting (coarse dominates); we still warn on inconsistency.
-    zero_contact_state_for_stageB = bool(
-        cfg.model.get("zero_contact_state_for_stageB", False)
-    )
-    zero_contact_target_for_stageB = bool(
-        cfg.model.get("zero_contact_target_for_stageB", False)
-    )
-    zero_phase_for_stageB = bool(
-        cfg.model.get("zero_phase_for_stageB", False)
-    )
-    zero_support_for_stageB = bool(
-        cfg.model.get("zero_support_for_stageB", False)
-    )
-    # zero_plan_target_for_stageB (per
-    # claude_code_v11_next_localdyn_target_routing.md §C.2). Zeros
-    # anchor_target_local/world + segment_target_summary_local before
-    # the interaction-plan encoder; target-aware hint receives zeros
-    # accordingly. Plan still describes WHEN / WHICH-PART / phase /
-    # support, but not WHERE.
-    zero_plan_target_for_stageB = bool(
-        cfg.model.get("zero_plan_target_for_stageB", False)
-    )
+    # Round-28 cleanup: all zero_*_for_stageB flags hardcoded inside
+    # step_fn (active configs all set them True; the Stage-1.5 plan
+    # tokens carry contact / part / phase / support info now).
 
     # Round-22: Stage-1 Coarse-v1 oracle condition wiring.
     stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
@@ -2577,31 +1853,14 @@ def main() -> None:
     else:
         stage1_coarse_norm_mean = None
         stage1_coarse_norm_std = None
-    if zero_z_int_for_stageB and (
-        not zero_contact_state_for_stageB
-        or not zero_contact_target_for_stageB
-        or not zero_phase_for_stageB
-        or not zero_support_for_stageB
-    ):
-        accelerator.print(
-            "[StageB condition mode] WARNING: legacy zero_z_int_for_stageB=True "
-            "overrides one or more fine-grained zero_*_for_stageB=False settings. "
-            "Effective behaviour: all four z_int components zeroed."
-        )
-    # Stage B condition-mode startup print (per spec §B.3) — never silent.
     accelerator.print(
         "[StageB condition mode]\n"
         f"  use_interaction_plan: {use_interaction_plan}\n"
         f"  plan_per_part_tokens: {bool(cfg.model.denoiser.get('plan_per_part_tokens', False))}\n"
         f"  plan_context_hint_mode: {cfg.model.denoiser.get('plan_context_hint_mode', 'time_only')!r}\n"
         f"  object_traj_dim: {int(cfg.model.denoiser.object_traj_dim)}\n"
-        f"  zero_z_int_for_stageB (legacy coarse): {zero_z_int_for_stageB}\n"
-        f"  zero_contact_state_for_stageB: {zero_contact_state_for_stageB}\n"
-        f"  zero_contact_target_for_stageB: {zero_contact_target_for_stageB}\n"
-        f"  zero_phase_for_stageB: {zero_phase_for_stageB}\n"
-        f"  zero_support_for_stageB: {zero_support_for_stageB}\n"
-        f"  zero_dense_contact_target_for_stageB: {zero_dense_contact_target_for_stageB}\n"
-        f"  zero_plan_target_for_stageB: {zero_plan_target_for_stageB}\n"
+        f"  z_int channels: forced to zero (Round-28 PLAN-only mode)\n"
+        f"  dense contact-target portion of object_traj: forced to zero\n"
         f"  dense FK L_pos enabled: {_fk_pos_enabled}\n"
         f"  active-part endpoint losses: "
         f"{anchor_joint_pos_weight > 0 or anchor_joint_vel_weight > 0}"
@@ -2622,11 +1881,6 @@ def main() -> None:
         f"rf_schedule={getattr(accelerator.unwrap_model(model).diffusion, 'rf_time_schedule', 'n/a')!r})\n"
         f"  min-SNR weighting: {use_min_snr_weighting}  (gamma={min_snr_gamma}, "
         f"pred_target={getattr(accelerator.unwrap_model(model).diffusion, 'prediction_target', 'x0')})\n"
-        f"  self-conditioning: {bool(cfg.model.denoiser.get('use_self_conditioning', False))}"
-        f"  (prob={float(cfg.model.denoiser.get('self_conditioning_prob', 0.0))}, "
-        f"mode={cfg.model.denoiser.get('self_conditioning_mode', 'standard')!r}, "
-        f"t_max={int(cfg.model.denoiser.get('self_conditioning_t_max', 700))}, "
-        f"zero_init={bool(cfg.model.denoiser.get('self_conditioning_zero_init', True))})"
     )
     step_fn = build_anchordiff_step_fn(
         model=model,
@@ -2647,8 +1901,6 @@ def main() -> None:
         anchor_joint_pos_weight=anchor_joint_pos_weight,
         anchor_joint_vel_weight=anchor_joint_vel_weight,
         anchor_joint_part_weights=anchor_joint_part_weights,
-        cond_motion_keyframe_weight=cond_motion_keyframe_weight,
-        diffusion_unobserved_only=diffusion_unobserved_only,
         use_interaction_plan=use_interaction_plan,
         plan_anchor_weight=plan_anchor_weight,
         plan_segment_weight=plan_segment_weight,
@@ -2662,24 +1914,9 @@ def main() -> None:
         stable_local_vel_cm_weight=stable_local_vel_cm_weight,
         stable_local_acc_cm_weight=stable_local_acc_cm_weight,
         stable_local_speed_moment_weight=stable_local_speed_moment_weight,
-        use_fix_v_loss=use_fix_v_loss,
-        fix_v_mse_root_weight=fix_v_mse_root_weight,
-        fix_v_mse_local_weight=fix_v_mse_local_weight,
-        fix_v_joint_vel_weight=fix_v_joint_vel_weight,
-        fix_v_joint_acc_weight=fix_v_joint_acc_weight,
-        fix_v_hpf_weight=fix_v_hpf_weight,
-        fix_v_obj_rel_vel_weight=fix_v_obj_rel_vel_weight,
-        fix_v_hpf_smooth_window=fix_v_hpf_smooth_window,
         use_min_snr_weighting=use_min_snr_weighting,
         min_snr_gamma=min_snr_gamma,
         stable_support_erode=stable_support_erode,
-        zero_z_int_for_stageB=zero_z_int_for_stageB,
-        zero_dense_contact_target_for_stageB=zero_dense_contact_target_for_stageB,
-        zero_contact_state_for_stageB=zero_contact_state_for_stageB,
-        zero_contact_target_for_stageB=zero_contact_target_for_stageB,
-        zero_phase_for_stageB=zero_phase_for_stageB,
-        zero_support_for_stageB=zero_support_for_stageB,
-        zero_plan_target_for_stageB=zero_plan_target_for_stageB,
         stage1_coarse_dim=stage1_coarse_dim,
         stage1_coarse_norm_mean=stage1_coarse_norm_mean,
         stage1_coarse_norm_std=stage1_coarse_norm_std,
@@ -2706,30 +1943,6 @@ def main() -> None:
             f"anchor_joint_pos={out.get('loss_anchor_joint_pos', torch.zeros(())).item():.4f}  "
             f"anchor_joint_vel={out.get('loss_anchor_joint_vel', torch.zeros(())).item():.4f}"
         )
-        if "fix_v_loss_mse_root" in out:
-            accelerator.print(
-                f"  [Fix V] raw: mse_root={out['fix_v_loss_mse_root'].item():.5f}  "
-                f"mse_local={out['fix_v_loss_mse_local'].item():.5f}  "
-                f"joint_vel={out['fix_v_loss_joint_vel'].item():.5f}  "
-                f"joint_acc={out['fix_v_loss_joint_acc'].item():.5f}  "
-                f"hpf={out['fix_v_loss_hpf'].item():.5f}  "
-                f"obj_rel_vel={out['fix_v_loss_obj_rel_vel'].item():.5f}\n"
-                f"  [Fix V] weighted: mse_root={out['fix_v_weighted_mse_root'].item():.5f}  "
-                f"mse_local={out['fix_v_weighted_mse_local'].item():.5f}  "
-                f"joint_vel={out['fix_v_weighted_joint_vel'].item():.5f}  "
-                f"joint_acc={out['fix_v_weighted_joint_acc'].item():.5f}  "
-                f"hpf={out['fix_v_weighted_hpf'].item():.5f}  "
-                f"obj_rel_vel={out['fix_v_weighted_obj_rel_vel'].item():.5f}\n"
-                f"  [Fix V] ratios: vel={out['fix_v_vel_magnitude_ratio'].item():.3f}  "
-                f"acc={out['fix_v_acc_magnitude_ratio'].item():.3f}  "
-                f"hpf_energy={out['fix_v_hpf_energy_ratio'].item():.3f}\n"
-                f"  [Fix V] per-joint vel pred/gt cm/fr: "
-                f"L_hand={out['fix_v_per_joint_vel_pred_lhand_cm'].item():.3f}/{out['fix_v_per_joint_vel_gt_lhand_cm'].item():.3f}  "
-                f"R_hand={out['fix_v_per_joint_vel_pred_rhand_cm'].item():.3f}/{out['fix_v_per_joint_vel_gt_rhand_cm'].item():.3f}  "
-                f"L_foot={out['fix_v_per_joint_vel_pred_lfoot_cm'].item():.3f}/{out['fix_v_per_joint_vel_gt_lfoot_cm'].item():.3f}  "
-                f"R_foot={out['fix_v_per_joint_vel_pred_rfoot_cm'].item():.3f}/{out['fix_v_per_joint_vel_gt_rfoot_cm'].item():.3f}  "
-                f"pelvis={out['fix_v_per_joint_vel_pred_pelvis_cm'].item():.3f}/{out['fix_v_per_joint_vel_gt_pelvis_cm'].item():.3f}"
-            )
         if "loss_stable_local_vel" in out:
             accelerator.print(
                 f"  stable_root_vel={out.get('loss_stable_root_vel', torch.zeros(())).item():.4f}  "
