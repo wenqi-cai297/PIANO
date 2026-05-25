@@ -1744,18 +1744,20 @@ def main() -> None:
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
-    # --- FeatureWeightState (static v2 / dynamic v2.1) ---
-    static_w_cfg = (
-        OmegaConf.to_container(cfg.loss.motion_feature_weights, resolve=True)
-        if "motion_feature_weights" in cfg.loss else None
-    )
+    # --- FeatureWeightState ---
+    # Only valid for motion_263 (263-dim per-feature weights). Round-28
+    # uses smpl_pose_135_plan (motion_dim=135), so the per-feature weight
+    # cache is disabled (the trainer's _WeightCache returns all-ones).
     dyn_cfg = cfg.loss.get("dynamic_metric", None)
     if dyn_cfg is not None and dyn_cfg.get("enabled", False):
         raise ValueError(
             "dynamic_metric is not supported in Round-28 (was motion_263-only)"
         )
-    feature_weight_state = FeatureWeightState.static_from_config(static_w_cfg)
-    accelerator.print("FeatureWeightState STATIC mode")
+    feature_weight_state = None
+    accelerator.print(
+        "FeatureWeightState DISABLED (smpl_pose_135_plan; per-feature "
+        "weighting is motion_263-only)"
+    )
 
     use_interaction_plan = bool(
         cfg.model.denoiser.get("use_interaction_plan", False)

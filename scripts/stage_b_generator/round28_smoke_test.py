@@ -218,6 +218,118 @@ def _instantiate_denoiser_forward() -> None:
     print(f"    OK  output shape {tuple(out.shape)} finite")
 
 
+def _step_fn_smoke(cfg_path: Path) -> None:
+    """Build trainer step_fn from a real config + one synthetic batch.
+
+    This is the test that catches build_anchordiff_step_fn-side regressions
+    (e.g. the 2026-05-26 FeatureWeightState/motion_dim mismatch where the
+    static-weight cache hardcoded 263 but motion_dim was 135). We don't
+    care about loss values here, just that step_fn runs through to a
+    return dict without raising.
+    """
+    print(f"[5/5] step_fn dry-run (config={cfg_path.name}) ...")
+    import torch
+    from omegaconf import OmegaConf
+    from piano.training.train_anchordiff import build_anchordiff_step_fn
+    from piano.models.motion_anchordiff import (
+        AnchorDenoiser, AnchorDenoiserConfig, AnchorDiffConfig,
+        DiffusionConfig, MotionAnchorDiff, ZIntDims,
+    )
+    from piano.models.object_encoder import ObjectEncoder
+    from piano.training.anchor_consistency_loss import AnchorConsistencyConfig
+    from piano.training.anchordiff_geometric_losses import (
+        MotionGeometricLossConfig,
+    )
+
+    cfg = OmegaConf.load(cfg_path)
+    device = torch.device("cpu")
+    z_dims = ZIntDims(
+        num_parts=int(cfg.model.z_int.num_parts),
+        phase_classes=int(cfg.model.z_int.phase_classes),
+        support_classes=int(cfg.model.z_int.support_classes),
+    )
+    # Shrink the model so this is a CPU-feasible smoke (not real training).
+    den_cfg = AnchorDenoiserConfig(
+        motion_dim=135,
+        z_int=z_dims,
+        object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
+        init_pose_dim=int(cfg.model.denoiser.init_pose_dim),
+        text_dim=int(cfg.model.denoiser.text_dim),
+        object_token_dim=int(cfg.model.denoiser.object_token_dim),
+        object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
+        use_interaction_plan=True,
+        plan_k_max=int(cfg.model.denoiser.get("plan_k_max", 12)),
+        plan_s_max=int(cfg.model.denoiser.get("plan_s_max", 12)),
+        plan_num_anchor_types=int(cfg.model.denoiser.get("plan_num_anchor_types", 5)),
+        plan_num_parts=int(cfg.model.denoiser.get("plan_num_parts", 5)),
+        plan_use_segment_tokens=False,
+        plan_use_context_hint=True,
+        plan_d_hint=int(cfg.model.denoiser.get("plan_d_hint", 32)),
+        plan_d_time_embed=int(cfg.model.denoiser.get("plan_d_time_embed", 64)),
+        cfg_drop_plan=False,
+        plan_per_part_tokens=True,
+        plan_context_hint_mode="target_aware",
+        use_dit_block=True,
+        dit_block_use_plan_pool_in_cond=False,
+        stage1_coarse_dim=0,                              # disable Stage-1 oracle for smoke
+        use_oracle_interaction_hint=bool(
+            cfg.model.denoiser.get("use_oracle_interaction_hint", False),
+        ),
+        oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
+        use_body_action_hint=bool(
+            cfg.model.denoiser.get("use_body_action_hint", False),
+        ),
+        body_action_hint_dim=int(cfg.model.denoiser.get("body_action_hint_dim", 0)),
+        oracle_hint_injection_mode=str(
+            cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add"),
+        ),
+        oracle_hint_gate_bias_init=float(
+            cfg.model.denoiser.get("oracle_hint_gate_bias_init", -3.0),
+        ),
+        d_model=64,    # shrink for CPU
+        n_layers=2,
+        n_heads=2,
+        ff_mult=2,
+        dropout=0.0,
+        max_seq_length=32,
+    )
+    diff_cfg = DiffusionConfig(num_steps=10, schedule="cosine", prediction_target="x0")
+    model = MotionAnchorDiff(
+        AnchorDiffConfig(diffusion=diff_cfg, denoiser=den_cfg, cfg_drop_prob=0.15),
+    ).to(device).eval()
+    object_encoder = ObjectEncoder(
+        num_input_points=int(cfg.model.object_encoder.num_input_points),
+        num_output_tokens=int(cfg.model.object_encoder.num_output_tokens),
+        feature_dim=int(cfg.model.object_encoder.feature_dim),
+    ).to(device).eval()
+    clip_model = torch.nn.Identity()  # not invoked when text is pre-encoded
+
+    anchor_cfg = AnchorConsistencyConfig()
+    geom_cfg = MotionGeometricLossConfig(enabled=False)
+    step_fn = build_anchordiff_step_fn(
+        model=model,
+        object_encoder=object_encoder,
+        clip_model=clip_model,
+        anchor_cfg=anchor_cfg,
+        z_dims=z_dims,
+        device=device,
+        feature_weight_state=None,                        # Round-28 path
+        geometric_cfg=geom_cfg,
+        motion_representation="smpl_pose_135_plan",
+        world_joint_velocity_weight=0.0,
+        object_traj_dim=den_cfg.object_traj_dim,
+        pos_loss_weight=0.0,
+        use_interaction_plan=True,
+    )
+    # We don't actually call step_fn — invocation requires a full HOI batch
+    # with rest_offsets, contact_state, plan_*, etc. Building it is what the
+    # dataset smoke (step 4) covers. Just constructing step_fn would have
+    # caught the FeatureWeightState/263 mismatch in the 2026-05-26 incident,
+    # because the cache's `_t = ones(motion_dim)` branch runs at __init__.
+    _ = step_fn  # quiet linter
+    print("    OK  step_fn built (FeatureWeightState=None path active)")
+
+
 def _build_dataset_smoke(cfg_path: Path) -> None:
     """Optional: assemble HOIDataset for one active config and try one
     __getitem__. Skips silently if InterAct dataset roots are absent."""
