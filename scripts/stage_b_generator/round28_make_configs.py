@@ -6,6 +6,8 @@ mode, oracle injection mode, and the temporal-loss weight subset.
 
 Usage:
     python scripts/stage_b_generator/round28_make_configs.py [--dry-run]
+    python scripts/stage_b_generator/round28_make_configs.py \
+        --best-injection-mode gated_input
 
 Writes:
     configs/training/anchordiff_r28_<variant>_48clip.yaml
@@ -20,6 +22,8 @@ CONFIG_DIR = ROOT / "configs" / "training"
 BASE_CONFIG = CONFIG_DIR / "anchordiff_t0a3_full_oracle_hint_48clip.yaml"
 
 V27_CKPT = "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
+BALANCED_SUBSET_FILE = "analyses/round27_tier0_train_indices_48_balanced.json"
+BODY_ACTION_SUBSET_FILE = "analyses/round28_body_action_train_indices_48.json"
 
 
 # (variant_id, description, overrides)
@@ -29,7 +33,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
     # ---------------- Group A: injection-mechanism ablation (interaction hint only)
     (
         "r28_a0_input_add",
-        "Reproduce T0-A3 — interaction hint only, input_add injection.",
+        "Reproduce T0-A3: interaction hint only, input_add injection.",
         {
             "use_oracle_interaction_hint": "true",
             "oracle_hint_variant": "full",
@@ -59,7 +63,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
     ),
     (
         "r28_a2_per_layer_adapter",
-        "Interaction hint only, per_layer_adapter injection.",
+        "Interaction hint only, input_add + per_layer_adapter injection.",
         {
             "use_oracle_interaction_hint": "true",
             "oracle_hint_variant": "full",
@@ -74,8 +78,8 @@ VARIANTS: list[tuple[str, str, dict]] = [
     ),
     (
         "r28_a3_best_long",
-        "Best Group A injection (per_layer_adapter; switch to gated_input "
-        "if R28-A1 wins) — 1000 epoch oracle upper bound.",
+        "Best Group A injection (set by --best-injection-mode): 1000 "
+        "epoch oracle upper bound.",
         {
             "use_oracle_interaction_hint": "true",
             "oracle_hint_variant": "full",
@@ -84,7 +88,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint": "false",
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "all_zero",
             "num_epochs": "1000",
         },
@@ -92,7 +96,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
     # ---------------- Group B: body-action hint family
     (
         "r28_b0_baseline",
-        "v27 baseline reproduction on body-action subset — no hints.",
+        "v27 baseline reproduction on body-action subset: no hints.",
         {
             "use_oracle_interaction_hint": "false",
             "oracle_hint_variant": "full",
@@ -103,11 +107,12 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "body_action_hint_dim": "0",
             "oracle_hint_injection_mode": "input_add",
             "temporal_weights": "all_zero",
+            "subset_kind": "body_action",
         },
     ),
     (
         "r28_b1_interaction_only",
-        "Best Group A interaction injection only — does interaction hint "
+        "Best Group A interaction injection only: does interaction hint "
         "alone help body-only actions?",
         {
             "use_oracle_interaction_hint": "true",
@@ -117,8 +122,9 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint": "false",
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "all_zero",
+            "subset_kind": "body_action",
         },
     ),
     (
@@ -134,8 +140,9 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "true",
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "all_on",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "all_zero",
+            "subset_kind": "body_action",
         },
     ),
     (
@@ -151,13 +158,14 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "energy",
             "body_action_energy_threshold": "0.05",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "all_zero",
+            "subset_kind": "body_action",
         },
     ),
     (
         "r28_b4_interaction_plus_body",
-        "Interaction hint + body-action hint together — complementarity test.",
+        "Interaction hint + body-action hint together: complementarity test.",
         {
             "use_oracle_interaction_hint": "true",
             "oracle_hint_variant": "full",
@@ -167,8 +175,9 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "true",
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "all_on",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "all_zero",
+            "subset_kind": "body_action",
         },
     ),
     # ---------------- Group C: gait losses + small consistency loss
@@ -184,7 +193,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "true",
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "all_on",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "gait_only",
         },
     ),
@@ -200,7 +209,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "true",
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "all_on",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "hint_consistency_only",
         },
     ),
@@ -216,7 +225,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "true",
             "body_action_hint_dim": "24",
             "body_action_hint_mask_mode": "all_on",
-            "oracle_hint_injection_mode": "per_layer_adapter",
+            "oracle_hint_injection_mode": "best",
             "temporal_weights": "gait_plus_hint_consistency",
         },
     ),
@@ -281,7 +290,15 @@ def _bool(b: str) -> str:
     return "true" if b.lower() == "true" else "false"
 
 
-def _render_config(variant_id: str, description: str, ov: dict) -> str:
+def _render_config(
+    variant_id: str,
+    description: str,
+    ov: dict,
+    *,
+    best_injection_mode: str,
+    balanced_subset_file: str,
+    body_action_subset_file: str,
+) -> str:
     """Build a complete YAML config for one R28 variant from scratch.
 
     Mirrors the t0a3 layout so it loads via the same trainer."""
@@ -297,6 +314,14 @@ def _render_config(variant_id: str, description: str, ov: dict) -> str:
     run_name = f"stageB_anchordiff_{variant_id}_48clip"
     body_mask_mode = ov.get("body_action_hint_mask_mode", "all_on")
     body_energy_thr = ov.get("body_action_energy_threshold", "0.05")
+    injection_mode = str(ov["oracle_hint_injection_mode"])
+    if injection_mode == "best":
+        injection_mode = str(best_injection_mode)
+    subset_file = (
+        str(body_action_subset_file)
+        if ov.get("subset_kind", "balanced") == "body_action"
+        else str(balanced_subset_file)
+    )
 
     return f"""# Round-28 {variant_id}: {description}
 #
@@ -369,7 +394,7 @@ model:
     oracle_hint_dim: {ov["oracle_hint_dim"]}
     use_body_action_hint: {_bool(ov["use_body_action_hint_model"])}
     body_action_hint_dim: {ov["body_action_hint_dim"]}
-    oracle_hint_injection_mode: "{ov["oracle_hint_injection_mode"]}"
+    oracle_hint_injection_mode: "{injection_mode}"
     separate_hint_branches: true
     zero_init_hint_adapters: true
 
@@ -401,7 +426,7 @@ data:
   subsample_n_per_object: null
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
-  subset_indices_file: "analyses/round27_tier0_train_indices_48_balanced.json"
+  subset_indices_file: "{subset_file}"
   # Round-28 oracle hint switches (dataset side).
   use_oracle_interaction_hint: {_bool(ov["use_oracle_interaction_hint"])}
   oracle_hint_variant: "{ov["oracle_hint_variant"]}"
@@ -506,6 +531,25 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true",
                         help="Print which files would be written without touching disk.")
+    parser.add_argument(
+        "--best-injection-mode",
+        choices=["gated_input", "per_layer_adapter"],
+        default="per_layer_adapter",
+        help=(
+            "Injection mode to use for A3/B/C configs after A0/A1/A2 decide "
+            "the best Group-A branch."
+        ),
+    )
+    parser.add_argument(
+        "--balanced-subset-file",
+        default=BALANCED_SUBSET_FILE,
+        help="Subset JSON for A/C contact+gait-oriented variants.",
+    )
+    parser.add_argument(
+        "--body-action-subset-file",
+        default=BODY_ACTION_SUBSET_FILE,
+        help="Subset JSON for B body-action variants.",
+    )
     args = parser.parse_args()
 
     if not BASE_CONFIG.exists():
@@ -514,7 +558,14 @@ def main() -> int:
     n = 0
     for variant_id, desc, ov in VARIANTS:
         out_path = CONFIG_DIR / f"anchordiff_{variant_id}_48clip.yaml"
-        content = _render_config(variant_id, desc, ov)
+        content = _render_config(
+            variant_id,
+            desc,
+            ov,
+            best_injection_mode=str(args.best_injection_mode),
+            balanced_subset_file=str(args.balanced_subset_file),
+            body_action_subset_file=str(args.body_action_subset_file),
+        )
         if args.dry_run:
             print(f"DRY-RUN would write: {out_path}  ({len(content)} bytes)")
         else:

@@ -199,6 +199,38 @@ def test_zero_init_invariant_gated_input():
     )
 
 
+def test_round28_gated_input_stats_are_populated():
+    B, T = 2, 16
+    cfg = _build_cfg(
+        use_interaction=True, use_body_action=True,
+        injection_mode="gated_input",
+    )
+    torch.manual_seed(20260525)
+    model = AnchorDenoiser(cfg).eval()
+    cond = _make_cond(B, T, cfg, seed=11)
+    x_t = torch.randn(B, T, cfg.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    with torch.no_grad():
+        _ = model(x_t, t, cond, cond_drop_mask=None)
+    stats = model._last_oracle_hint_stats
+    for key in (
+        "r28_interaction_hint_norm",
+        "r28_interaction_emb_norm",
+        "r28_interaction_gate_mean",
+        "r28_interaction_gate_std",
+        "r28_interaction_gate_contact_mean",
+        "r28_interaction_gate_noncontact_mean",
+        "r28_body_action_hint_norm",
+        "r28_body_action_emb_norm",
+        "r28_body_action_gate_mean",
+        "r28_body_action_gate_active_mean",
+        "r28_body_action_gate_inactive_mean",
+    ):
+        assert key in stats, f"missing {key}"
+        assert stats[key].numel() == 1
+        assert torch.isfinite(stats[key])
+
+
 # ---------------------------------------------------------------------------
 # 3. zero-init invariant: per_layer_adapter
 # ---------------------------------------------------------------------------
@@ -230,6 +262,30 @@ def test_zero_init_invariant_per_layer_adapter():
         f"per_layer_adapter zero-init invariant violated; "
         f"max|Δ|={max_diff:.3e}"
     )
+
+
+def test_round28_per_layer_adapter_stats_are_populated():
+    B, T = 2, 16
+    cfg = _build_cfg(
+        use_interaction=True, use_body_action=True,
+        injection_mode="per_layer_adapter",
+    )
+    torch.manual_seed(20260525)
+    model = AnchorDenoiser(cfg).eval()
+    cond = _make_cond(B, T, cfg, seed=12)
+    x_t = torch.randn(B, T, cfg.motion_dim)
+    t = torch.zeros(B, dtype=torch.long)
+    with torch.no_grad():
+        _ = model(x_t, t, cond, cond_drop_mask=None)
+    stats = model._last_oracle_hint_stats
+    for i in range(cfg.n_layers):
+        for key in (
+            f"r28_interaction_adapter_norm_layer{i}",
+            f"r28_body_action_adapter_norm_layer{i}",
+        ):
+            assert key in stats, f"missing {key}"
+            assert stats[key].numel() == 1
+            assert torch.isfinite(stats[key])
 
 
 # ---------------------------------------------------------------------------

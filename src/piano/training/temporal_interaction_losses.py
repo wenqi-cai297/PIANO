@@ -67,8 +67,19 @@ RIGHT_WRIST_IDX: int = 21
 LEFT_ANKLE_IDX: int = 7
 RIGHT_ANKLE_IDX: int = 8
 ROOT_IDX: int = 0
+LEFT_KNEE_IDX: int = 4
+RIGHT_KNEE_IDX: int = 5
+NECK_IDX: int = 12
 CONTACT_LEFT_HAND_COL: int = 0
 CONTACT_RIGHT_HAND_COL: int = 1
+BODY_ACTION_KEY_JOINT_INDICES: tuple[int, ...] = (
+    LEFT_WRIST_IDX,
+    RIGHT_WRIST_IDX,
+    LEFT_KNEE_IDX,
+    RIGHT_KNEE_IDX,
+    NECK_IDX,
+    ROOT_IDX,
+)
 
 
 @dataclass(slots=True)
@@ -641,32 +652,13 @@ def loss_body_action_consistency(
                                        pelvis-local for non-pelvis joints,
                                        displacement-from-frame-0 for pelvis).
 
-    To keep this loss differentiable through ``pred_joints``, we compute
-    the pred-side delta with the SAME canonical-frame definition. To
-    avoid a torch port of ``_facing_angle_y``, we reuse the GT-derived
-    canonical frame embedded in the hint via a closed-form recovery:
-    take the GT delta vector at the first active frame for each joint
-    and compute the per-clip rotation, OR (simpler + sufficient here)
-    compute the pred-side delta in the **pelvis-translated, world-frame**
-    rotated to match the hint's canonical-yaw at frame 0. We use the
-    pelvis-translated frame and rotate to canonical via the recovered
-    rotation. Implementation note: to stay cheap, we use the
-    **pelvis-translated world frame** for pred and apply NO additional
-    rotation — this means the loss is most meaningful on joints where
-    intra-body delta is direction-equivariant under Y-yaw (the wrists,
-    knees, neck rooted at the pelvis). For non-pelvis joints this gives
-    a sound penalty on magnitude + direction; for pelvis we use the
-    pelvis displacement-from-frame-0 in world-frame which differs from
-    the canonical-frame pelvis delta only by the per-clip Y rotation
-    (magnitude is preserved).
-
-    A future revision can introduce a torch implementation of the
-    canonical-frame transform if a stronger pull is needed. For Round-28
-    the goal is a SMALL stabilizer; precision in the canonical frame is
-    secondary to gradient direction.
+    To keep this loss differentiable through ``pred_joints``, the
+    pred-side delta uses the SAME root-yaw-canonical definition as the
+    numpy oracle hint builder: non-pelvis joints are pelvis-translated,
+    rotated by frame-0 facing yaw, and differenced from frame 0; pelvis
+    uses displacement from frame-0 pelvis in the same canonical yaw
+    frame.
     """
-    from piano.data.interaction_hint import BODY_ACTION_KEY_JOINT_INDICES
-
     if body_action_hint.shape[-1] < 24:
         raise ValueError(
             f"body_action_hint must have 24 channels; got {body_action_hint.shape[-1]}"
@@ -674,26 +666,26 @@ def loss_body_action_consistency(
     B, T = pred_joints.shape[0], pred_joints.shape[1]
     J = len(BODY_ACTION_KEY_JOINT_INDICES)
     pelvis = pred_joints[..., ROOT_IDX, :]                                # (B, T, 3)
+    R_root0_T = _root0_world_to_canonical_yaw_matrix(pred_joints)          # (B, 3, 3)
 
     # Build (B, T, J, 3) of pelvis-translated joints + pelvis trace.
     deltas = []
     for j_pos, j_idx in enumerate(BODY_ACTION_KEY_JOINT_INDICES[:-1]):
         jw = pred_joints[..., j_idx, :]                                   # (B, T, 3)
         rel = jw - pelvis                                                 # (B, T, 3)
+        rel = torch.matmul(rel, R_root0_T.transpose(-1, -2))               # (B, T, 3)
         rel_anchor = rel[:, 0:1, :]                                       # (B, 1, 3)
         deltas.append(rel - rel_anchor)
-    # Pelvis: displacement from frame 0 (in world frame).
+    # Pelvis: displacement from frame 0 in the same canonical-yaw frame.
     pelvis_anchor = pelvis[:, 0:1, :]                                     # (B, 1, 3)
-    deltas.append(pelvis - pelvis_anchor)
+    pelvis_delta = torch.matmul(
+        pelvis - pelvis_anchor,
+        R_root0_T.transpose(-1, -2),
+    )
+    deltas.append(pelvis_delta)
     pred_delta = torch.stack(deltas, dim=2)                               # (B, T, J, 3)
 
-    # Magnitude of pred-side delta (frame-invariant), compared to the
-    # magnitude of the hint delta. We compare magnitudes + direction
-    # cosine separately — SmoothL1 on (magnitude, x, y, z) on the
-    # per-joint normalized-direction would require knowing the canonical
-    # rotation. Instead, we use the simpler proxy: SmoothL1 on the
-    # full 3D vector in the model's natural frame. This matches the
-    # hint only up to a per-clip Y rotation; the model learns to align.
+    # Both tensors are in the same root-yaw-canonical frame.
     hint_mask = body_action_hint[..., :J]                                 # (B, T, J)
     hint_delta = body_action_hint[..., J:].reshape(B, T, J, 3)            # (B, T, J, 3)
 
@@ -708,3 +700,25 @@ def loss_body_action_consistency(
     num = (diff * mask).sum()
     den = mask.sum().clamp_min(1.0)
     return num / den
+
+
+def _root0_world_to_canonical_yaw_matrix(pred_joints: Tensor) -> Tensor:
+    """Torch equivalent of interaction_hint._facing_angle_y + R_y(-yaw)."""
+    j0 = pred_joints[:, 0]                                                # (B, 22, 3)
+    across = (j0[:, 17] - j0[:, 16]) + (j0[:, 2] - j0[:, 1])
+    forward_x = -across[:, 2]
+    forward_z = across[:, 0]
+    yaw = torch.atan2(forward_x, forward_z)
+    angle = -yaw
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    zeros = torch.zeros_like(c)
+    ones = torch.ones_like(c)
+    return torch.stack(
+        [
+            torch.stack([c, zeros, s], dim=-1),
+            torch.stack([zeros, ones, zeros], dim=-1),
+            torch.stack([-s, zeros, c], dim=-1),
+        ],
+        dim=-2,
+    )

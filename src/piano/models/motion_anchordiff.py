@@ -1181,6 +1181,29 @@ class AnchorDenoiser(nn.Module):
         # None at the start of every forward pass.
         self._interaction_hint_emb_cache = None
         self._body_action_hint_emb_cache = None
+        # Scalar diagnostics from the most recent forward. The trainer
+        # reads this after ``model(...)`` and writes the values to
+        # metrics.jsonl / wandb. Values are detached tensors on-device.
+        self._last_oracle_hint_stats: dict[str, Tensor] = {}
+
+    @staticmethod
+    def _hint_scalar(x: Tensor) -> Tensor:
+        return x.detach().float()
+
+    @staticmethod
+    def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
+        """Mean of ``values`` over a boolean (B,T) mask, 0 when empty."""
+        values_f = values.detach().float()
+        mask_f = mask.detach().float()
+        denom = mask_f.sum().clamp_min(1.0)
+        return (values_f * mask_f).sum() / denom
+
+    @staticmethod
+    def _mean_norm(x: Tensor) -> Tensor:
+        return x.detach().float().norm(dim=-1).mean()
+
+    def _set_oracle_hint_stat(self, key: str, value: Tensor) -> None:
+        self._last_oracle_hint_stats[f"r28_{key}"] = self._hint_scalar(value)
 
     def _apply_oracle_hint_input_injection(
         self,
@@ -1200,9 +1223,11 @@ class AnchorDenoiser(nn.Module):
         cfg = self.cfg
         self._interaction_hint_emb_cache = None
         self._body_action_hint_emb_cache = None
+        self._last_oracle_hint_stats = {}
 
         # --- Interaction hint ----------------------------------------
         interaction_emb = None
+        interaction_hint = None
         if self.oracle_hint_proj is not None:
             if "oracle_interaction_hint" not in cond:
                 raise KeyError(
@@ -1213,11 +1238,31 @@ class AnchorDenoiser(nn.Module):
                     "data.use_oracle_interaction_hint=true in the config)."
                 )
             ih = cond["oracle_interaction_hint"]                          # (B, T, D_hint)
+            interaction_hint = ih
             interaction_emb = self.oracle_hint_proj(ih)                   # (B, T, D)
             self._interaction_hint_emb_cache = interaction_emb
+            self._set_oracle_hint_stat(
+                "interaction_hint_norm", self._mean_norm(ih),
+            )
+            self._set_oracle_hint_stat(
+                "interaction_emb_norm", self._mean_norm(interaction_emb),
+            )
+            if ih.shape[-1] >= 2:
+                contact_mask = ih[..., :2].amax(dim=-1) > 0.5
+                self._set_oracle_hint_stat(
+                    "interaction_contact_frame_frac",
+                    contact_mask.float().mean(),
+                )
+            if ih.shape[-1] >= 13:
+                walking_mask = ih[..., 12] > 0.5
+                self._set_oracle_hint_stat(
+                    "interaction_walking_frame_frac",
+                    walking_mask.float().mean(),
+                )
 
         # --- Body-action hint (R28) ----------------------------------
         body_emb = None
+        body_hint = None
         if self.body_action_hint_proj is not None:
             if "body_action_hint" not in cond:
                 raise KeyError(
@@ -1227,8 +1272,25 @@ class AnchorDenoiser(nn.Module):
                     "(set data.use_body_action_hint=true in the config)."
                 )
             bh = cond["body_action_hint"]                                  # (B, T, 24)
+            body_hint = bh
             body_emb = self.body_action_hint_proj(bh)                      # (B, T, D)
             self._body_action_hint_emb_cache = body_emb
+            self._set_oracle_hint_stat(
+                "body_action_hint_norm", self._mean_norm(bh),
+            )
+            self._set_oracle_hint_stat(
+                "body_action_emb_norm", self._mean_norm(body_emb),
+            )
+            if bh.shape[-1] >= 24:
+                joint_mask = bh[..., :6]
+                body_delta = bh[..., 6:24].reshape(*bh.shape[:2], 6, 3)
+                active_frame = body_delta.detach().float().norm(dim=-1).amax(dim=-1) > 0.01
+                self._set_oracle_hint_stat(
+                    "body_action_joint_mask_rate", joint_mask.float().mean(),
+                )
+                self._set_oracle_hint_stat(
+                    "body_action_active_frame_frac", active_frame.float().mean(),
+                )
 
         if interaction_emb is None and body_emb is None:
             return h
@@ -1249,12 +1311,53 @@ class AnchorDenoiser(nn.Module):
                     [interaction_emb, h], dim=-1,
                 )                                                        # (B, T, 2D)
                 g = torch.sigmoid(self.interaction_gate(gate_input))     # (B, T, 1)
+                g_bt = g.squeeze(-1)
+                self._set_oracle_hint_stat("interaction_gate_mean", g_bt.mean())
+                self._set_oracle_hint_stat(
+                    "interaction_gate_std", g_bt.float().std(unbiased=False),
+                )
+                if interaction_hint is not None and interaction_hint.shape[-1] >= 2:
+                    contact_mask = interaction_hint[..., :2].amax(dim=-1) > 0.5
+                    self._set_oracle_hint_stat(
+                        "interaction_gate_contact_mean",
+                        self._masked_mean(g_bt, contact_mask),
+                    )
+                    self._set_oracle_hint_stat(
+                        "interaction_gate_noncontact_mean",
+                        self._masked_mean(g_bt, ~contact_mask),
+                    )
+                if interaction_hint is not None and interaction_hint.shape[-1] >= 13:
+                    walking_mask = interaction_hint[..., 12] > 0.5
+                    self._set_oracle_hint_stat(
+                        "interaction_gate_walking_mean",
+                        self._masked_mean(g_bt, walking_mask),
+                    )
+                    self._set_oracle_hint_stat(
+                        "interaction_gate_nonwalking_mean",
+                        self._masked_mean(g_bt, ~walking_mask),
+                    )
                 h = h + g * interaction_emb
             if body_emb is not None and self.body_action_gate is not None:
                 gate_input = torch.cat(
                     [body_emb, h], dim=-1,
                 )                                                        # (B, T, 2D)
                 g = torch.sigmoid(self.body_action_gate(gate_input))     # (B, T, 1)
+                g_bt = g.squeeze(-1)
+                self._set_oracle_hint_stat("body_action_gate_mean", g_bt.mean())
+                self._set_oracle_hint_stat(
+                    "body_action_gate_std", g_bt.float().std(unbiased=False),
+                )
+                if body_hint is not None and body_hint.shape[-1] >= 24:
+                    body_delta = body_hint[..., 6:24].reshape(*body_hint.shape[:2], 6, 3)
+                    active_frame = body_delta.detach().float().norm(dim=-1).amax(dim=-1) > 0.01
+                    self._set_oracle_hint_stat(
+                        "body_action_gate_active_mean",
+                        self._masked_mean(g_bt, active_frame),
+                    )
+                    self._set_oracle_hint_stat(
+                        "body_action_gate_inactive_mean",
+                        self._masked_mean(g_bt, ~active_frame),
+                    )
                 h = h + g * body_emb
             return h
         raise ValueError(
@@ -1286,6 +1389,10 @@ class AnchorDenoiser(nn.Module):
             delta = self.interaction_adapters[layer_idx](
                 self._interaction_hint_emb_cache,
             )                                                              # (B, T, D)
+            self._set_oracle_hint_stat(
+                f"interaction_adapter_norm_layer{layer_idx}",
+                self._mean_norm(delta),
+            )
             seq = seq.clone()
             seq[:, motion_token_start:, :] = (
                 seq[:, motion_token_start:, :] + delta
@@ -1297,6 +1404,10 @@ class AnchorDenoiser(nn.Module):
         ):
             delta = self.body_action_adapters[layer_idx](
                 self._body_action_hint_emb_cache,
+            )
+            self._set_oracle_hint_stat(
+                f"body_action_adapter_norm_layer{layer_idx}",
+                self._mean_norm(delta),
             )
             if not added:
                 seq = seq.clone()

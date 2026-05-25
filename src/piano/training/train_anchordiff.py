@@ -1189,6 +1189,11 @@ def build_anchordiff_step_fn(
                     contact_state=cs_f, cfg=temporal_loss_cfg,
                     seq_mask=sm_f,
                 )
+            elif float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) > 0.0:
+                raise KeyError(
+                    "hint_contact_consistency_weight > 0 but batch is missing "
+                    "oracle_interaction_hint; set data.use_oracle_interaction_hint=true."
+                )
             # Round-28 §7.4 — body-action consistency. Pull pred
             # six-joint deltas toward the oracle body_action_hint,
             # masked by the hint's joint mask.
@@ -1201,6 +1206,11 @@ def build_anchordiff_step_fn(
                     body_action_hint=batch["body_action_hint"]
                     .to(device).float(),
                     seq_mask=sm_f,
+                )
+            elif float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) > 0.0:
+                raise KeyError(
+                    "body_action_consistency_weight > 0 but batch is missing "
+                    "body_action_hint; set data.use_body_action_hint=true."
                 )
 
         # --- v10 plan-aware losses ---
@@ -1884,6 +1894,20 @@ def build_anchordiff_step_fn(
             "min_snr_weight_min": min_snr_weight_min,
             "min_snr_weight_max": min_snr_weight_max,
         }
+
+        # Round-28 hint-interface diagnostics. The denoiser caches
+        # scalar stats during forward (hint norms, gate stats, adapter
+        # output norms). The generic trainer adds branch grad norms
+        # after backward when these r28_* keys are present.
+        _inner_model = _model.module if hasattr(_model, "module") else _model
+        _denoiser_stats = getattr(
+            getattr(_inner_model, "denoiser", None),
+            "_last_oracle_hint_stats",
+            {},
+        )
+        for _k, _v in _denoiser_stats.items():
+            if isinstance(_v, torch.Tensor) and _v.numel() == 1:
+                out[_k] = _v.detach()
 
         # v12 architecture-utilization metrics (per
         # analyses/2026-05-11_v12_implementation_doc.md §2.4 / §3.2).

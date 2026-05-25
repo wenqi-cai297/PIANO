@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Round-28 train+diag — pack all analysis-relevant files into a single
+# Round-28 train+diag: pack all analysis-relevant files into a single
 # tarball for transfer to the local machine.
 #
 # Includes (~50-80 MB):
-#   - analyses/round28_<variant>_diag_{best_val,final}/* — per-variant
+#   - analyses/round28_<variant>_diag_{best_val,final}/*: per-variant
 #       sustained-contact + gait + body-action diag outputs
-#   - analyses/round28_baseline_v27_diag_final/*       — v27 baseline
-#   - analyses/round28_gt_reference_diag/*             — GT-as-pred sanity
-#   - analyses/round27_tier0_train_indices_48_balanced.json — selection
+#   - analyses/round28_baseline_v27*_diag_final/*: v27 baseline
+#   - analyses/round28_gt_reference*diag/*: GT-as-pred sanity
+#   - analyses/round27_tier0_train_indices_48_balanced.json: balanced selection
 #   - analyses/round27_tier0_eval_selection_balanced.json
+#   - analyses/round28_body_action_{train_indices_48,eval_selection}.json
 #   - analyses/round28_claude_code_stage2_oracle_interface_prompt.md
-#   - runs/round28_train/*.log                          — stage logs
+#   - runs/round28_train/*.log: stage logs
 #   - runs/training/stageB_anchordiff_r28_*/metrics.jsonl + *.log + *.txt + *.yaml
 #
 # Excludes:
@@ -54,7 +55,9 @@ for V in "${VARIANTS[@]}"; do
 done
 for DIR in \
     analyses/round28_baseline_v27_diag_final \
-    analyses/round28_gt_reference_diag
+    analyses/round28_baseline_v27_body_diag_final \
+    analyses/round28_gt_reference_diag \
+    analyses/round28_gt_reference_body_diag
 do
     [[ -d "${DIR}" ]] && ITEMS+=("${DIR}")
 done
@@ -63,6 +66,8 @@ done
 for f in \
     analyses/round27_tier0_train_indices_48_balanced.json \
     analyses/round27_tier0_eval_selection_balanced.json \
+    analyses/round28_body_action_train_indices_48.json \
+    analyses/round28_body_action_eval_selection.json \
     analyses/round28_claude_code_stage2_oracle_interface_prompt.md
 do
     [[ -f "${f}" ]] && ITEMS+=("${f}")
