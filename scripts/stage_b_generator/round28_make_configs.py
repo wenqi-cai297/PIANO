@@ -1,4 +1,4 @@
-"""Generate Round-28 configs (R28-A0..A3, B0..B4, C1..C3) from a single base.
+"""Generate Round-28 configs (Group A/A1b/A2b, B0..B4, C1..C3) from a single base.
 
 Each variant differs from `anchordiff_t0a3_full_oracle_hint_48clip.yaml`
 only in a small block of: oracle hint enable/disable, body-action hint
@@ -7,7 +7,7 @@ mode, oracle injection mode, and the temporal-loss weight subset.
 Usage:
     python scripts/stage_b_generator/round28_make_configs.py [--dry-run]
     python scripts/stage_b_generator/round28_make_configs.py \
-        --best-injection-mode gated_input
+        --best-injection-mode gated_input_m1
 
 Writes:
     configs/training/anchordiff_r28_<variant>_48clip.yaml
@@ -43,12 +43,13 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
             "oracle_hint_injection_mode": "input_add",
+            "best_label": "input_add",
             "temporal_weights": "all_zero",
         },
     ),
     (
         "r28_a1_gated_input",
-        "Interaction hint only, gated_input injection.",
+        "Interaction hint only, gated_input injection, conservative gate bias -3.",
         {
             "use_oracle_interaction_hint": "true",
             "oracle_hint_variant": "full",
@@ -58,6 +59,25 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
             "oracle_hint_injection_mode": "gated_input",
+            "oracle_hint_gate_bias_init": "-3.0",
+            "best_label": "gated_input_m3",
+            "temporal_weights": "all_zero",
+        },
+    ),
+    (
+        "r28_a1b_gated_input_open",
+        "Interaction hint only, gated_input injection, fairer gate bias -1.",
+        {
+            "use_oracle_interaction_hint": "true",
+            "oracle_hint_variant": "full",
+            "use_oracle_interaction_hint_model": "true",
+            "oracle_hint_dim": "13",
+            "use_body_action_hint": "false",
+            "use_body_action_hint_model": "false",
+            "body_action_hint_dim": "0",
+            "oracle_hint_injection_mode": "gated_input",
+            "oracle_hint_gate_bias_init": "-1.0",
+            "best_label": "gated_input_m1",
             "temporal_weights": "all_zero",
         },
     ),
@@ -73,6 +93,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
             "oracle_hint_injection_mode": "per_layer_adapter",
+            "best_label": "per_layer_adapter",
             "temporal_weights": "all_zero",
         },
     ),
@@ -91,6 +112,7 @@ VARIANTS: list[tuple[str, str, dict]] = [
             "use_body_action_hint_model": "false",
             "body_action_hint_dim": "0",
             "oracle_hint_injection_mode": "adapter_only",
+            "best_label": "adapter_only",
             "temporal_weights": "all_zero",
         },
     ),
@@ -308,6 +330,21 @@ def _bool(b: str) -> str:
     return "true" if b.lower() == "true" else "false"
 
 
+def _resolve_best_injection(best: str) -> tuple[str, str]:
+    """Return (model injection mode, gate bias) for an A-group winner label."""
+    if best == "input_add":
+        return "input_add", "-3.0"
+    if best in {"gated_input", "gated_input_m3"}:
+        return "gated_input", "-3.0"
+    if best == "gated_input_m1":
+        return "gated_input", "-1.0"
+    if best == "per_layer_adapter":
+        return "per_layer_adapter", "-3.0"
+    if best == "adapter_only":
+        return "adapter_only", "-3.0"
+    raise ValueError(f"unknown best injection label: {best}")
+
+
 def _render_config(
     variant_id: str,
     description: str,
@@ -333,8 +370,9 @@ def _render_config(
     body_mask_mode = ov.get("body_action_hint_mask_mode", "all_on")
     body_energy_thr = ov.get("body_action_energy_threshold", "0.05")
     injection_mode = str(ov["oracle_hint_injection_mode"])
+    gate_bias = str(ov.get("oracle_hint_gate_bias_init", "-3.0"))
     if injection_mode == "best":
-        injection_mode = str(best_injection_mode)
+        injection_mode, gate_bias = _resolve_best_injection(str(best_injection_mode))
     subset_file = (
         str(body_action_subset_file)
         if ov.get("subset_kind", "balanced") == "body_action"
@@ -413,6 +451,7 @@ model:
     use_body_action_hint: {_bool(ov["use_body_action_hint_model"])}
     body_action_hint_dim: {ov["body_action_hint_dim"]}
     oracle_hint_injection_mode: "{injection_mode}"
+    oracle_hint_gate_bias_init: {gate_bias}
     separate_hint_branches: true
     zero_init_hint_adapters: true
 
@@ -551,12 +590,19 @@ def main() -> int:
                         help="Print which files would be written without touching disk.")
     parser.add_argument(
         "--best-injection-mode",
-        choices=["input_add", "gated_input", "per_layer_adapter", "adapter_only"],
+        choices=[
+            "input_add",
+            "gated_input",
+            "gated_input_m3",
+            "gated_input_m1",
+            "per_layer_adapter",
+            "adapter_only",
+        ],
         default="per_layer_adapter",
         help=(
-            "Injection mode to use for A3/B/C configs after A0/A1/A2/A2b "
-            "decide the best Group-A branch. `input_add` is the R27 "
-            "baseline mode and is also valid as the Step-2 choice."
+            "Winner label to use for A3/B/C configs after A-group decides "
+            "the best branch. `gated_input` is an alias for gated_input_m3; "
+            "use gated_input_m1 if A1b wins."
         ),
     )
     parser.add_argument(

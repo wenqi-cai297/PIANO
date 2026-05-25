@@ -2,14 +2,16 @@
 # Round-28 Stage-2 oracle interface refinement: train + eval selected
 # variants from analyses/round28_claude_code_stage2_oracle_interface_prompt.md.
 #
-# Default protocol runs only Group A. Run A0/A1/A2 first, inspect metrics,
+# Default protocol runs only Group A. Run A0/A1/A1b/A2/A2b first, inspect metrics,
 # then launch A3/B/C with ROUND28_BEST_INJECTION_MODE set to the measured
-# winner (gated_input or input_add+per_layer_adapter).
+# winner (input_add, gated_input_m3, gated_input_m1, per_layer_adapter, adapter_only).
 #
 # Variants:
 #   a0  reproduce T0-A3 (input_add)              ~20 min
-#   a1  interaction hint + gated_input            ~20 min
+#   a1  interaction hint + gated_input bias=-3    ~20 min
+#   a1b interaction hint + gated_input bias=-1    ~20 min
 #   a2  interaction hint + input_add+adapter      ~20 min
+#   a2b interaction hint + adapter_only           ~20 min
 #   a3  best Group A, 1000 epochs                 ~60 min
 #   b0  baseline (no hints)                       ~15 min
 #   b1  interaction hint only (best injection)    ~20 min
@@ -23,14 +25,14 @@
 # Each variant:
 #   1. TRAIN  48-clip overfit, 300 epochs (1000 for a3), warm-start from v27.
 #   2. EVAL   sustained-contact + gait + body-action diagnostics on the
-#             same 48 clips on best_val.pt and final.pt.
+#             same 48 train clips AND true held-out val clips.
 #   3. PACK   tarball (no .pt ckpts).
 #
 # Usage:
-#   bash scripts/stage_b_generator/run_round28_train.sh                    # A0/A1/A2 only
+#   bash scripts/stage_b_generator/run_round28_train.sh                    # A0/A1/A1b/A2/A2b
 #   bash scripts/stage_b_generator/run_round28_train.sh r28_a0_input_add   # one
-#   bash scripts/stage_b_generator/run_round28_train.sh r28_a0_input_add r28_a1_gated_input r28_a2_per_layer_adapter
-#   ROUND28_BEST_INJECTION_MODE=gated_input bash scripts/stage_b_generator/run_round28_train.sh r28_a3_best_long r28_b0_baseline ...
+#   bash scripts/stage_b_generator/run_round28_train.sh r28_a0_input_add r28_a1b_gated_input_open r28_a2b_adapter_only
+#   ROUND28_BEST_INJECTION_MODE=gated_input_m1 bash scripts/stage_b_generator/run_round28_train.sh r28_a3_best_long r28_b0_baseline ...
 #   ROUND28_BEST_INJECTION_MODE=per_layer_adapter bash scripts/stage_b_generator/run_round28_train.sh r28_a3_best_long r28_b2_body_only_all_on
 #
 # Skip-stage:
@@ -49,8 +51,11 @@ mkdir -p "${LOG_DIR}"
 V27_CKPT="runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
 V27_CFG_LOCAL="configs/training/anchordiff_v27_stage2_anchoraware_FULL_DATA_local.yaml"
 TRAIN_INDICES="${ROUND28_TRAIN_INDICES:-analyses/round27_tier0_train_indices_48_balanced.json}"
+VAL_INDICES="${ROUND28_VAL_INDICES:-analyses/round28_val_tier0_indices_48_balanced.json}"
 BODY_INDICES="${ROUND28_BODY_ACTION_INDICES:-analyses/round28_body_action_train_indices_48.json}"
+BODY_VAL_INDICES="${ROUND28_BODY_ACTION_VAL_INDICES:-analyses/round28_body_action_val_indices_48.json}"
 BEST_INJECTION_MODE="${ROUND28_BEST_INJECTION_MODE:-}"
+RUN_HELDOUT_DIAG="${ROUND28_RUN_HELDOUT_DIAG:-1}"
 
 SINGLE_GPU="${ROUND28_SINGLE_GPU:-0}"
 RESUME_FROM="${ROUND28_RESUME_FROM:-}"
@@ -58,6 +63,7 @@ RESUME_FROM="${ROUND28_RESUME_FROM:-}"
 DEFAULT_VARIANTS=(
     r28_a0_input_add
     r28_a1_gated_input
+    r28_a1b_gated_input_open
     r28_a2_per_layer_adapter
     r28_a2b_adapter_only
 )
@@ -148,9 +154,9 @@ _any_body_subset_variant() {
 }
 
 if _any_followup_variant && [[ -z "${BEST_INJECTION_MODE}" ]]; then
-    echo "ERROR: A3/B/C variants require ROUND28_BEST_INJECTION_MODE=input_add | gated_input | per_layer_adapter | adapter_only."
-    echo "Note: input_add = R27 baseline; per_layer_adapter = input_add + per-layer adapters; adapter_only = pure per-layer adapters (A2b)."
-    echo "Run A0/A1/A2/A2b first, inspect metrics, then rerun follow-up variants with the winner set."
+    echo "ERROR: A3/B/C variants require ROUND28_BEST_INJECTION_MODE=input_add | gated_input_m3 | gated_input_m1 | per_layer_adapter | adapter_only."
+    echo "Note: gated_input is accepted as gated_input_m3; per_layer_adapter = input_add + per-layer adapters; adapter_only = pure per-layer adapters (A2b)."
+    echo "Run A0/A1/A1b/A2/A2b first, inspect metrics, then rerun follow-up variants with the winner set."
     exit 1
 fi
 
@@ -248,7 +254,9 @@ fi
 # EVAL: sustained-contact + gait + body-action on best_val.pt and final.pt
 # ============================================================
 EVAL_SUBSET_BALANCED="${ROUND28_EVAL_SUBSET_BALANCED:-analyses/round27_tier0_eval_selection_balanced.json}"
+EVAL_SUBSET_BALANCED_VAL="${ROUND28_EVAL_SUBSET_BALANCED_VAL:-analyses/round28_val_tier0_eval_selection_balanced.json}"
 EVAL_SUBSET_BODY="${ROUND28_EVAL_SUBSET_BODY:-analyses/round28_body_action_eval_selection.json}"
+EVAL_SUBSET_BODY_VAL="${ROUND28_EVAL_SUBSET_BODY_VAL:-analyses/round28_body_action_val_eval_selection.json}"
 
 if _should_skip eval; then
     echo "[SKIP] EVAL (ROUND28_RESUME_FROM=${RESUME_FROM})"
@@ -257,36 +265,59 @@ else
         local SRC_INDICES="$1"
         local OUT_JSON="$2"
         local DESC="$3"
+        local BUCKET="$4"
         [[ -f "${OUT_JSON}" ]] && return 0
         echo "[$(date '+%F %T')] Building eval selection JSON: ${OUT_JSON}"
-        conda run --no-capture-output -n piano python -c "
-import json
-src = json.load(open('${SRC_INDICES}', encoding='utf-8'))
-clips = src['clips']
-out = {
-    'description': '${DESC}',
-    'selection_source': '${SRC_INDICES}',
-    'bucket': 'train',
-    'n_clips': len(clips),
-    'selected': [
-        {'subset': c['subset'], 'seq_id': c['seq_id'],
-         'mode_category': c.get('mode_category', c.get('body_action_category', 'unknown')),
-         'text': c.get('text', ''), 'confidence': 1.0, 'n_known_valid_modes': 1}
-        for c in clips
-    ],
-}
-json.dump(out, open('${OUT_JSON}', 'w', encoding='utf-8'), indent=2)
-print(f'wrote {len(clips)} clips to ${OUT_JSON}')
-"
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round28_indices_to_eval_selection.py \
+            --indices-json "${SRC_INDICES}" \
+            --output "${OUT_JSON}" \
+            --description "${DESC}" \
+            --bucket "${BUCKET}"
     }
+
+    if [[ "${RUN_HELDOUT_DIAG}" == "1" && ! -f "${VAL_INDICES}" ]]; then
+        run_step "build_val_indices" \
+            conda run --no-capture-output -n piano python -u \
+                scripts/stage_b_generator/round27_build_tier0_train_indices.py \
+                --config "${V27_CFG_LOCAL}" \
+                --bucket val \
+                --n-clips 48 \
+                --output "${VAL_INDICES}" \
+                --max-candidates-per-subset 600
+    fi
+    if _any_body_subset_variant && [[ "${RUN_HELDOUT_DIAG}" == "1" && ! -f "${BODY_VAL_INDICES}" ]]; then
+        run_step "build_body_action_val_indices" \
+            conda run --no-capture-output -n piano python -u \
+                scripts/stage_b_generator/round28_build_body_action_subset.py \
+                --config "${V27_CFG_LOCAL}" \
+                --bucket val \
+                --n-clips 48 \
+                --output "${BODY_VAL_INDICES}" \
+                --max-candidates-per-subset 900
+    fi
 
     build_eval_selection \
         "${TRAIN_INDICES}" "${EVAL_SUBSET_BALANCED}" \
-        "Round-28 balanced train-bucket overfit selection."
+        "Round-28 balanced train-bucket overfit selection." \
+        train
+    if [[ "${RUN_HELDOUT_DIAG}" == "1" ]]; then
+        build_eval_selection \
+            "${VAL_INDICES}" "${EVAL_SUBSET_BALANCED_VAL}" \
+            "Round-28 balanced true held-out val-bucket selection." \
+            val
+    fi
     if _any_body_subset_variant; then
         build_eval_selection \
             "${BODY_INDICES}" "${EVAL_SUBSET_BODY}" \
-            "Round-28 body-action train-bucket overfit selection."
+            "Round-28 body-action train-bucket overfit selection." \
+            train
+        if [[ "${RUN_HELDOUT_DIAG}" == "1" ]]; then
+            build_eval_selection \
+                "${BODY_VAL_INDICES}" "${EVAL_SUBSET_BODY_VAL}" \
+                "Round-28 body-action true held-out val-bucket selection." \
+                val
+        fi
     fi
 
     run_diagnostics() {
@@ -295,6 +326,7 @@ print(f'wrote {len(clips)} clips to ${OUT_JSON}')
         local CKPT="$1"; shift
         local OUT_DIR="$1"; shift
         local SELECTION_JSON="$1"; shift
+        local DIAG_BUCKET="$1"; shift
         mkdir -p "${OUT_DIR}"
 
         run_step "${NAME}_sustained" \
@@ -303,7 +335,7 @@ print(f'wrote {len(clips)} clips to ${OUT_JSON}')
                 --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
                 --selection-json "${SELECTION_JSON}" \
                 --output-dir "${OUT_DIR}" \
-                --bucket train --cfg-scale 1.0 --seed 42 "$@"
+                --bucket "${DIAG_BUCKET}" --cfg-scale 1.0 --seed 42 "$@"
 
         run_step "${NAME}_gait" \
             conda run --no-capture-output -n piano python -u \
@@ -311,7 +343,7 @@ print(f'wrote {len(clips)} clips to ${OUT_JSON}')
                 --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
                 --selection-json "${SELECTION_JSON}" \
                 --output-dir "${OUT_DIR}" \
-                --bucket train --cfg-scale 1.0 --seed 42 "$@"
+                --bucket "${DIAG_BUCKET}" --cfg-scale 1.0 --seed 42 "$@"
 
         run_step "${NAME}_body_action" \
             conda run --no-capture-output -n piano python -u \
@@ -319,29 +351,51 @@ print(f'wrote {len(clips)} clips to ${OUT_JSON}')
                 --config "${CFG_LOCAL}" --ckpt "${CKPT}" \
                 --selection-json "${SELECTION_JSON}" \
                 --output-dir "${OUT_DIR}" \
-                --bucket train --cfg-scale 1.0 --seed 42 "$@"
+                --bucket "${DIAG_BUCKET}" --cfg-scale 1.0 --seed 42 "$@"
     }
 
     # Balanced same-subset baselines (run once per pack).
     run_diagnostics "baseline_v27_final" \
         "${V27_CFG_LOCAL}" "${V27_CKPT}" \
         "analyses/round28_baseline_v27_diag_final" \
-        "${EVAL_SUBSET_BALANCED}"
+        "${EVAL_SUBSET_BALANCED}" train
     run_diagnostics "gt_reference" \
         "${V27_CFG_LOCAL}" "${V27_CKPT}" \
         "analyses/round28_gt_reference_diag" \
-        "${EVAL_SUBSET_BALANCED}" \
+        "${EVAL_SUBSET_BALANCED}" train \
         --use-gt-as-pred
+    if [[ "${RUN_HELDOUT_DIAG}" == "1" ]]; then
+        run_diagnostics "baseline_v27_val_final" \
+            "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+            "analyses/round28_baseline_v27_val_diag_final" \
+            "${EVAL_SUBSET_BALANCED_VAL}" val
+        run_diagnostics "gt_reference_val" \
+            "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+            "analyses/round28_gt_reference_val_diag" \
+            "${EVAL_SUBSET_BALANCED_VAL}" val \
+            --use-gt-as-pred
+    fi
     if _any_body_subset_variant; then
         run_diagnostics "baseline_v27_body_final" \
             "${V27_CFG_LOCAL}" "${V27_CKPT}" \
             "analyses/round28_baseline_v27_body_diag_final" \
-            "${EVAL_SUBSET_BODY}"
+            "${EVAL_SUBSET_BODY}" train
         run_diagnostics "gt_reference_body" \
             "${V27_CFG_LOCAL}" "${V27_CKPT}" \
             "analyses/round28_gt_reference_body_diag" \
-            "${EVAL_SUBSET_BODY}" \
+            "${EVAL_SUBSET_BODY}" train \
             --use-gt-as-pred
+        if [[ "${RUN_HELDOUT_DIAG}" == "1" ]]; then
+            run_diagnostics "baseline_v27_body_val_final" \
+                "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+                "analyses/round28_baseline_v27_body_val_diag_final" \
+                "${EVAL_SUBSET_BODY_VAL}" val
+            run_diagnostics "gt_reference_body_val" \
+                "${V27_CFG_LOCAL}" "${V27_CKPT}" \
+                "analyses/round28_gt_reference_body_val_diag" \
+                "${EVAL_SUBSET_BODY_VAL}" val \
+                --use-gt-as-pred
+        fi
     fi
 
     for V in "${VARIANTS[@]}"; do
@@ -359,9 +413,24 @@ print(f'wrote {len(clips)} clips to ${OUT_JSON}')
             if _uses_body_subset "${V}"; then
                 SEL="${EVAL_SUBSET_BODY}"
             fi
-            run_diagnostics "${V}_${TAG}" "${CFG_LOCAL}" "${CKPT}" "${OUT_DIR}" "${SEL}"
+            run_diagnostics "${V}_${TAG}" "${CFG_LOCAL}" "${CKPT}" "${OUT_DIR}" "${SEL}" train
+            if [[ "${RUN_HELDOUT_DIAG}" == "1" ]]; then
+                HELDOUT_SEL="${EVAL_SUBSET_BALANCED_VAL}"
+                if _uses_body_subset "${V}"; then
+                    HELDOUT_SEL="${EVAL_SUBSET_BODY_VAL}"
+                fi
+                HELDOUT_OUT_DIR="analyses/round28_${V}_heldout_val_diag_${TAG}"
+                run_diagnostics \
+                    "${V}_${TAG}_heldout_val" \
+                    "${CFG_LOCAL}" "${CKPT}" \
+                    "${HELDOUT_OUT_DIR}" "${HELDOUT_SEL}" val
+            fi
         done
     done
+
+    run_step "summarize_a_group_matrix" \
+        conda run --no-capture-output -n piano python -u \
+            scripts/stage_b_generator/round28_summarize_a_group_matrix.py
 fi
 
 # ============================================================

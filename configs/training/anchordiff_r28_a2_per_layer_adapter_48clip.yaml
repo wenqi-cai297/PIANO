@@ -70,6 +70,7 @@ model:
     use_body_action_hint: false
     body_action_hint_dim: 0
     oracle_hint_injection_mode: "per_layer_adapter"
+    oracle_hint_gate_bias_init: -3.0
     separate_hint_branches: true
     zero_init_hint_adapters: true
 

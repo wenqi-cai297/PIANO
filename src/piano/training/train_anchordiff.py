@@ -2182,6 +2182,9 @@ def main() -> None:
         oracle_hint_injection_mode=str(
             cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
         ),
+        oracle_hint_gate_bias_init=float(
+            cfg.model.denoiser.get("oracle_hint_gate_bias_init", -3.0)
+        ),
         separate_hint_branches=bool(
             cfg.model.denoiser.get("separate_hint_branches", True)
         ),

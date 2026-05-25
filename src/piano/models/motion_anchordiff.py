@@ -764,6 +764,9 @@ class AnchorDenoiserConfig:
     body_action_hint_dim: int = 0
     # `input_add` / `gated_input` / `per_layer_adapter` / `adapter_only`.
     oracle_hint_injection_mode: str = "input_add"
+    # Initial sigmoid gate bias for ``gated_input``. -3.0 is the
+    # conservative A1 setting; -1.0 is the fair-gate A1b ablation.
+    oracle_hint_gate_bias_init: float = -3.0
     # When True, interaction & body-action hints have their own
     # projections + (if gated/adapter) their own gates/adapters.
     separate_hint_branches: bool = True
@@ -1117,21 +1120,22 @@ class AnchorDenoiser(nn.Module):
         # Sigmoid gate driven by [c_summary (D), hint_emb (D)] -> 1 scalar
         # gate per (B, T, 1). When ``oracle_hint_injection_mode ==
         # "gated_input"``, the gate modulates the additive injection.
-        # Bias is initialized to a small negative value so initial gate
-        # is ~ sigmoid(-3) = 0.047 (closed → close to baseline at step 0).
+        # Historical default -3.0 is conservative/nearly closed;
+        # A1b uses -1.0 for a less cold-started gate.
         if cfg.oracle_hint_injection_mode == "gated_input":
+            gate_bias = float(cfg.oracle_hint_gate_bias_init)
             if self.oracle_hint_proj is not None:
                 self.interaction_gate = nn.Linear(2 * cfg.d_model, 1)
                 if cfg.zero_init_hint_adapters:
                     nn.init.zeros_(self.interaction_gate.weight)
-                    nn.init.constant_(self.interaction_gate.bias, -3.0)
+                    nn.init.constant_(self.interaction_gate.bias, gate_bias)
             else:
                 self.interaction_gate = None
             if self.body_action_hint_proj is not None:
                 self.body_action_gate = nn.Linear(2 * cfg.d_model, 1)
                 if cfg.zero_init_hint_adapters:
                     nn.init.zeros_(self.body_action_gate.weight)
-                    nn.init.constant_(self.body_action_gate.bias, -3.0)
+                    nn.init.constant_(self.body_action_gate.bias, gate_bias)
             else:
                 self.body_action_gate = None
         else:

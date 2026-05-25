@@ -39,6 +39,7 @@ def _build_cfg(
     use_body_action: bool = False,
     body_action_dim: int = 24,
     injection_mode: str = "input_add",
+    gate_bias_init: float = -3.0,
     zero_init_adapters: bool = True,
 ) -> AnchorDenoiserConfig:
     return AnchorDenoiserConfig(
@@ -70,6 +71,7 @@ def _build_cfg(
         use_body_action_hint=use_body_action,
         body_action_hint_dim=body_action_dim if use_body_action else 0,
         oracle_hint_injection_mode=injection_mode,
+        oracle_hint_gate_bias_init=gate_bias_init,
         separate_hint_branches=True,
         zero_init_hint_adapters=zero_init_adapters,
         d_model=64,
@@ -229,6 +231,26 @@ def test_round28_gated_input_stats_are_populated():
         assert key in stats, f"missing {key}"
         assert stats[key].numel() == 1
         assert torch.isfinite(stats[key])
+
+
+def test_round28_gated_input_gate_bias_is_configurable():
+    cfg = _build_cfg(
+        use_interaction=True,
+        use_body_action=True,
+        injection_mode="gated_input",
+        gate_bias_init=-1.0,
+    )
+    model = AnchorDenoiser(cfg)
+    assert model.interaction_gate is not None
+    assert model.body_action_gate is not None
+    assert torch.allclose(
+        model.interaction_gate.bias.detach(),
+        torch.full_like(model.interaction_gate.bias.detach(), -1.0),
+    )
+    assert torch.allclose(
+        model.body_action_gate.bias.detach(),
+        torch.full_like(model.body_action_gate.bias.detach(), -1.0),
+    )
 
 
 # ---------------------------------------------------------------------------
