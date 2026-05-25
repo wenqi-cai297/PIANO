@@ -1,23 +1,22 @@
 """Round-22 P0: tests for the Stage-1 Coarse-v1 oracle condition branch.
 
-Six checks per the Round-22 Codex prompt §Task 5:
+Five checks per the Round-22 Codex prompt §Task 5 (Round-28 cleanup
+removed the obsolete numpy-extractor equivalence check):
 
-  1. ``extract_coarse_v1_batched`` matches the canonical numpy
-     ``extract_coarse_v0_v1`` on a single clip (channel-by-channel).
-  2. Collate / padding correctness — synthetic batch of mixed lengths
+  1. Collate / padding correctness — synthetic batch of mixed lengths
      should yield a (B, T_max, 23) tensor without nans.
-  3. ``AnchorDenoiser(stage1_coarse_dim=23)`` accepts the new cond key
+  2. ``AnchorDenoiser(stage1_coarse_dim=23)`` accepts the new cond key
      and returns (B, T, 135) under v12 (use_dit_block=True).
-  4. **Zero-init invariant** — at construction, the two denoisers
+  3. **Zero-init invariant** — at construction, the two denoisers
      (with and without ``stage1_coarse_dim=23``) produce bit-exact equal
      forward outputs given identical RNG seed and identical other inputs.
      This is the proof that adding the branch does not invalidate v18
      numerics.
-  5. Clean contract zeroing — when both ``zero_z_int_for_stageB=True``
-     and ``zero_dense_contact_target_for_stageB=True``, the trainer's
-     cond assembly produces all-zero ``z_int`` and zeros the 15-D dense
-     contact-target suffix of ``object_world_traj``.
-  6. ``object_traj_dim=9`` build path does not silently expect 24 dims —
+  4. Clean contract zeroing — the trainer's cond assembly produces
+     all-zero ``z_int`` and zeros the 15-D dense contact-target suffix
+     of ``object_world_traj`` (Round-28 hardcodes this; both fields
+     used to be config-gated).
+  5. ``object_traj_dim=9`` build path does not silently expect 24 dims —
      ``_build_object_traj`` returns a 9-D tensor and the denoiser's
      ``null_obj_traj`` parameter is sized 9.
 
@@ -35,15 +34,11 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-# Add scripts/stage_b_generator to sys.path so we can import the canonical
-# numpy extractor for the equivalence test (it's not packaged in the wheel).
+# Add scripts/stage_b_generator to sys.path so we can import diagnostic helpers.
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts" / "stage_b_generator"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from extract_coarse_motion_representation import (  # type: ignore  # noqa: E402
-    extract_coarse_v0_v1,
-)
 import plan_condition_diagnostics as pcd  # type: ignore  # noqa: E402
 
 from piano.data.stage1_coarse_oracle import (  # noqa: E402
@@ -230,35 +225,12 @@ def _build_full_denoiser_config_from_yaml(
 
 
 # ---------------------------------------------------------------------------
-# Check 1 — oracle adapter matches canonical numpy extractor
+# Check 1 — collate/padding correctness on a 2-clip mixed-length batch
 # ---------------------------------------------------------------------------
-
-
-def test_extract_coarse_v1_batched_matches_numpy_extractor():
-    T = 24
-    motion_np, rest_np = _make_synthetic_motion_135(T, seed=42)
-
-    # Canonical numpy extractor (single clip).
-    out_np = extract_coarse_v0_v1(motion_np, rest_np, seq_len=T)
-    coarse_v1_np = out_np["coarse_v1"]                             # (T, 23)
-    assert coarse_v1_np.shape == (T, COARSE_V1_DIM)
-
-    # Torch batched extractor (B=1).
-    motion_t = torch.from_numpy(motion_np).unsqueeze(0)            # (1, T, 135)
-    rest_t = torch.from_numpy(rest_np).unsqueeze(0)                # (1, 22, 3)
-    coarse_v1_t = extract_coarse_v1_batched(motion_t, rest_t).squeeze(0).numpy()
-    assert coarse_v1_t.shape == (T, COARSE_V1_DIM)
-
-    # Tolerance: float32 FK + atan2 give small numeric noise.
-    assert np.allclose(coarse_v1_t, coarse_v1_np, atol=1e-5, rtol=1e-5), (
-        f"max|diff|={np.max(np.abs(coarse_v1_t - coarse_v1_np)):.3e}"
-    )
-    assert np.isfinite(coarse_v1_t).all()
-
-
-# ---------------------------------------------------------------------------
-# Check 2 — collate/padding correctness on a 2-clip mixed-length batch
-# ---------------------------------------------------------------------------
+# (Round-28 cleanup: removed the obsolete "numpy reference extractor"
+# equivalence test. Its single-clip reference script
+# extract_coarse_motion_representation.py was a Round-22 Stage-1 ad-hoc
+# probe — pruned alongside the other 154 dead stage_b_generator scripts.)
 
 
 def test_extract_coarse_v1_batched_shape_and_finite():
