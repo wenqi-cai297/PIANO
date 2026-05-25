@@ -206,6 +206,19 @@ class HOIDataset(Dataset):
         # these as masks; they are independent of whether the model
         # also receives the oracle hint as a CONDITION.
         surface_temporal_aux_fields: bool = False,
+        # Round-29 typed Stage-2 condition bundle (prompt §3, §5.1).
+        # Per-family variant strings. ``C0/I0/S0/B0`` (and the
+        # "C23" alias for "no extra coarse channel") disable that
+        # family. When ALL FOUR families are disabled the bundle is
+        # not built.
+        r29_coarse_variant: str = "C23",
+        r29_interaction_variant: str = "I0",
+        r29_support_variant: str = "S0",
+        r29_body_variant: str = "B0",
+        r29_body_coord_frame: str | None = None,
+        r29_body_energy_threshold: float = 0.05,
+        r29_body_lowpass_window: int = 9,
+        r29_hand_offset_clamp_m: float = 2.0,
     ) -> None:
         self.root = Path(root)
         self.max_seq_length = max_seq_length
@@ -253,6 +266,55 @@ class HOIDataset(Dataset):
             self.body_action_hint_dim = int(_HINT_DIM_BODY_ACTION)
         else:
             self.body_action_hint_dim = 0
+        # Round-29 typed condition bundle.
+        from piano.data.stage2_oracle_conditions import (
+            COARSE_VARIANT_DIMS as _R29_C_DIMS,
+            INTERACTION_VARIANT_DIMS as _R29_I_DIMS,
+            SUPPORT_VARIANT_DIMS as _R29_S_DIMS,
+            BODY_VARIANT_DIMS as _R29_B_DIMS,
+        )
+        if r29_coarse_variant not in _R29_C_DIMS:
+            raise ValueError(
+                f"r29_coarse_variant must be in {sorted(_R29_C_DIMS)}; "
+                f"got {r29_coarse_variant!r}"
+            )
+        if r29_interaction_variant not in _R29_I_DIMS:
+            raise ValueError(
+                f"r29_interaction_variant must be in {sorted(_R29_I_DIMS)}; "
+                f"got {r29_interaction_variant!r}"
+            )
+        if r29_support_variant not in _R29_S_DIMS:
+            raise ValueError(
+                f"r29_support_variant must be in {sorted(_R29_S_DIMS)}; "
+                f"got {r29_support_variant!r}"
+            )
+        if r29_body_variant not in _R29_B_DIMS:
+            raise ValueError(
+                f"r29_body_variant must be in {sorted(_R29_B_DIMS)}; "
+                f"got {r29_body_variant!r}"
+            )
+        self.r29_coarse_variant = str(r29_coarse_variant)
+        self.r29_interaction_variant = str(r29_interaction_variant)
+        self.r29_support_variant = str(r29_support_variant)
+        self.r29_body_variant = str(r29_body_variant)
+        self.r29_body_coord_frame = (
+            str(r29_body_coord_frame) if r29_body_coord_frame is not None else None
+        )
+        self.r29_body_energy_threshold = float(r29_body_energy_threshold)
+        self.r29_body_lowpass_window = int(r29_body_lowpass_window)
+        self.r29_hand_offset_clamp_m = float(r29_hand_offset_clamp_m)
+        self.r29_coarse_extra_dim = int(_R29_C_DIMS[self.r29_coarse_variant])
+        self.r29_interaction_dim = int(_R29_I_DIMS[self.r29_interaction_variant])
+        self.r29_support_dim = int(_R29_S_DIMS[self.r29_support_variant])
+        self.r29_body_refine_dim = int(_R29_B_DIMS[self.r29_body_variant])
+        self.r29_any_active = any(
+            d > 0 for d in (
+                self.r29_coarse_extra_dim,
+                self.r29_interaction_dim,
+                self.r29_support_dim,
+                self.r29_body_refine_dim,
+            )
+        )
         # v0.3-α (2026-04-27 evening): when True AND surface_obj_pose is
         # True, the obj-pose channels are returned in WORLD frame instead
         # of body-canonical frame. Tests Hypothesis E (frame-choice
@@ -864,6 +926,86 @@ class HOIDataset(Dataset):
                 f"expected ({self.max_seq_length}, {self.body_action_hint_dim})"
             )
             result["body_action_hint"] = torch.from_numpy(body_hint)
+
+        # ---------------------------------------------------------------
+        # Round-29 typed Stage-2 condition bundle (prompt §3, §5.1)
+        # ---------------------------------------------------------------
+        if self.r29_any_active:
+            from piano.data.stage2_oracle_conditions import (
+                build_stage2_condition_bundle,
+            )
+            valid_T = int(min(seq_len, self.max_seq_length))
+            needs_io = (
+                self.r29_interaction_dim > 0
+                and (
+                    object_positions is None
+                    or object_rotations is None
+                    or padded_labels.get("contact_state") is None
+                )
+            )
+            if needs_io:
+                raise ValueError(
+                    "R29 interaction variant requires object_positions, "
+                    "object_rotations, and contact_state; one is missing for "
+                    f"seq_id={seq_id!r}."
+                )
+            bundle = build_stage2_condition_bundle(
+                joints_22=joints[:valid_T].astype(np.float32),
+                coarse_variant=self.r29_coarse_variant,
+                interaction_variant=self.r29_interaction_variant,
+                support_variant=self.r29_support_variant,
+                body_variant=self.r29_body_variant,
+                body_coord_frame=self.r29_body_coord_frame,
+                body_energy_threshold=self.r29_body_energy_threshold,
+                body_lowpass_window=self.r29_body_lowpass_window,
+                object_positions=(
+                    object_positions[:valid_T].astype(np.float32)
+                    if object_positions is not None
+                    and self.r29_interaction_dim > 0
+                    else None
+                ),
+                object_rotations=(
+                    object_rotations[:valid_T].astype(np.float32)
+                    if object_rotations is not None
+                    and self.r29_interaction_dim > 0
+                    else None
+                ),
+                contact_state=(
+                    padded_labels["contact_state"][:valid_T].astype(np.float32)
+                    if padded_labels.get("contact_state") is not None
+                    and self.r29_interaction_dim > 0
+                    else None
+                ),
+                fps=self.oracle_hint_fps,
+                hand_offset_clamp_m=self.r29_hand_offset_clamp_m,
+            )
+
+            def _pad_and_set(arr, expected_dim: int, key: str) -> None:
+                if arr is None or expected_dim == 0:
+                    return
+                padded = self._pad_or_truncate(arr, self.max_seq_length)
+                if padded.shape != (self.max_seq_length, expected_dim):
+                    raise AssertionError(
+                        f"R29 {key} padded shape {padded.shape} != "
+                        f"({self.max_seq_length}, {expected_dim})"
+                    )
+                result[key] = torch.from_numpy(padded.astype(np.float32))
+
+            _pad_and_set(
+                bundle.coarse_extra, self.r29_coarse_extra_dim,
+                "stage2_coarse_extra",
+            )
+            _pad_and_set(
+                bundle.interaction, self.r29_interaction_dim,
+                "stage2_interaction",
+            )
+            _pad_and_set(
+                bundle.support, self.r29_support_dim, "stage2_support",
+            )
+            _pad_and_set(
+                bundle.body_refine, self.r29_body_refine_dim,
+                "stage2_body_refine",
+            )
 
         return result
 

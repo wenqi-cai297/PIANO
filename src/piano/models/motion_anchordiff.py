@@ -774,6 +774,27 @@ class AnchorDenoiserConfig:
     # zero-initialized so step-0 forward matches the no-hint baseline.
     zero_init_hint_adapters: bool = True
 
+    # Round-29 Stage-2 condition injection (per analyses/
+    # 2026-05-26_stage2_cond_injection_ablation_claude_code_prompt.md).
+    # Opt-in alternative to R28 oracle_interaction_hint + body_action_hint
+    # paths: typed per-family projections for the four condition families
+    # (coarse_extra / interaction / support / body_refine), with one of
+    # five injection modes (input_add, gated_input, adapter_only,
+    # input_add_adapter, typed). When ALL four family dims are 0 OR
+    # use_round29_cond_injection=False, this branch is fully bypassed and
+    # the model behaves identically to R28.
+    use_round29_cond_injection: bool = False
+    r29_coarse_extra_dim: int = 0
+    r29_interaction_dim: int = 0
+    r29_support_dim: int = 0
+    r29_body_refine_dim: int = 0
+    r29_injection_mode: str = "input_add"
+    r29_gate_bias_init: float = -1.0
+    # Typed per-family modes (J4). None = uniform mode from
+    # r29_injection_mode; dict = per-family override.
+    r29_per_family_modes: dict | None = None
+    r29_zero_init_adapters: bool = True
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -1071,6 +1092,32 @@ class AnchorDenoiser(nn.Module):
             # Naming kept as `oracle_hint_proj` for backward-compatible
             # checkpoint loading from R27 T0-A3 (interaction-only) runs.
             self._build_oracle_hint_branches(cfg)
+
+            # Round-29 condition injection module (opt-in, v12-only).
+            if cfg.use_round29_cond_injection:
+                from piano.models.round29_cond_injection import (
+                    Round29CondInjectionConfig,
+                    Round29CondInjectionModule,
+                    coerce_per_family_modes,
+                )
+                r29_cfg = Round29CondInjectionConfig(
+                    coarse_extra_dim=int(cfg.r29_coarse_extra_dim),
+                    interaction_dim=int(cfg.r29_interaction_dim),
+                    support_dim=int(cfg.r29_support_dim),
+                    body_refine_dim=int(cfg.r29_body_refine_dim),
+                    injection_mode=str(cfg.r29_injection_mode),
+                    gate_bias_init=float(cfg.r29_gate_bias_init),
+                    per_family_modes=coerce_per_family_modes(
+                        cfg.r29_per_family_modes,
+                    ),
+                    zero_init_adapters=bool(cfg.r29_zero_init_adapters),
+                )
+                self.r29_inject = Round29CondInjectionModule(
+                    r29_cfg, d_model=cfg.d_model,
+                )
+                self.r29_inject.configure_adapter_layers(int(cfg.n_layers))
+            else:
+                self.r29_inject = None
 
     # ------------------------------------------------------------------
     # Round-27/28 oracle hint branch builder + helpers
@@ -1736,6 +1783,14 @@ class AnchorDenoiser(nn.Module):
             t_emb=t_emb, plan_tokens=plan_tokens, plan_mask=plan_mask,
         )                                                                # (B, D)
 
+        # ─── Round-29: typed condition family input injection ───
+        # Opt-in alternative path (use_round29_cond_injection=True).
+        # ``c`` (B, D) feeds the gated_input branch. All families'
+        # projection MLPs are zero-init at the last Linear so the
+        # bit-exact step-0 baseline is preserved.
+        if self.r29_inject is not None:
+            h = self.r29_inject.apply_input_injection(h, cond, c_summary=c)
+
         # ─── Prepend init_pose token (time_tok dropped — timestep is in AdaLN) ───
         pose_tok = self.pose_proj(init_pose).unsqueeze(1)                # (B, 1, D)
         seq = torch.cat([pose_tok, h], dim=1)                            # (B, T+1, D)
@@ -1786,6 +1841,14 @@ class AnchorDenoiser(nn.Module):
             seq = self._apply_oracle_hint_per_layer_adapter(
                 seq, layer_idx=layer_idx, motion_token_start=1,
             )
+            # Round-29: optional per-family per-layer adapters. No-op
+            # unless ``r29_inject`` is present and at least one active
+            # family uses an adapter-mode (adapter_only or
+            # input_add_adapter, including under 'typed').
+            if self.r29_inject is not None:
+                seq = self.r29_inject.apply_per_layer_adapter(
+                    seq, layer_idx=layer_idx, motion_token_start=1,
+                )
 
         # ─── Text + obj cross-attn at end of encoder (v11 carryover) ───
         text_kv = self.text_proj(text_tok)

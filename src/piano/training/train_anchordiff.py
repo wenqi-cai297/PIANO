@@ -171,6 +171,32 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
             body_action_energy_threshold=float(
                 cfg.data.get("body_action_energy_threshold", 0.05)
             ),
+            r29_coarse_variant=str(
+                cfg.data.get("r29_coarse_variant", "C23")
+            ),
+            r29_interaction_variant=str(
+                cfg.data.get("r29_interaction_variant", "I0")
+            ),
+            r29_support_variant=str(
+                cfg.data.get("r29_support_variant", "S0")
+            ),
+            r29_body_variant=str(
+                cfg.data.get("r29_body_variant", "B0")
+            ),
+            r29_body_coord_frame=(
+                str(cfg.data.get("r29_body_coord_frame"))
+                if cfg.data.get("r29_body_coord_frame") is not None
+                else None
+            ),
+            r29_body_energy_threshold=float(
+                cfg.data.get("r29_body_energy_threshold", 0.05)
+            ),
+            r29_body_lowpass_window=int(
+                cfg.data.get("r29_body_lowpass_window", 9)
+            ),
+            r29_hand_offset_clamp_m=float(
+                cfg.data.get("r29_hand_offset_clamp_m", 2.0)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -529,6 +555,21 @@ def build_anchordiff_step_fn(
             cond["body_action_hint"] = (
                 batch["body_action_hint"].to(device).float()
             )
+
+        # ── Round-29: typed Stage-2 condition bundle ──
+        # The dataset's Stage2ConditionBundle is surfaced as four
+        # optional keys; each is present iff the corresponding family
+        # variant is enabled. The model's Round29CondInjectionModule
+        # raises a KeyError if a required family key is missing, so
+        # we just forward whatever the dataset produced.
+        for _r29_key in (
+            "stage2_coarse_extra",
+            "stage2_interaction",
+            "stage2_support",
+            "stage2_body_refine",
+        ):
+            if _r29_key in batch:
+                cond[_r29_key] = batch[_r29_key].to(device).float()
 
         # --- v10 InteractionPlan: thread the compiled plan through cond ---
         # The dataset compiles the plan in __getitem__ for the
@@ -1296,14 +1337,21 @@ def build_anchordiff_step_fn(
         # output norms). The generic trainer adds branch grad norms
         # after backward when these r28_* keys are present.
         _inner_model = _model.module if hasattr(_model, "module") else _model
-        _denoiser_stats = getattr(
-            getattr(_inner_model, "denoiser", None),
-            "_last_oracle_hint_stats",
-            {},
-        )
+        _denoiser = getattr(_inner_model, "denoiser", None)
+        _denoiser_stats = getattr(_denoiser, "_last_oracle_hint_stats", {})
         for _k, _v in _denoiser_stats.items():
             if isinstance(_v, torch.Tensor) and _v.numel() == 1:
                 out[_k] = _v.detach()
+
+        # Round-29 typed-condition diagnostics. The r29_inject module
+        # caches its own scalar stats during forward; we surface them
+        # alongside the r28_* keys so the generic trainer's grad-norm
+        # helper can fire on the r29_grad_norm_* groups.
+        _r29 = getattr(_denoiser, "r29_inject", None) if _denoiser is not None else None
+        if _r29 is not None:
+            for _k, _v in _r29.last_stats().items():
+                if isinstance(_v, torch.Tensor) and _v.numel() == 1:
+                    out[_k] = _v.detach()
 
         # v12 architecture-utilization metrics (per
         # analyses/2026-05-11_v12_implementation_doc.md §2.4 / §3.2).
@@ -1560,6 +1608,34 @@ def main() -> None:
         ),
         zero_init_hint_adapters=bool(
             cfg.model.denoiser.get("zero_init_hint_adapters", True)
+        ),
+        # Round-29 typed condition injection.
+        use_round29_cond_injection=bool(
+            cfg.model.denoiser.get("use_round29_cond_injection", False)
+        ),
+        r29_coarse_extra_dim=int(
+            cfg.model.denoiser.get("r29_coarse_extra_dim", 0)
+        ),
+        r29_interaction_dim=int(
+            cfg.model.denoiser.get("r29_interaction_dim", 0)
+        ),
+        r29_support_dim=int(cfg.model.denoiser.get("r29_support_dim", 0)),
+        r29_body_refine_dim=int(
+            cfg.model.denoiser.get("r29_body_refine_dim", 0)
+        ),
+        r29_injection_mode=str(
+            cfg.model.denoiser.get("r29_injection_mode", "input_add")
+        ),
+        r29_gate_bias_init=float(
+            cfg.model.denoiser.get("r29_gate_bias_init", -1.0)
+        ),
+        r29_per_family_modes=(
+            dict(cfg.model.denoiser.get("r29_per_family_modes"))
+            if cfg.model.denoiser.get("r29_per_family_modes") is not None
+            else None
+        ),
+        r29_zero_init_adapters=bool(
+            cfg.model.denoiser.get("r29_zero_init_adapters", True)
         ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),

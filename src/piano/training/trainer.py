@@ -280,6 +280,7 @@ def run_training_loop(
                 # Backward
                 accelerator.backward(loss)
                 _maybe_add_oracle_hint_grad_stats(model, loss_dict)
+                _maybe_add_r29_cond_grad_stats(model, loss_dict)
                 if max_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
@@ -541,6 +542,50 @@ def _maybe_add_oracle_hint_grad_stats(
         "r28_grad_norm_body_action_gate": "body_action_gate",
         "r28_grad_norm_interaction_adapters": "interaction_adapters",
         "r28_grad_norm_body_action_adapters": "body_action_adapters",
+    }
+    grouped: dict[str, list[torch.nn.Parameter]] = {k: [] for k in groups}
+    for name, param in model.named_parameters():
+        for metric_key, needle in groups.items():
+            if needle in name:
+                grouped[metric_key].append(param)
+
+    for metric_key, params in grouped.items():
+        if not params:
+            continue
+        total = None
+        for param in params:
+            if param.grad is None:
+                continue
+            sq = param.grad.detach().float().pow(2).sum()
+            total = sq if total is None else total + sq
+        if total is None:
+            ref = params[0]
+            total = torch.zeros((), device=ref.device, dtype=torch.float32)
+        loss_dict[metric_key] = total.sqrt().detach()
+
+
+def _maybe_add_r29_cond_grad_stats(
+    model: torch.nn.Module,
+    loss_dict: dict[str, Any],
+) -> None:
+    """Append Round-29 typed-condition grad norms after backward.
+
+    Guarded by the presence of forward-side ``r29_*`` diagnostics (the
+    R29 inject module sets these via ``last_stats()`` -> step_fn output).
+    Non-R29 models pay no parameter-scan cost.
+
+    Grouping mirrors the R29 module's submodule names:
+        r29_grad_norm_proj      — all per-family projection MLPs
+        r29_grad_norm_gate      — per-family sigmoid gates (gated_input)
+        r29_grad_norm_adapters  — per-family per-DiT-block adapters
+    """
+    if not any(str(k).startswith("r29_") for k in loss_dict):
+        return
+
+    groups = {
+        "r29_grad_norm_proj":     "r29_inject.proj",
+        "r29_grad_norm_gate":     "r29_inject.gate",
+        "r29_grad_norm_adapters": "r29_inject.adapters",
     }
     grouped: dict[str, list[torch.nn.Parameter]] = {k: [] for k in groups}
     for name, param in model.named_parameters():
