@@ -111,21 +111,72 @@ def _sustained_row(stats: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+_GAIT_FIELDS = (
+    "frac_both_swing", "frac_both_stance", "transitions_per_sec",
+    "L_R_height_corr", "step_period_rate", "n_walking_segments",
+)
+
+
 def _gait_row(stats: dict[str, Any] | None) -> dict[str, Any]:
+    """Pull both pred_aggregate AND gt_aggregate gait stats into a flat row.
+
+    The hardcoded GT reference paragraph in v1 of this report was wrong
+    for the heldout-val subset (Codex P1 review 2026-05-27): the val
+    subset is a DIFFERENT 48 clips, so its GT walking distribution
+    differs from the train subset's. ``round26_gait_diag.py:432`` emits
+    ``gt_aggregate`` alongside ``pred_aggregate`` with identical schema;
+    we now surface it as ``gt_<field>`` so the renderer can show a
+    per-subset GT reference row.
+    """
     if not stats:
-        return {k: None for k in (
-            "frac_both_swing", "frac_both_stance", "transitions_per_sec",
-            "L_R_height_corr", "step_period_rate", "n_walking_segments",
-        )}
+        out = {k: None for k in _GAIT_FIELDS}
+        out.update({f"gt_{k}": None for k in _GAIT_FIELDS})
+        return out
+
     pa = stats.get("pred_aggregate", {}) or {}
-    return {
-        "frac_both_swing": (pa.get("frac_both_swing", {}) or {}).get("mean"),
-        "frac_both_stance": (pa.get("frac_both_stance", {}) or {}).get("mean"),
-        "transitions_per_sec": (pa.get("transitions_per_second", {}) or {}).get("mean"),
-        "L_R_height_corr": (pa.get("L_R_height_corr", {}) or {}).get("mean"),
-        "step_period_rate": (pa.get("step_period_frames", {}) or {}).get("rate_with_period"),
-        "n_walking_segments": stats.get("n_walking_segments"),
-    }
+    ga = stats.get("gt_aggregate", {}) or {}
+
+    def _extract(agg: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "frac_both_swing": (agg.get("frac_both_swing", {}) or {}).get("mean"),
+            "frac_both_stance": (agg.get("frac_both_stance", {}) or {}).get("mean"),
+            "transitions_per_sec": (agg.get("transitions_per_second", {}) or {}).get("mean"),
+            "L_R_height_corr": (agg.get("L_R_height_corr", {}) or {}).get("mean"),
+            "step_period_rate": (agg.get("step_period_frames", {}) or {}).get("rate_with_period"),
+        }
+
+    pred = _extract(pa)
+    gt = _extract(ga)
+    out = dict(pred)
+    out["n_walking_segments"] = stats.get("n_walking_segments")
+    out.update({f"gt_{k}": gt[k] for k in pred})
+    return out
+
+
+def _subset_gt_reference(
+    rows: dict[str, dict[str, dict[str, dict[str, Any]]]],
+    sublabel: str,
+) -> dict[str, Any]:
+    """Mean GT gait values across all variants for the given sublabel.
+
+    All variants share the same 48-clip selection and run the gait diag
+    on the same GT joints → ``gt_aggregate`` is identical across them
+    (modulo any floating-point variability). We take the mean of the
+    available rows as a defensive aggregate.
+    """
+    fields = ("frac_both_swing", "frac_both_stance", "transitions_per_sec",
+              "L_R_height_corr", "step_period_rate")
+    bucket: dict[str, list[float]] = {k: [] for k in fields}
+    for variant_rows in rows.values():
+        gait = variant_rows.get(sublabel, {}).get("gait", {})
+        for f in fields:
+            val = gait.get(f"gt_{f}")
+            if val is not None:
+                try:
+                    bucket[f].append(float(val))
+                except (TypeError, ValueError):
+                    pass
+    return {f: (sum(vs) / len(vs)) if vs else None for f, vs in bucket.items()}
 
 
 def _body_action_row(stats: dict[str, Any] | None) -> dict[str, Any]:
@@ -204,11 +255,23 @@ def _render_section_for_sublabel(
         )
     a("")
 
-    # Gait
+    # Gait — prepend a per-subset GT reference row (read from
+    # gt_aggregate in each variant's gait_stats.json; mean across
+    # variants). v1 used hardcoded train-subset values uniformly across
+    # both subsets, which mis-anchored val-subset interpretation.
     a("### Gait")
     a("")
+    gt = _subset_gt_reference(rows, sublabel)
     a("| variant | n_walk_seg | frac_both_swing | frac_both_stance | trans/sec | L_R_corr | step_period_rate |")
     a("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    a(
+        f"| **GT ({sublabel} subset)** | - | "
+        f"**{_fmt(gt.get('frac_both_swing'), 3)}** | "
+        f"**{_fmt(gt.get('frac_both_stance'), 3)}** | "
+        f"**{_fmt(gt.get('transitions_per_sec'), 3)}** | "
+        f"**{_fmt(gt.get('L_R_height_corr'), 3)}** | "
+        f"**{_pct(gt.get('step_period_rate'))}** |"
+    )
     for lbl in label_order:
         r = rows.get(lbl, {}).get(sublabel, {}).get("gait", {})
         a(
@@ -264,8 +327,12 @@ def _render_report(rows: dict) -> str:
     a("    used by the v2 48-clip mechanism screen — direct comparison).")
     a("  - **`val`**: 48-clip heldout-val balanced subset (generalization).")
     a("")
-    a("GT physical reference for gait: `both_swing=0.291`, `both_stance=0.153`,")
-    a("`trans/s=0.790`, `L_R_corr=-0.309`, `step_period_rate=26.6%`.")
+    a("GT walking reference for gait is shown per-subset inside each gait")
+    a("table (read from `gt_aggregate` in each variant's `gait_stats.json`).")
+    a("The train-subset and val-subset GT values differ because they are")
+    a("different 48 clips with different walking compositions; using one as")
+    a("a reference for the other (as v1 of this summarizer did) would")
+    a("mislead `both_stance` / `step_period_rate` interpretations.")
     a("")
 
     label_order = (

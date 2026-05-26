@@ -184,3 +184,27 @@ def test_full_dense_content_in_all_variants(tmp_path: Path) -> None:
         assert cfg["data"]["r29_interaction_variant"] == "I3-contact-offset-masked"
         assert cfg["data"]["r29_support_variant"] == "S4-S1-phase-footstep"
         assert cfg["data"]["r29_body_variant"] == "B4-lowpass-residual-mask"
+
+
+def test_no_init_checkpoint_in_yaml(tmp_path: Path) -> None:
+    """All 4 variants must train from scratch — no init_checkpoint key.
+
+    Codex v2 review §"Non-blocking" 2026-05-27: from-scratch is currently
+    enforced only by field absence + comments. This regression guard
+    ensures no future edit accidentally adds an init_checkpoint that
+    would warm-start one of these "from-scratch" variants.
+    """
+    cfg_dir, manifest = _run_generator(tmp_path)
+    for v in manifest["variants"]:
+        yaml_path = cfg_dir / Path(v["config_path"]).name
+        cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        training = cfg.get("training", {})
+        assert "init_checkpoint" not in training, (
+            f"{v['variant_id']} has training.init_checkpoint — these "
+            "variants must be from-scratch (no warm-start) per Codex review."
+        )
+        # Also guard against partial_init_allow_shape_mismatch slipping back in.
+        assert "partial_init_allow_shape_mismatch" not in training, (
+            f"{v['variant_id']} has training.partial_init_allow_shape_mismatch — "
+            "this field belonged to the deleted warm-start machinery (Tier-1b)."
+        )
