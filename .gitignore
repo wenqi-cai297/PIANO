@@ -41,6 +41,13 @@ cache/
 configs/accelerate_local_*.yaml
 configs/training/*_local.yaml
 
+# Round-29 ablation YAMLs are pure build artefacts emitted by
+# scripts/stage_b_generator/round29_make_stage2_cond_ablation_configs.py
+# and round29_make_tier2_ablation_configs.py. Each machine generates its
+# own (with the local data_root baked in) — they should NEVER be in the
+# repo. The generators + manifest are the source of truth.
+configs/training/anchordiff_r29_*.yaml
+
 # Local-machine launch scripts (PowerShell, Windows-specific paths).
 # Server uses bash + paths in PLAN.md.
 scripts/**/run_*_local_*.ps1
