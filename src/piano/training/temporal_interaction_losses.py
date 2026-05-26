@@ -110,6 +110,14 @@ class TemporalInteractionLossConfig:
     r29_support_both_airborne_weight: float = 0.0
     r29_support_stance_velocity_weight: float = 0.0
 
+    # Round-29 interaction-consistency normalization clamp. Must match
+    # the value used by ``piano.data.stage2_oracle_conditions.build_interaction_condition``
+    # (clamp before normalization → values in [-1, 1]). Configured via
+    # ``data.r29_hand_offset_clamp_m`` in the YAML. Pre-existing
+    # ``contact_rel_clamp_m`` above is for the R27 contact_rel_offset
+    # loss and is independent.
+    r29_hand_offset_clamp_m: float = 2.0
+
     # Hand-object thresholds.
     contact_threshold: float = 0.5
     """Frames with hand_contact < threshold are excluded."""

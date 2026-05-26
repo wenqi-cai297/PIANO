@@ -181,3 +181,73 @@ def test_val_best_key_matches_enabled_loss_strategy(tmp_path: Path) -> None:
             assert v["val_best_key"] == "loss_anchor_joint_pos"
             assert cfg["training"]["val_best_key"] == "loss_anchor_joint_pos"
             assert cfg["loss"]["anchor_joint_pos_weight"] > 0.0
+
+
+def test_step_fn_closure_does_not_reference_bare_cfg() -> None:
+    """Regression test for the 2026-05-27 bug where step_fn referenced
+    ``cfg.data.get(...)`` instead of pulling the value from its closure
+    scope (build_anchordiff_step_fn). step_fn is a closure built outside
+    main()'s scope, so the only valid config-like names it may reference
+    are its own kwargs (anchor_cfg, temporal_loss_cfg, etc.) — NOT the
+    bare ``cfg`` from main().
+
+    Failure mode caught: at first batch, ``NameError: name 'cfg' is not
+    defined`` would crash training. Pre-existing tests did not exercise
+    the step_fn path, so a YAML smoke run would always have caught it
+    earlier than a server training launch.
+    """
+    import ast
+
+    src_path = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "piano" / "training" / "train_anchordiff.py"
+    )
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+
+    builder_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_anchordiff_step_fn":
+            builder_fn = node
+            break
+    assert builder_fn is not None, "build_anchordiff_step_fn not found in train_anchordiff.py"
+
+    step_fn_node = None
+    for node in ast.walk(builder_fn):
+        if isinstance(node, ast.FunctionDef) and node.name == "step_fn":
+            step_fn_node = node
+            break
+    assert step_fn_node is not None, "step_fn closure not found inside build_anchordiff_step_fn"
+
+    # Walk step_fn's body for any bare `cfg` name read.
+    illegal_lines: list[int] = []
+    for node in ast.walk(step_fn_node):
+        if isinstance(node, ast.Name) and node.id == "cfg":
+            illegal_lines.append(node.lineno)
+        # Catch ``cfg.data.X`` / ``cfg.training.X`` attribute chains too.
+        if isinstance(node, ast.Attribute):
+            base = node
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id == "cfg":
+                illegal_lines.append(node.lineno)
+
+    assert not illegal_lines, (
+        "step_fn closure references bare ``cfg`` at line(s) "
+        f"{sorted(set(illegal_lines))} — this is a scope leak (cfg only "
+        "exists in main()). Pass the value as a kwarg to "
+        "build_anchordiff_step_fn or via temporal_loss_cfg instead."
+    )
+
+
+def test_temporal_interaction_loss_config_has_r29_hand_offset_clamp() -> None:
+    """Regression test: the R29 interaction-consistency loss needs the
+    hand_offset_clamp_m value that matches the dataset's I3 condition
+    builder. Both must read from the same source (data.r29_hand_offset_clamp_m).
+    """
+    from piano.training.temporal_interaction_losses import TemporalInteractionLossConfig
+
+    cfg = TemporalInteractionLossConfig()
+    assert hasattr(cfg, "r29_hand_offset_clamp_m")
+    # Default must match the dataset builder default (see
+    # piano.data.stage2_oracle_conditions.build_interaction_condition).
+    assert float(cfg.r29_hand_offset_clamp_m) == 2.0

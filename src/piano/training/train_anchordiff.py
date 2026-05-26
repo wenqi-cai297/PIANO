@@ -736,15 +736,14 @@ def build_anchordiff_step_fn(
                         "missing stage2_interaction. Enable an I-family variant "
                         "via data.r29_interaction_variant (e.g. I3-contact-offset-masked)."
                     )
-                _hand_clamp = float(
-                    cfg.data.get("r29_hand_offset_clamp_m", 2.0)
-                )
                 loss_r29_interaction_cons = loss_r29_interaction_consistency(
                     pred_joints=jpf,
                     object_positions=op_f, object_rotations=or_f,
                     stage2_interaction=cond["stage2_interaction"].float(),
                     cfg=temporal_loss_cfg, seq_mask=sm_f,
-                    hand_offset_clamp_m=_hand_clamp,
+                    hand_offset_clamp_m=float(
+                        getattr(temporal_loss_cfg, "r29_hand_offset_clamp_m", 2.0)
+                    ),
                 )
 
             # Round-29 P0 — support both-airborne. Walking mask comes
@@ -1474,6 +1473,11 @@ def main() -> None:
             ),
             r29_support_stance_velocity_weight=float(
                 _tloss.get("r29_support_stance_velocity_weight", 0.0)
+            ),
+            # Pulled from cfg.data (used by both the dataset's condition
+            # builder and the R29 interaction-consistency loss; must match).
+            r29_hand_offset_clamp_m=float(
+                cfg.data.get("r29_hand_offset_clamp_m", 2.0)
             ),
             contact_threshold=float(_tloss.get("contact_threshold", 0.5)),
             contact_rel_clamp_m=float(_tloss.get("contact_rel_clamp_m", 2.0)),
