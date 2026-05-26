@@ -294,17 +294,129 @@ def _diag_commands(
 # Run helpers
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], log_file: Path) -> int:
+def _run(cmd: list[str], log_file: Path, *, env_extra: dict[str, str] | None = None) -> int:
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[R29] $ {' '.join(shlex.quote(s) for s in cmd)}")
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    cuda_label = (
+        f" CUDA_VISIBLE_DEVICES={env_extra['CUDA_VISIBLE_DEVICES']}"
+        if env_extra and "CUDA_VISIBLE_DEVICES" in env_extra else ""
+    )
+    print(f"[R29]{cuda_label} $ {' '.join(shlex.quote(s) for s in cmd)}")
     with log_file.open("ab") as f:
-        ret = subprocess.run(cmd, cwd=str(ROOT), stdout=f, stderr=subprocess.STDOUT)
+        ret = subprocess.run(
+            cmd, cwd=str(ROOT), stdout=f, stderr=subprocess.STDOUT, env=env,
+        )
     return ret.returncode
 
 
-def _print_dry_run(label: str, cmd: list[str]) -> None:
-    print(f"[R29 DRY-RUN {label}]")
-    print(f"    $ {' '.join(shlex.quote(s) for s in cmd)}")
+def _print_dry_run(label: str, cmd: list[str], *, gpu_id: int | None = None) -> None:
+    gpu_label = f" [GPU {gpu_id}]" if gpu_id is not None else ""
+    print(f"[R29 DRY-RUN{gpu_label} {label}]")
+    if gpu_id is not None:
+        print(f"    $ CUDA_VISIBLE_DEVICES={gpu_id} \\\n        {' '.join(shlex.quote(s) for s in cmd)}")
+    else:
+        print(f"    $ {' '.join(shlex.quote(s) for s in cmd)}")
+
+
+# ---------------------------------------------------------------------------
+# Parallel diag scheduler — assign tasks to GPU pool with CUDA_VISIBLE_DEVICES
+# ---------------------------------------------------------------------------
+
+def _run_diag_pool(
+    tasks: list[tuple[dict, str, list[str], Path]],
+    *,
+    num_workers: int,
+    log_dir: Path,
+    dry_run: bool,
+) -> int:
+    """Run a list of (variant, kind, cmd, out_dir) diag tasks across
+    `num_workers` GPU workers in parallel.
+
+    Each worker is bound to a single GPU via ``CUDA_VISIBLE_DEVICES=<id>``
+    so the diag scripts (which always use ``cuda:0``) end up on different
+    physical GPUs without modifying the scripts themselves.
+
+    Tasks are pulled greedily — when any worker finishes, the next
+    queued task is launched on that worker's GPU. This keeps all GPUs
+    busy even when individual diags finish at different rates.
+
+    Returns the number of failed tasks (rc != 0).
+    """
+    if num_workers <= 0:
+        num_workers = 1
+
+    if dry_run:
+        # Round-robin assignment so the printout is readable.
+        for i, (v, kind, cmd, out_dir) in enumerate(tasks):
+            gpu = i % num_workers
+            _print_dry_run(f"{v['variant_id']} DIAG/{kind}", cmd, gpu_id=gpu)
+        print(f"[R29 DRY-RUN] {len(tasks)} diag tasks would run across "
+              f"{num_workers} GPUs ({(len(tasks) + num_workers - 1) // num_workers} batches max)")
+        return 0
+
+    # Process pool: at most `num_workers` subprocesses alive at once.
+    # Each Popen owns one GPU; when it exits we free the GPU for the next task.
+    queue: list[tuple[dict, str, list[str], Path]] = list(tasks)
+    in_flight: dict[int, tuple[subprocess.Popen, Path, dict, str, float]] = {}  # gpu -> (proc, log_path, v, kind, t0)
+    free_gpus: list[int] = list(range(num_workers))
+    failures = 0
+    completed = 0
+    total = len(tasks)
+
+    print(f"[R29] launching {total} diag tasks across {num_workers} GPU workers...")
+
+    while queue or in_flight:
+        # Start as many tasks as we have free GPUs + pending work.
+        while queue and free_gpus:
+            gpu = free_gpus.pop(0)
+            v, kind, cmd, out_dir = queue.pop(0)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{v['variant_id']}_diag_{kind}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            t0 = time.time()
+            cuda_label = f"CUDA_VISIBLE_DEVICES={gpu}"
+            print(f"[R29] [GPU {gpu}] START {v['variant_id']}/{kind}  log: {log_path}")
+            log_fp = log_path.open("ab")
+            proc = subprocess.Popen(
+                cmd, cwd=str(ROOT), stdout=log_fp, stderr=subprocess.STDOUT, env=env,
+            )
+            in_flight[gpu] = (proc, log_path, v, kind, t0, log_fp)  # type: ignore[assignment]
+
+        # Wait for any to finish (poll once per second).
+        if not in_flight:
+            break
+        done_gpu = None
+        while done_gpu is None:
+            for gpu, (proc, log_path, v, kind, t0, log_fp) in list(in_flight.items()):
+                rc = proc.poll()
+                if rc is not None:
+                    log_fp.close()
+                    dt = time.time() - t0
+                    done_gpu = gpu
+                    completed += 1
+                    if rc != 0:
+                        failures += 1
+                        print(f"[R29] [GPU {gpu}] FAIL  {v['variant_id']}/{kind}  rc={rc}  "
+                              f"({dt:.0f}s)  [{completed}/{total}]  log: {log_path}")
+                    else:
+                        print(f"[R29] [GPU {gpu}] DONE  {v['variant_id']}/{kind}  "
+                              f"({dt:.0f}s)  [{completed}/{total}]")
+                    del in_flight[gpu]
+                    free_gpus.append(gpu)
+                    break
+            else:
+                time.sleep(1.0)
+
+    if failures:
+        print(f"[R29] parallel diag: {failures}/{total} tasks failed.")
+    else:
+        print(f"[R29] parallel diag: all {total} tasks succeeded.")
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +464,19 @@ def main() -> int:
         help="Filename of the checkpoint diagnostics should evaluate "
              "(under <output_dir>/). Default: final.pt.",
     )
+    parser.add_argument(
+        "--parallel-diag-workers", type=int,
+        default=int(os.environ.get("ROUND29_PARALLEL_DIAG_WORKERS", "0")),
+        help=(
+            "Number of diag tasks to run in parallel, each pinned to a "
+            "different GPU via CUDA_VISIBLE_DEVICES. Default: 0 = match "
+            "--num-processes (1 GPU per worker, all GPUs used). Each "
+            "diag uses batch_size=1 internally so memory per worker is "
+            "small. Pass 1 to force serial. Each variant emits 3 diag "
+            "tasks (sustained_contact / gait / body_action), so 5 "
+            "variants × 3 = 15 tasks; with 3 workers ≈ 3× speedup."
+        ),
+    )
     args = parser.parse_args()
 
     # Auto-detect num_processes if not set explicitly.
@@ -363,6 +488,11 @@ def main() -> int:
             args.num_processes = 1
         print(f"[R29] auto-detected num_processes = {args.num_processes} "
               f"(override via --num-processes or ROUND29_NUM_PROCESSES env)")
+
+    # Diag parallelism defaults to num_processes (one diag per GPU).
+    if args.parallel_diag_workers <= 0:
+        args.parallel_diag_workers = args.num_processes
+    print(f"[R29] parallel_diag_workers = {args.parallel_diag_workers}")
 
     manifest = _ensure_manifest()
     variants = _pick_variants(manifest, args.group, args.only)
@@ -412,19 +542,23 @@ def main() -> int:
             return 1
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # =====================================================================
+    # PHASE 1: training (sequential — accelerate uses all GPUs per variant)
+    # =====================================================================
+    trained_ok: list[dict] = []  # variants whose training succeeded (or skipped)
     for v in variants:
         vid = v["variant_id"]
         log_path = LOG_DIR / f"{vid}.log"
         t0 = time.time()
         print()
         print("================================================================")
-        print(f"[{datetime.now():%F %T}] BEGIN {vid}  group={v['group']}")
+        print(f"[{datetime.now():%F %T}] TRAIN {vid}  group={v['group']}")
         print(f"    config: {v['config_path']}")
         print(f"    output: {v['output_dir']}")
         print(f"    log:    {log_path}")
         print("================================================================")
 
-        # TRAIN
         train_cmd = _train_command(
             v["config_path"],
             single_gpu=args.single_gpu,
@@ -432,36 +566,61 @@ def main() -> int:
         )
         if args.skip_train:
             print(f"--skip-train: skipping training for {vid}")
+            trained_ok.append(v)
         elif args.dry_run:
             _print_dry_run(f"{vid} TRAIN", train_cmd)
+            trained_ok.append(v)
         else:
             ret = _run(train_cmd, log_path)
             if ret != 0:
                 print(f"[R29] WARN: training failed for {vid} (rc={ret}); skipping diag")
                 continue
+            trained_ok.append(v)
+            print(f"[{datetime.now():%F %T}] DONE  TRAIN {vid} in {time.time() - t0:.0f}s")
 
-        # DIAGNOSTICS
-        if args.skip_eval:
-            print(f"--skip-eval: skipping diag for {vid}")
-        else:
+    # =====================================================================
+    # PHASE 2: diagnostics (parallel across GPUs via CUDA_VISIBLE_DEVICES)
+    # =====================================================================
+    if args.skip_eval:
+        print("--skip-eval: skipping diag for all variants")
+    elif not trained_ok:
+        print("[R29] No variants succeeded training; no diag tasks to run.")
+    else:
+        print()
+        print("================================================================")
+        print(f"[{datetime.now():%F %T}] DIAG PHASE  ({len(trained_ok)} variants, "
+              f"{args.parallel_diag_workers} GPU workers)")
+        print("================================================================")
+
+        # Build the global task pool. Skip variants whose diag ckpt is missing.
+        diag_tasks: list[tuple[dict, str, list[str], Path]] = []
+        for v in trained_ok:
+            vid = v["variant_id"]
+            ckpt = ROOT / v["output_dir"] / args.diag_ckpt_name
+            if not args.dry_run and not ckpt.exists():
+                if args.allow_missing_diag_inputs:
+                    print(f"[R29] WARN: diag ckpt missing for {vid}: {ckpt} (skipped)")
+                    continue
+                print(
+                    f"[R29] FATAL: diag ckpt missing for {vid}: {ckpt} — "
+                    "pass --allow-missing-diag-inputs to skip."
+                )
+                return 2
             for kind, cmd, out_dir in _diag_commands(
                 v, diag_ckpt_name=args.diag_ckpt_name,
             ):
-                if args.dry_run:
-                    _print_dry_run(f"{vid} DIAG/{kind}", cmd)
-                    continue
-                # Re-check the ckpt now (in real mode after training).
-                ckpt = ROOT / v["output_dir"] / args.diag_ckpt_name
-                if not ckpt.exists() and not args.allow_missing_diag_inputs:
-                    print(
-                        f"[R29] FATAL: diag ckpt missing for {vid}/{kind}: "
-                        f"{ckpt} — pass --allow-missing-diag-inputs to skip."
-                    )
-                    return 2
-                out_dir.mkdir(parents=True, exist_ok=True)
-                _run(cmd, log_path)
+                diag_tasks.append((v, kind, cmd, out_dir))
 
-        print(f"[{datetime.now():%F %T}] DONE  {vid} in {time.time() - t0:.0f}s")
+        if diag_tasks:
+            failures = _run_diag_pool(
+                diag_tasks,
+                num_workers=args.parallel_diag_workers,
+                log_dir=LOG_DIR,
+                dry_run=args.dry_run,
+            )
+            if failures > 0 and not args.allow_missing_diag_inputs:
+                print(f"[R29] WARN: {failures} diag task(s) failed; "
+                      "continuing to summarizer anyway.")
 
     # SUMMARIZE
     if not args.dry_run:

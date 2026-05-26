@@ -21,13 +21,19 @@
 #   all       -> all
 #
 # Environment overrides:
-#   ROUND29_SINGLE_GPU=1            run on a single GPU instead of accelerate launch
-#   ROUND29_NUM_PROCESSES=N         override accelerate --num_processes (default:
-#                                   auto-detect via nvidia-smi -L; falls back to 2)
-#   ROUND29_DIAG_CKPT_NAME=best_val.pt  diagnostic checkpoint filename
-#   ROUND29_INIT_CKPT=...           init checkpoint path (when regenerating configs)
+#   ROUND29_SINGLE_GPU=1                  single-GPU mode (no accelerate launch)
+#   ROUND29_NUM_PROCESSES=N               accelerate --num_processes (default:
+#                                         nvidia-smi -L count; falls back to 2)
+#   ROUND29_PARALLEL_DIAG_WORKERS=N       diag-phase parallel workers (default:
+#                                         ROUND29_NUM_PROCESSES; each worker
+#                                         pinned to one GPU via CUDA_VISIBLE_DEVICES)
+#   ROUND29_DIAG_CKPT_NAME=best_val.pt    diagnostic checkpoint filename
+#   ROUND29_INIT_CKPT=...                 init checkpoint path (when regenerating configs)
 #
-# Reviewed prompt section P1+P2 before fixing this launcher: yes.
+# Speedup vs the original sequential single-GPU diag: with N variants
+# × 3 diag kinds and W parallel workers, the diag phase finishes in
+# ceil((3*N) / W) sequential durations instead of 3*N. For A-group
+# (N=5, W=3) that's ~5 durations instead of 15, ≈ 3× faster.
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -50,6 +56,9 @@ elif command -v nvidia-smi >/dev/null 2>&1; then
 else
     NUM_PROCESSES=2
 fi
+# Diag parallelism — defaults to NUM_PROCESSES (one diag per GPU).
+# Override with --parallel-diag-workers N or ROUND29_PARALLEL_DIAG_WORKERS env.
+PARALLEL_DIAG_WORKERS="${ROUND29_PARALLEL_DIAG_WORKERS:-${NUM_PROCESSES}}"
 DIAG_CKPT_NAME="${ROUND29_DIAG_CKPT_NAME:-final.pt}"
 MANIFEST="analyses/round29_stage2_cond_ablation_manifest.json"
 LOG_DIR="runs/round29_stage2_cond_ablation"
@@ -68,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --allow-missing-diag-inputs) ALLOW_MISSING_DIAG=1; shift ;;
         --diag-ckpt-name) DIAG_CKPT_NAME="$2"; shift 2 ;;
         --num-processes) NUM_PROCESSES="$2"; shift 2 ;;
+        --parallel-diag-workers) PARALLEL_DIAG_WORKERS="$2"; shift 2 ;;
         --single-gpu)    SINGLE_GPU=1; shift ;;
         -h|--help)
             sed -n '1,33p' "$0"; exit 0 ;;
@@ -96,7 +106,7 @@ resolve_group() {
 
 GROUPS_RESOLVED="$(resolve_group "${GROUP}")"
 
-echo "[R29] launcher config: NUM_PROCESSES=${NUM_PROCESSES}  SINGLE_GPU=${SINGLE_GPU}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}"
+echo "[R29] launcher config: NUM_PROCESSES=${NUM_PROCESSES}  PARALLEL_DIAG_WORKERS=${PARALLEL_DIAG_WORKERS}  SINGLE_GPU=${SINGLE_GPU}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}"
 
 # Generate manifest if missing.
 if [[ ! -f "${MANIFEST}" ]]; then
@@ -213,23 +223,22 @@ if b not in ('train','val'): b = 'train'
 print(b)" "${sel}"
 }
 
-# Per-variant train + diag.
+# =============================================================================
+# PHASE 1: training — sequential (accelerate uses all GPUs per variant)
+# =============================================================================
+TRAINED_OK=""   # accumulate "VID GRP CFG OUTDIR SUBSET INIT_CKPT" lines, one per success
 while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
     [[ -z "${VID}" ]] && continue
     LOG="${LOG_DIR}/${VID}.log"
-    BUCKET="$(selection_bucket "${SUBSET}")"
-    CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
 
     echo
     echo "================================================================"
-    echo "[$(date '+%F %T')] BEGIN ${VID}  group=${GRP}"
+    echo "[$(date '+%F %T')] TRAIN ${VID}  group=${GRP}"
     echo "    config:  ${CFG}"
     echo "    output:  ${OUTDIR}"
-    echo "    subset:  ${SUBSET}  bucket=${BUCKET}"
     echo "    log:     ${LOG}"
     echo "================================================================"
 
-    # TRAIN
     # When ${NUM_PROCESSES} == 1, fall through to the single-GPU path so we
     # don't pay the accelerate-launch overhead with no actual distribution.
     if [[ ${SKIP_TRAIN} -eq 0 ]]; then
@@ -243,15 +252,55 @@ while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
         if [[ ${DRY_RUN} -eq 1 ]]; then
             echo "[R29 DRY-RUN ${VID} TRAIN]  (NUM_PROCESSES=${NUM_PROCESSES})"
             echo "    \$ ${TRAIN_CMD[*]}"
+            TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
         else
-            "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"
+            if "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"; then
+                TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
+            else
+                echo "[R29] WARN: training failed for ${VID}; skipping diag"
+            fi
         fi
     else
         echo "--skip-train: skipping training for ${VID}"
+        TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
     fi
+done <<< "${VARIANTS}"
 
-    # DIAGNOSTICS — call with the actual diag CLI.
-    if [[ ${SKIP_EVAL} -eq 0 ]]; then
+# =============================================================================
+# PHASE 2: diagnostics — parallel via CUDA_VISIBLE_DEVICES on N workers.
+# Each variant emits 3 diag tasks (sustained_contact / gait / body_action),
+# so 5 variants × 3 = 15 tasks; with 3 workers ≈ 3× speedup.
+# =============================================================================
+if [[ ${SKIP_EVAL} -eq 1 ]]; then
+    echo
+    echo "--skip-eval: skipping diag for all variants"
+elif [[ -z "${TRAINED_OK}" ]]; then
+    echo "[R29] No variants succeeded training; no diag tasks to run."
+else
+    echo
+    echo "================================================================"
+    echo "[$(date '+%F %T')] DIAG PHASE  (parallel, workers=${PARALLEL_DIAG_WORKERS})"
+    echo "================================================================"
+
+    # Build the diag-task queue (one line per (vid, kind, cmd) triple).
+    # Using a temp file because bash arrays-of-arrays are clumsy.
+    TASK_QUEUE="$(mktemp -t r29_diag_tasks.XXXXXX)"
+    trap "rm -f '${TASK_QUEUE}'" EXIT
+
+    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+        [[ -z "${VID}" ]] && continue
+        BUCKET="$(selection_bucket "${SUBSET}")"
+        CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
+        # Pre-flight: ckpt must exist (unless allowed missing).
+        if [[ ! -e "${CKPT_PATH}" ]]; then
+            if [[ ${ALLOW_MISSING_DIAG} -eq 1 ]]; then
+                echo "[R29] WARN: diag ckpt missing for ${VID}: ${CKPT_PATH} (skipped)"
+                continue
+            fi
+            echo "[R29] FATAL: diag ckpt missing for ${VID}: ${CKPT_PATH}"
+            echo "      Pass --allow-missing-diag-inputs to skip."
+            exit 2
+        fi
         for kind in sustained_contact gait body_action; do
             case "${kind}" in
                 sustained_contact) DIAG_SCRIPT="scripts/stage_b_generator/round26_sustained_contact_diag.py" ;;
@@ -259,29 +308,86 @@ while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
                 body_action)       DIAG_SCRIPT="scripts/stage_b_generator/round28_body_action_diag.py" ;;
             esac
             OUT_DIR="analyses/round29_${VID}_diag_${kind}"
-            CMD=("${PY}" -u "${DIAG_SCRIPT}" \
-                 --config "${CFG}" \
-                 --ckpt "${CKPT_PATH}" \
-                 --selection-json "${SUBSET}" \
-                 --output-dir "${OUT_DIR}" \
-                 --bucket "${BUCKET}")
-            if [[ ${DRY_RUN} -eq 1 ]]; then
-                echo "[R29 DRY-RUN ${VID} DIAG/${kind}]"
-                echo "    \$ ${CMD[*]}"
-                continue
-            fi
-            if [[ ! -e "${CKPT_PATH}" && ${ALLOW_MISSING_DIAG} -eq 0 ]]; then
-                echo "[R29] FATAL: diag ckpt missing for ${VID}/${kind}: ${CKPT_PATH}"
-                echo "      Pass --allow-missing-diag-inputs to skip."
-                exit 2
-            fi
             mkdir -p "${OUT_DIR}"
-            "${CMD[@]}" 2>&1 | tee -a "${LOG}" || true
+            # Tab-separated so spaces in args (none here) wouldn't bite.
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${VID}" "${kind}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${SUBSET}" "${BUCKET}" \
+                >> "${TASK_QUEUE}"
         done
+    done <<< "${TRAINED_OK}"
+
+    N_TASKS="$(wc -l < "${TASK_QUEUE}")"
+    echo "[R29] ${N_TASKS} diag tasks queued; launching ${PARALLEL_DIAG_WORKERS} GPU workers..."
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        # Just print what would run, round-robin across GPUs.
+        IDX=0
+        while IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET; do
+            GPU=$((IDX % PARALLEL_DIAG_WORKERS))
+            OUT_DIR="analyses/round29_${VID}_diag_${KIND}"
+            echo "[R29 DRY-RUN [GPU ${GPU}] ${VID} DIAG/${KIND}]"
+            echo "    \$ CUDA_VISIBLE_DEVICES=${GPU} ${PY} -u ${DIAG_SCRIPT} --config ${CFG} --ckpt ${CKPT_PATH} --selection-json ${SUBSET} --output-dir ${OUT_DIR} --bucket ${BUCKET}"
+            IDX=$((IDX + 1))
+        done < "${TASK_QUEUE}"
+        echo "[R29 DRY-RUN] ${N_TASKS} diag tasks across ${PARALLEL_DIAG_WORKERS} GPUs"
     else
-        echo "--skip-eval: skipping diag for ${VID}"
+        # Real parallel run: per-GPU worker subshell pulls from the queue via flock.
+        QUEUE_LOCK="${TASK_QUEUE}.lock"
+        : > "${QUEUE_LOCK}"
+        WORKER_PIDS=()
+        for ((W = 0; W < PARALLEL_DIAG_WORKERS; W++)); do
+            (
+                while true; do
+                    # Atomically take the first remaining line.
+                    TASK_LINE="$(
+                        flock -x "${QUEUE_LOCK}" -c "
+                            line=\$(head -n 1 '${TASK_QUEUE}')
+                            if [[ -n \"\$line\" ]]; then
+                                sed -i '1d' '${TASK_QUEUE}'
+                                echo \"\$line\"
+                            fi
+                        "
+                    )"
+                    [[ -z "${TASK_LINE}" ]] && break
+                    IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET <<< "${TASK_LINE}"
+                    OUT_DIR="analyses/round29_${VID}_diag_${KIND}"
+                    DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
+                    T0=$(date +%s)
+                    echo "[R29] [GPU ${W}] START ${VID}/${KIND}  log: ${DIAG_LOG}"
+                    CUDA_VISIBLE_DEVICES="${W}" \
+                        "${PY}" -u "${DIAG_SCRIPT}" \
+                        --config "${CFG}" \
+                        --ckpt "${CKPT_PATH}" \
+                        --selection-json "${SUBSET}" \
+                        --output-dir "${OUT_DIR}" \
+                        --bucket "${BUCKET}" \
+                        >> "${DIAG_LOG}" 2>&1
+                    RC=$?
+                    T1=$(date +%s)
+                    if [[ ${RC} -eq 0 ]]; then
+                        echo "[R29] [GPU ${W}] DONE  ${VID}/${KIND}  ($((T1 - T0))s)"
+                    else
+                        echo "[R29] [GPU ${W}] FAIL  ${VID}/${KIND}  rc=${RC} ($((T1 - T0))s)  log: ${DIAG_LOG}"
+                    fi
+                done
+            ) &
+            WORKER_PIDS+=($!)
+        done
+        # Wait for all workers; collect any failure.
+        DIAG_FAILED=0
+        for pid in "${WORKER_PIDS[@]}"; do
+            if ! wait "${pid}"; then
+                DIAG_FAILED=1
+            fi
+        done
+        rm -f "${QUEUE_LOCK}"
+        if [[ ${DIAG_FAILED} -ne 0 ]]; then
+            echo "[R29] parallel diag: some tasks failed (see per-task logs above)."
+        else
+            echo "[R29] parallel diag: all tasks succeeded."
+        fi
     fi
-done <<< "${VARIANTS}"
+fi
 
 # Summarize.
 if [[ ${DRY_RUN} -eq 0 ]]; then
