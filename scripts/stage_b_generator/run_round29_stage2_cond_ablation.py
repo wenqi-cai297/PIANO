@@ -23,6 +23,21 @@ Per the Codex post-review prompt (2026-05-26), this launcher:
     files).
   * Runs the summarizer at the end and packs results.
 
+Two-phase execution (applies to ALL groups, A through F):
+
+  Phase 1 TRAIN — for each selected variant, train sequentially. Each
+  training run uses all available GPUs via accelerate launch
+  --num_processes <N> (default N = nvidia-smi -L count).
+
+  Phase 2 DIAG  — pool the 3 diag kinds × N selected variants into a
+  single task queue, and run W tasks in parallel where each worker is
+  pinned to one GPU via CUDA_VISIBLE_DEVICES. Default W = N. Speedup
+  is roughly W× vs the original sequential single-GPU diag:
+      A (5 variants)  → 15 tasks → 5 batches on 3 GPUs
+      B (7 variants)  → 21 tasks → 7 batches
+      E (8 variants)  → 24 tasks → 8 batches
+      all (36)        → 108 tasks → 36 batches
+
 Usage:
     python scripts/stage_b_generator/run_round29_stage2_cond_ablation.py --group injection --dry-run
     python scripts/stage_b_generator/run_round29_stage2_cond_ablation.py --group content

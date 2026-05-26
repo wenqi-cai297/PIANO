@@ -31,9 +31,13 @@
 #   ROUND29_INIT_CKPT=...                 init checkpoint path (when regenerating configs)
 #
 # Speedup vs the original sequential single-GPU diag: with N variants
-# × 3 diag kinds and W parallel workers, the diag phase finishes in
-# ceil((3*N) / W) sequential durations instead of 3*N. For A-group
-# (N=5, W=3) that's ~5 durations instead of 15, ≈ 3× faster.
+# selected (via --group / --only) and 3 diag kinds per variant, and W
+# parallel workers, the diag phase finishes in ceil((3*N) / W)
+# sequential durations instead of 3*N. Applies to every group:
+#   A (5 variants) → 15 tasks → 5 batches on 3 GPUs (~3× faster)
+#   B (7 variants) → 21 tasks → 7 batches
+#   E (8 variants) → 24 tasks → 8 batches
+#   all (36)       → 108 tasks → 36 batches
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
