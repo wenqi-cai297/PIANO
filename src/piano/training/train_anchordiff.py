@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -1566,15 +1567,24 @@ def main() -> None:
         return
 
     # --- Wandb (optional) ---
+    # Honour WANDB_MODE env (e.g. WANDB_MODE=offline / WANDB_DISABLED=true).
+    # Any init failure (no API key, no network, no install) is non-fatal —
+    # training continues with wandb_run=None and metrics still go to
+    # metrics.jsonl + accelerator.print.
     wandb_run = None
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and os.environ.get("WANDB_DISABLED", "").lower() not in ("1", "true", "yes"):
         try:
             import wandb
             wandb_run = wandb.init(
                 project=cfg.logging.project, name=cfg.logging.run_name,
             )
-        except ImportError:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            accelerator.print(
+                f"[wandb] init failed ({type(exc).__name__}: {exc}); "
+                "continuing without wandb. Set WANDB_DISABLED=1 to silence, "
+                "or run `wandb login` to enable."
+            )
+            wandb_run = None
 
     # Calibration / dynamic feature-weighting was a motion_263-only Round-28
     # feature. Removed alongside FeatureWeightState in the Tier-1 cleanup.
