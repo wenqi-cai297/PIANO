@@ -82,7 +82,8 @@ only = sys.argv[2]
 want_only = set(only.split(",")) if only else None
 for v in m["variants"]:
     if want_only is not None and v["variant_id"] not in want_only: continue
-    print(v["variant_id"], v["config_path"], v["output_dir"], v["subset_file"])
+    print(v["variant_id"], v["config_path"], v["output_dir"],
+          v["diag_train_subset"], v["diag_val_subset"])
 '
 VARIANTS="$("${PY}" -c "${PICK_SCRIPT}" "${MANIFEST}" "${ONLY}")"
 
@@ -97,9 +98,9 @@ echo "${VARIANTS}"
 # (3) Preflight.
 if [[ ${DRY_RUN} -eq 0 ]]; then
     preflight_fail=0
-    while IFS=' ' read -r VID CFG OUTDIR SUBSET; do
+    while IFS=' ' read -r VID CFG OUTDIR TRAIN_SUBSET VAL_SUBSET; do
         [[ -z "${VID}" ]] && continue
-        for p in "${CFG}" "${SUBSET}"; do
+        for p in "${CFG}" "${TRAIN_SUBSET}" "${VAL_SUBSET}"; do
             if [[ ! -e "${p}" ]]; then
                 echo "    [${VID}] missing: ${p}"
                 preflight_fail=1
@@ -133,7 +134,7 @@ fi
 
 # (4) PHASE 1: TRAIN sequentially.
 TRAINED_OK=""
-while IFS=' ' read -r VID CFG OUTDIR SUBSET; do
+while IFS=' ' read -r VID CFG OUTDIR TRAIN_SUBSET VAL_SUBSET; do
     [[ -z "${VID}" ]] && continue
     LOG="${LOG_DIR}/${VID}.log"
     echo
@@ -155,17 +156,17 @@ while IFS=' ' read -r VID CFG OUTDIR SUBSET; do
         if [[ ${DRY_RUN} -eq 1 ]]; then
             echo "[T2 DRY-RUN ${VID} TRAIN]"
             echo "    \$ ${TRAIN_CMD[*]}"
-            TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
+            TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${TRAIN_SUBSET} ${VAL_SUBSET}"$'\n'
         else
             if "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"; then
-                TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
+                TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${TRAIN_SUBSET} ${VAL_SUBSET}"$'\n'
             else
                 echo "[T2] WARN: training failed for ${VID}; skipping diag"
             fi
         fi
     else
         echo "--skip-train: skipping training for ${VID}"
-        TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
+        TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR} ${TRAIN_SUBSET} ${VAL_SUBSET}"$'\n'
     fi
 done <<< "${VARIANTS}"
 
@@ -184,36 +185,32 @@ else
     TASK_QUEUE="$(mktemp -t t2_diag_tasks.XXXXXX)"
     trap "rm -f '${TASK_QUEUE}' '${TASK_QUEUE}.lock'" EXIT
 
-    selection_bucket() {
-        local sel="$1"
-        if [[ ! -e "${sel}" ]]; then echo "train"; return; fi
-        "${PY}" -c "
-import json, sys
-data = json.load(open(sys.argv[1]))
-b = data.get('bucket', 'train')
-if b not in ('train','val'): b = 'train'
-print(b)" "${sel}"
-    }
-
-    while IFS=' ' read -r VID CFG OUTDIR SUBSET; do
+    while IFS=' ' read -r VID CFG OUTDIR TRAIN_SUBSET VAL_SUBSET; do
         [[ -z "${VID}" ]] && continue
-        BUCKET="$(selection_bucket "${SUBSET}")"
         CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
         if [[ ! -e "${CKPT_PATH}" && ${DRY_RUN} -eq 0 ]]; then
             echo "[T2] WARN: diag ckpt missing: ${CKPT_PATH} (skipped)"
             continue
         fi
+        # 3 diag kinds × 2 selection subsets = 6 tasks per variant.
+        # Subset labels: "train" = in-distribution sanity, "val" = generalization.
         for kind in sustained_contact gait body_action; do
             case "${kind}" in
                 sustained_contact) DIAG_SCRIPT="scripts/stage_b_generator/round26_sustained_contact_diag.py" ;;
                 gait)              DIAG_SCRIPT="scripts/stage_b_generator/round26_gait_diag.py" ;;
                 body_action)       DIAG_SCRIPT="scripts/stage_b_generator/round28_body_action_diag.py" ;;
             esac
-            OUT_DIR="analyses/round29_${VID}_diag_${kind}"
-            mkdir -p "${OUT_DIR}"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "${VID}" "${kind}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${SUBSET}" "${BUCKET}" \
-                >> "${TASK_QUEUE}"
+            for sublabel in train val; do
+                case "${sublabel}" in
+                    train) SUBSET_PATH="${TRAIN_SUBSET}" ;;
+                    val)   SUBSET_PATH="${VAL_SUBSET}" ;;
+                esac
+                OUT_DIR="analyses/round29_${VID}_diag_${kind}_${sublabel}"
+                mkdir -p "${OUT_DIR}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "${VID}" "${kind}_${sublabel}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${SUBSET_PATH}" "${sublabel}" \
+                    >> "${TASK_QUEUE}"
+            done
         done
     done <<< "${TRAINED_OK}"
 

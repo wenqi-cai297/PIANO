@@ -37,7 +37,11 @@ SKIP_TRAIN=0
 SKIP_EVAL=0
 SINGLE_GPU="${ROUND29_SINGLE_GPU:-0}"
 DIAG_CKPT_NAME="${ROUND29_DIAG_CKPT_NAME:-final.pt}"
-SELECTION_JSON="analyses/round27_tier0_train_indices_48_balanced.json"
+# Two 48-clip selections — diag runs on both for fair comparison:
+#   train  = in-distribution sanity (same selection a-group used)
+#   val    = heldout-val generalization (built by round29_build_val_diag_subset.py)
+SELECTION_TRAIN="analyses/round27_tier0_train_indices_48_balanced.json"
+SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
 
 if [[ -n "${ROUND29_NUM_PROCESSES:-}" ]]; then
     NUM_PROCESSES="${ROUND29_NUM_PROCESSES}"
@@ -109,10 +113,15 @@ if [[ ${DRY_RUN} -eq 0 ]]; then
             preflight_fail=1
         fi
     done
-    if [[ ! -e "${SELECTION_JSON}" ]]; then
-        echo "    missing selection JSON: ${SELECTION_JSON}"
-        preflight_fail=1
-    fi
+    for sel in "${SELECTION_TRAIN}" "${SELECTION_VAL}"; do
+        if [[ ! -e "${sel}" ]]; then
+            echo "    missing selection JSON: ${sel}"
+            if [[ "${sel}" == "${SELECTION_VAL}" ]]; then
+                echo "    -> generate it with: python scripts/stage_b_generator/round29_build_val_diag_subset.py --config ${VARIANT_CFG[${SELECTED[0]}]}"
+            fi
+            preflight_fail=1
+        fi
+    done
     # Dataset roots — parse first config.
     if [[ ${SKIP_TRAIN} -eq 0 ]]; then
         FIRST_CFG="${VARIANT_CFG[${SELECTED[0]}]}"
@@ -193,13 +202,6 @@ else
     TASK_QUEUE="$(mktemp -t a23_diag_tasks.XXXXXX)"
     trap "rm -f '${TASK_QUEUE}' '${TASK_QUEUE}.lock'" EXIT
 
-    BUCKET="$("${PY}" -c "
-import json, sys
-data = json.load(open(sys.argv[1]))
-b = data.get('bucket', 'train')
-if b not in ('train','val'): b = 'train'
-print(b)" "${SELECTION_JSON}")"
-
     for VID in "${TRAINED_OK[@]}"; do
         CFG="${VARIANT_CFG[$VID]}"
         OUTDIR="${VARIANT_OUT[$VID]}"
@@ -208,17 +210,24 @@ print(b)" "${SELECTION_JSON}")"
             echo "[A23] WARN: diag ckpt missing: ${CKPT_PATH} (skipped)"
             continue
         fi
+        # 3 diag kinds × 2 selection buckets = 6 tasks per variant.
         for kind in sustained_contact gait body_action; do
             case "${kind}" in
                 sustained_contact) DIAG_SCRIPT="scripts/stage_b_generator/round26_sustained_contact_diag.py" ;;
                 gait)              DIAG_SCRIPT="scripts/stage_b_generator/round26_gait_diag.py" ;;
                 body_action)       DIAG_SCRIPT="scripts/stage_b_generator/round28_body_action_diag.py" ;;
             esac
-            OUT_DIR="analyses/round29_full_${VID}_diag_${kind}"
-            mkdir -p "${OUT_DIR}"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "${VID}" "${kind}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${BUCKET}" \
-                >> "${TASK_QUEUE}"
+            for sublabel in train val; do
+                case "${sublabel}" in
+                    train) SUBSET_PATH="${SELECTION_TRAIN}" ;;
+                    val)   SUBSET_PATH="${SELECTION_VAL}" ;;
+                esac
+                OUT_DIR="analyses/round29_full_${VID}_diag_${kind}_${sublabel}"
+                mkdir -p "${OUT_DIR}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "${VID}" "${kind}_${sublabel}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${SUBSET_PATH}" "${sublabel}" \
+                    >> "${TASK_QUEUE}"
+            done
         done
     done
 
@@ -227,11 +236,11 @@ print(b)" "${SELECTION_JSON}")"
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
         IDX=0
-        while IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH BUCKET; do
+        while IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET; do
             GPU=$((IDX % PARALLEL_DIAG_WORKERS))
             OUT_DIR="analyses/round29_full_${VID}_diag_${KIND}"
             echo "[A23 DRY-RUN [GPU ${GPU}] ${VID} DIAG/${KIND}]"
-            echo "    \$ CUDA_VISIBLE_DEVICES=${GPU} ${PY} -u ${DIAG_SCRIPT} --config ${CFG} --ckpt ${CKPT_PATH} --selection-json ${SELECTION_JSON} --output-dir ${OUT_DIR} --bucket ${BUCKET}"
+            echo "    \$ CUDA_VISIBLE_DEVICES=${GPU} ${PY} -u ${DIAG_SCRIPT} --config ${CFG} --ckpt ${CKPT_PATH} --selection-json ${SUBSET} --output-dir ${OUT_DIR} --bucket ${BUCKET}"
             IDX=$((IDX + 1))
         done < "${TASK_QUEUE}"
     else
@@ -254,7 +263,7 @@ print(b)" "${SELECTION_JSON}")"
                         "
                     )"
                     [[ -z "${TASK_LINE}" ]] && break
-                    IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH BUCKET <<< "${TASK_LINE}"
+                    IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET <<< "${TASK_LINE}"
                     OUT_DIR="analyses/round29_full_${VID}_diag_${KIND}"
                     DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
                     T0=$(date +%s)
@@ -265,7 +274,7 @@ print(b)" "${SELECTION_JSON}")"
                         "${PY}" -u "${DIAG_SCRIPT}" \
                         --config "${CFG}" \
                         --ckpt "${CKPT_PATH}" \
-                        --selection-json "${SELECTION_JSON}" \
+                        --selection-json "${SUBSET}" \
                         --output-dir "${OUT_DIR}" \
                         --bucket "${BUCKET}" \
                         > "${DIAG_LOG}" 2>&1
