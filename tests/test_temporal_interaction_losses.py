@@ -29,6 +29,9 @@ from piano.training.temporal_interaction_losses import (
     loss_contact_tracking_projection,
     loss_gait_both_airborne,
     loss_gait_stance_velocity,
+    loss_r29_interaction_consistency,
+    loss_r29_support_both_airborne,
+    loss_r29_support_stance_velocity,
 )
 
 
@@ -380,5 +383,269 @@ def test_object_local_frame_under_90deg_rotation():
     assert torch.isfinite(loss_id) and torch.isfinite(loss_rot)
     assert loss_id.item() > 1e-6 and loss_rot.item() > 1e-6
     assert loss_rot.item() == pytest.approx(loss_id.item(), rel=1e-3, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Round-29 condition-consistency losses (loss strategy ablation)
+# Per analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md
+# ---------------------------------------------------------------------------
+
+
+def _build_i3_condition(
+    gt_joints: torch.Tensor,
+    obj_pos: torch.Tensor,
+    obj_rot: torch.Tensor,
+    contact_state: torch.Tensor,
+    hand_offset_clamp_m: float = 2.0,
+) -> torch.Tensor:
+    """Build a synthetic (B, T, 8) I3 condition tensor that matches the
+    dataset-side builder ``build_interaction_condition('I3-...')``:
+
+        [..., 0:2] = hand_contact  (L, R) soft 0..1
+        [..., 2:8] = (rel_norm * hand_contact)[..., L/R, xyz] flattened,
+                     where rel_norm = clamp(R_obj.T @ (wrist - obj_pos),
+                                            ±clamp_m) / clamp_m
+    """
+    from piano.training.temporal_interaction_losses import (
+        _axis_angle_to_matrix_t,
+        _wrist_object_local,
+        _wrist_world_pred_gt,
+    )
+    R_obj = _axis_angle_to_matrix_t(obj_rot)                                   # (B, T, 3, 3)
+    pw, _ = _wrist_world_pred_gt(gt_joints, gt_joints)                         # (B, T, 2, 3)
+    rel = _wrist_object_local(pw, obj_pos, R_obj)                              # (B, T, 2, 3)
+    rel = rel.clamp(-hand_offset_clamp_m, hand_offset_clamp_m)
+    rel_norm = rel / float(hand_offset_clamp_m)
+    hand_contact = contact_state[..., 0:2].clamp(0.0, 1.0)                     # (B, T, 2)
+    target_offset = rel_norm * hand_contact.unsqueeze(-1)                      # (B, T, 2, 3)
+    return torch.cat(
+        [hand_contact, target_offset.reshape(*target_offset.shape[:2], 6)],
+        dim=-1,
+    )                                                                           # (B, T, 8)
+
+
+def _build_s4_condition(
+    walking_mask: torch.Tensor,        # (B, T, 1)
+    foot_stance: torch.Tensor,         # (B, T, 2)
+) -> torch.Tensor:
+    """Build a minimal (B, T, 13) S4-shaped condition. We only need
+    the first 5 channels for the R29 support losses; the rest are
+    zero-filled per the prompt §1 layout."""
+    B, T, _ = walking_mask.shape
+    height_norm = torch.zeros(B, T, 2, dtype=walking_mask.dtype)
+    s1 = torch.cat([foot_stance, height_norm, walking_mask], dim=-1)           # (B, T, 5)
+    phase_pad = torch.zeros(B, T, 4, dtype=walking_mask.dtype)                 # S2 phase
+    footstep_pad = torch.zeros(B, T, 4, dtype=walking_mask.dtype)              # S3 footstep
+    return torch.cat([s1, phase_pad, footstep_pad], dim=-1)                    # (B, T, 13)
+
+
+# ----- R29 interaction consistency -----------------------------------
+
+
+def test_r29_interaction_consistency_zero_when_pred_eq_gt():
+    joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
+    stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, contact_state)
+    loss = loss_r29_interaction_consistency(
+        pred_joints=joints,
+        object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=stage2_int, cfg=_default_cfg(),
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() < 1e-6
+
+
+def test_r29_interaction_consistency_positive_on_perturbation():
+    joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
+    stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, contact_state)
+    pred = joints.clone()
+    pred[:, :, LEFT_WRIST_IDX, 0] += 0.15
+    loss = loss_r29_interaction_consistency(
+        pred_joints=pred,
+        object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=stage2_int, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_interaction_consistency_empty_mask_returns_zero():
+    joints, obj_pos, obj_rot, _contact_state, _, _ = _make_clip(with_contact=False)
+    # No contact frames anywhere → hand_contact == 0 everywhere.
+    zero_contact = torch.zeros_like(_contact_state)
+    stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, zero_contact)
+    pred = joints.clone()
+    pred[:, :, LEFT_WRIST_IDX, 0] += 0.50  # large perturbation, but mask is empty
+    loss = loss_r29_interaction_consistency(
+        pred_joints=pred,
+        object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=stage2_int, cfg=_default_cfg(),
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+
+
+def test_r29_interaction_consistency_wrong_dim_raises():
+    joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
+    # Pass an I2-shaped (B, T, 6) tensor — should reject with ValueError.
+    bad_cond = torch.zeros(joints.shape[0], joints.shape[1], 6, dtype=joints.dtype)
+    with pytest.raises(ValueError, match="I3 layout"):
+        loss_r29_interaction_consistency(
+            pred_joints=joints,
+            object_positions=obj_pos, object_rotations=obj_rot,
+            stage2_interaction=bad_cond, cfg=_default_cfg(),
+        )
+
+
+def test_r29_interaction_consistency_gradient_flows():
+    joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
+    stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, contact_state)
+    pred = joints.clone()
+    pred[:, :, LEFT_WRIST_IDX, 0] += 0.10
+    pred.requires_grad_(True)
+    loss = loss_r29_interaction_consistency(
+        pred_joints=pred,
+        object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=stage2_int, cfg=_default_cfg(),
+    )
+    loss.backward()
+    assert pred.grad is not None
+    assert pred.grad.abs().sum().item() > 0.0
+
+
+# ----- R29 support both-airborne -------------------------------------
+
+
+def test_r29_support_both_airborne_zero_when_ankle_grounded():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    loss = loss_r29_support_both_airborne(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    # Ankles in fixture sit at y=0 (floor); both grounded with sigmoid
+    # softness=3cm gives grounded_prob ≈ 0.965 each, so (1-L_g)(1-R_g) ≈ 1.2e-3.
+    # Should be much smaller than the airborne-feet case (which is order 1.0).
+    assert torch.isfinite(loss)
+    assert loss.item() < 5e-3
+
+
+def test_r29_support_both_airborne_positive_when_both_feet_up():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    # Lift BOTH ankles to 50 cm — both airborne.
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.50
+    pred[:, :, RIGHT_ANKLE_IDX, 1] = 0.50
+    loss = loss_r29_support_both_airborne(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_support_both_airborne_empty_walking_returns_zero():
+    joints, _, _, _, _, foot_stance = _make_clip(with_walking=False)
+    walking_mask = torch.zeros(1, joints.shape[1], 1)
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.50
+    pred[:, :, RIGHT_ANKLE_IDX, 1] = 0.50
+    loss = loss_r29_support_both_airborne(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+
+
+def test_r29_support_both_airborne_gradient_flows():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.30
+    pred[:, :, RIGHT_ANKLE_IDX, 1] = 0.30
+    pred.requires_grad_(True)
+    loss = loss_r29_support_both_airborne(
+        pred_joints=pred, gt_joints=joints.detach(),
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    loss.backward()
+    assert pred.grad is not None
+    assert pred.grad.abs().sum().item() > 0.0
+
+
+def test_r29_support_both_airborne_low_dim_raises():
+    """An S0-dim (or any dim<5) support condition must raise — the
+    walking-mask slice does not exist."""
+    joints, _, _, _, _, _ = _make_clip()
+    bad = torch.zeros(joints.shape[0], joints.shape[1], 4, dtype=joints.dtype)
+    with pytest.raises(ValueError, match="at least 5 channels"):
+        loss_r29_support_both_airborne(
+            pred_joints=joints, gt_joints=joints,
+            stage2_support=bad, cfg=_default_cfg(),
+        )
+
+
+# ----- R29 support stance velocity -----------------------------------
+
+
+def test_r29_support_stance_velocity_zero_when_feet_still():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    # Ankles are stationary across t in _make_clip → zero stance velocity.
+    loss = loss_r29_support_stance_velocity(
+        pred_joints=joints,
+        stage2_support=stage2_sup,
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() < 1e-6
+
+
+def test_r29_support_stance_velocity_positive_when_stance_foot_slides():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    T = pred.shape[1]
+    # Slide left ankle +0.025 m/frame in +X.
+    pred[:, :, LEFT_ANKLE_IDX, 0] = 0.1 + 0.025 * torch.arange(T, dtype=torch.float32)
+    loss = loss_r29_support_stance_velocity(
+        pred_joints=pred,
+        stage2_support=stage2_sup,
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_support_stance_velocity_empty_returns_zero():
+    """No walking frames AND no stance → finite zero."""
+    joints, _, _, _, _, _ = _make_clip(with_walking=False)
+    walking_mask = torch.zeros(1, joints.shape[1], 1)
+    foot_stance = torch.zeros(1, joints.shape[1], 2)
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 0] = 0.1 + 0.025 * torch.arange(
+        pred.shape[1], dtype=torch.float32,
+    )
+    loss = loss_r29_support_stance_velocity(
+        pred_joints=pred,
+        stage2_support=stage2_sup,
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+
+
+def test_r29_support_stance_velocity_gradient_flows():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 0] = 0.1 + 0.025 * torch.arange(
+        pred.shape[1], dtype=torch.float32,
+    )
+    pred.requires_grad_(True)
+    loss = loss_r29_support_stance_velocity(
+        pred_joints=pred,
+        stage2_support=stage2_sup,
+    )
+    loss.backward()
+    assert pred.grad is not None
+    assert pred.grad.abs().sum().item() > 0.0
 
 

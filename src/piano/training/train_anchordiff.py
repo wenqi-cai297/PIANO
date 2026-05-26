@@ -597,6 +597,10 @@ def build_anchordiff_step_fn(
         # Round-28 consistency losses (prompt §7.3 / §7.4).
         loss_hint_contact_cons = torch.zeros((), device=device, dtype=motion.dtype)
         loss_body_action_cons = torch.zeros((), device=device, dtype=motion.dtype)
+        # Round-29 condition-consistency losses (analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md).
+        loss_r29_interaction_cons = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_r29_support_air = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_r29_support_stance_vel = torch.zeros((), device=device, dtype=motion.dtype)
         if temporal_loss_cfg is not None and (
             float(getattr(temporal_loss_cfg, "contact_rel_offset_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "contact_drift_weight", 0.0)) > 0.0
@@ -605,6 +609,9 @@ def build_anchordiff_step_fn(
             or float(getattr(temporal_loss_cfg, "gait_stance_velocity_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0)) > 0.0
         ):
             from piano.training.temporal_interaction_losses import (
                 loss_body_action_consistency,
@@ -614,6 +621,9 @@ def build_anchordiff_step_fn(
                 loss_gait_both_airborne,
                 loss_gait_stance_velocity,
                 loss_hint_contact_consistency,
+                loss_r29_interaction_consistency,
+                loss_r29_support_both_airborne,
+                loss_r29_support_stance_velocity,
             )
 
             # Aux walking/foot_stance fields are required only for the
@@ -713,6 +723,58 @@ def build_anchordiff_step_fn(
                 raise KeyError(
                     "body_action_consistency_weight > 0 but batch is missing "
                     "body_action_hint; set data.use_body_action_hint=true."
+                )
+
+            # Round-29 P0 — interaction consistency. Pull pred wrist
+            # toward the I3 target_offset channel (object-local), masked
+            # by the I3 hand_contact channel. Self-contained on the R29
+            # condition; does NOT need data.surface_temporal_aux_fields.
+            if float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0)) > 0.0:
+                if "stage2_interaction" not in cond:
+                    raise KeyError(
+                        "r29_interaction_consistency_weight > 0 but cond is "
+                        "missing stage2_interaction. Enable an I-family variant "
+                        "via data.r29_interaction_variant (e.g. I3-contact-offset-masked)."
+                    )
+                _hand_clamp = float(
+                    cfg.data.get("r29_hand_offset_clamp_m", 2.0)
+                )
+                loss_r29_interaction_cons = loss_r29_interaction_consistency(
+                    pred_joints=jpf,
+                    object_positions=op_f, object_rotations=or_f,
+                    stage2_interaction=cond["stage2_interaction"].float(),
+                    cfg=temporal_loss_cfg, seq_mask=sm_f,
+                    hand_offset_clamp_m=_hand_clamp,
+                )
+
+            # Round-29 P0 — support both-airborne. Walking mask comes
+            # from stage2_support[..., 4:5], not from a dataset aux field.
+            if float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0)) > 0.0:
+                if "stage2_support" not in cond:
+                    raise KeyError(
+                        "r29_support_both_airborne_weight > 0 but cond is "
+                        "missing stage2_support. Enable an S-family variant "
+                        "with dim>=5 via data.r29_support_variant (S1/S2/S3/S4)."
+                    )
+                loss_r29_support_air = loss_r29_support_both_airborne(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, seq_mask=sm_f,
+                )
+
+            # Round-29 P0 — support stance velocity. Foot stance + walking
+            # mask both come from stage2_support.
+            if float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0)) > 0.0:
+                if "stage2_support" not in cond:
+                    raise KeyError(
+                        "r29_support_stance_velocity_weight > 0 but cond is "
+                        "missing stage2_support. Enable an S-family variant "
+                        "with dim>=5 via data.r29_support_variant (S1/S2/S3/S4)."
+                    )
+                loss_r29_support_stance_vel = loss_r29_support_stance_velocity(
+                    pred_joints=jpf,
+                    stage2_support=cond["stage2_support"].float(),
+                    fps=float(fps), seq_mask=sm_f,
                 )
 
         # --- Stable-support root stability loss (per
@@ -914,6 +976,7 @@ def build_anchordiff_step_fn(
             + stable_local_speed_moment_weight * loss_stable_local_speed_moment
             # Round-27 Tier-0B temporal interaction losses (zero by default).
             # Round-28 adds two consistency terms (also zero by default).
+            # Round-29 adds three condition-consistency terms (also zero by default).
             + (
                 float(temporal_loss_cfg.contact_rel_offset_weight) * loss_contact_rel
                 + float(temporal_loss_cfg.contact_drift_weight) * loss_contact_drift
@@ -922,6 +985,9 @@ def build_anchordiff_step_fn(
                 + float(temporal_loss_cfg.gait_stance_velocity_weight) * loss_gait_stance_vel
                 + float(getattr(temporal_loss_cfg, "hint_contact_consistency_weight", 0.0)) * loss_hint_contact_cons
                 + float(getattr(temporal_loss_cfg, "body_action_consistency_weight", 0.0)) * loss_body_action_cons
+                + float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0)) * loss_r29_interaction_cons
+                + float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0)) * loss_r29_support_air
+                + float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0)) * loss_r29_support_stance_vel
                 if temporal_loss_cfg is not None else 0.0
             )
         )
@@ -961,6 +1027,22 @@ def build_anchordiff_step_fn(
             # Round-28 consistency loss components.
             "loss_hint_contact_cons": loss_hint_contact_cons.detach(),
             "loss_body_action_cons": loss_body_action_cons.detach(),
+            # Round-29 condition-consistency loss components.
+            "loss_r29_interaction_cons": loss_r29_interaction_cons.detach(),
+            "loss_r29_support_air": loss_r29_support_air.detach(),
+            "loss_r29_support_stance_vel": loss_r29_support_stance_vel.detach(),
+            "weighted_r29_interaction_cons": (
+                float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0))
+                * loss_r29_interaction_cons
+            ).detach() if temporal_loss_cfg is not None else loss_r29_interaction_cons.detach(),
+            "weighted_r29_support_air": (
+                float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0))
+                * loss_r29_support_air
+            ).detach() if temporal_loss_cfg is not None else loss_r29_support_air.detach(),
+            "weighted_r29_support_stance_vel": (
+                float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0))
+                * loss_r29_support_stance_vel
+            ).detach() if temporal_loss_cfg is not None else loss_r29_support_stance_vel.detach(),
             "weighted_stable_local_vel_cm": (
                 stable_local_vel_cm_weight * loss_stable_local_vel_cm
             ).detach(),
@@ -1382,6 +1464,16 @@ def main() -> None:
             ),
             body_action_consistency_weight=float(
                 _tloss.get("body_action_consistency_weight", 0.0)
+            ),
+            # Round-29 loss-strategy ablation (analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md).
+            r29_interaction_consistency_weight=float(
+                _tloss.get("r29_interaction_consistency_weight", 0.0)
+            ),
+            r29_support_both_airborne_weight=float(
+                _tloss.get("r29_support_both_airborne_weight", 0.0)
+            ),
+            r29_support_stance_velocity_weight=float(
+                _tloss.get("r29_support_stance_velocity_weight", 0.0)
             ),
             contact_threshold=float(_tloss.get("contact_threshold", 0.5)),
             contact_rel_clamp_m=float(_tloss.get("contact_rel_clamp_m", 2.0)),

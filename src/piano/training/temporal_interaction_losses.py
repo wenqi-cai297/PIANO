@@ -99,6 +99,17 @@ class TemporalInteractionLossConfig:
     hint_contact_consistency_weight: float = 0.0
     body_action_consistency_weight: float = 0.0
 
+    # Round-29 loss-strategy ablation (analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md).
+    # These three losses replace absolute-GT anchor losses with condition-
+    # consistency losses: instead of pulling joints toward GT world
+    # positions (which over-penalises equivalent valid modes like
+    # left-hand-first vs right-hand-first), they pull pred motion toward
+    # the geometric relations that the R29 I3/S4 conditions specify.
+    # Recommended initial weights: 0.25 - 0.75 (see prompt §7.2).
+    r29_interaction_consistency_weight: float = 0.0
+    r29_support_both_airborne_weight: float = 0.0
+    r29_support_stance_velocity_weight: float = 0.0
+
     # Hand-object thresholds.
     contact_threshold: float = 0.5
     """Frames with hand_contact < threshold are excluded."""
@@ -700,6 +711,177 @@ def loss_body_action_consistency(
     num = (diff * mask).sum()
     den = mask.sum().clamp_min(1.0)
     return num / den
+
+
+# ===========================================================================
+# Round-29 condition-consistency losses
+# Per analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md
+#
+# These three losses pull pred motion toward the geometric relations
+# specified by the R29 typed conditions (I3 / S4), NOT toward absolute
+# GT world joint positions. The motivation: absolute-GT auxiliary
+# losses over-penalise equivalent valid modes (e.g. left-hand-first
+# vs right-hand-first under an ambiguous condition). By contrast,
+# condition-consistency losses ask whether the predicted motion
+# *realises the condition*.
+#
+# Design rule (prompt §3): when the R29 condition specifies side
+# (I3 left/right hand, S4 left/right foot), the loss must enforce
+# that side. These losses are NOT permutation-invariant — they read
+# the side directly from the condition channels.
+# ===========================================================================
+
+
+def _r29_walking_mask_from_support(
+    stage2_support: Tensor,                 # (B, T, >=5)
+) -> Tensor:
+    """Pull the walking_mask channel out of the R29 S-family condition.
+
+    S1/S2/S3/S4 all share the same first 5 channels: ``[L_stance, R_stance,
+    L_height_norm, R_height_norm, walking_mask]``. Returns ``(B, T, 1)``
+    float in [0, 1].
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "stage2_support must have at least 5 channels (S1+ layout: "
+            "[L_stance, R_stance, L_height_norm, R_height_norm, walking_mask]); "
+            f"got dim={stage2_support.shape[-1]}. Use S1/S2/S3/S4 variants."
+        )
+    return stage2_support[..., 4:5]                                       # (B, T, 1)
+
+
+def _r29_foot_stance_from_support(
+    stage2_support: Tensor,                 # (B, T, >=5)
+) -> Tensor:
+    """Pull the L/R foot-stance channels out of the R29 S-family condition.
+
+    Returns ``(B, T, 2)`` float in [0, 1] — soft stance probabilities from
+    ``derive_foot_stance_from_gt`` (height + xz-velocity sigmoid).
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "stage2_support must have at least 5 channels for foot_stance "
+            "extraction; got dim={stage2_support.shape[-1]}."
+        )
+    return stage2_support[..., 0:2]                                       # (B, T, 2)
+
+
+def loss_r29_interaction_consistency(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    object_positions: Tensor,           # (B, T, 3)
+    object_rotations: Tensor,           # (B, T, 3), axis-angle
+    stage2_interaction: Tensor,         # (B, T, 8) — I3 layout only for P0
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+    hand_offset_clamp_m: float = 2.0,
+) -> Tensor:
+    """R29 P0 — SmoothL1 between pred object-local wrist offset and the
+    I3 ``target_offset`` channel, masked to contact frames.
+
+    Layout of I3 ``stage2_interaction`` (per
+    ``piano.data.stage2_oracle_conditions.build_interaction_condition``):
+
+        [:, :, 0:2]  hand_contact  (L, R) — soft 0..1
+        [:, :, 2:8]  target_offset (L_xyz, R_xyz), clamped to ±clamp_m
+                     and divided by clamp_m → values in [-1, 1].
+                     Multiplied by hand_contact so non-contact frames
+                     are exactly zero in the channel.
+
+    Loss:
+        pred_offset_norm = clamp(R_obj.T @ (pred_wrist - obj_pos)) / clamp_m
+        SmoothL1(pred_offset_norm, stage2_interaction[..., 2:8])
+        averaged over (hand_contact > threshold) frames.
+
+    Unlike ``loss_hint_contact_consistency`` (R28), this loss is
+    self-contained on the R29 condition — it does NOT need
+    ``contact_state`` from the dataset; the mask comes from the I3
+    ``hand_contact`` channel itself.
+    """
+    expected_dim = 8
+    if stage2_interaction.shape[-1] != expected_dim:
+        raise ValueError(
+            "loss_r29_interaction_consistency P0 supports only the I3 "
+            f"layout (dim={expected_dim}); got "
+            f"dim={stage2_interaction.shape[-1]}. To enable other I-variants, "
+            "extend this loss with their channel layout."
+        )
+
+    R_obj = _axis_angle_to_matrix_t(object_rotations.to(pred_joints.dtype))
+    pw, _ = _wrist_world_pred_gt(pred_joints, pred_joints)                 # (B, T, 2, 3)
+    r_pred = _wrist_object_local(pw, object_positions, R_obj)              # (B, T, 2, 3)
+    r_pred = r_pred.clamp(-hand_offset_clamp_m, hand_offset_clamp_m)
+    pred_offset_norm = r_pred / float(hand_offset_clamp_m)                 # (B, T, 2, 3)
+
+    hand_contact = stage2_interaction[..., 0:2]                            # (B, T, 2)
+    target_offset = stage2_interaction[..., 2:8].reshape(
+        *stage2_interaction.shape[:2], 2, 3,
+    )                                                                       # (B, T, 2, 3)
+
+    mask = (hand_contact > cfg.contact_threshold).to(dtype=pred_joints.dtype)
+    if seq_mask is not None:
+        if seq_mask.dim() == 2:
+            sm = seq_mask.to(dtype=mask.dtype).unsqueeze(-1)               # (B, T, 1)
+        else:
+            sm = seq_mask.to(dtype=mask.dtype)
+        mask = mask * sm
+    mask3 = mask.unsqueeze(-1)                                              # (B, T, 2, 1)
+
+    diff = F.smooth_l1_loss(pred_offset_norm, target_offset, reduction="none")  # (B, T, 2, 3)
+    diff = diff.sum(dim=-1, keepdim=True)                                   # (B, T, 2, 1)
+    num = (diff * mask3).sum()
+    den = mask3.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_support_both_airborne(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — only for floor estimate
+    stage2_support: Tensor,             # (B, T, >=5) — walking_mask at [..., 4:5]
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R29 P0 — Penalty for both feet airborne on walking frames, using
+    the R29 S-family ``walking_mask`` channel instead of a dataset aux
+    field.
+
+    Same grounded-probability formula as ``loss_gait_both_airborne``:
+        grounded_prob = sigmoid((floor_y + threshold - ankle_y) / softness)
+        loss          = mean( walking * (1 - L_g) * (1 - R_g) )
+
+    Returns 0 if no walking frames (clamp denominator).
+    """
+    walking_mask = _r29_walking_mask_from_support(stage2_support)          # (B, T, 1)
+    return loss_gait_both_airborne(
+        pred_joints=pred_joints,
+        gt_joints=gt_joints,
+        walking_mask=walking_mask,
+        cfg=cfg,
+        seq_mask=seq_mask,
+    )
+
+
+def loss_r29_support_stance_velocity(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    stage2_support: Tensor,             # (B, T, >=5)
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R29 P0 — Penalty for stance-foot horizontal velocity on walking
+    frames, using R29 S-family ``foot_stance`` and ``walking_mask``
+    channels.
+
+    Same formula as ``loss_gait_stance_velocity``, but stance + walking
+    come from ``stage2_support`` instead of dataset aux fields.
+    """
+    foot_stance = _r29_foot_stance_from_support(stage2_support)            # (B, T, 2)
+    walking_mask = _r29_walking_mask_from_support(stage2_support)          # (B, T, 1)
+    return loss_gait_stance_velocity(
+        pred_joints=pred_joints,
+        foot_stance_gt=foot_stance,
+        walking_mask=walking_mask,
+        fps=fps,
+        seq_mask=seq_mask,
+    )
 
 
 def _root0_world_to_canonical_yaw_matrix(pred_joints: Tensor) -> Tensor:
