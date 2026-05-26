@@ -53,7 +53,16 @@ PARALLEL_DIAG_WORKERS="${ROUND29_PARALLEL_DIAG_WORKERS:-${NUM_PROCESSES}}"
 MANIFEST="analyses/round29_loss_strategy_ablation_manifest.json"
 LOG_DIR="runs/round29_loss_strategy_ablation"
 mkdir -p "${LOG_DIR}"
-PY="${PY:-python}"
+if [[ -z "${PY:-}" ]]; then
+    if command -v python >/dev/null 2>&1; then
+        PY="python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PY="python3"
+    else
+        echo "[LS] FATAL: neither python nor python3 was found; set PY=/path/to/python" >&2
+        exit 127
+    fi
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -165,3 +165,19 @@ def test_no_dense_pos_yaml_keeps_anchor(tmp_path: Path) -> None:
         assert cfg["loss"]["pos_loss_weight"] == 0.0
         assert cfg["loss"]["anchor_joint_pos_weight"] > 0.0
         assert cfg["loss"]["anchor_joint_vel_weight"] > 0.0
+
+
+def test_val_best_key_matches_enabled_loss_strategy(tmp_path: Path) -> None:
+    """Do not select best_val.pt on a disabled loss component."""
+    cfg_dir, manifest = _run_generator(tmp_path)
+    for v in manifest["variants"]:
+        yaml_path = cfg_dir / Path(v["config_path"]).name
+        cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        if v["loss_strategy"] == "relative_behavior":
+            assert v["val_best_key"] == "loss"
+            assert cfg["training"]["val_best_key"] == "loss"
+            assert cfg["loss"]["anchor_joint_pos_weight"] == 0.0
+        else:
+            assert v["val_best_key"] == "loss_anchor_joint_pos"
+            assert cfg["training"]["val_best_key"] == "loss_anchor_joint_pos"
+            assert cfg["loss"]["anchor_joint_pos_weight"] > 0.0

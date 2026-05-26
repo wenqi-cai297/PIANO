@@ -98,6 +98,9 @@ class LossStrategyVariant:
     r29_interaction_consistency_weight: float = 0.0
     r29_support_both_airborne_weight: float = 0.0
     r29_support_stance_velocity_weight: float = 0.0
+    # Validation checkpoint selector. ``relative_behavior`` disables
+    # anchor_joint_pos, so it must not select best_val.pt on that metric.
+    val_best_key: str = "loss_anchor_joint_pos"
     diagnostics: tuple[str, ...] = field(default_factory=lambda: (
         "sustained_contact", "gait", "body_action",
     ))
@@ -133,6 +136,7 @@ _RELATIVE_BEHAVIOR = dict(
     r29_interaction_consistency_weight=0.75,
     r29_support_both_airborne_weight=0.5,
     r29_support_stance_velocity_weight=0.25,
+    val_best_key="loss",
 )
 
 
@@ -290,7 +294,7 @@ training:
   mixed_precision: "bf16"
   val_on_train_subset: true
   val_every_epochs: 50
-  val_best_key: "loss_anchor_joint_pos"
+  val_best_key: "{v.val_best_key}"
 
 loss:
   anchor_weight: 0.0
@@ -412,6 +416,7 @@ def main() -> int:
             "num_epochs": 300,
             "seed": 42,
             "val_on_train_subset": True,
+            "val_best_key": v.val_best_key,
             "config_path": canonical_cfg,
             "output_dir": f"runs/training/stageB_anchordiff_{v.variant_id}",
             "diagnostics": list(v.diagnostics),
@@ -440,13 +445,14 @@ def main() -> int:
         "All variants use the same 48-clip balanced subset and 300 ep schedule",
         "as the regular A-group baselines for direct comparison.",
         "",
-        "| variant | injection | strategy | pos_loss | anchor_pos | r29_int_cons | r29_supp_air | r29_stance_vel |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| variant | injection | strategy | val_best_key | pos_loss | anchor_pos | r29_int_cons | r29_supp_air | r29_stance_vel |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         k = r["knobs"]
         md_lines.append(
             f"| `{r['variant_id']}` | {r['injection_mode']} | {r['loss_strategy']} | "
+            f"`{r['val_best_key']}` | "
             f"{k['pos_loss_weight']} | {k['anchor_joint_pos_weight']} | "
             f"{k['r29_interaction_consistency_weight']} | "
             f"{k['r29_support_both_airborne_weight']} | "
