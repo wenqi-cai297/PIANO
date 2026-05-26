@@ -328,15 +328,6 @@ def main() -> int:
     stage1_norm = _stage1_norm_for_cfg(cfg, device)
     model.eval()
 
-    plan_keys = [
-        "anchor_time", "anchor_part", "anchor_target_local",
-        "anchor_target_world", "anchor_type", "anchor_phase",
-        "anchor_support", "anchor_conf", "anchor_mask",
-        "segment_start", "segment_end", "segment_part",
-        "segment_target_summary_local", "segment_phase",
-        "segment_support", "segment_conf", "segment_mask",
-    ]
-
     clip_rows: list[dict] = []
     per_clip_records: list[dict] = []
     n_processed = 0
@@ -351,9 +342,6 @@ def main() -> int:
             batch, model, object_encoder, clip_model, z_dims, cfg, device,
             stage1_norm=stage1_norm,
         )
-        cond["interaction_plan"] = {
-            k: batch[f"plan_{k}"].to(device) for k in plan_keys
-        }
 
         gt_motion = batch["motion"][:, :T].to(device).float()
         if args.use_gt_as_pred:

@@ -231,7 +231,10 @@ print(b)" "${sel}"
         done < "${TASK_QUEUE}"
     else
         QUEUE_LOCK="${TASK_QUEUE}.lock"
+        FAIL_LOG="${TASK_QUEUE}.fail"
         : > "${QUEUE_LOCK}"
+        : > "${FAIL_LOG}"
+        trap "rm -f '${TASK_QUEUE}' '${QUEUE_LOCK}' '${FAIL_LOG}'" EXIT
         WORKER_PIDS=()
         for ((W = 0; W < PARALLEL_DIAG_WORKERS; W++)); do
             (
@@ -251,8 +254,10 @@ print(b)" "${sel}"
                     DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
                     T0=$(date +%s)
                     echo "[T2] [GPU ${W}] START ${VID}/${KIND}  log: ${DIAG_LOG}"
-                    # `|| true` so `set -e` does not kill the worker subshell
-                    # on non-zero diag exit; we then read $? from PIPESTATUS.
+                    # Truncate per task so re-runs do not accumulate stale tracebacks.
+                    : > "${DIAG_LOG}"
+                    # set +e so set -e does not kill the worker subshell on
+                    # non-zero diag exit; capture RC for DONE/FAIL reporting.
                     set +e
                     CUDA_VISIBLE_DEVICES="${W}" \
                         "${PY}" -u "${DIAG_SCRIPT}" \
@@ -261,16 +266,16 @@ print(b)" "${sel}"
                         --selection-json "${SUBSET}" \
                         --output-dir "${OUT_DIR}" \
                         --bucket "${BUCKET}" \
-                        >> "${DIAG_LOG}" 2>&1
+                        > "${DIAG_LOG}" 2>&1
                     RC=$?
                     set -e
                     T1=$(date +%s)
                     if [[ ${RC} -eq 0 ]]; then
                         echo "[T2] [GPU ${W}] DONE  ${VID}/${KIND}  ($((T1 - T0))s)"
                     else
+                        # Record the failure for the launcher-level summary.
+                        flock -x "${QUEUE_LOCK}" -c "echo '${VID}/${KIND} rc=${RC}' >> '${FAIL_LOG}'"
                         echo "[T2] [GPU ${W}] FAIL  ${VID}/${KIND}  rc=${RC} ($((T1 - T0))s)  log: ${DIAG_LOG}"
-                        # Echo the tail of the failing log to the launcher's
-                        # stdout so root cause is visible without grepping.
                         echo "[T2] [GPU ${W}] tail of ${DIAG_LOG}:"
                         tail -n 20 "${DIAG_LOG}" | sed "s/^/[T2] [GPU ${W}]   /"
                     fi
@@ -278,17 +283,16 @@ print(b)" "${sel}"
             ) &
             WORKER_PIDS+=($!)
         done
-        DIAG_FAILED=0
         for pid in "${WORKER_PIDS[@]}"; do
-            if ! wait "${pid}"; then
-                DIAG_FAILED=1
-            fi
+            wait "${pid}" || true
         done
         rm -f "${QUEUE_LOCK}"
-        if [[ ${DIAG_FAILED} -ne 0 ]]; then
-            echo "[T2] some diag tasks failed (see logs)."
+        N_FAIL=$(wc -l < "${FAIL_LOG}" 2>/dev/null || echo 0)
+        if [[ ${N_FAIL} -gt 0 ]]; then
+            echo "[T2] ${N_FAIL}/${N_TASKS} diag tasks FAILED:"
+            sed 's/^/[T2]   /' "${FAIL_LOG}"
         else
-            echo "[T2] all diag tasks succeeded."
+            echo "[T2] all ${N_TASKS} diag tasks succeeded."
         fi
     fi
 fi

@@ -236,7 +236,10 @@ print(b)" "${SELECTION_JSON}")"
         done < "${TASK_QUEUE}"
     else
         QUEUE_LOCK="${TASK_QUEUE}.lock"
+        FAIL_LOG="${TASK_QUEUE}.fail"
         : > "${QUEUE_LOCK}"
+        : > "${FAIL_LOG}"
+        trap "rm -f '${TASK_QUEUE}' '${QUEUE_LOCK}' '${FAIL_LOG}'" EXIT
         WORKER_PIDS=()
         for ((W = 0; W < PARALLEL_DIAG_WORKERS; W++)); do
             (
@@ -256,6 +259,7 @@ print(b)" "${SELECTION_JSON}")"
                     DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
                     T0=$(date +%s)
                     echo "[A23] [GPU ${W}] START ${VID}/${KIND}  log: ${DIAG_LOG}"
+                    : > "${DIAG_LOG}"
                     set +e
                     CUDA_VISIBLE_DEVICES="${W}" \
                         "${PY}" -u "${DIAG_SCRIPT}" \
@@ -264,13 +268,14 @@ print(b)" "${SELECTION_JSON}")"
                         --selection-json "${SELECTION_JSON}" \
                         --output-dir "${OUT_DIR}" \
                         --bucket "${BUCKET}" \
-                        >> "${DIAG_LOG}" 2>&1
+                        > "${DIAG_LOG}" 2>&1
                     RC=$?
                     set -e
                     T1=$(date +%s)
                     if [[ ${RC} -eq 0 ]]; then
                         echo "[A23] [GPU ${W}] DONE  ${VID}/${KIND}  ($((T1 - T0))s)"
                     else
+                        flock -x "${QUEUE_LOCK}" -c "echo '${VID}/${KIND} rc=${RC}' >> '${FAIL_LOG}'"
                         echo "[A23] [GPU ${W}] FAIL  ${VID}/${KIND}  rc=${RC} ($((T1 - T0))s)  log: ${DIAG_LOG}"
                         echo "[A23] [GPU ${W}] tail of ${DIAG_LOG}:"
                         tail -n 20 "${DIAG_LOG}" | sed "s/^/[A23] [GPU ${W}]   /"
@@ -279,17 +284,16 @@ print(b)" "${SELECTION_JSON}")"
             ) &
             WORKER_PIDS+=($!)
         done
-        DIAG_FAILED=0
         for pid in "${WORKER_PIDS[@]}"; do
-            if ! wait "${pid}"; then
-                DIAG_FAILED=1
-            fi
+            wait "${pid}" || true
         done
         rm -f "${QUEUE_LOCK}"
-        if [[ ${DIAG_FAILED} -ne 0 ]]; then
-            echo "[A23] some diag tasks failed (see logs)."
+        N_FAIL=$(wc -l < "${FAIL_LOG}" 2>/dev/null || echo 0)
+        if [[ ${N_FAIL} -gt 0 ]]; then
+            echo "[A23] ${N_FAIL}/${N_TASKS} diag tasks FAILED:"
+            sed 's/^/[A23]   /' "${FAIL_LOG}"
         else
-            echo "[A23] all diag tasks succeeded."
+            echo "[A23] all ${N_TASKS} diag tasks succeeded."
         fi
     fi
 fi
