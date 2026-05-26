@@ -190,7 +190,7 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
 def build_anchordiff_step_fn(
     model: MotionAnchorDiff,
     object_encoder: ObjectEncoder,
-    clip_model: torch.nn.Module,
+    clip_model: torch.nn.Module | None,
     anchor_cfg: AnchorConsistencyConfig,
     z_dims: ZIntDims,
     device: torch.device,
@@ -353,13 +353,21 @@ def build_anchordiff_step_fn(
             obj_rot_world=obj_rot_world,
         )
 
-        # --- Init pose: SMPL-22 frame 0 ---
-        init_pose = joints[:, 0, :, :].reshape(B, -1)              # (B, 66)
+        # --- Init pose: SMPL-22 frame 0 (optional — Tier-2 ablation) ---
+        _denoiser = model.module.denoiser if hasattr(model, "module") else model.denoiser
+        if _denoiser.use_init_pose:
+            init_pose = joints[:, 0, :, :].reshape(B, -1)              # (B, 66)
+        else:
+            init_pose = None
 
-        # --- Text features via CLIP per-token ---
-        text_features, _text_mask = encode_text_per_token(
-            clip_model, batch["text"], device,
-        )                                                          # (B, L, text_dim)
+        # --- Text features via CLIP per-token (optional — Tier-2 ablation) ---
+        if _denoiser.use_text:
+            text_features, _text_mask = encode_text_per_token(
+                clip_model, batch["text"], device,
+            )                                                          # (B, L, text_dim)
+            text_features = text_features.float()
+        else:
+            text_features = None
 
         # --- Object tokens via PointNet++ encoder ---
         obj_tokens = object_encoder(object_pc)                     # (B, N, obj_dim)
@@ -374,10 +382,12 @@ def build_anchordiff_step_fn(
         cond = {
             "z_int": z_int,
             "object_world_traj": object_traj,
-            "init_pose": init_pose,
-            "text": text_features.float(),
             "object_tokens": obj_tokens,
         }
+        if init_pose is not None:
+            cond["init_pose"] = init_pose
+        if text_features is not None:
+            cond["text"] = text_features
 
         # ── Round-22: Stage-1 Coarse-v1 oracle condition ──
         # Extract 23-D Coarse-v1 from GT motion_135 + rest_offsets, z-score
@@ -1243,11 +1253,17 @@ def main() -> None:
         feature_dim=int(cfg.model.object_encoder.feature_dim),
     )
 
-    clip_model = load_clip_text_encoder(
-        device=device,
-        model_name=str(cfg.model.text_encoder.clip_version),
-        download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
-    )
+    # Tier-2 ablation: skip loading CLIP entirely when text is disabled.
+    # Saves ~1 GB GPU memory + per-step encode cost.
+    if int(cfg.model.denoiser.text_dim) > 0:
+        clip_model = load_clip_text_encoder(
+            device=device,
+            model_name=str(cfg.model.text_encoder.clip_version),
+            download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
+        )
+    else:
+        clip_model = None
+        accelerator.print("text_dim=0: skipping CLIP text encoder load.")
 
     anchor_cfg = AnchorConsistencyConfig(
         weight=float(cfg.loss.anchor_weight),

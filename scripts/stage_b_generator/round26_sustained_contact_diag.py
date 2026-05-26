@@ -335,11 +335,15 @@ def main() -> int:
             object_encoder.load_state_dict(state["object_encoder"])
         elif "extra_modules" in state and "object_encoder" in state["extra_modules"]:
             object_encoder.load_state_dict(state["extra_modules"]["object_encoder"])
-    clip_model = load_clip_text_encoder(
-        device=device,
-        model_name=str(cfg.model.text_encoder.clip_version),
-        download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
-    )
+    # Skip CLIP load when model was trained with text_dim=0 (Tier-2 ablation).
+    if int(cfg.model.denoiser.get("text_dim", 0)) > 0:
+        clip_model = load_clip_text_encoder(
+            device=device,
+            model_name=str(cfg.model.text_encoder.clip_version),
+            download_root=str(cfg.model.text_encoder.get("download_root", "cache/clip")),
+        )
+    else:
+        clip_model = None
     stage1_norm = _stage1_norm_for_cfg(cfg, device)
     model.eval()
 

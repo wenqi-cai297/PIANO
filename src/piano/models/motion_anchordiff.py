@@ -547,26 +547,42 @@ class AnchorDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.d_model, cfg.d_model),
         )
-        self.pose_proj = nn.Linear(cfg.init_pose_dim, cfg.d_model)
-        self.text_proj = nn.Linear(cfg.text_dim, cfg.d_model)
+        # init_pose_dim=0 disables the frame-0 SMPL-22 init-pose token
+        # entirely (Tier-2 ablation: is frame-0 GT a useful redundant
+        # signal on top of motion[0] + stage1_coarse[0], or just a
+        # train/inference distribution leak?).
+        self.use_init_pose = cfg.init_pose_dim > 0
+        if self.use_init_pose:
+            self.pose_proj = nn.Linear(cfg.init_pose_dim, cfg.d_model)
+        else:
+            self.pose_proj = None
+        # text_dim=0 disables the CLIP text condition + text_xattn entirely
+        # (Tier-2 ablation: does the InterAct text label add anything that
+        # object_tokens doesn't already encode?).
+        self.use_text = cfg.text_dim > 0
+        if self.use_text:
+            self.text_proj = nn.Linear(cfg.text_dim, cfg.d_model)
+            self.text_xattn = nn.MultiheadAttention(
+                cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True,
+            )
+            self.text_norm = nn.LayerNorm(cfg.d_model)
+            self.null_text = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+        else:
+            self.text_proj = None
+            self.text_xattn = None
+            self.text_norm = None
+            self.register_parameter("null_text", None)
         self.object_proj = nn.Linear(cfg.object_token_dim, cfg.d_model)
 
-        # Learned null embeddings for CFG dropout. Three live conditioning
-        # channels participate: object_world_traj, text, object_tokens.
+        # Learned null embeddings for CFG dropout. Live channels in R29
+        # are object_world_traj and object_tokens (and text when on).
         # z_int and stage1_coarse are never CFG-dropped (z_int is identically
-        # zero in R29; stage1_coarse is treated as a deterministic Stage-1
-        # output that should always reach the denoiser).
+        # zero; stage1_coarse is a deterministic Stage-1 output).
         self.null_obj_traj = nn.Parameter(torch.zeros(cfg.object_traj_dim))
-        self.null_text = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         self.null_obj_tokens = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
 
         self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_seq_length + 2)
 
-        # Cross-attn for text / object tokens — applied AFTER encoder.
-        self.text_xattn = nn.MultiheadAttention(
-            cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True
-        )
-        self.text_norm = nn.LayerNorm(cfg.d_model)
         self.obj_xattn = nn.MultiheadAttention(
             cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True
         )
@@ -659,9 +675,10 @@ class AnchorDenoiser(nn.Module):
 
         z_int: Tensor = cond["z_int"]                  # (B, T, zint_total)
         obj_traj: Tensor = cond["object_world_traj"]   # (B, T, 9)
-        init_pose: Tensor = cond["init_pose"]          # (B, init_pose_dim)
-        text_tok: Tensor = cond["text"]                # (B, L_text, text_dim)
         obj_tok: Tensor = cond["object_tokens"]        # (B, N_obj, object_token_dim)
+        # init_pose and text are optional in R29 ablations.
+        init_pose: Tensor | None = cond.get("init_pose") if self.use_init_pose else None
+        text_tok: Tensor | None = cond.get("text") if self.use_text else None
 
         # --- CFG drop: replace conditioning channels with null embeddings ---
         # z_int is identically zero in R29; nothing to drop.
@@ -698,8 +715,15 @@ class AnchorDenoiser(nn.Module):
             h = self.r29_inject.apply_input_injection(h, cond, c_summary=c)
 
         # ─── Prepend init_pose token (time_tok dropped — timestep is in AdaLN) ───
-        pose_tok = self.pose_proj(init_pose).unsqueeze(1)                # (B, 1, D)
-        seq = torch.cat([pose_tok, h], dim=1)                            # (B, T+1, D)
+        # When init_pose_dim=0 the model skips the prefix token entirely;
+        # the motion-token slice starts at index 0 instead of 1.
+        if self.use_init_pose:
+            pose_tok = self.pose_proj(init_pose).unsqueeze(1)            # (B, 1, D)
+            seq = torch.cat([pose_tok, h], dim=1)                        # (B, T+1, D)
+            motion_token_start = 1
+        else:
+            seq = h                                                       # (B, T, D)
+            motion_token_start = 0
         seq = self.pos_enc(seq)
 
         # ─── §4.5 ConditionedEncoderLayer × n_layers ───
@@ -710,22 +734,24 @@ class AnchorDenoiser(nn.Module):
             # family uses an adapter-mode.
             if self.r29_inject is not None:
                 seq = self.r29_inject.apply_per_layer_adapter(
-                    seq, layer_idx=layer_idx, motion_token_start=1,
+                    seq, layer_idx=layer_idx,
+                    motion_token_start=motion_token_start,
                 )
 
-        # ─── Text + obj cross-attn at end of encoder (v11 carryover) ───
-        text_kv = self.text_proj(text_tok)
-        text_kv = self._broadcast_drop(cond_drop_mask, text_kv, self.null_text)
-        text_attn, _ = self.text_xattn(seq, text_kv, text_kv, need_weights=False)
-        seq = self.text_norm(seq + text_attn)
+        # ─── Text cross-attn (optional) + obj cross-attn at end of encoder ───
+        if self.use_text:
+            text_kv = self.text_proj(text_tok)
+            text_kv = self._broadcast_drop(cond_drop_mask, text_kv, self.null_text)
+            text_attn, _ = self.text_xattn(seq, text_kv, text_kv, need_weights=False)
+            seq = self.text_norm(seq + text_attn)
 
         obj_kv = self.object_proj(obj_tok)
         obj_kv = self._broadcast_drop(cond_drop_mask, obj_kv, self.null_obj_tokens)
         obj_attn, _ = self.obj_xattn(seq, obj_kv, obj_kv, need_weights=False)
         seq = self.obj_norm(seq + obj_attn)
 
-        # ─── §4.6 Final layer (drop pose prefix token, AdaLN-Zero readout) ───
-        h_motion = seq[:, 1:, :]                                         # (B, T, D)
+        # ─── §4.6 Final layer (drop pose prefix token if present, AdaLN-Zero readout) ───
+        h_motion = seq[:, motion_token_start:, :]                        # (B, T, D)
         x0 = self.v12_final_layer(h_motion, c)                           # (B, T, motion_dim)
         return x0
 

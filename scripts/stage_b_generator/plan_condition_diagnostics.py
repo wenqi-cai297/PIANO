@@ -734,16 +734,21 @@ def _build_cond(
         obj_rot_world=obj_rot_world,
     )
 
-    init_pose = joints[:, 0, :, :].reshape(B, -1)
-    text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
+    # init_pose and text are optional in R29 Tier-2 ablations.
+    _denoiser = model.denoiser if model is not None else None
+    use_init_pose = _denoiser is None or getattr(_denoiser, "use_init_pose", True)
+    use_text = _denoiser is None or getattr(_denoiser, "use_text", True)
     obj_tokens = object_encoder(object_pc)
     cond = {
         "z_int": z_int,
         "object_world_traj": object_traj,
-        "init_pose": init_pose,
-        "text": text_features.float(),
         "object_tokens": obj_tokens,
     }
+    if use_init_pose:
+        cond["init_pose"] = joints[:, 0, :, :].reshape(B, -1)
+    if use_text and clip_model is not None:
+        text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
+        cond["text"] = text_features.float()
     if "oracle_interaction_hint" in batch:
         cond["oracle_interaction_hint"] = (
             batch["oracle_interaction_hint"].to(device).float()
