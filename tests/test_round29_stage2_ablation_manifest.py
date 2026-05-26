@@ -87,20 +87,43 @@ def test_manifest_dims_match_builder_dim_tables(tmp_path: Path) -> None:
 
 def test_manifest_paths_are_repo_relative(tmp_path: Path) -> None:
     """Codex P2: no absolute paths in manifest (config_path, output_dir,
-    subset_file, init_checkpoint) — they must be portable repo-relative."""
+    subset_file, diag_selection_file, init_checkpoint) — they must be
+    portable repo-relative."""
     _, _, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        for key in ("config_path", "output_dir", "subset_file", "init_checkpoint"):
+        for key in (
+            "config_path", "output_dir", "subset_file",
+            "diag_selection_file", "init_checkpoint",
+        ):
             val = v[key]
             assert val, f"{v['variant_id']} {key} is empty"
             # Reject Windows-style absolutes (E:\ ...) and POSIX absolutes (/...).
             assert ":" not in val, f"{v['variant_id']} {key} contains drive letter: {val!r}"
             assert not val.startswith("/"), f"{v['variant_id']} {key} is POSIX-absolute: {val!r}"
     defaults = manifest["defaults"]
-    for key in ("init_checkpoint", "balanced_subset_file", "body_action_subset_file"):
+    for key in (
+        "init_checkpoint",
+        "balanced_subset_file", "body_action_subset_file",
+        "balanced_diag_selection_file", "body_action_diag_selection_file",
+    ):
         val = defaults[key]
         assert ":" not in val, f"defaults.{key} contains drive letter: {val!r}"
         assert not val.startswith("/"), f"defaults.{key} is POSIX-absolute: {val!r}"
+
+
+def test_manifest_diag_selection_file_differs_from_train_subset_file(tmp_path: Path) -> None:
+    """The diag scripts need (subset, seq_id) entries; the trainer needs
+    int indices. They must be SEPARATE files."""
+    _, _, manifest = _run_generator(tmp_path)
+    for v in manifest["variants"]:
+        assert v["subset_file"] != v["diag_selection_file"], (
+            f"{v['variant_id']} has subset_file == diag_selection_file = "
+            f"{v['subset_file']!r}; the trainer needs int indices and the "
+            f"diag needs eval-selection — they must be different files."
+        )
+        # Sanity on the names so we don't accidentally swap them.
+        assert "train_indices" in v["subset_file"], v["subset_file"]
+        assert "eval_selection" in v["diag_selection_file"], v["diag_selection_file"]
 
 
 def test_f3_heldout_differs_from_f1_in_val_subset(tmp_path: Path) -> None:

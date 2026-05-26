@@ -105,7 +105,9 @@ for v in m["variants"]:
         if v["variant_id"] not in want_only: continue
     elif want_groups is not None and v["group"] not in want_groups:
         continue
-    print(v["variant_id"], v["group"], v["config_path"], v["output_dir"], v["subset_file"], v.get("init_checkpoint",""))
+    # Six fields: vid grp cfg outdir train_subset diag_selection init_ckpt
+    diag_sel = v.get("diag_selection_file") or v["subset_file"]
+    print(v["variant_id"], v["group"], v["config_path"], v["output_dir"], v["subset_file"], diag_sel, v.get("init_checkpoint",""))
 '
 VARIANTS="$("${PY}" -c "${PICK_SCRIPT}" "${MANIFEST}" "${GROUPS_RESOLVED}" "${ONLY}")"
 
@@ -121,14 +123,28 @@ echo "${VARIANTS}"
 preflight_fail=0
 if [[ ${SKIP_PREFLIGHT} -eq 0 && ${DRY_RUN} -eq 0 ]]; then
     echo "[R29] Preflight..."
-    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET DIAG_SEL INIT_CKPT; do
         [[ -z "${VID}" ]] && continue
-        for p in "${CFG}" "${SUBSET}"; do
+        for p in "${CFG}" "${SUBSET}" "${DIAG_SEL}"; do
             if [[ ! -e "${p}" ]]; then
                 echo "    [${VID}] missing: ${p}"
                 preflight_fail=1
             fi
         done
+        # Diag selection JSON must have non-empty selected/candidates.
+        if [[ -e "${DIAG_SEL}" && ${SKIP_EVAL} -eq 0 ]]; then
+            N_SEL="$("${PY}" -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+sel = data.get('selected') or data.get('candidates') or []
+print(len(sel))
+" "${DIAG_SEL}")"
+            if [[ "${N_SEL}" == "0" ]]; then
+                echo "    [${VID}] diag selection JSON has empty selected list: ${DIAG_SEL}"
+                echo "    [${VID}]   -> looks like train-indices (int positions); diag needs eval-selection (list of {subset, seq_id})."
+                preflight_fail=1
+            fi
+        fi
         if [[ ${SKIP_TRAIN} -eq 0 && -n "${INIT_CKPT}" && ! -e "${INIT_CKPT}" ]]; then
             echo "    [${VID}] init_checkpoint not on disk: ${INIT_CKPT}"
             preflight_fail=1
@@ -186,19 +202,20 @@ print(b)" "${sel}"
 }
 
 # Per-variant train + diag.
-while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET DIAG_SEL INIT_CKPT; do
     [[ -z "${VID}" ]] && continue
     LOG="${LOG_DIR}/${VID}.log"
-    BUCKET="$(selection_bucket "${SUBSET}")"
+    BUCKET="$(selection_bucket "${DIAG_SEL}")"
     CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
 
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] BEGIN ${VID}  group=${GRP}"
-    echo "    config:  ${CFG}"
-    echo "    output:  ${OUTDIR}"
-    echo "    subset:  ${SUBSET}  bucket=${BUCKET}"
-    echo "    log:     ${LOG}"
+    echo "    config:        ${CFG}"
+    echo "    output:        ${OUTDIR}"
+    echo "    train subset:  ${SUBSET}"
+    echo "    diag selection: ${DIAG_SEL}  bucket=${BUCKET}"
+    echo "    log:           ${LOG}"
     echo "================================================================"
 
     # TRAIN
@@ -236,7 +253,7 @@ while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
             CMD=("${PY}" -u "${DIAG_SCRIPT}" \
                  --config "${CFG}" \
                  --ckpt "${CKPT_PATH}" \
-                 --selection-json "${SUBSET}" \
+                 --selection-json "${DIAG_SEL}" \
                  --output-dir "${OUT_DIR}" \
                  --bucket "${BUCKET}")
             if [[ ${DRY_RUN} -eq 1 ]]; then

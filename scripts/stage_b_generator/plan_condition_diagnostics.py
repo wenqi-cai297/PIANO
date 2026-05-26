@@ -444,6 +444,34 @@ def _build_dataset(cfg, bucket: str, augment: bool) -> Subset | torch.utils.data
             body_action_energy_threshold=float(
                 cfg.data.get("body_action_energy_threshold", 0.05)
             ),
+            # Round-29 typed condition bundle (off by default; emits the
+            # stage2_* keys when any family variant is non-zero).
+            r29_coarse_variant=str(
+                cfg.data.get("r29_coarse_variant", "C23")
+            ),
+            r29_interaction_variant=str(
+                cfg.data.get("r29_interaction_variant", "I0")
+            ),
+            r29_support_variant=str(
+                cfg.data.get("r29_support_variant", "S0")
+            ),
+            r29_body_variant=str(
+                cfg.data.get("r29_body_variant", "B0")
+            ),
+            r29_body_coord_frame=(
+                str(cfg.data.get("r29_body_coord_frame"))
+                if cfg.data.get("r29_body_coord_frame") is not None
+                else None
+            ),
+            r29_body_energy_threshold=float(
+                cfg.data.get("r29_body_energy_threshold", 0.05)
+            ),
+            r29_body_lowpass_window=int(
+                cfg.data.get("r29_body_lowpass_window", 9)
+            ),
+            r29_hand_offset_clamp_m=float(
+                cfg.data.get("r29_hand_offset_clamp_m", 2.0)
+            ),
         )
         datasets.append(ds)
     return ConcatDataset(datasets)
@@ -523,11 +551,45 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         oracle_hint_injection_mode=str(
             cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
         ),
+        oracle_hint_gate_bias_init=float(
+            cfg.model.denoiser.get("oracle_hint_gate_bias_init", -3.0)
+        ),
         separate_hint_branches=bool(
             cfg.model.denoiser.get("separate_hint_branches", True)
         ),
         zero_init_hint_adapters=bool(
             cfg.model.denoiser.get("zero_init_hint_adapters", True)
+        ),
+        # Round-29 typed condition injection. Required so diagnostic
+        # scripts can load R29 ckpts (which carry r29_inject.* keys)
+        # without falling back to strict=False (which would silently
+        # drop the conditioning the trainer learned).
+        use_round29_cond_injection=bool(
+            cfg.model.denoiser.get("use_round29_cond_injection", False)
+        ),
+        r29_coarse_extra_dim=int(
+            cfg.model.denoiser.get("r29_coarse_extra_dim", 0)
+        ),
+        r29_interaction_dim=int(
+            cfg.model.denoiser.get("r29_interaction_dim", 0)
+        ),
+        r29_support_dim=int(cfg.model.denoiser.get("r29_support_dim", 0)),
+        r29_body_refine_dim=int(
+            cfg.model.denoiser.get("r29_body_refine_dim", 0)
+        ),
+        r29_injection_mode=str(
+            cfg.model.denoiser.get("r29_injection_mode", "input_add")
+        ),
+        r29_gate_bias_init=float(
+            cfg.model.denoiser.get("r29_gate_bias_init", -1.0)
+        ),
+        r29_per_family_modes=(
+            dict(cfg.model.denoiser.get("r29_per_family_modes"))
+            if cfg.model.denoiser.get("r29_per_family_modes") is not None
+            else None
+        ),
+        r29_zero_init_adapters=bool(
+            cfg.model.denoiser.get("r29_zero_init_adapters", True)
         ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
@@ -708,6 +770,22 @@ def _build_cond(
             "batch['body_action_hint'] is missing. Set "
             "data.use_body_action_hint=true in the diagnostic config."
         )
+
+    # Round-29 typed condition bundle. The dataset surfaces each of
+    # stage2_coarse_extra / stage2_interaction / stage2_support /
+    # stage2_body_refine iff the corresponding family is active in
+    # the diagnostic config (data.r29_<family>_variant != *0). The
+    # model's Round29CondInjectionModule raises KeyError when an
+    # active family's key is missing, so we just forward whatever
+    # the dataset emitted.
+    for _r29_key in (
+        "stage2_coarse_extra",
+        "stage2_interaction",
+        "stage2_support",
+        "stage2_body_refine",
+    ):
+        if _r29_key in batch:
+            cond[_r29_key] = batch[_r29_key].to(device).float()
     stage1_coarse_dim = int(cfg.model.denoiser.get("stage1_coarse_dim", 0))
     if stage1_coarse_dim > 0:
         if str(cfg.data.get("motion_representation", "motion_263")) != "smpl_pose_135_plan":
