@@ -56,65 +56,92 @@ def test_generator_dry_run_runs_clean() -> None:
     assert res.returncode == 0, res.stderr
 
 
-def test_four_variants_emitted(tmp_path: Path) -> None:
+def test_six_variants_emitted(tmp_path: Path) -> None:
     _, manifest = _run_generator(tmp_path)
     ids = {v["variant_id"] for v in manifest["variants"]}
-    assert ids == {
-        "r29_ls_a2_no_dense_pos",
-        "r29_ls_a3_no_dense_pos",
-        "r29_ls_a2_relative_behavior",
-        "r29_ls_a3_relative_behavior",
+    expected = {
+        "r29_ls_a2_baseline_from_scratch",
+        "r29_ls_a3_baseline_from_scratch",
+        "r29_ls_a2_relbeh_v2_anchor0_low",
+        "r29_ls_a3_relbeh_v2_anchor0_low",
+        "r29_ls_a2_relbeh_v2_anchor2_mixed",
+        "r29_ls_a3_relbeh_v2_anchor2_mixed",
     }
+    assert ids == expected
 
 
 def test_injection_modes_per_variant(tmp_path: Path) -> None:
     _, manifest = _run_generator(tmp_path)
     by_id = {v["variant_id"]: v for v in manifest["variants"]}
-    # A2 ⇒ adapter_only.
-    assert by_id["r29_ls_a2_no_dense_pos"]["injection_mode"] == "adapter_only"
-    assert by_id["r29_ls_a2_relative_behavior"]["injection_mode"] == "adapter_only"
-    # A3 ⇒ input_add_adapter.
-    assert by_id["r29_ls_a3_no_dense_pos"]["injection_mode"] == "input_add_adapter"
-    assert by_id["r29_ls_a3_relative_behavior"]["injection_mode"] == "input_add_adapter"
+    for family in ("baseline_from_scratch", "relbeh_v2_anchor0_low", "relbeh_v2_anchor2_mixed"):
+        assert by_id[f"r29_ls_a2_{family}"]["injection_mode"] == "adapter_only"
+        assert by_id[f"r29_ls_a3_{family}"]["injection_mode"] == "input_add_adapter"
 
 
-def test_no_dense_pos_keeps_anchor_drops_pos_loss(tmp_path: Path) -> None:
+def test_baseline_from_scratch_uses_original_a_group_weights(tmp_path: Path) -> None:
+    """baseline_from_scratch must mirror the original a-group losses
+    (pos_loss=5, anchor_pos=10, anchor_vel=2, world_vel=1) so the
+    only varied axis is the init regime (no init_checkpoint)."""
     _, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        if v["loss_strategy"] != "no_dense_pos":
+        if v["loss_strategy"] != "baseline_from_scratch":
             continue
         k = v["knobs"]
-        assert k["pos_loss_weight"] == 0.0
-        assert k["anchor_joint_pos_weight"] > 0.0
-        assert k["anchor_joint_vel_weight"] > 0.0
-        # No R29 consistency weights in the no_dense_pos variant.
+        assert k["pos_loss_weight"] == 5.0
+        assert k["anchor_joint_pos_weight"] == 10.0
+        assert k["anchor_joint_vel_weight"] == 2.0
+        assert k["world_joint_velocity_weight"] == 1.0
+        # No relative / R29 consistency weights in the baseline.
         assert k["r29_interaction_consistency_weight"] == 0.0
         assert k["r29_support_both_airborne_weight"] == 0.0
         assert k["r29_support_stance_velocity_weight"] == 0.0
+        assert k["r29_swing_clearance_weight"] == 0.0
+        assert k["contact_rel_offset_weight"] == 0.0
 
 
-def test_relative_behavior_drops_all_absolute_gt_and_enables_r29_consistency(
-    tmp_path: Path,
-) -> None:
+def test_anchor0_low_pure_condition_supervision(tmp_path: Path) -> None:
+    """anchor0_low must be a pure condition-consistency test:
+    pos_loss=0, anchor=0, weak world_vel=0.5, low R29 weights at 0.10,
+    swing_clearance ON at 0.10."""
     _, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        if v["loss_strategy"] != "relative_behavior":
+        if v["loss_strategy"] != "relbeh_v2_anchor0_low":
             continue
         k = v["knobs"]
-        # Absolute-GT pulls off.
         assert k["pos_loss_weight"] == 0.0
         assert k["anchor_joint_pos_weight"] == 0.0
         assert k["anchor_joint_vel_weight"] == 0.0
-        # Weak global velocity prior (per prompt §7.2).
         assert 0.0 < k["world_joint_velocity_weight"] < 1.0
-        # R29 consistency weights enabled.
-        assert k["r29_interaction_consistency_weight"] > 0.0
-        assert k["r29_support_both_airborne_weight"] > 0.0
-        assert k["r29_support_stance_velocity_weight"] > 0.0
-        # Existing relative contact losses also on (rel_offset / drift / tracking).
-        assert k["contact_rel_offset_weight"] > 0.0
-        assert k["contact_drift_weight"] > 0.0
-        assert k["contact_tracking_weight"] > 0.0
+        # R29 weights low and uniform per Codex review.
+        assert k["r29_interaction_consistency_weight"] == 0.10
+        assert k["r29_support_both_airborne_weight"] == 0.10
+        assert k["r29_support_stance_velocity_weight"] == 0.10
+        assert k["r29_swing_clearance_weight"] == 0.10
+        # Existing relative contact losses on.
+        assert k["contact_rel_offset_weight"] == 0.25
+        assert k["contact_drift_weight"] == 0.25
+        assert k["contact_tracking_weight"] == 0.25
+
+
+def test_anchor2_mixed_weak_absolute_stabilizer(tmp_path: Path) -> None:
+    """anchor2_mixed must have anchor_joint_pos=2 (weak stabilizer),
+    anchor_vel=0.5, same low R29 weights as anchor0_low, AND
+    swing_clearance ON. This is the 'is a weak absolute pull needed'
+    counterfactual to anchor0_low."""
+    _, manifest = _run_generator(tmp_path)
+    for v in manifest["variants"]:
+        if v["loss_strategy"] != "relbeh_v2_anchor2_mixed":
+            continue
+        k = v["knobs"]
+        assert k["pos_loss_weight"] == 0.0
+        assert k["anchor_joint_pos_weight"] == 2.0   # weak stabilizer
+        assert k["anchor_joint_vel_weight"] == 0.5
+        assert k["world_joint_velocity_weight"] == 0.5
+        # Same low R29 weights as anchor0_low.
+        assert k["r29_interaction_consistency_weight"] == 0.10
+        assert k["r29_support_both_airborne_weight"] == 0.10
+        assert k["r29_support_stance_velocity_weight"] == 0.10
+        assert k["r29_swing_clearance_weight"] == 0.10
 
 
 def test_yamls_use_48_clip_balanced_subset(tmp_path: Path) -> None:
@@ -122,17 +149,13 @@ def test_yamls_use_48_clip_balanced_subset(tmp_path: Path) -> None:
     for v in manifest["variants"]:
         yaml_path = cfg_dir / Path(v["config_path"]).name
         cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        # subset_indices_file is present and points at the balanced JSON.
         sif = cfg["data"]["subset_indices_file"]
         assert sif.endswith("round27_tier0_train_indices_48_balanced.json")
-        # 48-clip overfit defaults (per prompt §8).
         assert int(cfg["training"]["num_epochs"]) == 300
         assert bool(cfg["training"]["val_on_train_subset"]) is True
 
 
 def test_yaml_injection_mode_matches_manifest(tmp_path: Path) -> None:
-    """Sanity-check that the rendered YAML's r29_injection_mode matches
-    the manifest's injection_mode field."""
     cfg_dir, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
         yaml_path = cfg_dir / Path(v["config_path"]).name
@@ -140,40 +163,48 @@ def test_yaml_injection_mode_matches_manifest(tmp_path: Path) -> None:
         assert cfg["model"]["denoiser"]["r29_injection_mode"] == v["injection_mode"]
 
 
-def test_relative_behavior_yaml_has_r29_consistency_weights(tmp_path: Path) -> None:
-    """The relative_behavior YAML must declare every r29_*_consistency
-    weight under loss.temporal_interaction with the expected sign."""
+def test_r29_consistency_weights_in_yaml_for_v2_families(tmp_path: Path) -> None:
+    """Both v2 families must declare every r29_*_weight (including
+    swing_clearance) under loss.temporal_interaction."""
     cfg_dir, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        if v["loss_strategy"] != "relative_behavior":
+        if not v["loss_strategy"].startswith("relbeh_v2"):
             continue
         yaml_path = cfg_dir / Path(v["config_path"]).name
         cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         ti = cfg["loss"]["temporal_interaction"]
-        assert ti["r29_interaction_consistency_weight"] > 0.0
-        assert ti["r29_support_both_airborne_weight"] > 0.0
-        assert ti["r29_support_stance_velocity_weight"] > 0.0
+        assert ti["r29_interaction_consistency_weight"] == 0.10
+        assert ti["r29_support_both_airborne_weight"] == 0.10
+        assert ti["r29_support_stance_velocity_weight"] == 0.10
+        assert ti["r29_swing_clearance_weight"] == 0.10
+        # Threshold default 5 cm.
+        assert ti["r29_swing_clearance_m"] == 0.05
 
 
-def test_no_dense_pos_yaml_keeps_anchor(tmp_path: Path) -> None:
+def test_swing_clearance_off_for_baseline(tmp_path: Path) -> None:
+    """baseline_from_scratch must NOT enable swing_clearance — it tests
+    the original a-group loss configuration."""
     cfg_dir, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        if v["loss_strategy"] != "no_dense_pos":
+        if v["loss_strategy"] != "baseline_from_scratch":
             continue
         yaml_path = cfg_dir / Path(v["config_path"]).name
         cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        assert cfg["loss"]["pos_loss_weight"] == 0.0
-        assert cfg["loss"]["anchor_joint_pos_weight"] > 0.0
-        assert cfg["loss"]["anchor_joint_vel_weight"] > 0.0
+        ti = cfg["loss"]["temporal_interaction"]
+        assert ti["r29_swing_clearance_weight"] == 0.0
 
 
 def test_val_best_key_matches_enabled_loss_strategy(tmp_path: Path) -> None:
-    """Do not select best_val.pt on a disabled loss component."""
+    """Do not select best_val.pt on a disabled loss component.
+    - baseline_from_scratch: anchor active -> loss_anchor_joint_pos
+    - relbeh_v2_anchor0_low: anchor disabled -> loss (total)
+    - relbeh_v2_anchor2_mixed: anchor active (weight 2) -> loss_anchor_joint_pos
+    """
     cfg_dir, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
         yaml_path = cfg_dir / Path(v["config_path"]).name
         cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        if v["loss_strategy"] == "relative_behavior":
+        if v["loss_strategy"] == "relbeh_v2_anchor0_low":
             assert v["val_best_key"] == "loss"
             assert cfg["training"]["val_best_key"] == "loss"
             assert cfg["loss"]["anchor_joint_pos_weight"] == 0.0

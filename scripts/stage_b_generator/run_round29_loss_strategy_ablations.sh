@@ -3,15 +3,23 @@
 #
 # Per analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md.
 #
-# Four variants on the 48-clip balanced subset (300 ep), comparing
-# absolute-GT supervision against condition/behavior consistency:
-#   r29_ls_a2_no_dense_pos        A2, drop dense FK only
-#   r29_ls_a3_no_dense_pos        A3, drop dense FK only
-#   r29_ls_a2_relative_behavior   A2, switch to R29 consistency losses
-#   r29_ls_a3_relative_behavior   A3, switch to R29 consistency losses
+# Six v2 variants on the 48-clip balanced subset (300 ep), per Codex review
+# (analyses/2026-05-27_round29_loss_strategy_codex_review.md).
+# Three families × A2/A3 injection:
+#   r29_ls_{a2,a3}_baseline_from_scratch    fair from-scratch baseline
+#                                            (no init_checkpoint, original
+#                                             a-group losses) — provides the
+#                                             missing Rule-1 reference.
+#   r29_ls_{a2,a3}_relbeh_v2_anchor0_low    pure low-weight condition strat
+#                                            (anchor=0, R29 weights 0.10).
+#   r29_ls_{a2,a3}_relbeh_v2_anchor2_mixed  weak absolute stabilizer
+#                                            (anchor_pos=2, anchor_vel=0.5)
+#                                            + low R29 weights.
+# All v2 families include swing_clearance (Codex P0+ patch) at weight 0.10
+# with 5 cm threshold to fight the "both feet planted" minimum v1 produced.
 #
-# Phase 1 (TRAIN): 4 variants sequential, each uses all GPUs via accelerate.
-# Phase 2 (DIAG): 4 variants × 3 diag = 12 tasks parallel across N GPU workers.
+# Phase 1 (TRAIN): 6 variants sequential, each uses all GPUs via accelerate.
+# Phase 2 (DIAG): 6 variants × 3 diag = 18 tasks parallel across N GPU workers.
 #
 # Diag uses the same 48-clip balanced subset as the A-group baselines
 # so deltas are directly comparable to a2/a3 final.pt results.
@@ -20,7 +28,7 @@
 #   bash scripts/stage_b_generator/run_round29_loss_strategy_ablations.sh
 #   bash scripts/stage_b_generator/run_round29_loss_strategy_ablations.sh --dry-run
 #   bash scripts/stage_b_generator/run_round29_loss_strategy_ablations.sh \\
-#       --only r29_ls_a2_relative_behavior,r29_ls_a3_relative_behavior
+#       --only r29_ls_a2_relbeh_v2_anchor0_low,r29_ls_a3_relbeh_v2_anchor0_low
 #   bash scripts/stage_b_generator/run_round29_loss_strategy_ablations.sh --skip-train
 #
 # Environment overrides:

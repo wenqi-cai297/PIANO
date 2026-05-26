@@ -601,6 +601,9 @@ def build_anchordiff_step_fn(
         loss_r29_interaction_cons = torch.zeros((), device=device, dtype=motion.dtype)
         loss_r29_support_air = torch.zeros((), device=device, dtype=motion.dtype)
         loss_r29_support_stance_vel = torch.zeros((), device=device, dtype=motion.dtype)
+        # Round-29 swing clearance (post-Codex v1 review): forces swing
+        # ankle off the floor during walking-non-stance frames.
+        loss_r29_swing_clear = torch.zeros((), device=device, dtype=motion.dtype)
         if temporal_loss_cfg is not None and (
             float(getattr(temporal_loss_cfg, "contact_rel_offset_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "contact_drift_weight", 0.0)) > 0.0
@@ -612,6 +615,7 @@ def build_anchordiff_step_fn(
             or float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_swing_clearance_weight", 0.0)) > 0.0
         ):
             from piano.training.temporal_interaction_losses import (
                 loss_body_action_consistency,
@@ -624,6 +628,7 @@ def build_anchordiff_step_fn(
                 loss_r29_interaction_consistency,
                 loss_r29_support_both_airborne,
                 loss_r29_support_stance_velocity,
+                loss_r29_swing_clearance,
             )
 
             # Aux walking/foot_stance fields are required only for the
@@ -774,6 +779,23 @@ def build_anchordiff_step_fn(
                     pred_joints=jpf,
                     stage2_support=cond["stage2_support"].float(),
                     fps=float(fps), seq_mask=sm_f,
+                )
+
+            # Round-29 P0+ — swing clearance. Forces swing ankle above
+            # the per-clip floor during walking-non-stance frames. Required
+            # because both_airborne+stance_velocity alone do not prevent
+            # the "both feet planted" trivial solution v1 produced.
+            if float(getattr(temporal_loss_cfg, "r29_swing_clearance_weight", 0.0)) > 0.0:
+                if "stage2_support" not in cond:
+                    raise KeyError(
+                        "r29_swing_clearance_weight > 0 but cond is missing "
+                        "stage2_support. Enable an S-family variant with "
+                        "dim>=5 via data.r29_support_variant (S1/S2/S3/S4)."
+                    )
+                loss_r29_swing_clear = loss_r29_swing_clearance(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, seq_mask=sm_f,
                 )
 
         # --- Stable-support root stability loss (per
@@ -987,6 +1009,7 @@ def build_anchordiff_step_fn(
                 + float(getattr(temporal_loss_cfg, "r29_interaction_consistency_weight", 0.0)) * loss_r29_interaction_cons
                 + float(getattr(temporal_loss_cfg, "r29_support_both_airborne_weight", 0.0)) * loss_r29_support_air
                 + float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0)) * loss_r29_support_stance_vel
+                + float(getattr(temporal_loss_cfg, "r29_swing_clearance_weight", 0.0)) * loss_r29_swing_clear
                 if temporal_loss_cfg is not None else 0.0
             )
         )
@@ -1042,6 +1065,11 @@ def build_anchordiff_step_fn(
                 float(getattr(temporal_loss_cfg, "r29_support_stance_velocity_weight", 0.0))
                 * loss_r29_support_stance_vel
             ).detach() if temporal_loss_cfg is not None else loss_r29_support_stance_vel.detach(),
+            "loss_r29_swing_clear": loss_r29_swing_clear.detach(),
+            "weighted_r29_swing_clear": (
+                float(getattr(temporal_loss_cfg, "r29_swing_clearance_weight", 0.0))
+                * loss_r29_swing_clear
+            ).detach() if temporal_loss_cfg is not None else loss_r29_swing_clear.detach(),
             "weighted_stable_local_vel_cm": (
                 stable_local_vel_cm_weight * loss_stable_local_vel_cm
             ).detach(),
@@ -1473,6 +1501,13 @@ def main() -> None:
             ),
             r29_support_stance_velocity_weight=float(
                 _tloss.get("r29_support_stance_velocity_weight", 0.0)
+            ),
+            # Round-29 swing clearance (post-Codex v1 review).
+            r29_swing_clearance_weight=float(
+                _tloss.get("r29_swing_clearance_weight", 0.0)
+            ),
+            r29_swing_clearance_m=float(
+                _tloss.get("r29_swing_clearance_m", 0.05)
             ),
             # Pulled from cfg.data (used by both the dataset's condition
             # builder and the R29 interaction-consistency loss; must match).

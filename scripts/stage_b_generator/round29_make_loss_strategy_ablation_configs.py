@@ -81,7 +81,13 @@ class LossStrategyVariant:
     purpose: str
     # Injection (A-axis): "adapter_only" (A2) or "input_add_adapter" (A3).
     injection_mode: str
-    # Loss strategy (L-axis): "no_dense_pos" or "relative_behavior".
+    # Loss strategy family. Three v2 families per Codex review:
+    #   "baseline_from_scratch" — fair from-scratch reference using the
+    #     original a-group loss weights (NO init_checkpoint).
+    #   "relbeh_v2_anchor0_low" — pure condition/relative supervision,
+    #     low R29 weights, anchor=0.
+    #   "relbeh_v2_anchor2_mixed" — weak absolute stabilizer (anchor=2)
+    #     plus low R29 weights.
     loss_strategy: str
     # Absolute-GT auxiliary loss weights.
     pos_loss_weight: float = 5.0
@@ -94,83 +100,134 @@ class LossStrategyVariant:
     contact_rel_offset_weight: float = 0.0
     contact_drift_weight: float = 0.0
     contact_tracking_weight: float = 0.0
-    # New R29 condition-consistency losses.
+    # R29 condition-consistency losses.
     r29_interaction_consistency_weight: float = 0.0
     r29_support_both_airborne_weight: float = 0.0
     r29_support_stance_velocity_weight: float = 0.0
-    # Validation checkpoint selector. ``relative_behavior`` disables
-    # anchor_joint_pos, so it must not select best_val.pt on that metric.
+    # R29 swing clearance (Codex post-v1 patch). Forces swing ankle
+    # off the floor during walking-non-stance frames.
+    r29_swing_clearance_weight: float = 0.0
+    r29_swing_clearance_m: float = 0.05
+    # Validation checkpoint selector. A family that disables
+    # anchor_joint_pos must NOT select best_val.pt on that metric.
     val_best_key: str = "loss_anchor_joint_pos"
     diagnostics: tuple[str, ...] = field(default_factory=lambda: (
         "sustained_contact", "gait", "body_action",
     ))
 
 
-# Build the 4-variant matrix: A-axis × L-axis.
+# ----------------------------------------------------------------------
+# Three v2 families × 2 injections = 6 variants
+#
+# Per analyses/2026-05-27_round29_loss_strategy_codex_review.md:
+#   - baseline_from_scratch: fair Rule-1 baseline; original a-group losses,
+#     NO init checkpoint. Provides the missing comparison anchor that v1's
+#     report could not draw cleanly.
+#   - relbeh_v2_anchor0_low: pure low-weight relative/condition strategy.
+#     anchor=0 to test the direction without absolute floor.
+#   - relbeh_v2_anchor2_mixed: anchor=2 weak stabilizer + low R29 weights.
+#     Tests whether a small absolute pull is needed to keep contact stable
+#     while still letting condition-consistency drive most supervision.
+#
+# All three families share the same support/swing structure to fight the
+# "both feet planted" minimum v1 produced. swing_clearance is set in BOTH
+# relbeh_v2 families at weight 0.10 with 5 cm threshold.
+# ----------------------------------------------------------------------
 
-_NO_DENSE_POS = dict(
-    loss_strategy="no_dense_pos",
-    pos_loss_weight=0.0,
-    hand_endpoint_weight=1.0,
-    foot_endpoint_weight=1.0,
-    # Anchor (absolute-GT active-part pull) is KEPT in no_dense_pos.
+
+_BASELINE_FROM_SCRATCH = dict(
+    loss_strategy="baseline_from_scratch",
+    # Original a-group loss weights (matches a2/a3 a-group baseline a-group
+    # configs except NO init_checkpoint).
+    pos_loss_weight=5.0,
+    hand_endpoint_weight=2.0,
+    foot_endpoint_weight=2.0,
     anchor_joint_pos_weight=10.0,
     anchor_joint_vel_weight=2.0,
     world_joint_velocity_weight=1.0,
-    # All relative + R29 consistency weights stay at 0.
+    # All relative / R29 weights stay at 0 in baseline.
 )
 
-# Per prompt §7.2 — modest initial weights for R29 consistency losses,
-# weak global velocity prior (0.2 not 1.0), anchor weights OFF.
-_RELATIVE_BEHAVIOR = dict(
-    loss_strategy="relative_behavior",
+_RELBEH_V2_ANCHOR0_LOW = dict(
+    loss_strategy="relbeh_v2_anchor0_low",
     pos_loss_weight=0.0,
     hand_endpoint_weight=1.0,
     foot_endpoint_weight=1.0,
+    # Pure condition-consistency: anchor OFF.
     anchor_joint_pos_weight=0.0,
     anchor_joint_vel_weight=0.0,
-    world_joint_velocity_weight=0.2,
+    world_joint_velocity_weight=0.5,
     contact_rel_offset_weight=0.25,
     contact_drift_weight=0.25,
     contact_tracking_weight=0.25,
-    r29_interaction_consistency_weight=0.75,
-    r29_support_both_airborne_weight=0.5,
-    r29_support_stance_velocity_weight=0.25,
+    r29_interaction_consistency_weight=0.10,
+    r29_support_both_airborne_weight=0.10,
+    r29_support_stance_velocity_weight=0.10,
+    r29_swing_clearance_weight=0.10,
+    r29_swing_clearance_m=0.05,
     val_best_key="loss",
 )
+
+_RELBEH_V2_ANCHOR2_MIXED = dict(
+    loss_strategy="relbeh_v2_anchor2_mixed",
+    pos_loss_weight=0.0,
+    hand_endpoint_weight=1.0,
+    foot_endpoint_weight=1.0,
+    # Weak absolute stabilizer.
+    anchor_joint_pos_weight=2.0,
+    anchor_joint_vel_weight=0.5,
+    world_joint_velocity_weight=0.5,
+    contact_rel_offset_weight=0.25,
+    contact_drift_weight=0.25,
+    contact_tracking_weight=0.25,
+    r29_interaction_consistency_weight=0.10,
+    r29_support_both_airborne_weight=0.10,
+    r29_support_stance_velocity_weight=0.10,
+    r29_swing_clearance_weight=0.10,
+    r29_swing_clearance_m=0.05,
+    # Anchor is non-zero so best_val.pt on loss_anchor_joint_pos is meaningful.
+    val_best_key="loss_anchor_joint_pos",
+)
+
+
+_FAMILY_PRESETS: dict[str, dict] = {
+    "baseline_from_scratch": _BASELINE_FROM_SCRATCH,
+    "relbeh_v2_anchor0_low": _RELBEH_V2_ANCHOR0_LOW,
+    "relbeh_v2_anchor2_mixed": _RELBEH_V2_ANCHOR2_MIXED,
+}
+
+_FAMILY_PURPOSE_PHRASE: dict[str, str] = {
+    "baseline_from_scratch": (
+        "fair from-scratch baseline using the original a-group losses "
+        "(pos_loss=5, anchor_pos=10, anchor_vel=2, world_vel=1). Provides "
+        "the missing comparison anchor for §9.3 rule 1 (no init checkpoint)."
+    ),
+    "relbeh_v2_anchor0_low": (
+        "pure low-weight condition/relative supervision (anchor=0). Low "
+        "R29 consistency weights (0.10 each) to avoid the v1 contact "
+        "regression. Adds swing_clearance to break the 'both planted' minimum."
+    ),
+    "relbeh_v2_anchor2_mixed": (
+        "weak absolute stabilizer (anchor_pos=2, anchor_vel=0.5) plus low "
+        "R29 weights (0.10 each). Tests whether a small absolute floor is "
+        "needed to keep contact stable while condition-consistency drives gait."
+    ),
+}
 
 
 def _make_variants() -> list[LossStrategyVariant]:
     out: list[LossStrategyVariant] = []
     for inj_label, inj_mode in (("a2", "adapter_only"), ("a3", "input_add_adapter")):
-        # no_dense_pos
-        out.append(LossStrategyVariant(
-            variant_id=f"r29_ls_{inj_label}_no_dense_pos",
-            purpose=(
-                f"{inj_label.upper()} injection ({inj_mode}), no_dense_pos: "
-                "drop the dense FK position MSE (pos_loss_weight=0). Keep "
-                "active-part anchor_joint_pos/vel. Isolates whether dense "
-                "FK is causing over-absolute supervision while leaving "
-                "active-part anchor in place."
-            ),
-            injection_mode=inj_mode,
-            **_NO_DENSE_POS,
-        ))
-        # relative_behavior
-        out.append(LossStrategyVariant(
-            variant_id=f"r29_ls_{inj_label}_relative_behavior",
-            purpose=(
-                f"{inj_label.upper()} injection ({inj_mode}), relative_behavior: "
-                "turn off the largest absolute-GT auxiliary pulls "
-                "(pos_loss=0, anchor_joint_pos/vel=0, weak vel=0.2) and "
-                "switch to condition-consistency losses (R29 interaction + "
-                "support both-airborne + stance velocity) and existing "
-                "relative contact losses (rel_offset, drift, tracking). "
-                "Tests whether condition-realization supervision is enough."
-            ),
-            injection_mode=inj_mode,
-            **_RELATIVE_BEHAVIOR,
-        ))
+        for family_id, preset in _FAMILY_PRESETS.items():
+            out.append(LossStrategyVariant(
+                variant_id=f"r29_ls_{inj_label}_{family_id}",
+                purpose=(
+                    f"{inj_label.upper()} injection ({inj_mode}), "
+                    f"{family_id}: {_FAMILY_PURPOSE_PHRASE[family_id]}"
+                ),
+                injection_mode=inj_mode,
+                **preset,
+            ))
     return out
 
 
@@ -324,6 +381,8 @@ loss:
     r29_interaction_consistency_weight: {v.r29_interaction_consistency_weight}
     r29_support_both_airborne_weight: {v.r29_support_both_airborne_weight}
     r29_support_stance_velocity_weight: {v.r29_support_stance_velocity_weight}
+    r29_swing_clearance_weight: {v.r29_swing_clearance_weight}
+    r29_swing_clearance_m: {v.r29_swing_clearance_m}
     contact_threshold: 0.5
     contact_rel_clamp_m: 2.0
     tracking_margin_m: 0.03
@@ -410,6 +469,8 @@ def main() -> int:
                 "r29_interaction_consistency_weight": v.r29_interaction_consistency_weight,
                 "r29_support_both_airborne_weight": v.r29_support_both_airborne_weight,
                 "r29_support_stance_velocity_weight": v.r29_support_stance_velocity_weight,
+                "r29_swing_clearance_weight": v.r29_swing_clearance_weight,
+                "r29_swing_clearance_m": v.r29_swing_clearance_m,
             },
             "subset_kind": "balanced",
             "subset_file": subset_file,
@@ -433,20 +494,26 @@ def main() -> int:
     manifest_md = analyses_dir / "round29_loss_strategy_ablation_manifest.md"
 
     md_lines: list[str] = [
-        "# Round-29 loss-strategy ablation manifest",
+        "# Round-29 loss-strategy ablation manifest (v2 — Codex review)",
         "",
-        "Per analyses/2026-05-27_round29_loss_strategy_ablation_prompt_for_claude_code.md.",
-        "Each variant fixes the R29 FULL-DENSE C/I/S/B content and the A-axis",
-        "injection mode (A2=adapter_only or A3=input_add_adapter), then varies",
-        "the loss strategy: keep absolute-GT pulls (baseline a2/a3 — NOT in",
-        "this group), drop only dense FK (`no_dense_pos`), or fully switch to",
-        "condition-consistency (`relative_behavior`).",
+        "Per analyses/2026-05-27_round29_loss_strategy_codex_review.md.",
+        "Three v2 variant families × A2/A3 injection = 6 variants. All",
+        "from-scratch (no init_checkpoint), 48-clip balanced subset, 300 ep,",
+        "FULL-DENSE C/I/S/B oracle content.",
         "",
-        "All variants use the same 48-clip balanced subset and 300 ep schedule",
-        "as the regular A-group baselines for direct comparison.",
+        "Families:",
+        "  - `baseline_from_scratch`: original a-group losses, no warm-start.",
+        "    Provides the missing fair Rule-1 reference for the loss-strategy",
+        "    comparison (warm-start a-group ckpts cannot be used).",
+        "  - `relbeh_v2_anchor0_low`: pure low-weight relative/condition",
+        "    supervision. Anchor=0. Adds swing_clearance (Codex P0+) to fight",
+        "    'both feet planted' minimum that v1 produced.",
+        "  - `relbeh_v2_anchor2_mixed`: weak absolute stabilizer (anchor_pos=2,",
+        "    anchor_vel=0.5) + low R29 weights. Tests whether a small",
+        "    absolute pull is needed to keep contact stable.",
         "",
-        "| variant | injection | strategy | val_best_key | pos_loss | anchor_pos | r29_int_cons | r29_supp_air | r29_stance_vel |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| variant | injection | family | val_best_key | pos_loss | anchor_pos | anchor_vel | r29_int_cons | r29_supp_air | r29_stance_vel | r29_swing_clear |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         k = r["knobs"]
@@ -454,15 +521,19 @@ def main() -> int:
             f"| `{r['variant_id']}` | {r['injection_mode']} | {r['loss_strategy']} | "
             f"`{r['val_best_key']}` | "
             f"{k['pos_loss_weight']} | {k['anchor_joint_pos_weight']} | "
+            f"{k['anchor_joint_vel_weight']} | "
             f"{k['r29_interaction_consistency_weight']} | "
             f"{k['r29_support_both_airborne_weight']} | "
-            f"{k['r29_support_stance_velocity_weight']} |"
+            f"{k['r29_support_stance_velocity_weight']} | "
+            f"{k['r29_swing_clearance_weight']} |"
         )
     md_lines.append("")
     md_lines.append(
-        "Compare each variant's three diag outputs against the corresponding "
-        "regular A-group ckpt (a2_adapter_only / a3_input_add_adapter on the "
-        "same 48-clip subset, 300 ep)."
+        "Fair within-protocol comparisons: `baseline_from_scratch` provides "
+        "the Rule-1 reference; `anchor0_low` vs `anchor2_mixed` directly "
+        "tests whether weak absolute stabilization is necessary; both v2 "
+        "families vs `baseline_from_scratch` tests whether the loss-strategy "
+        "axis matters at all on from-scratch + 48-clip."
     )
     if args.dry_run:
         print(f"DRY-RUN would write: {manifest_json}")

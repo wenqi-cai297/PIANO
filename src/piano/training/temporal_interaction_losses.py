@@ -110,6 +110,17 @@ class TemporalInteractionLossConfig:
     r29_support_both_airborne_weight: float = 0.0
     r29_support_stance_velocity_weight: float = 0.0
 
+    # Round-29 swing clearance loss (per Codex review of v1 loss-strategy
+    # ablation, 2026-05-27). Penalises low ankle height during walking
+    # frames where the foot is NOT in stance (i.e. swing foot must lift).
+    # Targets the "both feet planted" pathology v1 produced when
+    # both_airborne suppressed double-airborne without ensuring stepping.
+    # Active only on walking_mask * (1 - foot_stance) frames.
+    r29_swing_clearance_weight: float = 0.0
+    r29_swing_clearance_m: float = 0.05
+    """Minimum ankle-above-floor height (metres) for a swing foot.
+    Frames where the ankle is below this contribute relu(clearance - h)^2."""
+
     # Round-29 interaction-consistency normalization clamp. Must match
     # the value used by ``piano.data.stage2_oracle_conditions.build_interaction_condition``
     # (clamp before normalization → values in [-1, 1]). Configured via
@@ -890,6 +901,67 @@ def loss_r29_support_stance_velocity(
         fps=fps,
         seq_mask=seq_mask,
     )
+
+
+def loss_r29_swing_clearance(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor estimate
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R29 P0+ — Penalise low swing ankle on walking frames.
+
+    Per Codex review of v1 loss-strategy ablation: the existing
+    ``loss_r29_support_both_airborne`` only suppresses double-airborne and
+    ``loss_r29_support_stance_velocity`` only freezes stance foot. Neither
+    forces the swing foot to actually lift, so the model's easy equilibrium
+    becomes "both feet planted" (v1 showed ``frac_both_stance`` going from
+    0.16 to 0.44+ when relative_behavior was enabled).
+
+    This loss says: during walking, for any foot that is NOT in stance
+    (i.e. the GT-tagged swing foot), its ankle should rise above
+    ``cfg.r29_swing_clearance_m`` (default 5 cm above floor).
+
+        floor_y = per-clip quantile(GT ankle y) — same estimate as
+                  loss_gait_both_airborne uses (sample-specific floor).
+        h_above_floor = ankle_y - floor_y                    (B, T, 2)
+        swing_mask = walking_mask * (1 - foot_stance)        (B, T, 2)
+        penalty    = relu(clearance - h_above_floor)^2       (B, T, 2)
+        loss       = sum(swing_mask * penalty) / sum(swing_mask).clamp_min(1)
+
+    Returns 0 if no swing-during-walking frames in batch.
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "loss_r29_swing_clearance requires stage2_support dim >= 5 "
+            f"(S1+ layout: [L_stance, R_stance, ..., walking_mask]); got "
+            f"dim={stage2_support.shape[-1]}."
+        )
+
+    floor_y = _per_clip_floor_y(gt_joints, seq_mask, cfg.floor_quantile)    # (B,)
+    clearance = float(cfg.r29_swing_clearance_m)
+
+    l_y = pred_joints[..., LEFT_ANKLE_IDX, 1]                              # (B, T)
+    r_y = pred_joints[..., RIGHT_ANKLE_IDX, 1]
+    h_lr = torch.stack(
+        [l_y - floor_y.unsqueeze(-1), r_y - floor_y.unsqueeze(-1)],
+        dim=-1,
+    )                                                                       # (B, T, 2)
+
+    foot_stance = _r29_foot_stance_from_support(stage2_support).to(pred_joints.dtype)  # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)     # (B, T, 1)
+    # Swing = walking AND NOT stance. ``foot_stance`` is soft in [0, 1],
+    # so (1 - foot_stance) is a soft swing weight.
+    swing_mask = walking * (1.0 - foot_stance)                              # (B, T, 2)
+    if seq_mask is not None:
+        sm = seq_mask.to(pred_joints.dtype).unsqueeze(-1)                   # (B, T, 1)
+        swing_mask = swing_mask * sm
+
+    penalty = F.relu(clearance - h_lr).pow(2)                               # (B, T, 2)
+    num = (swing_mask * penalty).sum()
+    den = swing_mask.sum().clamp_min(1.0)
+    return num / den
 
 
 def _root0_world_to_canonical_yaw_matrix(pred_joints: Tensor) -> Tensor:

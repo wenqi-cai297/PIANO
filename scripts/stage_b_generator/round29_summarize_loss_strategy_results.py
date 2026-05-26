@@ -47,25 +47,22 @@ DEFAULT_REPORT_PATH = (
     ROOT / "analyses" / "2026-05-27_round29_loss_strategy_ablation_report.md"
 )
 
+# Six v2 variants per Codex review. Three families × A2/A3 injection.
+# Order within the tuple drives report row order.
 VARIANTS: tuple[str, ...] = (
-    "r29_ls_a2_no_dense_pos",
-    "r29_ls_a3_no_dense_pos",
-    "r29_ls_a2_relative_behavior",
-    "r29_ls_a3_relative_behavior",
+    "r29_ls_a2_baseline_from_scratch",
+    "r29_ls_a2_relbeh_v2_anchor0_low",
+    "r29_ls_a2_relbeh_v2_anchor2_mixed",
+    "r29_ls_a3_baseline_from_scratch",
+    "r29_ls_a3_relbeh_v2_anchor0_low",
+    "r29_ls_a3_relbeh_v2_anchor2_mixed",
 )
 
-# A2/A3 a-group baselines (v27 warm-start, 48-clip 300ep). Diag results
-# may be on disk under round29_agroup_extracted/ if the user has them.
-BASELINE_CANDIDATES: dict[str, list[str]] = {
-    "a2_baseline": [
-        "round29_agroup_extracted/analyses/round29_r29_a2_adapter_only_diag_{kind}",
-        "round29_r29_a2_adapter_only_diag_{kind}",
-    ],
-    "a3_baseline": [
-        "round29_agroup_extracted/analyses/round29_r29_a3_input_add_adapter_diag_{kind}",
-        "round29_r29_a3_input_add_adapter_diag_{kind}",
-    ],
-}
+# v2 protocol deliberately drops v27-warm-start a-group baselines from the
+# comparison set: training-init confounds the loss-strategy axis (per
+# analyses/2026-05-27_round29_tier2_verdict.md). The fair reference is
+# now `baseline_from_scratch` inside this manifest itself.
+BASELINE_CANDIDATES: dict[str, list[str]] = {}
 
 KINDS: tuple[str, ...] = ("sustained_contact", "gait", "body_action")
 
@@ -225,38 +222,35 @@ def _render_report(rows: dict[str, dict[str, dict[str, Any]]]) -> str:
     lines: list[str] = []
     a = lines.append
 
-    a(f"# Round-29 loss-strategy ablation report")
+    a(f"# Round-29 loss-strategy ablation report (v2 — Codex review)")
     a("")
     a(f"**Date:** {today}")
-    a("**Protocol:** 48-clip balanced subset, 300 ep, FULL-DENSE C/I/S/B content.")
+    a("**Protocol:** 48-clip balanced subset, 300 ep, FULL-DENSE C/I/S/B content,")
+    a("from-scratch (no init_checkpoint) for ALL 6 variants.")
+    a("")
     a("**Axis A (injection):** A2 = `adapter_only`, A3 = `input_add_adapter`.")
-    a("**Axis L (loss strategy):**")
-    a("  - `no_dense_pos`: drop dense FK MSE only. Keeps anchor_joint_pos/vel.")
-    a("  - `relative_behavior`: drop pos_loss / anchor_pos / anchor_vel,")
-    a("    weak global vel (0.2), enable R29 condition-consistency losses")
-    a("    (interaction + both-airborne + stance velocity) + existing")
-    a("    relative contact losses (rel_offset / drift / tracking).")
     a("")
-    a("Baselines (when available) are pulled from")
-    a("`analyses/round29_agroup_extracted/` — A2/A3 a-group ckpts (v27")
-    a("warm-start, same 48-clip subset, same 300 ep). Note: baselines and")
-    a("ablations have different training-init (warm-start vs from-scratch)")
-    a("if the ablation ckpts also train from scratch; see ANALYSIS section.")
+    a("**Axis L (loss strategy family):**")
+    a("  - `baseline_from_scratch`: original a-group losses (pos_loss=5,")
+    a("    anchor_pos=10, anchor_vel=2, world_vel=1). Fair Rule-1 reference.")
+    a("  - `relbeh_v2_anchor0_low`: pure low-weight condition supervision.")
+    a("    anchor=0; R29 weights all 0.10; swing_clearance ON.")
+    a("  - `relbeh_v2_anchor2_mixed`: weak absolute stabilizer (anchor_pos=2,")
+    a("    anchor_vel=0.5) + low R29 weights; swing_clearance ON.")
     a("")
-    a("Variant key:")
-    a("- `a2_baseline` — R29 A2 (adapter_only) a-group ckpt, v27 warm-start.")
-    a("- `a3_baseline` — R29 A3 (input_add_adapter) a-group ckpt, v27 warm-start.")
-    a("- `r29_ls_a*_no_dense_pos` — pos_loss=0 only, anchor kept.")
-    a("- `r29_ls_a*_relative_behavior` — pos_loss=0, anchor=0, R29 consistency on.")
+    a("All 6 variants share the same from-scratch protocol → cross-variant")
+    a("deltas isolate the loss-strategy axis. v27-warm-start a-group baselines")
+    a("are NOT used here (per analyses/2026-05-27_round29_tier2_verdict.md:")
+    a("training-init confounds the loss-strategy comparison).")
     a("")
 
     label_order = (
-        "a2_baseline",
-        "r29_ls_a2_no_dense_pos",
-        "r29_ls_a2_relative_behavior",
-        "a3_baseline",
-        "r29_ls_a3_no_dense_pos",
-        "r29_ls_a3_relative_behavior",
+        "r29_ls_a2_baseline_from_scratch",
+        "r29_ls_a2_relbeh_v2_anchor0_low",
+        "r29_ls_a2_relbeh_v2_anchor2_mixed",
+        "r29_ls_a3_baseline_from_scratch",
+        "r29_ls_a3_relbeh_v2_anchor0_low",
+        "r29_ls_a3_relbeh_v2_anchor2_mixed",
     )
 
     # ---------------- Sustained contact ----------------
@@ -282,9 +276,12 @@ def _render_report(rows: dict[str, dict[str, dict[str, Any]]]) -> str:
     # ---------------- Gait ----------------
     a("## Gait")
     a("")
-    a("Reference GT values (from a-group baselines): `frac_both_swing≈0.29`,")
-    a("`frac_both_stance≈0.15`, `transitions/sec≈0.79`, `L_R_height_corr≈-0.31`,")
-    a("`step_period_rate≈0.27`. Closer to GT on these is better.")
+    a("GT physical reference: `frac_both_swing=0.291`, `frac_both_stance=0.153`,")
+    a("`trans/s=0.790`, `L_R_height_corr=-0.309`, `step_period_rate=26.6%`.")
+    a("Closer to GT on these is better. **Note:** under the current support")
+    a("losses (no swing/phase/footstep terms beyond `swing_clearance`),")
+    a("`L_R_corr` is a diagnostic only — do not treat its sign as a pass")
+    a("criterion (per Codex review).")
     a("")
     a("| variant | n_walk_seg | frac_both_swing | frac_both_stance | trans/sec | L_R_corr | step_period_rate |")
     a("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
@@ -324,42 +321,47 @@ def _render_report(rows: dict[str, dict[str, dict[str, Any]]]) -> str:
     a("")
 
     # ---------------- Decision rule ----------------
-    a("## Decision rule (per prompt §9.3)")
+    a("## Decision rule (per Codex review §revised success criteria)")
     a("")
     a(
-        "1. **`no_dense_pos` survives** if its sustained-contact, gait, and "
-        "body-action metrics do not regress materially against the matching "
-        "A2/A3 baseline. If yes, the dense FK position MSE was redundant or "
-        "harmful.")
-    a(
-        "2. **`relative_behavior` is promising** only if (a) sustained "
-        "contact does not collapse (drift_max < ~2× baseline), (b) gait "
-        "moves closer to GT reference on both-swing / transitions, (c) "
-        "body-action error does not blow up, AND (d) qualitative samples "
-        "remain plausible. All four checks must hold.")
-    a(
-        "3. **If `relative_behavior` improves gait/contact but worsens body "
-        "detail**, keep it as a direction but reduce its weights or add a "
-        "P1 body-refine consistency term before full-data training.")
-    a(
-        "4. **If both `relative_behavior` variants collapse**, do NOT "
-        "conclude the idea is wrong. First sanity-check: (a) are the new "
-        "consistency-loss weights too high? (b) is there a scaling bug in "
-        "the new losses (e.g. clamp/normalization mismatch with the "
-        "condition builder)?")
+        "Reference for each v2 variant is the matching `baseline_from_scratch` "
+        "(same injection, same init regime). Pass criteria:")
     a("")
     a(
-        "**Important caveat (per analyses/2026-05-27_round29_tier2_verdict.md):** "
-        "the A2/A3 a-group baselines were trained as v27 warm-start "
-        "fine-tunes. If the loss-strategy ablations train from scratch, "
-        "the comparison is contaminated by the training-init axis. Note "
-        "in the conclusion which init regime each row used.")
+        "1. **Contact**: `drift_max <= 1.5x baseline_from_scratch` AND "
+        "`%track<0.5` not worse by more than 10 pp.")
+    a(
+        "2. **Gait airborne**: `both_swing` and `trans/sec` should be "
+        "materially better than `baseline_from_scratch` (closer to GT).")
+    a(
+        "3. **Gait planted**: `both_stance < 0.25`. (v1 produced 0.44+; "
+        "swing_clearance is the new term added to fight this.)")
+    a(
+        "4. **L_R_corr**: diagnostic only. Current support losses do NOT "
+        "supervise S4 phase/footstep channels, so anti-phase coherence "
+        "is not expected from these losses alone. Do not require negative "
+        "L_R_corr from v2.")
+    a(
+        "5. **Body action**: mean delta error within ±2 cm of "
+        "`baseline_from_scratch`.")
     a("")
     a(
-        "Do NOT pick a full-data mainline from a single scalar in this "
-        "report. The point of this ablation is the strategic direction "
-        "(absolute-GT vs condition-consistency), not the specific full-data "
-        "mainline.")
+        "Interpretation paths after the run:")
+    a(
+        "- If `anchor0_low` passes all five, take it to full-data — cleaner "
+        "method (pure condition-consistency).")
+    a(
+        "- If only `anchor2_mixed` passes, take the mixed strategy to "
+        "full-data and describe honestly as weak absolute stabilization + "
+        "relative condition losses.")
+    a(
+        "- If both fail contact, fix the I3 target/mask (Codex recommended "
+        "unmasking the target inside the loss or threshold hand_contact "
+        "≥ 0.95) before spending full-data time.")
+    a(
+        "- If both pass contact but gait both_stance is still > 0.25, the "
+        "swing_clearance weight may need to be raised, or a phase/footstep "
+        "supervision term added before full-data.")
 
     return "\n".join(lines) + "\n"
 
@@ -367,8 +369,8 @@ def _render_report(rows: dict[str, dict[str, dict[str, Any]]]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize the 4 R29 loss-strategy ablation variants' diag "
-            "results into a single comparison Markdown report."
+            "Summarize the 6 R29 loss-strategy ablation variants' diag "
+            "results into a single comparison Markdown report (v2 — Codex review)."
         ),
     )
     parser.add_argument(

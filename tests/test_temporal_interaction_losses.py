@@ -32,6 +32,7 @@ from piano.training.temporal_interaction_losses import (
     loss_r29_interaction_consistency,
     loss_r29_support_both_airborne,
     loss_r29_support_stance_velocity,
+    loss_r29_swing_clearance,
 )
 
 
@@ -647,5 +648,92 @@ def test_r29_support_stance_velocity_gradient_flows():
     loss.backward()
     assert pred.grad is not None
     assert pred.grad.abs().sum().item() > 0.0
+
+
+# ----- R29 swing clearance (Codex P0+ patch) --------------------------
+
+
+def test_r29_swing_clearance_zero_when_swing_foot_lifted():
+    """If the swing foot is already above the clearance threshold,
+    the relu(clearance - h)^2 term is zero everywhere → loss = 0."""
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    stage2_sup = _build_s4_condition(walking_mask, foot_stance)
+    pred = joints.clone()
+    # foot_stance in fixture is all-1 during walking → swing_mask = 0 → loss = 0.
+    # Override foot_stance: make left foot swing (stance=0) and lift it.
+    fs2 = torch.zeros_like(foot_stance)
+    fs2[:, :, 1] = 1.0   # right is always stance
+    # left is always swing → must be above clearance
+    stage2_sup2 = _build_s4_condition(walking_mask, fs2)
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.20  # 20 cm above floor (>> 5 cm clearance)
+    cfg = _default_cfg()
+    loss = loss_r29_swing_clearance(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=stage2_sup2, cfg=cfg,
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() < 1e-6
+
+
+def test_r29_swing_clearance_positive_when_swing_foot_dragged():
+    """If the swing foot stays on the floor (height 0), it violates
+    the clearance threshold by the full ``clearance_m`` → positive loss."""
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    fs2 = torch.zeros_like(foot_stance)
+    fs2[:, :, 1] = 1.0   # right stance, left swing
+    stage2_sup2 = _build_s4_condition(walking_mask, fs2)
+    pred = joints.clone()
+    # left ankle stays at floor (y=0) → violates clearance=0.05 by 5 cm
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.0
+    cfg = _default_cfg()
+    loss = loss_r29_swing_clearance(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=stage2_sup2, cfg=cfg,
+    )
+    # Per-frame penalty = (0.05)^2 = 0.0025. Mask weight on left-swing-during-walk
+    # is non-zero → loss ~ 0.0025.
+    assert loss.item() > 1e-4
+
+
+def test_r29_swing_clearance_no_walking_returns_zero():
+    joints, _, _, _, _, foot_stance = _make_clip(with_walking=False)
+    walking_mask = torch.zeros(1, joints.shape[1], 1)
+    fs2 = torch.zeros_like(foot_stance)
+    stage2_sup = _build_s4_condition(walking_mask, fs2)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.0
+    loss = loss_r29_swing_clearance(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+
+
+def test_r29_swing_clearance_gradient_flows():
+    joints, _, _, _, walking_mask, foot_stance = _make_clip()
+    fs2 = torch.zeros_like(foot_stance)
+    fs2[:, :, 1] = 1.0
+    stage2_sup = _build_s4_condition(walking_mask, fs2)
+    pred = joints.clone()
+    pred[:, :, LEFT_ANKLE_IDX, 1] = 0.01   # 1 cm above floor, below clearance
+    pred.requires_grad_(True)
+    loss = loss_r29_swing_clearance(
+        pred_joints=pred, gt_joints=joints.detach(),
+        stage2_support=stage2_sup, cfg=_default_cfg(),
+    )
+    loss.backward()
+    assert pred.grad is not None
+    assert pred.grad.abs().sum().item() > 0.0
+
+
+def test_r29_swing_clearance_low_dim_raises():
+    joints, _, _, _, _, _ = _make_clip()
+    bad = torch.zeros(joints.shape[0], joints.shape[1], 4, dtype=joints.dtype)
+    with pytest.raises(ValueError, match="dim >= 5"):
+        loss_r29_swing_clearance(
+            pred_joints=joints, gt_joints=joints,
+            stage2_support=bad, cfg=_default_cfg(),
+        )
 
 
