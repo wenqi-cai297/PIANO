@@ -43,7 +43,6 @@ from piano.models.motion_anchordiff import (
     DiffusionConfig,
     MotionAnchorDiff,
     ZIntDims,
-    pack_z_int,
 )
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
@@ -52,11 +51,7 @@ from piano.training.anchor_consistency_loss import (
     anchor_consistency_loss_world_joints,
     lift_object_local_to_world,
 )
-from piano.training.feature_groups import FEATURE_GROUPS
-from piano.training.feature_weight_state import FeatureWeightState
 from piano.training.anchordiff_geometric_losses import (
-    MotionGeometricLossConfig,
-    compute_motion_geometric_losses,
     feature_velocity_loss,
 )
 from piano.training.trainer import (
@@ -152,24 +147,9 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
             motion_representation=str(
                 cfg.data.get("motion_representation", "smpl_pose_135_plan")
             ),
-            use_oracle_interaction_hint=bool(
-                cfg.data.get("use_oracle_interaction_hint", False)
-            ),
-            oracle_hint_variant=str(
-                cfg.data.get("oracle_hint_variant", "full")
-            ),
             oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
             surface_temporal_aux_fields=bool(
                 cfg.data.get("surface_temporal_aux_fields", False)
-            ),
-            use_body_action_hint=bool(
-                cfg.data.get("use_body_action_hint", False)
-            ),
-            body_action_hint_mask_mode=str(
-                cfg.data.get("body_action_hint_mask_mode", "all_on")
-            ),
-            body_action_energy_threshold=float(
-                cfg.data.get("body_action_energy_threshold", 0.05)
             ),
             r29_coarse_variant=str(
                 cfg.data.get("r29_coarse_variant", "C23")
@@ -244,21 +224,6 @@ def _load_state_dict_compatible(
 # ---------------------------------------------------------------------------
 
 
-def _phase_to_softmax(phase_idx: Tensor, num_classes: int) -> Tensor:
-    """One-hot phase ids → soft 'softmax' representation we feed into z_int.
-
-    Stage A produces softmax; GT during training is an integer index.
-    We one-hot it so the input shape is consistent with predicted-z_int
-    inference. (Identity at training time, soft at inference time.)
-    """
-    onehot = F.one_hot(phase_idx.clamp_min(0).long(), num_classes=num_classes)
-    return onehot.float()
-
-
-def _support_to_softmax(support_idx: Tensor, num_classes: int) -> Tensor:
-    return _phase_to_softmax(support_idx, num_classes)
-
-
 def build_anchordiff_step_fn(
     model: MotionAnchorDiff,
     object_encoder: ObjectEncoder,
@@ -266,12 +231,9 @@ def build_anchordiff_step_fn(
     anchor_cfg: AnchorConsistencyConfig,
     z_dims: ZIntDims,
     device: torch.device,
-    feature_weight_state: FeatureWeightState | None,
-    geometric_cfg: MotionGeometricLossConfig,
     motion_representation: str = "smpl_pose_135_plan",
     world_joint_velocity_weight: float = 0.0,
     object_traj_dim: int = 9,
-    fk_consistency_weight: float = 0.0,
     pos_loss_weight: float = 0.0,
     # Round-25 D5: per-joint weighting of the dense FK position loss.
     # Default 1.0 = back-compat (uniform 22-joint MSE). Set > 1 to
@@ -286,12 +248,6 @@ def build_anchordiff_step_fn(
     anchor_joint_pos_weight: float = 0.0,
     anchor_joint_vel_weight: float = 0.0,
     anchor_joint_part_weights: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0),
-    use_interaction_plan: bool = False,
-    plan_anchor_weight: float = 0.0,
-    plan_segment_weight: float = 0.0,
-    plan_transition_vel_weight: float = 0.0,
-    plan_transition_acc_weight: float = 0.0,
-    plan_transition_window: int = 3,
     stable_root_vel_weight: float = 0.0,
     stable_root_acc_weight: float = 0.0,
     stable_local_vel_weight: float = 0.0,
@@ -330,14 +286,7 @@ def build_anchordiff_step_fn(
     temporal_loss_cfg: object | None = None,
     fps: float = 20.0,
 ):
-    """Build the AnchorDiff step_fn closure.
-
-    The step_fn reads `feature_weight_state.current` every batch via
-    `to_per_frame_tensor` (cheap; lazily refreshed when state has changed).
-    Dynamic-update mode: an external epoch hook calls
-    `feature_weight_state.update(...)` after every K epochs; the next
-    batch's `cache.get()` automatically picks up the new weights.
-    """
+    """Build the AnchorDiff step_fn closure."""
 
     # Round-22: pre-convert Stage-1 Coarse-v1 norm stats to device tensors
     # once at step_fn construction (avoids per-step host→device copies). When
@@ -379,34 +328,6 @@ def build_anchordiff_step_fn(
     # training passes still go through the wrapped `model(...)` to keep
     # DDP gradient sync intact.
     _unwrapped_model_for_diff = model.module if hasattr(model, "module") else model
-
-    class _WeightCache:
-        def __init__(self) -> None:
-            self._t: Tensor | None = None
-            self._ver = -1
-            if feature_weight_state is not None:
-                self._t = feature_weight_state.to_per_frame_tensor(device)
-                self._ver = feature_weight_state.last_update_epoch
-
-        def get(self, motion_dim: int) -> Tensor:
-            if feature_weight_state is None:
-                if self._t is None or self._t.shape[-1] != motion_dim:
-                    self._t = torch.ones(
-                        1, 1, motion_dim, device=device, dtype=torch.float32,
-                    )
-                return self._t
-            if feature_weight_state.last_update_epoch != self._ver:
-                self._t = feature_weight_state.to_per_frame_tensor(device)
-                self._ver = feature_weight_state.last_update_epoch
-            if self._t is None or self._t.shape[-1] != motion_dim:
-                raise ValueError(
-                    "FeatureWeightState is only valid for motion_263; "
-                    f"got weight_dim={None if self._t is None else self._t.shape[-1]} "
-                    f"for motion_dim={motion_dim}"
-                )
-            return self._t
-
-    cache = _WeightCache()
 
     def _build_object_traj(
         obj_com: Tensor,
@@ -450,27 +371,10 @@ def build_anchordiff_step_fn(
         seq_idx = torch.arange(T, device=device).unsqueeze(0)
         seq_mask = (seq_idx < seq_len.unsqueeze(1)).float()        # (B, T)
 
-        # Round-28 cleanup: only smpl_pose_135_plan is supported. The
-        # legacy per-clip canonical->world transform (motion_263 path) and
-        # the v8 keyframed contact-zeroing were removed; downstream code
-        # treats R_y / T_xz_canon / T_y_canon as None.
-        R_y = T_xz_canon = T_y_canon = None
-        contact_target_xyz_for_z = contact_target_xyz
-
-        # --- Pack z_int (training: GT contact + GT target + GT phase/support) ---
-        phase_soft = _phase_to_softmax(phase, z_dims.phase_classes)
-        support_soft = _support_to_softmax(support, z_dims.support_classes)
-
-        # Round-28 cleanup: all active configs zero the z_int channels.
-        # Hard-coded since the Stage-1.5 plan supersedes per-frame z_int.
-        contact_state_for_z = torch.zeros_like(contact_state)
-        contact_target_xyz_for_z = torch.zeros_like(contact_target_xyz_for_z)
-        phase_soft_for_z = torch.zeros_like(phase_soft)
-        support_soft_for_z = torch.zeros_like(support_soft)
-        z_int = pack_z_int(
-            contact_state_for_z, contact_target_xyz_for_z,
-            phase_soft_for_z, support_soft_for_z, z_dims,
-        )                                                          # (B, T, total)
+        # R29 cleanup: z_int is pre-allocated zero; the projection in the
+        # denoiser's V12InputProjection is still present (kept zero-init for
+        # ckpt compat) but consumes a fixed zero tensor.
+        z_int = torch.zeros(B, T, z_dims.total, device=device, dtype=motion.dtype)
 
         # --- Object trajectory channel. v1-v4a use object pose only
         # (3 COM + 6 rot6d). v4b appends the five body-part anchor targets
@@ -481,7 +385,7 @@ def build_anchordiff_step_fn(
         object_traj = _build_object_traj(
             obj_com=obj_com,
             obj_rot6d=obj_rot6d,
-            contact_target_xyz=contact_target_xyz_for_z,
+            contact_target_xyz=contact_target_xyz,
             obj_pos_world=obj_pos_world,
             obj_rot_world=obj_rot_world,
         )
@@ -497,12 +401,9 @@ def build_anchordiff_step_fn(
         # --- Object tokens via PointNet++ encoder ---
         obj_tokens = object_encoder(object_pc)                     # (B, N, obj_dim)
 
-        # --- Stage B PLAN_ONLY condition mode (per
-        # Round-28 cleanup: PLAN_ONLY condition mode is the only mode now.
-        # Zero z_int and the contact-target portion of object_traj (first 9
-        # dims are object pose; last 15 are 5 lifted contact targets).
-        # Interaction plan tokens carry contact / part / phase / support info.
-        z_int = torch.zeros_like(z_int)
+        # R29 PLAN-only condition mode: zero the dense contact-target suffix
+        # of object_traj if a wider variant is used (first 9 dims are object
+        # pose, kept as the only object-pose channel).
         if object_traj.shape[-1] >= 24:
             object_traj = object_traj.clone()
             object_traj[..., 9:] = 0.0
@@ -537,25 +438,6 @@ def build_anchordiff_step_fn(
                 )
             cond["stage1_coarse"] = coarse_v1_norm
 
-        # ── Round-27 Tier-0A: oracle interaction hint condition ──
-        # Per roadmap §6.11 / §6.12. The dataset builds the (T, D) hint
-        # tensor in __getitem__ when data.use_oracle_interaction_hint=true;
-        # the denoiser's oracle_hint_proj (zero-init) consumes it via a
-        # direct addition into the per-frame motion-token embedding.
-        if "oracle_interaction_hint" in batch:
-            cond["oracle_interaction_hint"] = (
-                batch["oracle_interaction_hint"].to(device).float()
-            )
-        # ── Round-28: body-action oracle hint condition (24D) ──
-        # When data.use_body_action_hint=true, the dataset surfaces a
-        # per-frame 24D channel; the denoiser's body_action_hint_proj
-        # consumes it through a separate branch (gated / per-layer
-        # adapter / input-add depending on injection_mode).
-        if "body_action_hint" in batch:
-            cond["body_action_hint"] = (
-                batch["body_action_hint"].to(device).float()
-            )
-
         # ── Round-29: typed Stage-2 condition bundle ──
         # The dataset's Stage2ConditionBundle is surfaced as four
         # optional keys; each is present iff the corresponding family
@@ -570,24 +452,6 @@ def build_anchordiff_step_fn(
         ):
             if _r29_key in batch:
                 cond[_r29_key] = batch[_r29_key].to(device).float()
-
-        # --- v10 InteractionPlan: thread the compiled plan through cond ---
-        # The dataset compiles the plan in __getitem__ for the
-        # smpl_pose_135_plan motion_representation; we just collect the
-        # plan_* tensors back into a single dict the denoiser's
-        # InteractionPlanEncoder expects.
-        if use_interaction_plan:
-            plan_keys = [
-                "anchor_time", "anchor_part", "anchor_target_local",
-                "anchor_target_world", "anchor_type", "anchor_phase",
-                "anchor_support", "anchor_conf", "anchor_mask",
-                "segment_start", "segment_end", "segment_part",
-                "segment_target_summary_local", "segment_phase",
-                "segment_support", "segment_conf", "segment_mask",
-            ]
-            cond["interaction_plan"] = {
-                k: batch[f"plan_{k}"].to(device) for k in plan_keys
-            }
 
         # --- Diffusion training step (x₀-prediction or v-prediction) ---
         # NOTE: call via __call__ (not .training_step directly) so DDP can
@@ -605,7 +469,7 @@ def build_anchordiff_step_fn(
         # MSE(v_pred, v_target). Both target the same parameterisation
         # the network natively predicts.
         mse_per_dim = (diff_pred - diff_target).pow(2)              # (B, T, D)
-        weighted = (mse_per_dim * cache.get(motion_dim)).sum(-1)    # (B, T)
+        weighted = mse_per_dim.sum(-1)                              # (B, T)
 
         # ── Min-SNR-γ per-sample weighting on diffusion mse ────────────
         # Hang et al. arXiv:2303.09556, x_0-pred form: w_b = min(SNR_{t_b}, γ).
@@ -667,25 +531,12 @@ def build_anchordiff_step_fn(
             stability_mask=None,
         )
 
-        geom = compute_motion_geometric_losses(
-            x0_pred=x0_pred,
-            x0_target=x0_target,
-            seq_mask=seq_mask,
-            cfg=geometric_cfg,
-        )
         # World-frame velocity loss on the full 135-D motion vector.
         if world_joint_velocity_weight > 0.0:
             wv_pred, wv_target = x0_pred.float(), x0_target.float()
-            world_vel = feature_velocity_loss(wv_pred, wv_target, seq_mask.float())
-            geom = {
-                **geom,
-                "loss_geometric": geom["loss_geometric"]
-                + world_joint_velocity_weight * world_vel,
-                "loss_vel": world_vel,
-            }
-
-        # FK consistency removed in Round-28 cleanup (was v5-only).
-        loss_fk = torch.zeros((), device=device, dtype=x0_pred.dtype)
+            loss_world_vel = feature_velocity_loss(wv_pred, wv_target, seq_mask.float())
+        else:
+            loss_world_vel = torch.zeros((), device=device, dtype=x0_pred.dtype)
 
         # Full-body L_pos: MSE between FK-derived predicted joints and GT
         # joints_22, all 22 joints x all valid frames. Dense temporal
@@ -890,147 +741,6 @@ def build_anchordiff_step_fn(
                     "body_action_hint; set data.use_body_action_hint=true."
                 )
 
-        # --- v10 plan-aware losses ---
-        # Active only when the trainer was built with use_interaction_plan
-        # and the rep is smpl_pose_135_plan. Three sub-losses (per
-        # piano_interaction_plan_pipeline_reframe_for_claude_code.md §7.2):
-        # 1. plan_anchor: FK joint at anchor time × active part vs
-        #    anchor_target_world. Sparse — only fires at anchor frames
-        #    where parts are active.
-        # 2. plan_transition_vel/acc: ±W-frame window around each anchor,
-        #    MSE on world joint velocity / acceleration vs GT. Pulls the
-        #    near-anchor motion to GT dynamics so the unobserved frames
-        #    don't pop at boundaries.
-        # 3. plan_segment: optional segment-realization loss; default 0
-        #    weight to avoid recreating dense conditioning.
-        loss_plan_anchor = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_plan_segment = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_plan_trans_vel = torch.zeros((), device=device, dtype=motion.dtype)
-        loss_plan_trans_acc = torch.zeros((), device=device, dtype=motion.dtype)
-        if use_interaction_plan and (
-            plan_anchor_weight > 0.0
-            or plan_segment_weight > 0.0
-            or plan_transition_vel_weight > 0.0
-            or plan_transition_acc_weight > 0.0
-        ):
-            # Body-part → SMPL-22 joint index map (matches
-            # piano.utils.smpl_utils.INTERACTION_BODY_PARTS).
-            part_to_joint = torch.tensor(
-                [20, 21, 10, 11, 0], dtype=torch.long, device=device,
-            )
-            anchor_time = batch["plan_anchor_time"].to(device).long()       # (B, K)
-            anchor_part = batch["plan_anchor_part"].to(device).float()      # (B, K, P)
-            anchor_target_world = (
-                batch["plan_anchor_target_world"].to(device).float()
-            )                                                                 # (B, K, P, 3)
-            anchor_mask = batch["plan_anchor_mask"].to(device).bool()        # (B, K)
-            B_p, K_p, P_p = anchor_part.shape
-
-            # Plan anchor realization loss --------------------------------
-            if plan_anchor_weight > 0.0:
-                # FK joints at active anchor positions per part. We gather
-                # by anchor_time across the time dim, then by joint index
-                # per part. Active mask = anchor_mask AND parts_active.
-                # All ops are vectorised; works on B<=8 K=12 P=5.
-                t_idx = anchor_time.clamp(0, T - 1).view(B_p, K_p, 1, 1).expand(B_p, K_p, 22, 3)
-                fk_at_anchor = torch.gather(jpos_pred, 1, t_idx)             # (B, K, 22, 3)
-                joint_at_part = fk_at_anchor[:, :, part_to_joint, :]         # (B, K, P, 3)
-                err = (joint_at_part - anchor_target_world).pow(2).sum(-1)   # (B, K, P)
-                # Active = anchor valid AND part active
-                act = anchor_mask.unsqueeze(-1).float() * anchor_part        # (B, K, P)
-                num_active = act.sum().clamp_min(1.0)
-                loss_plan_anchor = (err * act).sum() / num_active
-
-            # Transition window losses -----------------------------------
-            if (
-                plan_transition_vel_weight > 0.0
-                or plan_transition_acc_weight > 0.0
-            ):
-                W = int(plan_transition_window)
-                # window_mask[b, t] = True if t is within ±W of any valid
-                # anchor frame in clip b.
-                t_grid = torch.arange(T, device=device).view(1, 1, T)
-                anchor_t_view = anchor_time.view(B_p, K_p, 1)                # (B, K, 1)
-                amask = anchor_mask.view(B_p, K_p, 1)
-                near = (
-                    (anchor_t_view - W <= t_grid)
-                    & (t_grid <= anchor_t_view + W)
-                    & amask
-                )                                                             # (B, K, T) bool
-                window_mask = near.any(dim=1) & seq_mask.bool()              # (B, T)
-
-                joints_gt_w = joints.float()
-                if plan_transition_vel_weight > 0.0:
-                    vel_pred = jpos_pred[:, 1:] - jpos_pred[:, :-1]            # (B, T-1, 22, 3)
-                    vel_gt = joints_gt_w[:, 1:] - joints_gt_w[:, :-1]
-                    vw = window_mask[:, 1:] & window_mask[:, :-1]              # (B, T-1)
-                    err_v = (vel_pred - vel_gt).pow(2).sum(-1).mean(-1)        # (B, T-1)
-                    denom_v = vw.float().sum().clamp_min(1.0)
-                    loss_plan_trans_vel = (err_v * vw.float()).sum() / denom_v
-
-                if plan_transition_acc_weight > 0.0:
-                    if jpos_pred.shape[1] >= 3:
-                        vel_pred = jpos_pred[:, 1:] - jpos_pred[:, :-1]
-                        vel_gt = joints_gt_w[:, 1:] - joints_gt_w[:, :-1]
-                        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-                        acc_gt = vel_gt[:, 1:] - vel_gt[:, :-1]
-                        aw = (
-                            window_mask[:, 2:]
-                            & window_mask[:, 1:-1]
-                            & window_mask[:, :-2]
-                        )                                                       # (B, T-2)
-                        err_a = (acc_pred - acc_gt).pow(2).sum(-1).mean(-1)     # (B, T-2)
-                        denom_a = aw.float().sum().clamp_min(1.0)
-                        loss_plan_trans_acc = (err_a * aw.float()).sum() / denom_a
-
-            # Segment consistency loss (optional) ------------------------
-            if plan_segment_weight > 0.0:
-                seg_start = batch["plan_segment_start"].to(device).long()     # (B, S)
-                seg_end = batch["plan_segment_end"].to(device).long()
-                seg_mask = batch["plan_segment_mask"].to(device).bool()
-                seg_part = batch["plan_segment_part"].to(device).float()      # (B, S, P)
-                seg_target = (
-                    batch["plan_segment_target_summary_local"].to(device).float()
-                )                                                              # (B, S, P, 3)
-                # Lift segment summary local→world via the per-frame object
-                # pose at the segment midpoint. Simple, avoids re-deriving
-                # full per-frame world targets here.
-                S_p = seg_start.shape[1]
-                mid = ((seg_start + seg_end) // 2).clamp(0, T - 1)              # (B, S)
-                from piano.training.anchor_consistency_loss import (
-                    lift_object_local_to_world as _lift,
-                )
-                # Build per-segment object pose at midpoint (B, S, 3)
-                obj_pos_seg = torch.gather(
-                    obj_pos_world, 1, mid.unsqueeze(-1).expand(-1, -1, 3),
-                )
-                obj_rot_seg = torch.gather(
-                    obj_rot_world, 1, mid.unsqueeze(-1).expand(-1, -1, 3),
-                )
-                seg_target_world = _lift(
-                    seg_target, obj_pos_seg, obj_rot_seg,
-                )                                                              # (B, S, P, 3)
-                # Mean FK joint position over the segment, per active part
-                t_grid_s = torch.arange(T, device=device).view(1, 1, T)
-                in_seg = (
-                    (t_grid_s >= seg_start.unsqueeze(-1))
-                    & (t_grid_s <= seg_end.unsqueeze(-1))
-                    & seg_mask.unsqueeze(-1)
-                )                                                              # (B, S, T)
-                in_seg_f = in_seg.float()
-                # jpos at part joints: (B, T, P, 3)
-                jpos_at_parts = jpos_pred[:, :, part_to_joint, :]              # (B, T, P, 3)
-                # mean over t-in-segment per (B, S, P, 3)
-                num_t = in_seg_f.sum(dim=-1).clamp_min(1.0).unsqueeze(-1).unsqueeze(-1)
-                jpos_mean = (
-                    in_seg_f.unsqueeze(-1).unsqueeze(-1)
-                    * jpos_at_parts.unsqueeze(1)
-                ).sum(dim=2) / num_t                                            # (B, S, P, 3)
-                err_s = (jpos_mean - seg_target_world).pow(2).sum(-1)           # (B, S, P)
-                act_s = seg_mask.unsqueeze(-1).float() * seg_part               # (B, S, P)
-                denom_s = act_s.sum().clamp_min(1.0)
-                loss_plan_segment = (err_s * act_s).sum() / denom_s
-
         # --- Stable-support root stability loss (per
         # claude_code_v11_planonly_stability_next_steps.md §A).
         # Active on stable-support frames only (pseudo-label support != 0
@@ -1217,15 +927,10 @@ def build_anchordiff_step_fn(
         total = (
             mse
             + anchor
-            + geom["loss_geometric"]
-            + fk_consistency_weight * loss_fk
+            + world_joint_velocity_weight * loss_world_vel
             + pos_loss_weight * loss_pos_full
             + anchor_joint_pos_weight * loss_anchor_joint_pos
             + anchor_joint_vel_weight * loss_anchor_joint_vel
-            + plan_anchor_weight * loss_plan_anchor
-            + plan_segment_weight * loss_plan_segment
-            + plan_transition_vel_weight * loss_plan_trans_vel
-            + plan_transition_acc_weight * loss_plan_trans_acc
             + stable_root_vel_weight * loss_stable_root_vel
             + stable_root_acc_weight * loss_stable_root_acc
             + stable_local_vel_weight * loss_stable_local_vel
@@ -1253,11 +958,7 @@ def build_anchordiff_step_fn(
             "mse_main": mse_main.detach(),
             "mse_kf": mse_kf.detach(),
             "anchor_l2": anchor.detach(),
-            "loss_geometric": geom["loss_geometric"].detach(),
-            "loss_pos": geom["loss_pos"].detach(),
-            "loss_vel": geom["loss_vel"].detach(),
-            "loss_foot": geom["loss_foot"].detach(),
-            "loss_fk": loss_fk.detach(),
+            "loss_vel": loss_world_vel.detach(),
             "loss_pos_full": loss_pos_full.detach(),
             "loss_pos_full_obs": loss_pos_full_obs_monitor.detach(),
             "loss_pos_full_unobs": loss_pos_full_unobs_monitor.detach(),
@@ -1270,10 +971,6 @@ def build_anchordiff_step_fn(
                 anchor_joint_vel_weight * loss_anchor_joint_vel
             ).detach(),
             "anchor_joint_active_ratio": anchor_joint_active_ratio.detach(),
-            "loss_plan_anchor": loss_plan_anchor.detach(),
-            "loss_plan_segment": loss_plan_segment.detach(),
-            "loss_plan_trans_vel": loss_plan_trans_vel.detach(),
-            "loss_plan_trans_acc": loss_plan_trans_acc.detach(),
             "loss_stable_root_vel": loss_stable_root_vel.detach(),
             "loss_stable_root_acc": loss_stable_root_acc.detach(),
             "loss_stable_local_vel": loss_stable_local_vel.detach(),
@@ -1320,7 +1017,6 @@ def build_anchordiff_step_fn(
             "_raw_loss_pos_full": loss_pos_full,
             "_raw_loss_anchor_joint_pos": loss_anchor_joint_pos,
             "_raw_loss_anchor_joint_vel": loss_anchor_joint_vel,
-            "_raw_loss_plan_anchor": loss_plan_anchor,
             "_raw_loss_stable_root_vel": loss_stable_root_vel,
             "_raw_loss_stable_local_vel_cm": loss_stable_local_vel_cm,
             "_raw_loss_stable_local_acc_cm": loss_stable_local_acc_cm,
@@ -1332,18 +1028,9 @@ def build_anchordiff_step_fn(
             "min_snr_weight_max": min_snr_weight_max,
         }
 
-        # Round-28 hint-interface diagnostics. The denoiser caches
-        # scalar stats during forward (hint norms, gate stats, adapter
-        # output norms). The generic trainer adds branch grad norms
-        # after backward when these r28_* keys are present.
+        # Round-29 typed-condition diagnostics. The r29_inject module
         _inner_model = _model.module if hasattr(_model, "module") else _model
         _denoiser = getattr(_inner_model, "denoiser", None)
-        _denoiser_stats = getattr(_denoiser, "_last_oracle_hint_stats", {})
-        for _k, _v in _denoiser_stats.items():
-            if isinstance(_v, torch.Tensor) and _v.numel() == 1:
-                out[_k] = _v.detach()
-
-        # Round-29 typed-condition diagnostics. The r29_inject module
         # caches its own scalar stats during forward; we surface them
         # alongside the r28_* keys so the generic trainer's grad-norm
         # helper can fire on the r29_grad_norm_* groups.
@@ -1358,7 +1045,7 @@ def build_anchordiff_step_fn(
         # Cheap to compute (norm of weight tensors), useful for diagnosing
         # whether the new conditioning pathways are actually engaging.
         denoiser = getattr(model, "denoiser", None)
-        if denoiser is not None and getattr(denoiser.cfg, "use_dit_block", False):
+        if denoiser is not None:
             with torch.no_grad():
                 out["v12_input_proj_norm_motion"] = (
                     denoiser.v12_input_proj.motion_proj.weight.norm().detach()
@@ -1369,46 +1056,17 @@ def build_anchordiff_step_fn(
                 out["v12_input_proj_norm_obj"] = (
                     denoiser.v12_input_proj.obj_proj.weight.norm().detach()
                 )
-                out["v12_input_proj_norm_hint"] = (
-                    denoiser.v12_input_proj.hint_proj.weight.norm().detach()
-                )
                 for i, block in enumerate(denoiser.v12_blocks):
                     out[f"v12_adaLN_norm_layer{i}"] = (
                         block.adaLN_modulation[-1].weight.norm().detach()
                     )
-                    out[f"v12_xattn_out_proj_norm_layer{i}"] = (
-                        block.plan_xattn.out_proj.weight.norm().detach()
-                    )
                 fl = denoiser.v12_final_layer
-                if hasattr(fl, "linear"):
-                    # v12 FinalLayer: AdaLN + single linear
-                    out["v12_final_adaLN_norm"] = (
-                        fl.adaLN_modulation[-1].weight.norm().detach()
-                    )
-                    out["v12_final_linear_norm"] = (
-                        fl.linear.weight.norm().detach()
-                    )
-                else:
-                    # v13 DynamicsHead: base + delta branches + learnable γ
-                    out["v13_final_adaLN_base_norm"] = (
-                        fl.adaLN_base[-1].weight.norm().detach()
-                    )
-                    out["v13_final_base_linear_norm"] = (
-                        fl.base_linear.weight.norm().detach()
-                    )
-                    out["v13_final_adaLN_delta_norm"] = (
-                        fl.adaLN_delta[-1].weight.norm().detach()
-                    )
-                    out["v13_final_delta_linear_norm"] = (
-                        fl.delta_linear.weight.norm().detach()
-                    )
-                    out["v13_gamma"] = fl.gamma.detach()
-                    # Per-block temporal conv gate norm (if v13 P2 active)
-                    if hasattr(denoiser.v12_blocks[0], "temporal_conv"):
-                        for i, block in enumerate(denoiser.v12_blocks):
-                            out[f"v13_temporal_conv_gate_layer{i}"] = (
-                                block.temporal_conv.gate.detach().squeeze()
-                            )
+                out["v12_final_adaLN_norm"] = (
+                    fl.adaLN_modulation[-1].weight.norm().detach()
+                )
+                out["v12_final_linear_norm"] = (
+                    fl.linear.weight.norm().detach()
+                )
         return out
 
     return step_fn
@@ -1558,56 +1216,9 @@ def main() -> None:
         text_dim=int(cfg.model.denoiser.text_dim),
         object_token_dim=int(cfg.model.denoiser.object_token_dim),
         object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
-        use_interaction_plan=bool(cfg.model.denoiser.get("use_interaction_plan", False)),
-        plan_k_max=int(cfg.model.denoiser.get("plan_k_max", 12)),
-        plan_s_max=int(cfg.model.denoiser.get("plan_s_max", 12)),
-        plan_num_anchor_types=int(cfg.model.denoiser.get("plan_num_anchor_types", 5)),
-        plan_num_parts=int(cfg.model.denoiser.get("plan_num_parts", 5)),
-        plan_use_segment_tokens=bool(cfg.model.denoiser.get("plan_use_segment_tokens", False)),
-        plan_use_context_hint=bool(cfg.model.denoiser.get("plan_use_context_hint", True)),
-        plan_d_hint=int(cfg.model.denoiser.get("plan_d_hint", 32)),
-        plan_d_time_embed=int(cfg.model.denoiser.get("plan_d_time_embed", 64)),
-        cfg_drop_plan=bool(cfg.model.denoiser.get("cfg_drop_plan", False)),
-        plan_per_part_tokens=bool(cfg.model.denoiser.get("plan_per_part_tokens", False)),
-        plan_context_hint_mode=str(cfg.model.denoiser.get("plan_context_hint_mode", "time_only")),
-        use_dit_block=bool(cfg.model.denoiser.get("use_dit_block", False)),
-        dit_block_use_plan_pool_in_cond=bool(
-            cfg.model.denoiser.get("dit_block_use_plan_pool_in_cond", True)
-        ),
         stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
         cfg_drop_stage1_coarse=bool(
             cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
-        ),
-        plan_xattn_relative_time_bias=bool(
-            cfg.model.denoiser.get("plan_xattn_relative_time_bias", False)
-        ),
-        plan_xattn_time_bias_init=float(
-            cfg.model.denoiser.get("plan_xattn_time_bias_init", 0.5)
-        ),
-        plan_tokens_force_null=bool(
-            cfg.model.denoiser.get("plan_tokens_force_null", False)
-        ),
-        use_oracle_interaction_hint=bool(
-            cfg.model.denoiser.get("use_oracle_interaction_hint", False)
-        ),
-        oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
-        use_body_action_hint=bool(
-            cfg.model.denoiser.get("use_body_action_hint", False)
-        ),
-        body_action_hint_dim=int(
-            cfg.model.denoiser.get("body_action_hint_dim", 0)
-        ),
-        oracle_hint_injection_mode=str(
-            cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
-        ),
-        oracle_hint_gate_bias_init=float(
-            cfg.model.denoiser.get("oracle_hint_gate_bias_init", -3.0)
-        ),
-        separate_hint_branches=bool(
-            cfg.model.denoiser.get("separate_hint_branches", True)
-        ),
-        zero_init_hint_adapters=bool(
-            cfg.model.denoiser.get("zero_init_hint_adapters", True)
         ),
         # Round-29 typed condition injection.
         use_round29_cond_injection=bool(
@@ -1713,39 +1324,6 @@ def main() -> None:
         weight=float(cfg.loss.anchor_weight),
         contact_threshold=float(cfg.loss.contact_threshold),
     )
-    geom_cfg_raw = cfg.loss.get("motion_geometric", None)
-    if geom_cfg_raw is None:
-        geometric_cfg = MotionGeometricLossConfig()
-    else:
-        foot_indices = tuple(
-            int(v)
-            for v in geom_cfg_raw.get(
-                "foot_joint_indices",
-                MotionGeometricLossConfig().foot_joint_indices,
-            )
-        )
-        if len(foot_indices) != 4:
-            raise ValueError("loss.motion_geometric.foot_joint_indices must have 4 entries")
-        geometric_cfg = MotionGeometricLossConfig(
-            enabled=bool(geom_cfg_raw.get("enabled", False)),
-            pos_weight=float(geom_cfg_raw.get("pos_weight", 0.0)),
-            vel_weight=float(geom_cfg_raw.get("vel_weight", 0.0)),
-            foot_weight=float(geom_cfg_raw.get("foot_weight", 0.0)),
-            foot_contact_threshold=float(
-                geom_cfg_raw.get("foot_contact_threshold", 0.5)
-            ),
-            foot_velocity_threshold=float(
-                geom_cfg_raw.get("foot_velocity_threshold", 0.01)
-            ),
-            foot_joint_indices=foot_indices,
-        )
-    accelerator.print(
-        "Motion geometric losses: "
-        f"enabled={geometric_cfg.enabled} "
-        f"pos={geometric_cfg.pos_weight} "
-        f"vel={geometric_cfg.vel_weight} "
-        f"foot={geometric_cfg.foot_weight}",
-    )
     motion_representation = str(cfg.data.get("motion_representation", "smpl_pose_135_plan"))
     if motion_representation != "smpl_pose_135_plan":
         raise ValueError(
@@ -1755,7 +1333,6 @@ def main() -> None:
     world_joint_velocity_weight = float(
         cfg.loss.get("world_joint_velocity_weight", 0.0)
     )
-    fk_consistency_weight = float(cfg.loss.get("fk_consistency_weight", 0.0))
     pos_loss_weight = float(cfg.loss.get("pos_loss_weight", 0.0))
     # Round-25 D5: per-joint endpoint weighting for the FK pos loss.
     hand_endpoint_weight = float(cfg.loss.get("hand_endpoint_weight", 1.0))
@@ -1793,11 +1370,6 @@ def main() -> None:
             "smpl_pose_135_plan requires model.denoiser.motion_dim=135 "
             f"(got {int(cfg.model.denoiser.motion_dim)})"
         )
-    if not bool(cfg.model.denoiser.get("use_interaction_plan", False)):
-        raise ValueError(
-            "smpl_pose_135_plan requires model.denoiser.use_interaction_plan=true"
-        )
-
     # --- Optimizer + scheduler ---
     accum = int(cfg.training.get("gradient_accumulation_steps", 1))
     steps_per_epoch = max(1, len(train_loader) // accum)
@@ -1820,33 +1392,6 @@ def main() -> None:
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
-    # --- FeatureWeightState ---
-    # Only valid for motion_263 (263-dim per-feature weights). Round-28
-    # uses smpl_pose_135_plan (motion_dim=135), so the per-feature weight
-    # cache is disabled (the trainer's _WeightCache returns all-ones).
-    dyn_cfg = cfg.loss.get("dynamic_metric", None)
-    if dyn_cfg is not None and dyn_cfg.get("enabled", False):
-        raise ValueError(
-            "dynamic_metric is not supported in Round-28 (was motion_263-only)"
-        )
-    feature_weight_state = None
-    accelerator.print(
-        "FeatureWeightState DISABLED (smpl_pose_135_plan; per-feature "
-        "weighting is motion_263-only)"
-    )
-
-    use_interaction_plan = bool(
-        cfg.model.denoiser.get("use_interaction_plan", False)
-    )
-    plan_anchor_weight = float(cfg.loss.get("plan_anchor_weight", 0.0))
-    plan_segment_weight = float(cfg.loss.get("plan_segment_weight", 0.0))
-    plan_transition_vel_weight = float(
-        cfg.loss.get("plan_transition_vel_weight", 0.0)
-    )
-    plan_transition_acc_weight = float(
-        cfg.loss.get("plan_transition_acc_weight", 0.0)
-    )
-    plan_transition_window = int(cfg.loss.get("plan_transition_window", 3))
     stable_root_vel_weight = float(cfg.loss.get("stable_root_vel_weight", 0.0))
     stable_root_acc_weight = float(cfg.loss.get("stable_root_acc_weight", 0.0))
     stable_local_vel_weight = float(cfg.loss.get("stable_local_vel_weight", 0.0))
@@ -1933,9 +1478,6 @@ def main() -> None:
         stage1_coarse_norm_std = None
     accelerator.print(
         "[StageB condition mode]\n"
-        f"  use_interaction_plan: {use_interaction_plan}\n"
-        f"  plan_per_part_tokens: {bool(cfg.model.denoiser.get('plan_per_part_tokens', False))}\n"
-        f"  plan_context_hint_mode: {cfg.model.denoiser.get('plan_context_hint_mode', 'time_only')!r}\n"
         f"  object_traj_dim: {int(cfg.model.denoiser.object_traj_dim)}\n"
         f"  z_int channels: forced to zero (Round-28 PLAN-only mode)\n"
         f"  dense contact-target portion of object_traj: forced to zero\n"
@@ -1967,24 +1509,15 @@ def main() -> None:
         anchor_cfg=anchor_cfg,
         z_dims=z_dims,
         device=device,
-        feature_weight_state=feature_weight_state,
-        geometric_cfg=geometric_cfg,
         motion_representation=motion_representation,
         world_joint_velocity_weight=world_joint_velocity_weight,
         object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
-        fk_consistency_weight=fk_consistency_weight,
         pos_loss_weight=pos_loss_weight,
         hand_endpoint_weight=hand_endpoint_weight,
         foot_endpoint_weight=foot_endpoint_weight,
         anchor_joint_pos_weight=anchor_joint_pos_weight,
         anchor_joint_vel_weight=anchor_joint_vel_weight,
         anchor_joint_part_weights=anchor_joint_part_weights,
-        use_interaction_plan=use_interaction_plan,
-        plan_anchor_weight=plan_anchor_weight,
-        plan_segment_weight=plan_segment_weight,
-        plan_transition_vel_weight=plan_transition_vel_weight,
-        plan_transition_acc_weight=plan_transition_acc_weight,
-        plan_transition_window=plan_transition_window,
         stable_root_vel_weight=stable_root_vel_weight,
         stable_root_acc_weight=stable_root_acc_weight,
         stable_local_vel_weight=stable_local_vel_weight,
@@ -2012,11 +1545,7 @@ def main() -> None:
             f"  loss={out['loss'].item():.4f}  "
             f"mse_x0={out['mse_x0'].item():.4f}  "
             f"anchor_l2={out['anchor_l2'].item():.4f}  "
-            f"geom={out['loss_geometric'].item():.4f}  "
-            f"pos={out['loss_pos'].item():.4f}  "
             f"vel={out['loss_vel'].item():.4f}  "
-            f"foot={out['loss_foot'].item():.4f}  "
-            f"fk={out.get('loss_fk', torch.zeros(())).item():.4f}  "
             f"pos_full={out.get('loss_pos_full', torch.zeros(())).item():.4f}  "
             f"anchor_joint_pos={out.get('loss_anchor_joint_pos', torch.zeros(())).item():.4f}  "
             f"anchor_joint_vel={out.get('loss_anchor_joint_vel', torch.zeros(())).item():.4f}"
@@ -2053,22 +1582,14 @@ def main() -> None:
         # loss had effectively zero gradient.
         if args.grad_audit:
             unwrapped = accelerator.unwrap_model(model)
-            # Pick the appropriate input projection weight to measure grad
-            # against. v11 has a single in_proj.weight; v12 has the
-            # motion_proj.weight inside the v12_input_proj module.
-            if getattr(unwrapped.denoiser.cfg, "use_dit_block", False):
-                in_proj = unwrapped.denoiser.v12_input_proj.motion_proj.weight
-                proj_name = "model.denoiser.v12_input_proj.motion_proj.weight"
-            else:
-                in_proj = unwrapped.denoiser.in_proj.weight
-                proj_name = "model.denoiser.in_proj.weight"
+            in_proj = unwrapped.denoiser.v12_input_proj.motion_proj.weight
+            proj_name = "model.denoiser.v12_input_proj.motion_proj.weight"
             accelerator.print(f"[grad audit] per-loss-term L2 grad norm at {proj_name}:")
             audit_terms = [
                 ("mse_x0",                       out.get("_raw_mse_x0")),
                 ("loss_pos_full",                out.get("_raw_loss_pos_full")),
                 ("loss_anchor_joint_pos",        out.get("_raw_loss_anchor_joint_pos")),
                 ("loss_anchor_joint_vel",        out.get("_raw_loss_anchor_joint_vel")),
-                ("loss_plan_anchor",             out.get("_raw_loss_plan_anchor")),
                 ("loss_stable_root_vel",         out.get("_raw_loss_stable_root_vel")),
                 ("loss_stable_local_vel_cm",     out.get("_raw_loss_stable_local_vel_cm")),
                 ("loss_stable_local_speed_mom",  out.get("_raw_loss_stable_local_speed_moment")),
@@ -2110,197 +1631,9 @@ def main() -> None:
         except ImportError:
             pass
 
-    # --- Calibration data + dynamic-weight update hook (v2.1 only) ---
+    # Calibration / dynamic feature-weighting was a motion_263-only Round-28
+    # feature. Removed alongside FeatureWeightState in the Tier-1 cleanup.
     epoch_end_hook = None
-    if feature_weight_state is not None and feature_weight_state.enable_dynamic:
-        from piano.data.dataset import HOIDataset
-        from piano.training.feature_groups import FEATURE_GROUPS as _FG
-        from piano.utils.io_utils import load_json as _load_json
-
-        cal_path = Path(dyn_cfg["calibration_clips"])
-        cal_manifest = _load_json(cal_path)
-        accelerator.print(
-            f"Loaded calibration manifest: {cal_manifest['num_clips']} clips from {cal_path}"
-        )
-
-        # Pre-build calibration HOIDatasets per subset.
-        cal_datasets: dict[str, HOIDataset] = {}
-        cal_index: dict[str, dict[str, int]] = {}
-        cal_subj_filter = _resolve_subject_split(cfg, "val")
-        pseudo_label_subdir_local = cfg.data.get("pseudo_label_subdir", None)
-        for entry in cfg.data.datasets:
-            sub_dir = (str(Path(entry.root) / pseudo_label_subdir_local)
-                       if pseudo_label_subdir_local is not None else None)
-            ds = HOIDataset(
-                root=entry.root,
-                pseudo_label_dir=sub_dir,
-                max_seq_length=cfg.data.max_seq_length,
-                subject_id_filter=cal_subj_filter,
-                augment=None,
-                support_collapse_hand_support=True,
-                surface_obj_pose=True,
-            )
-            cal_datasets[entry.name] = ds
-            if hasattr(ds, "metadata"):
-                cal_index[entry.name] = {
-                    str(meta.get("seq_id", "")): i
-                    for i, meta in enumerate(ds.metadata)
-                }
-            else:
-                cal_index[entry.name] = {}
-
-        # Use a local generator for the noise sampling at every update so
-        # the residual is stable across epochs (only the model state
-        # changes) without resetting the training RNG state.
-        cal_seed = int(dyn_cfg.get("calibration_seed", 12345))
-        cal_t = int(dyn_cfg.get("fixed_timestep", 200))     # mid-noise level
-
-        def _calibration_eval(
-            unwrapped_model: torch.nn.Module,
-            unwrapped_obj_enc: torch.nn.Module,
-        ) -> tuple[dict[str, float], dict[str, float]]:
-            """Single-step denoising on calibration clips.
-
-            Returns (per_group_RMSE, per_group_GT_std).
-            """
-            unwrapped_model.eval()
-            unwrapped_obj_enc.eval()
-            noise_gen = torch.Generator(device=device)
-            noise_gen.manual_seed(cal_seed)
-
-            n_groups = len(_FG)
-            sum_se = {g.name: 0.0 for g in _FG}
-            sum_gt = {g.name: 0.0 for g in _FG}
-            sum_gt_sq = {g.name: 0.0 for g in _FG}
-            count_dim = {g.name: 0 for g in _FG}
-
-            for clip_meta in cal_manifest["clips"]:
-                ds = cal_datasets[clip_meta["subset"]]
-                seq_to_idx = cal_index.get(clip_meta["subset"], {})
-                # Locate by seq_id. Prefer the manifest index when it still
-                # matches the fixed val-filtered calibration dataset; fall
-                # back to the precomputed seq_id index without scanning and
-                # loading every sample.
-                target_id = clip_meta["seq_id"]
-                idx = clip_meta.get("clip_idx_in_filtered_dataset", -1)
-                if not (0 <= idx < len(ds)):
-                    idx = seq_to_idx.get(target_id, -1)
-                elif seq_to_idx and seq_to_idx.get(target_id, idx) != idx:
-                    idx = seq_to_idx.get(target_id, -1)
-                if not (0 <= idx < len(ds)):
-                    continue
-                sample = ds[idx]
-                if str(sample["seq_id"]) != target_id:
-                    continue
-                seq_len_s = int(sample["seq_len"].item())
-                if seq_len_s < 5:
-                    continue
-
-                with torch.inference_mode():
-                    batch = collate_hoi([sample])
-                    motion_b = batch["motion"].to(device)
-                    joints_b = batch["joints"].to(device)
-                    cs_b = batch["contact_state"].to(device)
-                    ctx_b = batch["contact_target_xyz"].to(device)
-                    ph_b = batch["phase"].to(device)
-                    sp_b = batch["support"].to(device)
-                    obj_com_b = batch["obj_com_canonical"].to(device)
-                    obj_rot6d_b = batch["obj_rot6d_canonical"].to(device)
-                    object_pc_b = batch["object_pc"].to(device)
-
-                    Tlen = motion_b.shape[1]
-                    seq_idx_b = torch.arange(Tlen, device=device).unsqueeze(0)
-                    seq_mask_b = (
-                        seq_idx_b
-                        < torch.tensor([seq_len_s], device=device).unsqueeze(1)
-                    ).float()
-
-                    phase_soft_b = F.one_hot(
-                        ph_b.clamp_min(0).long(), z_dims.phase_classes,
-                    ).float()
-                    support_soft_b = F.one_hot(
-                        sp_b.clamp_min(0).long(), z_dims.support_classes,
-                    ).float()
-                    z_int_b = pack_z_int(cs_b, ctx_b, phase_soft_b, support_soft_b, z_dims)
-                    obj_traj_b = torch.cat([obj_com_b, obj_rot6d_b], dim=-1)
-                    init_pose_b = joints_b[:, 0, :, :].reshape(1, -1)
-                    text_features_b, _ = encode_text_per_token(clip_model, batch["text"], device)
-                    obj_tokens_b = unwrapped_obj_enc(object_pc_b)
-
-                    cond_b = {
-                        "z_int": z_int_b,
-                        "object_world_traj": obj_traj_b,
-                        "init_pose": init_pose_b,
-                        "text": text_features_b.float(),
-                        "object_tokens": obj_tokens_b,
-                    }
-                    # Single-step denoising at fixed t (cheaper than full DDPM)
-                    t_tensor = torch.full((1,), cal_t, device=device, dtype=torch.long)
-                    noise = torch.randn(
-                        motion_b.shape,
-                        device=device,
-                        dtype=motion_b.dtype,
-                        generator=noise_gen,
-                    )
-                    x_t = unwrapped_model.diffusion.q_sample(motion_b, t_tensor, noise)
-                    x0_pred = unwrapped_model.denoiser(x_t, t_tensor, cond_b, cond_drop_mask=None)
-
-                    # Per-group RMSE numerator + denominator
-                    err_sq = (x0_pred - motion_b).pow(2)            # (1, T, 263)
-                    gt_sq = motion_b.pow(2)
-                    gt_v = motion_b
-                    mask3 = seq_mask_b.unsqueeze(-1)                # (1, T, 1)
-                    for g in _FG:
-                        e_grp = err_sq[..., g.lo:g.hi]
-                        gt_grp = gt_v[..., g.lo:g.hi]
-                        gt_sq_grp = gt_sq[..., g.lo:g.hi]
-                        se = (e_grp * mask3).sum().item()
-                        s = (gt_grp * mask3).sum().item()
-                        s_sq = (gt_sq_grp * mask3).sum().item()
-                        sum_se[g.name] += se
-                        sum_gt[g.name] += s
-                        sum_gt_sq[g.name] += s_sq
-                        count_dim[g.name] += int(mask3.sum().item() * (g.hi - g.lo))
-
-            unwrapped_model.train()
-            unwrapped_obj_enc.train()
-
-            rmse = {n: (sum_se[n] / max(count_dim[n], 1)) ** 0.5 for n in sum_se}
-            mean_gt = {n: sum_gt[n] / max(count_dim[n], 1) for n in sum_gt}
-            var_gt = {n: max(sum_gt_sq[n] / max(count_dim[n], 1) - mean_gt[n] ** 2, 0.0)
-                      for n in sum_gt}
-            std_gt = {n: var_gt[n] ** 0.5 for n in var_gt}
-            return rmse, std_gt
-
-        def epoch_end_hook(epoch, accelerator, model, global_step, output_dir,
-                           metrics_appender, wandb_run):
-            if not feature_weight_state.should_update(epoch):
-                return
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_obj_enc = accelerator.unwrap_model(object_encoder)
-            rmse, gt_std = _calibration_eval(unwrapped_model, unwrapped_obj_enc)
-            log = feature_weight_state.update(
-                epoch=epoch, group_rmse=rmse, group_gt_std=gt_std,
-            )
-            feature_weight_state.broadcast(accelerator)
-            # Log to metrics + wandb + JSON snapshot
-            if accelerator.is_main_process:
-                metrics_appender("dynamic_weight_update", {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    **{f"weight_{k}": v for k, v in log["new_w_g"].items()},
-                    **{f"rmse_{k}": rmse[k] for k in rmse},
-                    **{f"norm_err_{k}": log["norm_err_g"][k] for k in log["norm_err_g"]},
-                })
-                snap_path = Path(output_dir) / f"feature_weights_epoch_{epoch:04d}.json"
-                snap_path.write_text(json.dumps(log, indent=2))
-                if wandb_run is not None:
-                    flat = {}
-                    for k, v in log["new_w_g"].items():
-                        flat[f"weight/{k}"] = v
-                    for k, v in rmse.items():
-                        flat[f"calib_rmse/{k}"] = v
-                    wandb_run.log(flat, step=epoch)
 
     run_training_loop(
         accelerator=accelerator,
@@ -2317,10 +1650,6 @@ def main() -> None:
         wandb_run=wandb_run,
         extra_modules={"object_encoder": object_encoder},
         epoch_end_hook=epoch_end_hook,
-        extra_state_fn=(
-            (lambda: {"feature_weight_state": feature_weight_state.state_dict()})
-            if feature_weight_state is not None else None
-        ),
         val_dataloader=val_loader,
         val_every_epochs=int(cfg.training.get("val_every_epochs", 0)),
         val_best_key=str(cfg.training.get("val_best_key", "loss")),

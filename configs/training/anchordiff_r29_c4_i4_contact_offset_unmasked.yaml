@@ -21,20 +21,6 @@ model:
     text_dim: 512
     object_token_dim: 256
     object_num_tokens: 128
-    use_interaction_plan: true
-    plan_k_max: 12
-    plan_s_max: 12
-    plan_num_anchor_types: 5
-    plan_num_parts: 5
-    plan_use_segment_tokens: false
-    plan_use_context_hint: true
-    plan_d_hint: 32
-    plan_d_time_embed: 64
-    cfg_drop_plan: false
-    plan_per_part_tokens: true
-    plan_context_hint_mode: "target_aware"
-    use_dit_block: true
-    dit_block_use_plan_pool_in_cond: false
     d_model: 512
     n_layers: 8
     n_heads: 4
@@ -42,15 +28,6 @@ model:
     dropout: 0.1
     stage1_coarse_dim: 23
     cfg_drop_stage1_coarse: false
-    plan_xattn_relative_time_bias: true
-    plan_xattn_time_bias_init: 0.5
-    plan_tokens_force_null: true
-    # Round-28 hint paths are DISABLED — R29 uses the typed bundle path.
-    use_oracle_interaction_hint: false
-    oracle_hint_dim: 0
-    use_body_action_hint: false
-    body_action_hint_dim: 0
-    oracle_hint_injection_mode: "input_add"
     # Round-29 typed condition injection.
     use_round29_cond_injection: true
     r29_coarse_extra_dim: 18
@@ -89,9 +66,7 @@ data:
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
   subset_indices_file: "analyses/round27_tier0_train_indices_48_balanced.json"
-  use_oracle_interaction_hint: false
-  use_body_action_hint: false
-  surface_temporal_aux_fields: true
+  surface_temporal_aux_fields: false
   # Round-29 typed bundle controls.
   r29_coarse_variant: "C41-current"
   r29_interaction_variant: "I4-contact-offset-unmasked"
@@ -138,11 +113,6 @@ training:
 loss:
   anchor_weight: 0.0
   contact_threshold: 0.5
-  plan_anchor_weight: 0.0
-  plan_segment_weight: 0.0
-  plan_transition_vel_weight: 0.0
-  plan_transition_acc_weight: 0.0
-  plan_transition_window: 3
   stable_root_vel_weight: 0.5
   stable_root_acc_weight: 0.25
   stable_support_erode: 4
@@ -156,20 +126,7 @@ loss:
   anchor_joint_part_weights: [2.0, 2.0, 0.0, 0.0, 0.5]
   use_min_snr_weighting: true
   min_snr_gamma: 5.0
-  motion_feature_weights:
-    root_rot_vel: 1.0
-    root_lin_vel: 1.0
-    root_height_y: 1.0
-    joint_pos_local: 1.0
-    joint_rot_6d: 1.0
-    joint_velocity: 1.0
-    foot_contact: 1.0
-  dynamic_metric:
-    enabled: false
-  motion_geometric:
-    enabled: false
   world_joint_velocity_weight: 1.0
-  fk_consistency_weight: 0.0
   temporal_interaction:
     contact_rel_offset_weight: 0.0
     contact_drift_weight: 0.0

@@ -89,8 +89,6 @@ def _build_denoiser_config(
     *,
     stage1_coarse_dim: int = 0,
     object_traj_dim: int = 24,
-    use_dit_block: bool = True,
-    use_interaction_plan: bool = True,
     cfg_drop_stage1_coarse: bool = False,
 ) -> AnchorDenoiserConfig:
     return AnchorDenoiserConfig(
@@ -101,20 +99,6 @@ def _build_denoiser_config(
         text_dim=512,
         object_token_dim=256,
         object_num_tokens=128,
-        use_interaction_plan=use_interaction_plan,
-        plan_k_max=12,
-        plan_s_max=12,
-        plan_num_anchor_types=5,
-        plan_num_parts=5,
-        plan_use_segment_tokens=False,
-        plan_use_context_hint=True,
-        plan_d_hint=32,
-        plan_d_time_embed=64,
-        cfg_drop_plan=False,
-        plan_per_part_tokens=True,
-        plan_context_hint_mode="target_aware",
-        use_dit_block=use_dit_block,
-        dit_block_use_plan_pool_in_cond=False,
         stage1_coarse_dim=stage1_coarse_dim,
         cfg_drop_stage1_coarse=cfg_drop_stage1_coarse,
         d_model=64,
@@ -135,28 +119,6 @@ def _make_synthetic_cond(B: int, T: int, cfg: AnchorDenoiserConfig, *, seed: int
         "init_pose": torch.randn(B, cfg.init_pose_dim, generator=g),
         "text": torch.randn(B, 77, cfg.text_dim, generator=g),
         "object_tokens": torch.randn(B, cfg.object_num_tokens, cfg.object_token_dim, generator=g),
-    }
-    # Synthetic InteractionPlan padded dict — minimal valid shape (all masks
-    # False is fine; the encoder handles an all-empty plan).
-    K, S, P = cfg.plan_k_max, cfg.plan_s_max, cfg.plan_num_parts
-    cond["interaction_plan"] = {
-        "anchor_time": torch.zeros(B, K, dtype=torch.long),
-        "anchor_part": torch.zeros(B, K, P),
-        "anchor_target_local": torch.zeros(B, K, P, 3),
-        "anchor_target_world": torch.zeros(B, K, P, 3),
-        "anchor_type": torch.zeros(B, K, dtype=torch.long),
-        "anchor_phase": torch.zeros(B, K, dtype=torch.long),
-        "anchor_support": torch.zeros(B, K, dtype=torch.long),
-        "anchor_conf": torch.zeros(B, K),
-        "anchor_mask": torch.zeros(B, K, dtype=torch.bool),
-        "segment_start": torch.zeros(B, S, dtype=torch.long),
-        "segment_end": torch.zeros(B, S, dtype=torch.long),
-        "segment_part": torch.zeros(B, S, P),
-        "segment_target_summary_local": torch.zeros(B, S, P, 3),
-        "segment_phase": torch.zeros(B, S, dtype=torch.long),
-        "segment_support": torch.zeros(B, S, dtype=torch.long),
-        "segment_conf": torch.zeros(B, S),
-        "segment_mask": torch.zeros(B, S, dtype=torch.bool),
     }
     if cfg.stage1_coarse_dim > 0:
         cond["stage1_coarse"] = torch.randn(B, T, cfg.stage1_coarse_dim, generator=g)
@@ -183,36 +145,6 @@ def _build_full_denoiser_config_from_yaml(
         text_dim=int(d.text_dim),
         object_token_dim=int(d.object_token_dim),
         object_num_tokens=int(d.object_num_tokens),
-        cond_motion_dim=int(d.get("cond_motion_dim", 0)),
-        cond_motion_output_skip=bool(d.get("cond_motion_output_skip", False)),
-        cfg_drop_cond_motion=bool(d.get("cfg_drop_cond_motion", False)),
-        cond_motion_xt_inject=bool(d.get("cond_motion_xt_inject", False)),
-        use_interaction_plan=bool(d.get("use_interaction_plan", False)),
-        plan_k_max=int(d.get("plan_k_max", 12)),
-        plan_s_max=int(d.get("plan_s_max", 12)),
-        plan_num_anchor_types=int(d.get("plan_num_anchor_types", 5)),
-        plan_num_parts=int(d.get("plan_num_parts", 5)),
-        plan_use_segment_tokens=bool(d.get("plan_use_segment_tokens", False)),
-        plan_use_context_hint=bool(d.get("plan_use_context_hint", True)),
-        plan_d_hint=int(d.get("plan_d_hint", 32)),
-        plan_d_time_embed=int(d.get("plan_d_time_embed", 64)),
-        cfg_drop_plan=bool(d.get("cfg_drop_plan", False)),
-        plan_per_part_tokens=bool(d.get("plan_per_part_tokens", False)),
-        plan_context_hint_mode=str(d.get("plan_context_hint_mode", "time_only")),
-        use_dit_block=bool(d.get("use_dit_block", False)),
-        dit_block_use_plan_pool_in_cond=bool(
-            d.get("dit_block_use_plan_pool_in_cond", True)
-        ),
-        use_v13_dynhead=bool(d.get("use_v13_dynhead", False)),
-        v13_dynhead_gamma_init=float(d.get("v13_dynhead_gamma_init", 0.1)),
-        v13_dynhead_learnable_gamma=bool(d.get("v13_dynhead_learnable_gamma", True)),
-        use_v13_temporal_conv=bool(d.get("use_v13_temporal_conv", False)),
-        v13_temporal_conv_kernel=int(d.get("v13_temporal_conv_kernel", 5)),
-        use_self_conditioning=bool(d.get("use_self_conditioning", False)),
-        self_conditioning_prob=float(d.get("self_conditioning_prob", 0.0)),
-        self_conditioning_mode=str(d.get("self_conditioning_mode", "standard")),
-        self_conditioning_t_max=int(d.get("self_conditioning_t_max", 700)),
-        self_conditioning_zero_init=bool(d.get("self_conditioning_zero_init", True)),
         stage1_coarse_dim=int(stage1_coarse_dim),
         cfg_drop_stage1_coarse=bool(d.get("cfg_drop_stage1_coarse", False)),
         d_model=int(d.d_model),
@@ -367,7 +299,6 @@ def test_stage1_coarse_branch_activates_when_proj_nonzero():
     motion_dim = 135
     zint_dim = 26
     obj_traj_dim = 9
-    hint_dim = 32
     d_model = 64
 
     torch.manual_seed(11111)
@@ -375,32 +306,30 @@ def test_stage1_coarse_branch_activates_when_proj_nonzero():
         motion_dim=motion_dim,
         zint_dim=zint_dim,
         obj_traj_dim=obj_traj_dim,
-        hint_dim=hint_dim,
         d_model=d_model,
         stage1_coarse_dim=23,
     )
     # Zero-init the aux projections (mirrors initialize_weights_v12).
     with torch.no_grad():
-        for sub in (proj.zint_proj, proj.obj_proj, proj.hint_proj, proj.stage1_coarse_proj):
+        for sub in (proj.zint_proj, proj.obj_proj, proj.stage1_coarse_proj):
             sub.weight.zero_()
             sub.bias.zero_()
 
     x_t = torch.randn(B, T, motion_dim)
     z_int = torch.randn(B, T, zint_dim)
     obj_traj = torch.randn(B, T, obj_traj_dim)
-    plan_hint = torch.randn(B, T, hint_dim)
     coarse = torch.randn(B, T, 23)
 
     with torch.no_grad():
         out_zero = proj(
             x_t=x_t, z_int=z_int, obj_traj=obj_traj,
-            plan_hint=plan_hint, stage1_coarse=coarse,
+            stage1_coarse=coarse,
         )
         # Activate the branch.
         torch.nn.init.xavier_uniform_(proj.stage1_coarse_proj.weight)
         out_active = proj(
             x_t=x_t, z_int=z_int, obj_traj=obj_traj,
-            plan_hint=plan_hint, stage1_coarse=coarse,
+            stage1_coarse=coarse,
         )
 
     max_diff = (out_zero - out_active).abs().max().item()
@@ -428,15 +357,14 @@ def test_v12_input_projection_missing_stage1_coarse_raises():
     from piano.models.dit_blocks import V12InputProjection
 
     proj = V12InputProjection(
-        motion_dim=135, zint_dim=26, obj_traj_dim=9, hint_dim=32,
+        motion_dim=135, zint_dim=26, obj_traj_dim=9,
         d_model=64, stage1_coarse_dim=23,
     )
     x_t = torch.randn(2, 16, 135)
     z_int = torch.randn(2, 16, 26)
     obj_traj = torch.randn(2, 16, 9)
-    plan_hint = torch.randn(2, 16, 32)
     with pytest.raises(KeyError, match="stage1_coarse"):
-        proj(x_t=x_t, z_int=z_int, obj_traj=obj_traj, plan_hint=plan_hint)
+        proj(x_t=x_t, z_int=z_int, obj_traj=obj_traj)
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +437,6 @@ def test_object_traj_dim_9_build_uses_pose_only():
 # ---------------------------------------------------------------------------
 # Bonus — guard against v11 misuse of the new branch
 # ---------------------------------------------------------------------------
-
-
-def test_v11_path_rejects_stage1_coarse_branch():
-    cfg = _build_denoiser_config(stage1_coarse_dim=23, use_dit_block=False, use_interaction_plan=False)
-    with pytest.raises(ValueError, match="stage1_coarse_dim > 0 requires use_dit_block=True"):
-        AnchorDenoiser(cfg)
 
 
 def test_cfg_drop_stage1_coarse_replaces_route_with_null():

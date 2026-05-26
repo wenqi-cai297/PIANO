@@ -56,28 +56,11 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 class V12InputProjection(nn.Module):
-    """Per-channel input projection: motion / z_int / obj_traj / plan_hint each
-    get their own Linear(in_dim_i, d_model), summed.
+    """Per-channel input projection: motion / z_int / obj_traj each get their
+    own Linear(in_dim_i, d_model), summed.
 
-    Decouples gradient through each channel (vs v11's single Linear(217, 512)
-    which had the dense_channel_audit-confirmed bandwidth-bottleneck issue).
-
-    Aux projections (zint, obj, hint, stage1_coarse) are zero-init'd so step-0
-    output equals motion_proj(x_t) only — preserving v11-like initial behavior.
-    Aux channels activate as their projections learn non-zero weights.
-
-    Round-22 adds the optional ``stage1_coarse_proj`` branch for Stage-1
-    Coarse-v1 (23-D route/backbone) conditioning. When ``stage1_coarse_dim==0``
-    the branch is absent and step-0 output is bit-exact equal to the pre-R22
-    v18 path. See ``analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md``
-    §5-6 for the design rationale.
-
-    Bandwidth per channel (effective rank bounded by input dim):
-      motion         (135-d) -> up to 135 of 512 (26.4%)
-      zint           (26-d)  -> up to 26 of 512  (5.1%)
-      obj            (24-d)  -> up to 24 of 512  (4.7%)
-      hint           (32-d)  -> up to 32 of 512  (6.3%)
-      stage1_coarse  (23-d)  -> up to 23 of 512  (4.5%)   [Round-22]
+    Aux projections (zint, obj, stage1_coarse) are zero-init'd so step-0
+    output equals motion_proj(x_t) only.
     """
 
     def __init__(
@@ -85,26 +68,14 @@ class V12InputProjection(nn.Module):
         motion_dim: int,
         zint_dim: int,
         obj_traj_dim: int,
-        hint_dim: int,
         d_model: int,
-        use_self_conditioning: bool = False,
-        self_conditioning_zero_init: bool = True,
         stage1_coarse_dim: int = 0,
     ) -> None:
         super().__init__()
-        self.use_self_conditioning = bool(use_self_conditioning)
-        self.self_conditioning_zero_init = bool(self_conditioning_zero_init)
         self.stage1_coarse_dim = int(stage1_coarse_dim)
         self.motion_proj = nn.Linear(motion_dim, d_model)
         self.zint_proj = nn.Linear(zint_dim, d_model)
         self.obj_proj = nn.Linear(obj_traj_dim, d_model)
-        self.hint_proj = nn.Linear(hint_dim, d_model)
-        if self.use_self_conditioning:
-            self.self_cond_proj = nn.Linear(motion_dim, d_model)
-            self.self_cond_gate = nn.Parameter(torch.zeros(()))
-        else:
-            self.self_cond_proj = None
-            self.register_parameter("self_cond_gate", None)
         if self.stage1_coarse_dim > 0:
             self.stage1_coarse_proj = nn.Linear(self.stage1_coarse_dim, d_model)
         else:
@@ -116,8 +87,6 @@ class V12InputProjection(nn.Module):
         x_t: Tensor,
         z_int: Tensor,
         obj_traj: Tensor,
-        plan_hint: Tensor,
-        self_cond: Tensor | None = None,
         stage1_coarse: Tensor | None = None,
     ) -> Tensor:
         """All inputs (B, T, *). Output (B, T, d_model)."""
@@ -125,12 +94,7 @@ class V12InputProjection(nn.Module):
             self.motion_proj(x_t)
             + self.zint_proj(z_int)
             + self.obj_proj(obj_traj)
-            + self.hint_proj(plan_hint)
         )
-        if self.use_self_conditioning:
-            if self_cond is None:
-                self_cond = torch.zeros_like(x_t)
-            h = h + self.self_cond_gate * self.self_cond_proj(self_cond)
         if self.stage1_coarse_proj is not None:
             if stage1_coarse is None:
                 raise KeyError(
@@ -150,94 +114,25 @@ class V12InputProjection(nn.Module):
 class GlobalCondSummary(nn.Module):
     """Produces a single per-sample (B, D) condition vector for AdaLN.
 
-    Two modes (`use_plan_pool` toggle):
-      - True (v12 default, InterGen-style): c = t_emb + plan_pool_emb
-        Where plan_pool_emb = MLP(masked_mean(plan_tokens)).
-      - False (v12-A1, post 2026-05-11 cond audit): c = t_emb only.
-        Forces ALL plan information to flow through per-layer plan cross-attn,
-        which preserves per-anchor spatial detail (the masked-mean pool was
-        destroying it — see analyses/2026-05-11_cond_diversity_audit.md §4.5).
-
-    Per-frame information does NOT enter here in either mode — it flows
-    through V12InputProjection's residual stream and per-layer plan cross-attn.
+    After the R29 cleanup the only input is the diffusion timestep
+    embedding (the plan-pool branch was removed alongside the interaction
+    plan tokens). Per-frame information flows through V12InputProjection.
     """
 
-    def __init__(self, d_model: int, use_plan_pool: bool = True) -> None:
+    def __init__(self, d_model: int) -> None:
         super().__init__()
-        self.use_plan_pool = use_plan_pool
-        if use_plan_pool:
-            self.plan_pool_mlp = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, d_model),
-            )
-        else:
-            self.plan_pool_mlp = None
+        # No parameters — kept as a Module for state_dict compatibility
+        # with the historical name.
+        self.plan_pool_mlp = None
 
-    def forward(
-        self, t_emb: Tensor, plan_tokens: Tensor, plan_mask: Tensor,
-    ) -> Tensor:
-        """
-        t_emb:       (B, D)
-        plan_tokens: (B, K, D)  (ignored when use_plan_pool=False)
-        plan_mask:   (B, K) bool — True at valid plan positions  (ignored when use_plan_pool=False)
-
-        Returns (B, D).
-        """
-        if not self.use_plan_pool:
-            return t_emb                                            # (B, D)
-        mask = plan_mask.float().unsqueeze(-1)                      # (B, K, 1)
-        denom = mask.sum(dim=1).clamp_min(1.0)                      # (B, 1)
-        plan_pool = (plan_tokens * mask).sum(dim=1) / denom         # (B, D)
-        plan_pool_emb = self.plan_pool_mlp(plan_pool)               # (B, D)
-        return t_emb + plan_pool_emb                                # (B, D)
+    def forward(self, t_emb: Tensor) -> Tensor:
+        """t_emb: (B, D). Returns (B, D)."""
+        return t_emb
 
 
 # ---------------------------------------------------------------------------
 # §4.5 — ConditionedEncoderLayer (DiT 6-output AdaLN-Zero + PixArt cross-attn)
 # ---------------------------------------------------------------------------
-
-
-class TemporalConvResidual(nn.Module):
-    """v13 P2 (per stageB_frozen_motion_diagnosis_and_fix_plan.md §9.1):
-    depthwise temporal Conv1D residual with zero-init gate.
-
-    Inserted between self-attn and plan cross-attn in each ConditionedEncoderLayer
-    when use_temporal_conv=True. Adds local temporal inductive bias (±k//2 frames)
-    on top of global self-attention. Applied only to motion tokens — the prepended
-    init_pose prefix is excluded by the caller.
-
-    Recipe (Conformer / ConvNeXt-style):
-        LayerNorm  →  Conv1d depthwise (k=5, groups=D)  →  GELU  →
-        Conv1d pointwise (1×1)  →  gate × output  +  residual
-
-    At init: gate = 0 → branch is identity → preserves v12 step-0 behavior.
-
-    Param count for d_model=512, k=5: 512*5 (dw) + 512*512 (pw) = 264_704 per
-    layer ≈ 0.27 M. For 8 layers: 2.1 M total (~0.8 % of model). Cheaper than
-    a full Conv1d (which would be 512*5*512 = 1.31 M per layer).
-    """
-
-    def __init__(self, dim: int, kernel_size: int = 5) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.dw_conv = nn.Conv1d(
-            dim, dim, kernel_size,
-            padding=kernel_size // 2, groups=dim,
-        )
-        self.act = nn.GELU(approximate="tanh")
-        self.pw_conv = nn.Conv1d(dim, dim, kernel_size=1)
-        self.gate = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (B, T, D). Returns (B, T, D) — same shape as input."""
-        h = self.norm(x)
-        h = h.transpose(1, 2)                       # (B, D, T)
-        h = self.dw_conv(h)
-        h = self.act(h)
-        h = self.pw_conv(h)
-        h = h.transpose(1, 2)                       # (B, T, D)
-        return x + self.gate * h
 
 
 class ConditionedEncoderLayer(nn.Module):
@@ -271,19 +166,10 @@ class ConditionedEncoderLayer(nn.Module):
 
     def __init__(
         self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.1,
-        use_temporal_conv: bool = False, temporal_conv_kernel: int = 5,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         self.self_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True,
-        )
-        self.use_temporal_conv = use_temporal_conv
-        if use_temporal_conv:
-            self.temporal_conv = TemporalConvResidual(
-                d_model, kernel_size=temporal_conv_kernel,
-            )
-        self.plan_xattn = nn.MultiheadAttention(
             d_model, n_heads, dropout=dropout, batch_first=True,
         )
         self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
@@ -302,20 +188,8 @@ class ConditionedEncoderLayer(nn.Module):
         self,
         x: Tensor,                      # (B, T, D)  motion tokens (including prepended init_pose_tok)
         c: Tensor,                      # (B, D)     global AdaLN condition vector (per sample)
-        plan_kv: Tensor,                # (B, K, D)  plan tokens
-        plan_key_padding_mask: Tensor,  # (B, K) bool, True at padded positions (PyTorch convention)
-        motion_token_start: int = 1,    # index where actual motion tokens begin (after prefix)
-        plan_xattn_attn_bias: Tensor | None = None,   # Round-23 ALiBi-style relative-time bias
     ) -> Tensor:
-        """Round-23 ``plan_xattn_attn_bias`` argument: optional additive
-        attention-score bias of shape ``(B*n_heads, T_q, T_k)`` applied to
-        the plan cross-attention before softmax. Encodes "this motion
-        frame is close in time to this plan token" so cross-attention has
-        an inductive bias toward temporally-nearest anchors. When ``None``
-        (default), the cross-attention behaves exactly as in v18. See
-        ``analyses/2026-05-22_round22_tier_b_v18_baseline_diagnostic_report.md``
-        §5 + ``AnchorDenoiserConfig.plan_xattn_relative_time_bias``.
-        """
+        """DiT-style block: AdaLN-Zero self-attn + AdaLN-Zero MLP."""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )  # each (B, D)
@@ -325,24 +199,7 @@ class ConditionedEncoderLayer(nn.Module):
         attn_out, _ = self.self_attn(h, h, h, need_weights=False)
         x = x + gate_msa.unsqueeze(1) * attn_out
 
-        # (1.5) [v13] Temporal Conv1D residual on motion tokens only —
-        # the prefix init_pose token is a scene fact, not a motion frame.
-        if self.use_temporal_conv:
-            prefix = x[:, :motion_token_start]
-            motion_tokens = x[:, motion_token_start:]
-            motion_tokens = self.temporal_conv(motion_tokens)
-            x = torch.cat([prefix, motion_tokens], dim=1)
-
-        # (2) Plan cross-attention, UNMODULATED (PixArt placement)
-        xattn_out, _ = self.plan_xattn(
-            x, plan_kv, plan_kv,
-            key_padding_mask=plan_key_padding_mask,
-            attn_mask=plan_xattn_attn_bias,
-            need_weights=False,
-        )
-        x = x + xattn_out
-
-        # (3) MLP with AdaLN-Zero
+        # (2) MLP with AdaLN-Zero
         h = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(h)
         return x
@@ -385,174 +242,45 @@ class V12FinalLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# v13 — Base + integrated-velocity-residual head (P1)
-# ---------------------------------------------------------------------------
-
-
-class V13DynamicsHead(nn.Module):
-    """v13 P1: base + cumsum-integrated velocity residual final layer.
-
-    Replaces V12FinalLayer when use_v13_dynhead=True. Two AdaLN-Zero branches
-    consume the same h_motion: a base branch (low-frequency pose) and a delta
-    branch whose output is integrated via cumsum to inject explicit temporal
-    dynamics into the prediction path.
-
-        x_base = base_linear(modulate(norm_base(h), shift_b, scale_b))
-        delta  = delta_linear(modulate(norm_delta(h), shift_d, scale_d))
-        delta[:, 0] = 0                     # no "prior-frame velocity" for frame 0
-        x_dyn = cumsum(delta, dim=1)
-        x_dyn = x_dyn - mean(x_dyn, dim=1)  # remove DC (absolute level lives in x_base)
-        x0_pred = x_base + gamma * x_dyn
-
-    At zero-init: both base_linear and delta_linear are zero → x0_pred = 0,
-    matching v12 step-0 behavior exactly. γ is a learnable scalar initialized
-    to 0.1 (or fixed if learnable_gamma=False). The optimizer picks how much
-    dynamics flows through the delta branch.
-
-    For motion_135 = [rot_6d_22, root_world_3], the cumsum integration is
-    physically meaningful for root translation (Δposition ≈ velocity) and
-    acts as a temporal-residual regularizer for the rot_6d block. Magnitude
-    is controlled by γ (default 0.1) so the rot_6d component remains a small
-    perturbation on x_base.
-
-    Source: Stage B v13 design doc §3.1, with the integrator pattern adapted
-    from MotionDiffuser (Jiang et al. CVPR 2023) trajectory-residual diffusion.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        motion_dim: int,
-        gamma_init: float = 0.1,
-        learnable_gamma: bool = True,
-    ) -> None:
-        super().__init__()
-        # Base branch (same recipe as V12FinalLayer)
-        self.norm_base = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.base_linear = nn.Linear(d_model, motion_dim, bias=True)
-        self.adaLN_base = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(d_model, 2 * d_model, bias=True),
-        )
-        # Delta branch (same recipe — independent norm + AdaLN MLP + linear)
-        self.norm_delta = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.delta_linear = nn.Linear(d_model, motion_dim, bias=True)
-        self.adaLN_delta = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(d_model, 2 * d_model, bias=True),
-        )
-        if learnable_gamma:
-            self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
-        else:
-            self.register_buffer(
-                "gamma", torch.tensor(gamma_init, dtype=torch.float32),
-            )
-
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
-        """x: (B, T, d_model), c: (B, d_model). Returns (B, T, motion_dim)."""
-        # Base branch
-        shift_b, scale_b = self.adaLN_base(c).chunk(2, dim=-1)
-        x_base = self.base_linear(modulate(self.norm_base(x), shift_b, scale_b))
-
-        # Delta branch
-        shift_d, scale_d = self.adaLN_delta(c).chunk(2, dim=-1)
-        delta = self.delta_linear(modulate(self.norm_delta(x), shift_d, scale_d))
-
-        # Zero out first-frame delta. Use masking (non-in-place) for clean autograd.
-        mask = torch.ones_like(delta)
-        mask[:, 0] = 0.0
-        delta = delta * mask
-
-        # Cumulative-integrate + mean-center (remove DC; absolute level is in x_base)
-        x_dyn = torch.cumsum(delta, dim=1)
-        x_dyn = x_dyn - x_dyn.mean(dim=1, keepdim=True)
-
-        return x_base + self.gamma * x_dyn
-
-
-# ---------------------------------------------------------------------------
-# §4.8 — Initialization recipe for v12 / v13 modules
+# §4.8 — Initialization recipe for v12 modules
 # ---------------------------------------------------------------------------
 
 
 def initialize_weights_v12(
     input_proj: V12InputProjection,
     blocks: nn.ModuleList,                  # of ConditionedEncoderLayer
-    final_layer: V12FinalLayer | "V13DynamicsHead",
+    final_layer: V12FinalLayer,
     cond_summary: GlobalCondSummary | None = None,
 ) -> None:
-    """Apply the v12 / v13 zero-init recipe.
+    """Apply the v12 zero-init recipe.
 
-    Per design doc §4.8 (v12) + v13 design doc §3.1, this guarantees a step-0
-    identity forward: all AdaLN gates = 0 -> blocks are identity; aux input
-    proj = 0 -> only motion contributes at input; final layer = 0 -> output
-    is exactly 0.
-
-    Handles both V12FinalLayer (single head) and V13DynamicsHead (base + delta).
-    The temporal-conv branch inside ConditionedEncoderLayer is zero-gated by
-    construction at TemporalConvResidual.__init__, so no extra init needed here.
+    Per design doc §4.8 this guarantees a step-0 identity forward: all AdaLN
+    gates = 0 -> blocks are identity; aux input proj = 0 -> only motion
+    contributes at input; final layer = 0 -> output is exactly 0.
 
     Components NOT touched here: timestep_embed MLP, plan_encoder, text_proj,
     object_proj, end-of-encoder text_xattn / obj_xattn — those are initialized
-    by AnchorDenoiser's own existing init (matches v11 behavior).
+    by AnchorDenoiser's own existing init.
     """
     # 1. Xavier-uniform on input_proj.motion_proj (motion MUST flow at init).
     nn.init.xavier_uniform_(input_proj.motion_proj.weight)
     nn.init.zeros_(input_proj.motion_proj.bias)
 
     # 2. Aux input projections zero-init (bandwidth allocation starts cold).
-    aux_projs = [input_proj.zint_proj, input_proj.obj_proj, input_proj.hint_proj]
+    aux_projs = [input_proj.zint_proj, input_proj.obj_proj]
     if getattr(input_proj, "stage1_coarse_proj", None) is not None:
-        # Round-22: same zero-init contract so step-0 output is preserved
-        # bit-exact against the pre-R22 v18 path when the branch is enabled.
         aux_projs.append(input_proj.stage1_coarse_proj)
     for proj in aux_projs:
         nn.init.zeros_(proj.weight)
         nn.init.zeros_(proj.bias)
-    if getattr(input_proj, "self_cond_proj", None) is not None:
-        # Option B for v22 self-conditioning: initialize the projection
-        # normally and zero only the scalar gate. Zeroing both projection and
-        # gate would make the branch dead at initialization because neither
-        # side receives a useful gradient.
-        nn.init.xavier_uniform_(input_proj.self_cond_proj.weight)
-        nn.init.zeros_(input_proj.self_cond_proj.bias)
-        if getattr(input_proj, "self_cond_gate", None) is not None:
-            nn.init.zeros_(input_proj.self_cond_gate)
 
     # 3. Per-block AdaLN-Zero: final Linear in each block's adaLN_modulation zeroed.
     for block in blocks:
         nn.init.zeros_(block.adaLN_modulation[-1].weight)
         nn.init.zeros_(block.adaLN_modulation[-1].bias)
-        # 4. Per-block cross-attn output projection zero-init.
-        nn.init.zeros_(block.plan_xattn.out_proj.weight)
-        nn.init.zeros_(block.plan_xattn.out_proj.bias)
-        # 4.5 [v13] Temporal-conv branch is already zero-gated at construction
-        # (gate = nn.Parameter(zeros(1))). No extra init needed.
 
     # 5. Final layer: AdaLN-Zero + zero-init linear -> step-0 output is 0.
-    if isinstance(final_layer, V13DynamicsHead):
-        # v13: zero both base and delta branches' AdaLN modulation + Linear.
-        nn.init.zeros_(final_layer.adaLN_base[-1].weight)
-        nn.init.zeros_(final_layer.adaLN_base[-1].bias)
-        nn.init.zeros_(final_layer.base_linear.weight)
-        nn.init.zeros_(final_layer.base_linear.bias)
-        nn.init.zeros_(final_layer.adaLN_delta[-1].weight)
-        nn.init.zeros_(final_layer.adaLN_delta[-1].bias)
-        nn.init.zeros_(final_layer.delta_linear.weight)
-        nn.init.zeros_(final_layer.delta_linear.bias)
-        # gamma remains at its init value (default 0.1).
-    else:
-        nn.init.zeros_(final_layer.adaLN_modulation[-1].weight)
-        nn.init.zeros_(final_layer.adaLN_modulation[-1].bias)
-        nn.init.zeros_(final_layer.linear.weight)
-        nn.init.zeros_(final_layer.linear.bias)
-
-    # 6. cond_summary MLP: standard small-normal init (NOT zero — c needs to be
-    # non-trivial from step 0; AdaLN zero-init handles the "no condition at start"
-    # guarantee via the adaLN_modulation, not via cond_summary).
-    # Skipped entirely when use_plan_pool=False (cond_summary.plan_pool_mlp is None).
-    if cond_summary is not None and cond_summary.plan_pool_mlp is not None:
-        for m in cond_summary.plan_pool_mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                nn.init.zeros_(m.bias)
+    nn.init.zeros_(final_layer.adaLN_modulation[-1].weight)
+    nn.init.zeros_(final_layer.adaLN_modulation[-1].bias)
+    nn.init.zeros_(final_layer.linear.weight)
+    nn.init.zeros_(final_layer.linear.bias)

@@ -29,9 +29,7 @@ from piano.training.temporal_interaction_losses import (
     loss_contact_tracking_projection,
     loss_gait_both_airborne,
     loss_gait_stance_velocity,
-    loss_body_action_consistency,
 )
-from piano.data.interaction_hint import build_body_action_oracle_hint
 
 
 def _make_clip(T: int = 20, with_contact: bool = True, with_walking: bool = True):
@@ -384,39 +382,3 @@ def test_object_local_frame_under_90deg_rotation():
     assert loss_rot.item() == pytest.approx(loss_id.item(), rel=1e-3, abs=1e-4)
 
 
-def test_body_action_consistency_matches_canonical_yaw_frame():
-    """GT-as-pred should be zero even when the clip is yaw-rotated.
-
-    This catches the Round-28 bug where pred deltas were compared in
-    world frame against a root-yaw-canonical oracle hint.
-    """
-    T = 8
-    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
-    # Canonical t=0 body with a well-defined facing direction.
-    joints[:, :, 1, :] = torch.tensor([-0.12, 0.9, 0.0])   # left hip
-    joints[:, :, 2, :] = torch.tensor([0.12, 0.9, 0.0])    # right hip
-    joints[:, :, 16, :] = torch.tensor([-0.20, 1.45, 0.0]) # left shoulder
-    joints[:, :, 17, :] = torch.tensor([0.20, 1.45, 0.0])  # right shoulder
-    joints[:, :, 20, :] = torch.tensor([-0.35, 1.20, 0.0]) # left wrist
-    joints[:, :, 21, :] = torch.tensor([0.35, 1.20, 0.0])  # right wrist
-    joints[:, :, 4, :] = torch.tensor([-0.10, 0.50, 0.0])  # left knee
-    joints[:, :, 5, :] = torch.tensor([0.10, 0.50, 0.0])   # right knee
-    joints[:, :, 12, :] = torch.tensor([0.0, 1.60, 0.0])   # neck
-    # Move left wrist and pelvis over time.
-    t = torch.linspace(0.0, 0.2, T)
-    joints[:, :, 20, 2] += t
-    joints[:, :, 0, 0] += 0.05 * t
-
-    # Rotate the entire clip by +90 degrees around Y.
-    c, s = math.cos(math.pi / 2.0), math.sin(math.pi / 2.0)
-    R = torch.tensor([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
-    joints = torch.matmul(joints, R.T)
-
-    hint_np = build_body_action_oracle_hint(
-        joints[0].numpy().astype("float32"),
-        mask_mode="all_on",
-    )
-    hint = torch.from_numpy(hint_np).unsqueeze(0)
-    loss = loss_body_action_consistency(joints, hint)
-    assert torch.isfinite(loss)
-    assert loss.item() < 1e-6

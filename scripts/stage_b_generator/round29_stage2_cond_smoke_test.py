@@ -278,19 +278,6 @@ def check_model_forward() -> str:
         text_dim=512,
         object_token_dim=256,
         object_num_tokens=128,
-        use_interaction_plan=True,
-        plan_k_max=4,
-        plan_s_max=4,
-        plan_num_parts=5,
-        plan_num_anchor_types=5,
-        plan_use_segment_tokens=False,
-        plan_use_context_hint=True,
-        plan_d_hint=32,
-        plan_d_time_embed=32,
-        plan_per_part_tokens=True,
-        plan_context_hint_mode="time_only",
-        use_dit_block=True,
-        dit_block_use_plan_pool_in_cond=False,
         use_round29_cond_injection=True,
         r29_coarse_extra_dim=18,
         r29_interaction_dim=8,
@@ -307,37 +294,12 @@ def check_model_forward() -> str:
     model = AnchorDenoiser(cfg)
     model.eval()
 
-    K = cfg.plan_k_max
-    S = cfg.plan_s_max
-    P = cfg.plan_num_parts
-    plan = {
-        "anchor_time":         torch.zeros(B, K, dtype=torch.float32),
-        "anchor_part":         torch.zeros(B, K, P, dtype=torch.float32),
-        "anchor_target_local": torch.zeros(B, K, P, 3, dtype=torch.float32),
-        "anchor_target_world": torch.zeros(B, K, P, 3, dtype=torch.float32),
-        "anchor_type":         torch.zeros(B, K, dtype=torch.long),
-        "anchor_phase":        torch.zeros(B, K, dtype=torch.long),
-        "anchor_support":      torch.zeros(B, K, dtype=torch.long),
-        "anchor_conf":         torch.zeros(B, K, dtype=torch.float32),
-        "anchor_mask":         torch.ones(B, K, dtype=torch.float32),
-        # Segment-* are read by _compute_plan_context_hint even in
-        # time_only mode (for active-segment phase / support lookup).
-        "segment_start":             torch.zeros(B, S, dtype=torch.long),
-        "segment_end":               torch.zeros(B, S, dtype=torch.long),
-        "segment_part":              torch.zeros(B, S, P, dtype=torch.float32),
-        "segment_target_summary_local": torch.zeros(B, S, P, 3, dtype=torch.float32),
-        "segment_phase":             torch.zeros(B, S, dtype=torch.long),
-        "segment_support":           torch.zeros(B, S, dtype=torch.long),
-        "segment_conf":              torch.zeros(B, S, dtype=torch.float32),
-        "segment_mask":              torch.zeros(B, S, dtype=torch.float32),
-    }
     cond = {
         "z_int": torch.zeros(B, T, cfg.z_int.total),
         "object_world_traj": torch.zeros(B, T, cfg.object_traj_dim),
         "init_pose": torch.zeros(B, cfg.init_pose_dim),
         "text": torch.zeros(B, 4, cfg.text_dim),
         "object_tokens": torch.zeros(B, cfg.object_num_tokens, cfg.object_token_dim),
-        "interaction_plan": plan,
         "stage2_coarse_extra": torch.randn(B, T, 18),
         "stage2_interaction":  torch.randn(B, T, 8),
         "stage2_support":      torch.randn(B, T, 13),
@@ -346,7 +308,7 @@ def check_model_forward() -> str:
     x_t = torch.randn(B, T, cfg.motion_dim)
     t = torch.zeros(B, dtype=torch.long)
     with torch.no_grad():
-        out = model(x_t, t, cond, cond_drop_mask=None, self_cond=None)
+        out = model(x_t, t, cond, cond_drop_mask=None)
     if out.shape != (B, T, cfg.motion_dim):
         raise AssertionError(f"forward shape {out.shape} != {(B, T, cfg.motion_dim)}")
     # Zero-init guarantee: step-0 forward should be (numerically) zero.
@@ -428,27 +390,7 @@ def check_strict_instantiate_configs(manifest_path: Path) -> dict[str, str]:
                 text_dim=int(d.text_dim),
                 object_token_dim=int(d.object_token_dim),
                 object_num_tokens=int(d.object_num_tokens),
-                use_interaction_plan=bool(d.get("use_interaction_plan", False)),
-                plan_k_max=int(d.get("plan_k_max", 12)),
-                plan_s_max=int(d.get("plan_s_max", 12)),
-                plan_num_anchor_types=int(d.get("plan_num_anchor_types", 5)),
-                plan_num_parts=int(d.get("plan_num_parts", 5)),
-                plan_use_segment_tokens=bool(d.get("plan_use_segment_tokens", False)),
-                plan_use_context_hint=bool(d.get("plan_use_context_hint", True)),
-                plan_d_hint=int(d.get("plan_d_hint", 32)),
-                plan_d_time_embed=int(d.get("plan_d_time_embed", 64)),
-                plan_per_part_tokens=bool(d.get("plan_per_part_tokens", False)),
-                plan_context_hint_mode=str(d.get("plan_context_hint_mode", "time_only")),
-                use_dit_block=bool(d.get("use_dit_block", False)),
-                dit_block_use_plan_pool_in_cond=bool(
-                    d.get("dit_block_use_plan_pool_in_cond", True)
-                ),
                 stage1_coarse_dim=int(d.get("stage1_coarse_dim", 0)),
-                plan_xattn_relative_time_bias=bool(
-                    d.get("plan_xattn_relative_time_bias", False)
-                ),
-                plan_xattn_time_bias_init=float(d.get("plan_xattn_time_bias_init", 0.5)),
-                plan_tokens_force_null=bool(d.get("plan_tokens_force_null", False)),
                 use_round29_cond_injection=bool(
                     d.get("use_round29_cond_injection", False)
                 ),

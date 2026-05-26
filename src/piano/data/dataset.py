@@ -169,9 +169,7 @@ class HOIDataset(Dataset):
         augment: AugmentConfig | None = None,
         surface_obj_pose: bool = False,
         force_world_frame: bool = False,
-        motion_representation: str = "motion_263",
-        keyframe_subdir: str = "keyframes/v8_default",
-        keyframe_max_k: int = 12,
+        motion_representation: str = "smpl_pose_135_plan",
         # v9.1 (2026-05-03): collapse hand_support (id=3) into both_feet
         # (id=0) at load time. The compound class hand_support
         # = (hand_contact ∧ pelvis_static ∧ phase_stable) is essentially
@@ -183,22 +181,7 @@ class HOIDataset(Dataset):
         # config and SUPPORT_NAMES is implicitly truncated to the
         # first 3 names.
         support_collapse_hand_support: bool = False,
-        # Tier-0A oracle interaction-hint (roadmap §6.11). When enabled,
-        # __getitem__ surfaces a per-frame ``oracle_interaction_hint``
-        # tensor of shape (T, D) where D = hint_dim(oracle_hint_variant)
-        # (hand=8 / foot=5 / full=13). Computed from joints + object pose
-        # + contact_state at load time. Requires
-        # ``object_positions``, ``object_rotations`` and the
-        # ``contact_state`` pseudo-label to be present.
-        use_oracle_interaction_hint: bool = False,
-        oracle_hint_variant: str = "full",
         oracle_hint_fps: float = 20.0,
-        # Round-28 body-action oracle hint (prompt §5). When enabled,
-        # __getitem__ surfaces a per-frame ``body_action_hint`` tensor
-        # of shape (T, 24): mask[6] + 6 joints × 3D delta_local.
-        use_body_action_hint: bool = False,
-        body_action_hint_mask_mode: str = "all_on",  # "all_on" | "energy"
-        body_action_energy_threshold: float = 0.05,
         # Round-27 Tier-0B aux fields: ``walking_mask`` (B, T, 1) and
         # ``foot_stance_gt`` (B, T, 2) — both derived from GT joints
         # exactly like the hint's foot sub-vector. The temporal
@@ -233,39 +216,8 @@ class HOIDataset(Dataset):
         # need them) doesn't pay the MoMask-recovery import cost.
         self.surface_obj_pose = surface_obj_pose
         self.support_collapse_hand_support = bool(support_collapse_hand_support)
-        # Tier-0A oracle interaction-hint (roadmap §6.11).
-        self.use_oracle_interaction_hint = bool(use_oracle_interaction_hint)
-        if self.use_oracle_interaction_hint:
-            from piano.data.interaction_hint import hint_dim as _hint_dim
-            if oracle_hint_variant not in {"hand", "foot", "full"}:
-                raise ValueError(
-                    "oracle_hint_variant must be one of "
-                    f"{{'hand', 'foot', 'full'}}, got {oracle_hint_variant!r}"
-                )
-            self.oracle_hint_variant = str(oracle_hint_variant)
-            self.oracle_hint_dim = int(_hint_dim(self.oracle_hint_variant))
-            self.oracle_hint_fps = float(oracle_hint_fps)
-        else:
-            self.oracle_hint_variant = str(oracle_hint_variant)
-            self.oracle_hint_dim = 0
-            self.oracle_hint_fps = float(oracle_hint_fps)
+        self.oracle_hint_fps = float(oracle_hint_fps)
         self.surface_temporal_aux_fields = bool(surface_temporal_aux_fields)
-        # Round-28 body-action oracle hint (prompt §5).
-        self.use_body_action_hint = bool(use_body_action_hint)
-        if body_action_hint_mask_mode not in {"all_on", "energy"}:
-            raise ValueError(
-                "body_action_hint_mask_mode must be 'all_on' or 'energy'; "
-                f"got {body_action_hint_mask_mode!r}"
-            )
-        self.body_action_hint_mask_mode = str(body_action_hint_mask_mode)
-        self.body_action_energy_threshold = float(body_action_energy_threshold)
-        if self.use_body_action_hint:
-            from piano.data.interaction_hint import (
-                HINT_DIM_BODY_ACTION as _HINT_DIM_BODY_ACTION,
-            )
-            self.body_action_hint_dim = int(_HINT_DIM_BODY_ACTION)
-        else:
-            self.body_action_hint_dim = 0
         # Round-29 typed condition bundle.
         from piano.data.stage2_oracle_conditions import (
             COARSE_VARIANT_DIMS as _R29_C_DIMS,
@@ -327,51 +279,22 @@ class HOIDataset(Dataset):
         # adapter (effect-size 9.3% mean / 21.2% peak), so this flag
         # tests the canonicalization choice in isolation.
         self.force_world_frame = force_world_frame
-        if motion_representation not in {
-            "motion_263",
-            "joints22_world",
-            "joints22_world_with_rot6d",
-            "smpl_pose_135",
-            "smpl_pose_135_keyframed",
-            "smpl_pose_135_condmdi",
-            "smpl_pose_135_plan",
-        }:
+        if motion_representation != "smpl_pose_135_plan":
             raise ValueError(
-                "motion_representation must be one of "
-                "{motion_263, joints22_world, joints22_world_with_rot6d, "
-                "smpl_pose_135, smpl_pose_135_keyframed, smpl_pose_135_condmdi, "
-                "smpl_pose_135_plan}, "
-                f"got {motion_representation!r}"
+                "Only motion_representation='smpl_pose_135_plan' is supported "
+                f"after the R29 Tier-1 cleanup; got {motion_representation!r}"
             )
         self.motion_representation = motion_representation
-        self.keyframe_subdir = str(keyframe_subdir)
-        self.keyframe_max_k = int(keyframe_max_k)
-        # InteractionPlan compiler config (lazily built in __getitem__ for
-        # the smpl_pose_135_plan branch). Attribute is None when not in
-        # plan mode so the lazy import + construction is paid only by the
-        # v10 plan-tokens path. See
-        # analyses/piano_interaction_plan_pipeline_reframe_for_claude_code.md.
-        self._interaction_plan_compiler_cfg = None
-        # The 198-D (jpos+rot_6d) and 135-D (rot_6d+root) reps both contain
-        # SMPL-22 global 6D rotations derived from raw smplx_poses. The
-        # current ``_apply_augmentation`` rotates joints / motion_263 /
-        # object pose but does NOT rotate smplx-derived global rotations,
-        # which would desync the rep. v5 / v6 configs must therefore disable
-        # mirror + Y-rotation augmentation.
-        if motion_representation in {
-            "joints22_world_with_rot6d",
-            "smpl_pose_135",
-            "smpl_pose_135_keyframed",
-            "smpl_pose_135_condmdi",
-            "smpl_pose_135_plan",
-        }:
-            aug = augment or AugmentConfig()
-            if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
-                raise ValueError(
-                    f"motion_representation={motion_representation!r} is not "
-                    "compatible with mirror_prob>0 or rotate_around_y_prob>0 — "
-                    "global rot 6D would desync. Set both probs to 0 in the config."
-                )
+        # smpl_pose_135_plan contains global rot 6D derived from smplx_poses;
+        # the augmentation path doesn't rotate them, so mirror / Y-rotation
+        # would desync the rep. Enforce mirror_prob=rotate_prob=0.
+        aug = augment or AugmentConfig()
+        if aug.enabled and (aug.mirror_prob > 0 or aug.rotate_around_y_prob > 0):
+            raise ValueError(
+                "smpl_pose_135_plan is not compatible with mirror_prob>0 or "
+                "rotate_around_y_prob>0 — global rot 6D would desync. Set both "
+                "probs to 0 in the config."
+            )
 
         # Load metadata — prefer metadata_clean.json when it exists so
         # training skips sequences the cleaning tool flagged as bad
@@ -626,104 +549,54 @@ class HOIDataset(Dataset):
         # through the SMPL-22 kinematic tree. ``rest_offsets`` is computed
         # by reverse-FK so FK(rot, offsets, root_pos) reproduces the GT
         # joints exactly (verified < 0.1 mm in scratch testing).
+        # smpl_pose_135_plan: cat(global_rot_6d: 132, root_world_pos: 3) = 135-D.
+        # Requires smplx_poses for global 6D rotations (computed via FK over
+        # SMPL-22 parents). Augmentation rotation propagation is not
+        # implemented for this rep — mirror_prob / rotate_around_y_prob are
+        # forced to 0 in __init__.
         rest_offsets_np: np.ndarray | None = None
-        if self.motion_representation == "motion_263":
-            motion = motion_263
-        elif self.motion_representation == "joints22_world":
-            motion = joints.reshape(joints.shape[0], 22 * 3).astype(
-                np.float32,
-                copy=False,
+        if smplx_poses is None:
+            raise KeyError(
+                f"smplx_poses missing in {motion_path}; smpl_pose_135_plan "
+                "requires smplx_poses (T, 156) and joints_22 (T, 22, 3) in the npz."
             )
-        elif self.motion_representation in {
-            "joints22_world_with_rot6d",
-            "smpl_pose_135",
-            "smpl_pose_135_keyframed",
-            "smpl_pose_135_condmdi",
-            "smpl_pose_135_plan",
-        }:
-            # v5 (joints22_world_with_rot6d) / v6 (smpl_pose_135) both need
-            # un-augmented smplx_poses to compute global 6D rotations. Augment
-            # rotation propagation is not implemented, so configs must disable
-            # mirror + Y-rotation augmentation (enforced in __init__).
-            if smplx_poses is None:
-                raise KeyError(
-                    f"smplx_poses missing in {motion_path}; "
-                    f"motion_representation={self.motion_representation!r} requires "
-                    "smplx_poses (T, 156) and joints_22 (T, 22, 3) in the npz."
-                )
-            # First 66 dims of smplx_poses = SMPL-22 root_orient(3)
-            # + body_pose(63=21*3) axis-angle local. The remaining 90 dims
-            # are SMPL-X jaw/eyes/hands which we ignore here.
-            pose_22_aa = smplx_poses[:, :66].reshape(-1, 22, 3)
+        # First 66 dims of smplx_poses = SMPL-22 root_orient(3)
+        # + body_pose(63=21*3) axis-angle local. The remaining 90 dims
+        # are SMPL-X jaw/eyes/hands which we ignore here.
+        pose_22_aa = smplx_poses[:, :66].reshape(-1, 22, 3)
 
-            # Compute global per-joint rotation matrices then 6D rep.
-            # Done in torch CPU because our smpl_kinematics utilities are
-            # torch-native (Rodrigues + chain through SMPL-22 parents).
-            from piano.training.smpl_kinematics import (
-                axis_angle_to_matrix as _aa2mat,
-                local2global_pose as _l2g,
-                matrix_to_rotation_6d as _mat2_6d,
-                SMPL22_PARENTS as _PARENTS,
-            )
-            aa_t = torch.from_numpy(pose_22_aa)                 # (max_T, 22, 3)
-            local_R = _aa2mat(aa_t)                             # (max_T, 22, 3, 3)
-            global_R = _l2g(local_R)                            # (max_T, 22, 3, 3)
-            global_rot_6d = _mat2_6d(global_R)                  # (max_T, 22, 6)
+        from piano.training.smpl_kinematics import (
+            axis_angle_to_matrix as _aa2mat,
+            local2global_pose as _l2g,
+            matrix_to_rotation_6d as _mat2_6d,
+            SMPL22_PARENTS as _PARENTS,
+        )
+        aa_t = torch.from_numpy(pose_22_aa)                 # (max_T, 22, 3)
+        local_R = _aa2mat(aa_t)                             # (max_T, 22, 3, 3)
+        global_R = _l2g(local_R)                            # (max_T, 22, 3, 3)
+        global_rot_6d = _mat2_6d(global_R)                  # (max_T, 22, 6)
 
-            # Reverse FK on valid frames: rest_offset[j] is the bone vector
-            # from parent(j) to j in T-pose coordinates of the parent.
-            # Solve: jpos[t,j] - jpos[t,parent(j)] = R_global[t,parent(j)] @ rest_offset[j]
-            #     => rest_offset[j] = R_global[t,parent(j)].T @ bone[t,j]
-            # Average over valid frames for stability (verified < 0.03 mm
-            # standard deviation in scratch test on chairs Sub0001).
-            joints_v = torch.from_numpy(joints[:seq_len])       # (seq_len, 22, 3)
-            global_R_v = global_R[:seq_len]                     # (seq_len, 22, 3, 3)
-            rest_offsets_t = torch.zeros(22, 3, dtype=torch.float32)
-            for j in range(1, 22):
-                p = int(_PARENTS[j])
-                bone = joints_v[:, j, :] - joints_v[:, p, :]    # (seq_len, 3)
-                R_inv = global_R_v[:, p, :, :].transpose(-1, -2)
-                offset_t = torch.einsum("tij,tj->ti", R_inv, bone)
-                rest_offsets_t[j] = offset_t.mean(dim=0)
-            rest_offsets_np = rest_offsets_t.numpy()            # (22, 3)
+        # Reverse FK on valid frames: rest_offset[j] is the bone vector
+        # from parent(j) to j in T-pose coordinates of the parent.
+        joints_v = torch.from_numpy(joints[:seq_len])       # (seq_len, 22, 3)
+        global_R_v = global_R[:seq_len]                     # (seq_len, 22, 3, 3)
+        rest_offsets_t = torch.zeros(22, 3, dtype=torch.float32)
+        for j in range(1, 22):
+            p = int(_PARENTS[j])
+            bone = joints_v[:, j, :] - joints_v[:, p, :]    # (seq_len, 3)
+            R_inv = global_R_v[:, p, :, :].transpose(-1, -2)
+            offset_t = torch.einsum("tij,tj->ti", R_inv, bone)
+            rest_offsets_t[j] = offset_t.mean(dim=0)
+        rest_offsets_np = rest_offsets_t.numpy()            # (22, 3)
 
-            if self.motion_representation == "joints22_world_with_rot6d":
-                # v5: cat(jpos: 66, global_rot_6d: 132) = 198-D
-                motion = np.concatenate(
-                    [
-                        joints.reshape(joints.shape[0], 22 * 3),
-                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
-                    ],
-                    axis=-1,
-                ).astype(np.float32, copy=False)                # (max_T, 198)
-            elif self.motion_representation == "smpl_pose_135_plan":
-                # v10: same 135-D base as smpl_pose_135. The
-                # InteractionPlan is added below as separate batch fields.
-                root_world_pos = joints[:, 0, :].astype(np.float32)
-                motion = np.concatenate(
-                    [
-                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
-                        root_world_pos,
-                    ],
-                    axis=-1,
-                ).astype(np.float32, copy=False)                # (max_T, 135)
-            else:
-                # v6 (smpl_pose_135): cat(global_rot_6d: 132, root_world_pos: 3) = 135-D
-                # joints[:, 0, :] is root world pos already in our preprocessing
-                # (it equals smplx_trans + trans2joint). We use joints[:, 0, :]
-                # directly for consistency with the FK chain target.
-                root_world_pos = joints[:, 0, :].astype(np.float32)   # (max_T, 3)
-                motion = np.concatenate(
-                    [
-                        global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
-                        root_world_pos,
-                    ],
-                    axis=-1,
-                ).astype(np.float32, copy=False)                # (max_T, 135)
-        else:                                                   # pragma: no cover
-            raise AssertionError(
-                f"motion_representation={self.motion_representation!r} not handled"
-            )
+        root_world_pos = joints[:, 0, :].astype(np.float32)
+        motion = np.concatenate(
+            [
+                global_rot_6d.numpy().reshape(global_rot_6d.shape[0], 132),
+                root_world_pos,
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False)                    # (max_T, 135)
 
         result: dict[str, torch.Tensor | str] = {
             "motion": torch.from_numpy(motion),
@@ -738,111 +611,6 @@ class HOIDataset(Dataset):
         if rest_offsets_np is not None:
             result["rest_offsets"] = torch.from_numpy(rest_offsets_np)
 
-        # ---------------------------------------------------------------
-        # InteractionPlan (v10 plan-tokens path)
-        # ---------------------------------------------------------------
-        # Compile a sparse interaction program from the dense
-        # pseudo-labels and surface as ``plan_*`` tensors. The compiler
-        # is deterministic given inputs + config (test_determinism in
-        # tests/test_interaction_plan_compiler.py), so caching on disk is
-        # not required for now — it adds < 1 ms per __getitem__ call on
-        # 196-frame clips.
-        if (
-            self.motion_representation == "smpl_pose_135_plan"
-            and padded_labels.get("contact_state") is not None
-            and padded_labels.get("contact_target_xyz") is not None
-            and padded_labels.get("phase") is not None
-            and padded_labels.get("support") is not None
-            and object_positions is not None
-            and object_rotations is not None
-        ):
-            from piano.data.interaction_plan_compiler import (
-                InteractionPlanCompilerConfig,
-                compile_interaction_plan,
-            )
-            if self._interaction_plan_compiler_cfg is None:
-                # Tied to default compiler hyperparameters (audited in
-                # analyses/2026-05-10_interaction_plan_compiler_audit.md).
-                # Number of phase / support classes derives from the
-                # pseudo-label set the dataset was constructed against.
-                num_phase = int(padded_labels["phase"].max()) + 1
-                num_phase = max(num_phase, 3)
-                # Support is collapsed to 3 in our v18+ ship label set.
-                num_support = 3
-                self._interaction_plan_compiler_cfg = InteractionPlanCompilerConfig(
-                    num_parts=int(padded_labels["contact_state"].shape[1]),
-                    num_phase_classes=num_phase,
-                    num_support_classes=num_support,
-                )
-
-            cfg_compile = self._interaction_plan_compiler_cfg
-
-            # Convert phase / support GT integer arrays to one-hot softmax
-            # of the same shape the compiler expects.
-            phase_int = padded_labels["phase"].astype(np.int64)
-            support_int = padded_labels["support"].astype(np.int64)
-            phase_softmax = np.zeros(
-                (len(phase_int), cfg_compile.num_phase_classes), dtype=np.float32,
-            )
-            support_softmax = np.zeros(
-                (len(support_int), cfg_compile.num_support_classes), dtype=np.float32,
-            )
-            phase_safe = np.clip(phase_int, 0, cfg_compile.num_phase_classes - 1)
-            support_safe = np.clip(support_int, 0, cfg_compile.num_support_classes - 1)
-            phase_softmax[np.arange(len(phase_int)), phase_safe] = 1.0
-            support_softmax[np.arange(len(support_int)), support_safe] = 1.0
-
-            plan = compile_interaction_plan(
-                contact_prob=padded_labels["contact_state"][:seq_len].astype(np.float32),
-                target_local=padded_labels["contact_target_xyz"][:seq_len].astype(np.float32),
-                phase_softmax=phase_softmax[:seq_len],
-                support_softmax=support_softmax[:seq_len],
-                object_pos_world=object_positions[:seq_len].astype(np.float32),
-                object_rot_world_aa=object_rotations[:seq_len].astype(np.float32),
-                seq_len=seq_len,
-                cfg=cfg_compile,
-            )
-            for k, v in plan.items():
-                result[f"plan_{k}"] = torch.from_numpy(v)
-        # v8 hierarchical: load offline-precomputed keyframes for the
-        # keyframed motion representation. Stage 1 uses these as
-        # supervision targets; Stage 2 uses them as sparse condition.
-        # Output schema: padded to keyframe_max_k with mask. Variable-K
-        # per clip handled via collate_fn default behavior.
-        if self.motion_representation == "smpl_pose_135_keyframed":
-            kf_path = self.root / self.keyframe_subdir / f"{seq_id}.npz"
-            if not kf_path.exists():
-                raise FileNotFoundError(
-                    f"v8 keyframe file missing: {kf_path}. Run "
-                    "scripts/stage_b_generator/extract_v8_keyframes.sh first."
-                )
-            kf_data = np.load(kf_path, allow_pickle=False)
-            indices = kf_data["indices"].astype(np.int64)         # (K,)
-            targets = kf_data["targets"].astype(np.float32)       # (K, 6, 3)
-            K = int(kf_data["num_keyframes"])
-            K_max = self.keyframe_max_k
-
-            # Drop keyframes that fall outside the truncated [0, seq_len)
-            # window (offline pass used original T which may exceed
-            # self.max_seq_length). Maintain alignment between indices
-            # and targets.
-            in_window = indices < seq_len
-            indices = indices[in_window]
-            targets = targets[in_window]
-            K = len(indices)
-
-            # Pad to K_max
-            kf_indices_padded = np.zeros(K_max, dtype=np.int64)
-            kf_targets_padded = np.zeros((K_max, 6, 3), dtype=np.float32)
-            kf_mask = np.zeros(K_max, dtype=np.float32)
-            n = min(K, K_max)
-            kf_indices_padded[:n] = indices[:n]
-            kf_targets_padded[:n] = targets[:n]
-            kf_mask[:n] = 1.0
-
-            result["keyframe_indices"] = torch.from_numpy(kf_indices_padded)
-            result["keyframe_targets"] = torch.from_numpy(kf_targets_padded)
-            result["keyframe_mask"] = torch.from_numpy(kf_mask)
         if object_positions is not None:
             result["object_positions"] = torch.from_numpy(object_positions)
         if object_rotations is not None:
@@ -855,41 +623,10 @@ class HOIDataset(Dataset):
             result[key] = torch.from_numpy(arr)
 
         # ---------------------------------------------------------------
-        # Tier-0A oracle interaction hint (roadmap §6.11)
+        # Aux fields: walking_mask + foot_stance_gt (used by temporal
+        # losses; not consumed when temporal weights are zero, but the R29
+        # YAML still emits them for ablation flexibility).
         # ---------------------------------------------------------------
-        # Compute on the valid prefix, then pad. The stance helper
-        # estimates a sample-specific floor via a height quantile, so
-        # zero-padded frames must not enter that estimate.
-        if (
-            self.use_oracle_interaction_hint
-            and object_positions is not None
-            and object_rotations is not None
-            and padded_labels.get("contact_state") is not None
-        ):
-            from piano.data.interaction_hint import build_oracle_interaction_hint
-            valid_T = int(min(seq_len, self.max_seq_length))
-            hint_valid = build_oracle_interaction_hint(
-                joints_22=joints[:valid_T].astype(np.float32),
-                object_positions=object_positions[:valid_T].astype(np.float32),
-                object_rotations=object_rotations[:valid_T].astype(np.float32),
-                contact_state=padded_labels["contact_state"][:valid_T].astype(np.float32),
-                variant=self.oracle_hint_variant,
-                fps=self.oracle_hint_fps,
-            )
-            hint = self._pad_or_truncate(hint_valid, self.max_seq_length)
-            assert hint.shape == (self.max_seq_length, self.oracle_hint_dim), (
-                f"oracle_interaction_hint shape {hint.shape!r} != "
-                f"expected ({self.max_seq_length}, {self.oracle_hint_dim})"
-            )
-            result["oracle_interaction_hint"] = torch.from_numpy(hint)
-
-        # ---------------------------------------------------------------
-        # Tier-0B aux fields: walking_mask + foot_stance_gt
-        # ---------------------------------------------------------------
-        # Same GT-derived quantities the hint uses internally, but
-        # exposed independently so the temporal interaction LOSSES can
-        # consume them without requiring the model to also consume the
-        # oracle hint as a condition.
         if self.surface_temporal_aux_fields:
             from piano.data.interaction_hint import (
                 derive_foot_stance_from_gt,
@@ -906,26 +643,6 @@ class HOIDataset(Dataset):
             foot_stance = self._pad_or_truncate(foot_stance_valid, self.max_seq_length)
             result["walking_mask"] = torch.from_numpy(walking)             # (T, 1)
             result["foot_stance_gt"] = torch.from_numpy(foot_stance)       # (T, 2)
-
-        # ---------------------------------------------------------------
-        # Round-28 body-action oracle hint (prompt §5)
-        # ---------------------------------------------------------------
-        # Compute on the valid prefix so the frame-0 anchor + per-joint
-        # energy stats are not contaminated by zero padding.
-        if self.use_body_action_hint:
-            from piano.data.interaction_hint import build_body_action_oracle_hint
-            valid_T = int(min(seq_len, self.max_seq_length))
-            body_hint_valid = build_body_action_oracle_hint(
-                joints_22=joints[:valid_T].astype(np.float32),
-                mask_mode=self.body_action_hint_mask_mode,
-                energy_threshold=self.body_action_energy_threshold,
-            )
-            body_hint = self._pad_or_truncate(body_hint_valid, self.max_seq_length)
-            assert body_hint.shape == (self.max_seq_length, self.body_action_hint_dim), (
-                f"body_action_hint shape {body_hint.shape!r} != "
-                f"expected ({self.max_seq_length}, {self.body_action_hint_dim})"
-            )
-            result["body_action_hint"] = torch.from_numpy(body_hint)
 
         # ---------------------------------------------------------------
         # Round-29 typed Stage-2 condition bundle (prompt §3, §5.1)
