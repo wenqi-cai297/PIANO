@@ -3,7 +3,7 @@
 Per analyses/2026-05-26_stage2_cond_injection_ablation_claude_code_prompt.md
 §5.4 + Codex post-review fixes from
 analyses/2026-05-26_round29_claude_code_fix_after_codex_review_prompt.md
-(portable paths, configurable init-checkpoint, real F3/F4 overrides,
+(portable paths, real F3/F4 overrides,
 emit repo-relative paths only).
 
 Writes:
@@ -48,13 +48,6 @@ from piano.models.round29_cond_injection import (  # noqa: E402
 DEFAULT_CONFIG_DIR = ROOT / "configs" / "training"
 DEFAULT_ANALYSES_DIR = ROOT / "analyses"
 
-# Default checkpoint path — relative to repo root. The CLI override
-# (--init-checkpoint) and ROUND29_INIT_CKPT env var let users point at a
-# real on-disk checkpoint without editing this file. The launcher's
-# preflight verifies the path actually exists before training.
-DEFAULT_INIT_CKPT = (
-    "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
-)
 # Selection JSON used by BOTH the trainer (via `data.subset_indices_file`,
 # which reads the `indices: [int]` field) AND the diag scripts (via
 # `--selection-json`, which after 2026-05-26 falls back to the `clips:
@@ -581,7 +574,6 @@ def _render_yaml(
     *,
     base_subset_file: str,
     body_action_subset_file: str,
-    init_checkpoint: str,
     data_root: str,
 ) -> str:
     subset_file = (
@@ -629,7 +621,6 @@ model:
     ff_mult: 4
     dropout: 0.1
     stage1_coarse_dim: 23
-    cfg_drop_stage1_coarse: false
     # Round-29 typed condition injection.
     use_round29_cond_injection: {"true" if any_active else "false"}
     r29_coarse_extra_dim: {coarse_extra_dim}
@@ -683,8 +674,6 @@ data:
     pc_jitter_std: 0.0
 
 training:
-  init_checkpoint: "{init_checkpoint}"
-  partial_init_allow_shape_mismatch: true
   batch_size: 8
   num_epochs: {v.num_epochs}
   num_workers: 4
@@ -759,7 +748,6 @@ def _manifest_row(
     config_path: str,
     base_subset_file: str,
     body_action_subset_file: str,
-    init_checkpoint: str,
 ) -> dict[str, Any]:
     cv = resolved["coarse_variant"]
     iv = resolved["interaction_variant"]
@@ -792,11 +780,10 @@ def _manifest_row(
         # diag scripts (read `clips`/`selected`/`candidates`).
         "subset_file": subset_file,
         "num_epochs": v.num_epochs,
-        # Codex review: per-variant training overrides exposed in the
-        # manifest so summarizer/launcher can show what was actually run.
+        # Per-variant training overrides exposed in the manifest so the
+        # launcher/summarizer can show what was actually run.
         "seed": v.seed,
         "val_on_train_subset": v.val_on_train_subset,
-        "init_checkpoint": init_checkpoint,
         "config_path": config_path,
         "output_dir": f"runs/training/stageB_anchordiff_{v.variant_id}",
         "diagnostics": list(v.diagnostics),
@@ -910,15 +897,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--init-checkpoint",
-        default=os.environ.get("ROUND29_INIT_CKPT", DEFAULT_INIT_CKPT),
-        help=(
-            "Init checkpoint path written into every config. Defaults to "
-            "ROUND29_INIT_CKPT env var or the v27 final.pt path. The "
-            "launcher's preflight verifies the file actually exists."
-        ),
-    )
-    parser.add_argument(
         "--data-root",
         default=os.environ.get("DATASETS_ROOT", DEFAULT_DATA_ROOT),
         help=(
@@ -955,7 +933,6 @@ def main() -> int:
         if args.only_groups else None
     )
 
-    init_ckpt = _to_posix_relpath(args.init_checkpoint, ROOT)
     base_subset = _to_posix_relpath(args.balanced_subset_file, ROOT)
     body_subset = _to_posix_relpath(args.body_action_subset_file, ROOT)
 
@@ -978,7 +955,6 @@ def main() -> int:
             v, resolved,
             base_subset_file=base_subset,
             body_action_subset_file=body_subset,
-            init_checkpoint=init_ckpt,
             data_root=args.data_root,
         )
         # The manifest always records the canonical repo-relative
@@ -991,7 +967,6 @@ def main() -> int:
             config_path=canonical_cfg,
             base_subset_file=base_subset,
             body_action_subset_file=body_subset,
-            init_checkpoint=init_ckpt,
         )
         rows.append(row)
         if args.dry_run:
@@ -1021,7 +996,6 @@ def main() -> int:
                         "injection": args.best_injection,
                     },
                     "defaults": {
-                        "init_checkpoint": init_ckpt,
                         "balanced_subset_file": base_subset,
                         "body_action_subset_file": body_subset,
                         "data_root": args.data_root,

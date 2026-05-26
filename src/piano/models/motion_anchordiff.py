@@ -469,21 +469,14 @@ class AnchorDenoiserConfig:
     object_token_dim: int = 256  # Stage A's object encoder output dim
     object_num_tokens: int = 128
 
-    # Round-22: Stage-1 Coarse-v1 (23-D route/backbone) condition branch.
+    # Stage-1 Coarse-v1 (23-D route/backbone) condition branch.
     # When ``stage1_coarse_dim > 0``: V12InputProjection instantiates a
-    # zero-init ``stage1_coarse_proj`` so the step-0 output is bit-exact
-    # equal to the pre-R22 path; the trainer must populate
+    # zero-init ``stage1_coarse_proj``; the trainer must populate
     # ``cond["stage1_coarse"]`` of shape (B, T, stage1_coarse_dim).
-    # ``cfg_drop_stage1_coarse`` controls whether the branch participates
-    # in CFG dropout (default False — Round-22 smokes don't perturb the
-    # route stream under cfg sweeps).
     # Frame convention: Coarse-v1 root_local_trans is root0-relative
-    # world axis (matches S1-O obj_traj_root0_world frame). See
-    # ``analyses/2026-05-22_stage2_condition_reframe_and_next_plan.md`` §6.
-    # Currently requires ``use_dit_block=True`` — v11 legacy path does
-    # not support this branch.
+    # world axis (matches S1-O obj_traj_root0_world frame). Stage-1
+    # output is treated as deterministic and is never CFG-dropped.
     stage1_coarse_dim: int = 0
-    cfg_drop_stage1_coarse: bool = False
 
     # Round-29 Stage-2 condition injection (per analyses/
     # 2026-05-26_stage2_cond_injection_ablation_claude_code_prompt.md).
@@ -558,19 +551,14 @@ class AnchorDenoiser(nn.Module):
         self.text_proj = nn.Linear(cfg.text_dim, cfg.d_model)
         self.object_proj = nn.Linear(cfg.object_token_dim, cfg.d_model)
 
-        # Learned null embeddings for CFG dropout (one per channel).
-        self.null_zint = nn.Parameter(torch.zeros(cfg.z_int.total))
+        # Learned null embeddings for CFG dropout. Three live conditioning
+        # channels participate: object_world_traj, text, object_tokens.
+        # z_int and stage1_coarse are never CFG-dropped (z_int is identically
+        # zero in R29; stage1_coarse is treated as a deterministic Stage-1
+        # output that should always reach the denoiser).
         self.null_obj_traj = nn.Parameter(torch.zeros(cfg.object_traj_dim))
         self.null_text = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         self.null_obj_tokens = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-
-        # Round-22: Stage-1 Coarse-v1 null embedding for cfg_drop_stage1_coarse=True.
-        if cfg.stage1_coarse_dim > 0:
-            self.null_stage1_coarse = nn.Parameter(
-                torch.zeros(cfg.stage1_coarse_dim)
-            )
-        else:
-            self.register_parameter("null_stage1_coarse", None)
 
         self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_seq_length + 2)
 
@@ -676,7 +664,9 @@ class AnchorDenoiser(nn.Module):
         obj_tok: Tensor = cond["object_tokens"]        # (B, N_obj, object_token_dim)
 
         # --- CFG drop: replace conditioning channels with null embeddings ---
-        z_int_eff = self._broadcast_drop(cond_drop_mask, z_int, self.null_zint)
+        # z_int is identically zero in R29; nothing to drop.
+        # stage1_coarse is treated as a deterministic Stage-1 output and is
+        # never CFG-dropped (it must always reach the denoiser at inference).
         obj_traj_eff = self._broadcast_drop(cond_drop_mask, obj_traj, self.null_obj_traj)
 
         # ─── Timestep embedding (B, D) ───
@@ -692,13 +682,9 @@ class AnchorDenoiser(nn.Module):
                     "this from oracle GT extraction or the S1-O sampler."
                 )
             stage1_coarse_eff = cond["stage1_coarse"]
-            if cfg.cfg_drop_stage1_coarse:
-                stage1_coarse_eff = self._broadcast_drop(
-                    cond_drop_mask, stage1_coarse_eff, self.null_stage1_coarse,
-                )
         h = self.v12_input_proj(
             x_t=x_t,
-            z_int=z_int_eff,
+            z_int=z_int,
             obj_traj=obj_traj_eff,
             stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)

@@ -27,7 +27,6 @@ model:
     ff_mult: 4
     dropout: 0.1
     stage1_coarse_dim: 23
-    cfg_drop_stage1_coarse: false
     # Round-29 typed condition injection.
     use_round29_cond_injection: true
     r29_coarse_extra_dim: 18
@@ -92,8 +91,6 @@ data:
     pc_jitter_std: 0.0
 
 training:
-  init_checkpoint: "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
-  partial_init_allow_shape_mismatch: true
   batch_size: 8
   num_epochs: 300
   num_workers: 4

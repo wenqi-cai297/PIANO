@@ -86,18 +86,17 @@ def test_manifest_dims_match_builder_dim_tables(tmp_path: Path) -> None:
 
 
 def test_manifest_paths_are_repo_relative(tmp_path: Path) -> None:
-    """Codex P2: no absolute paths in manifest (config_path, output_dir,
-    subset_file, init_checkpoint) — they must be portable repo-relative."""
+    """Codex P2: no absolute paths in manifest — must be portable repo-relative."""
     _, _, manifest = _run_generator(tmp_path)
     for v in manifest["variants"]:
-        for key in ("config_path", "output_dir", "subset_file", "init_checkpoint"):
+        for key in ("config_path", "output_dir", "subset_file"):
             val = v[key]
             assert val, f"{v['variant_id']} {key} is empty"
             # Reject Windows-style absolutes (E:\ ...) and POSIX absolutes (/...).
             assert ":" not in val, f"{v['variant_id']} {key} contains drive letter: {val!r}"
             assert not val.startswith("/"), f"{v['variant_id']} {key} is POSIX-absolute: {val!r}"
     defaults = manifest["defaults"]
-    for key in ("init_checkpoint", "balanced_subset_file", "body_action_subset_file"):
+    for key in ("balanced_subset_file", "body_action_subset_file"):
         val = defaults[key]
         assert ":" not in val, f"defaults.{key} contains drive letter: {val!r}"
         assert not val.startswith("/"), f"defaults.{key} is POSIX-absolute: {val!r}"
@@ -131,19 +130,6 @@ def test_generated_configs_reflect_f3_f4_overrides(tmp_path: Path) -> None:
     assert "seed: 42" in f1
     assert "seed: 42" in f3
     assert "seed: 43" in f4
-
-
-def test_init_checkpoint_override_writes_into_configs(tmp_path: Path) -> None:
-    """--init-checkpoint must be threaded into every generated config + manifest."""
-    fake_ckpt = "runs/training/some_test_ckpt/final.pt"
-    cfg_dir, _, manifest = _run_generator(
-        tmp_path, extra_args=["--init-checkpoint", fake_ckpt],
-    )
-    # Every config's training.init_checkpoint line carries the override.
-    sample_cfg = (cfg_dir / "anchordiff_r29_a0_input_add.yaml").read_text("utf-8")
-    assert f'init_checkpoint: "{fake_ckpt}"' in sample_cfg
-    for v in manifest["variants"]:
-        assert v["init_checkpoint"] == fake_ckpt
 
 
 def test_only_groups_filter(tmp_path: Path) -> None:

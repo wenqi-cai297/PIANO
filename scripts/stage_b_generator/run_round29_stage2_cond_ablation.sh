@@ -28,7 +28,6 @@
 #                                         ROUND29_NUM_PROCESSES; each worker
 #                                         pinned to one GPU via CUDA_VISIBLE_DEVICES)
 #   ROUND29_DIAG_CKPT_NAME=best_val.pt    diagnostic checkpoint filename
-#   ROUND29_INIT_CKPT=...                 init checkpoint path (when regenerating configs)
 #
 # Speedup vs the original sequential single-GPU diag: with N variants
 # selected (via --group / --only) and 3 diag kinds per variant, and W
@@ -116,8 +115,7 @@ echo "[R29] launcher config: NUM_PROCESSES=${NUM_PROCESSES}  PARALLEL_DIAG_WORKE
 if [[ ! -f "${MANIFEST}" ]]; then
     echo "[R29] Manifest missing — running config generator..."
     GEN_ARGS=()
-    [[ -n "${ROUND29_INIT_CKPT:-}" ]] && GEN_ARGS+=(--init-checkpoint "${ROUND29_INIT_CKPT}")
-    [[ -n "${DATASETS_ROOT:-}" ]]     && GEN_ARGS+=(--data-root "${DATASETS_ROOT}")
+    [[ -n "${DATASETS_ROOT:-}" ]] && GEN_ARGS+=(--data-root "${DATASETS_ROOT}")
     "${PY}" scripts/stage_b_generator/round29_make_stage2_cond_ablation_configs.py "${GEN_ARGS[@]}"
 fi
 
@@ -134,7 +132,7 @@ for v in m["variants"]:
         if v["variant_id"] not in want_only: continue
     elif want_groups is not None and v["group"] not in want_groups:
         continue
-    print(v["variant_id"], v["group"], v["config_path"], v["output_dir"], v["subset_file"], v.get("init_checkpoint",""))
+    print(v["variant_id"], v["group"], v["config_path"], v["output_dir"], v["subset_file"])
 '
 VARIANTS="$("${PY}" -c "${PICK_SCRIPT}" "${MANIFEST}" "${GROUPS_RESOLVED}" "${ONLY}")"
 
@@ -150,7 +148,7 @@ echo "${VARIANTS}"
 preflight_fail=0
 if [[ ${SKIP_PREFLIGHT} -eq 0 && ${DRY_RUN} -eq 0 ]]; then
     echo "[R29] Preflight..."
-    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET; do
         [[ -z "${VID}" ]] && continue
         for p in "${CFG}" "${SUBSET}"; do
             if [[ ! -e "${p}" ]]; then
@@ -170,10 +168,6 @@ print(len(sel))
                 echo "    [${VID}] selection JSON has no {subset, seq_id} pairs: ${SUBSET}"
                 preflight_fail=1
             fi
-        fi
-        if [[ ${SKIP_TRAIN} -eq 0 && -n "${INIT_CKPT}" && ! -e "${INIT_CKPT}" ]]; then
-            echo "    [${VID}] init_checkpoint not on disk: ${INIT_CKPT}"
-            preflight_fail=1
         fi
         # Dataset roots — parse the YAML and verify each root exists.
         # Skipping this lets training fail later at FileNotFoundError.
@@ -230,8 +224,8 @@ print(b)" "${sel}"
 # =============================================================================
 # PHASE 1: training — sequential (accelerate uses all GPUs per variant)
 # =============================================================================
-TRAINED_OK=""   # accumulate "VID GRP CFG OUTDIR SUBSET INIT_CKPT" lines, one per success
-while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+TRAINED_OK=""   # accumulate "VID GRP CFG OUTDIR SUBSET" lines, one per success
+while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET; do
     [[ -z "${VID}" ]] && continue
     LOG="${LOG_DIR}/${VID}.log"
 
@@ -256,17 +250,17 @@ while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
         if [[ ${DRY_RUN} -eq 1 ]]; then
             echo "[R29 DRY-RUN ${VID} TRAIN]  (NUM_PROCESSES=${NUM_PROCESSES})"
             echo "    \$ ${TRAIN_CMD[*]}"
-            TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
+            TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
         else
             if "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"; then
-                TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
+                TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
             else
                 echo "[R29] WARN: training failed for ${VID}; skipping diag"
             fi
         fi
     else
         echo "--skip-train: skipping training for ${VID}"
-        TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET} ${INIT_CKPT}"$'\n'
+        TRAINED_OK="${TRAINED_OK}${VID} ${GRP} ${CFG} ${OUTDIR} ${SUBSET}"$'\n'
     fi
 done <<< "${VARIANTS}"
 
@@ -291,7 +285,7 @@ else
     TASK_QUEUE="$(mktemp -t r29_diag_tasks.XXXXXX)"
     trap "rm -f '${TASK_QUEUE}'" EXIT
 
-    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
+    while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET; do
         [[ -z "${VID}" ]] && continue
         BUCKET="$(selection_bucket "${SUBSET}")"
         CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"

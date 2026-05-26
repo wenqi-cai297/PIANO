@@ -128,7 +128,6 @@ def _variant(vid: str, **over) -> dict:
         "num_epochs": 300,
         "seed": 42,
         "val_on_train_subset": True,
-        "init_checkpoint": "runs/training/v27/final.pt",
         "config_path": f"configs/training/anchordiff_{vid}.yaml",
         "output_dir": f"runs/training/stageB_anchordiff_{vid}",
         "diagnostics": ["sustained_contact", "gait", "body_action"],

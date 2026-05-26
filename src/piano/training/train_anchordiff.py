@@ -182,43 +182,6 @@ def _build_dataset(cfg, bucket: str = "train", augment: bool = True) -> ConcatDa
     return ConcatDataset(datasets)
 
 
-def _load_state_dict_compatible(
-    module: torch.nn.Module,
-    incoming: dict[str, Tensor],
-) -> tuple[list[str], list[str]]:
-    """Load matching checkpoint tensors and partially copy resized tensors.
-
-    Used by v4b to warm-start from v4a while expanding the per-frame object
-    trajectory channel from 9 dims to 24 dims. Exact-shape parameters load
-    normally; same-rank shape mismatches copy the overlapping slice and keep
-    the freshly initialized values for new rows/columns.
-    """
-    current = module.state_dict()
-    loadable: dict[str, Tensor] = {}
-    partial: list[str] = []
-    skipped: list[str] = []
-
-    for name, src in incoming.items():
-        if name not in current:
-            skipped.append(name)
-            continue
-        dst = current[name]
-        if dst.shape == src.shape:
-            loadable[name] = src
-            continue
-        if dst.ndim == src.ndim and dst.ndim > 0:
-            merged = dst.clone()
-            slices = tuple(slice(0, min(a, b)) for a, b in zip(dst.shape, src.shape))
-            merged[slices] = src.to(dtype=dst.dtype)[slices]
-            loadable[name] = merged
-            partial.append(name)
-            continue
-        skipped.append(name)
-
-    module.load_state_dict(loadable, strict=False)
-    return partial, skipped
-
-
 # ---------------------------------------------------------------------------
 # Step function
 # ---------------------------------------------------------------------------
@@ -1217,9 +1180,6 @@ def main() -> None:
         object_token_dim=int(cfg.model.denoiser.object_token_dim),
         object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
         stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
-        cfg_drop_stage1_coarse=bool(
-            cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
-        ),
         # Round-29 typed condition injection.
         use_round29_cond_injection=bool(
             cfg.model.denoiser.get("use_round29_cond_injection", False)
@@ -1282,37 +1242,6 @@ def main() -> None:
         num_output_tokens=int(cfg.model.object_encoder.num_output_tokens),
         feature_dim=int(cfg.model.object_encoder.feature_dim),
     )
-
-    init_ckpt = cfg.training.get("init_checkpoint", None)
-    if init_ckpt:
-        init_path = Path(str(init_ckpt))
-        accelerator.print(f"Loading model init checkpoint: {init_path}")
-        state = torch.load(init_path, map_location="cpu", weights_only=False)
-        model_state = state.get("model", state)
-        partial_init = bool(
-            cfg.training.get("partial_init_allow_shape_mismatch", False)
-        )
-        if partial_init:
-            partial, skipped = _load_state_dict_compatible(model, model_state)
-            accelerator.print(
-                f"Partial model init: {len(partial)} resized tensors, "
-                f"{len(skipped)} skipped tensors"
-            )
-            if partial:
-                accelerator.print("  resized: " + ", ".join(partial[:8]))
-        else:
-            model.load_state_dict(model_state)
-        if "object_encoder" in state:
-            object_encoder.load_state_dict(state["object_encoder"])
-        elif "extra_modules" in state and "object_encoder" in state["extra_modules"]:
-            object_encoder.load_state_dict(state["extra_modules"]["object_encoder"])
-        else:
-            raise KeyError(
-                f"init checkpoint {init_path} does not contain object_encoder weights"
-            )
-        accelerator.print(
-            "Loaded init checkpoint weights only; optimizer/scheduler are reset.",
-        )
 
     clip_model = load_clip_text_encoder(
         device=device,

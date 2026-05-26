@@ -89,7 +89,6 @@ def _build_denoiser_config(
     *,
     stage1_coarse_dim: int = 0,
     object_traj_dim: int = 24,
-    cfg_drop_stage1_coarse: bool = False,
 ) -> AnchorDenoiserConfig:
     return AnchorDenoiserConfig(
         motion_dim=135,
@@ -100,7 +99,6 @@ def _build_denoiser_config(
         object_token_dim=256,
         object_num_tokens=128,
         stage1_coarse_dim=stage1_coarse_dim,
-        cfg_drop_stage1_coarse=cfg_drop_stage1_coarse,
         d_model=64,
         n_layers=2,
         n_heads=2,
@@ -146,7 +144,6 @@ def _build_full_denoiser_config_from_yaml(
         object_token_dim=int(d.object_token_dim),
         object_num_tokens=int(d.object_num_tokens),
         stage1_coarse_dim=int(stage1_coarse_dim),
-        cfg_drop_stage1_coarse=bool(d.get("cfg_drop_stage1_coarse", False)),
         d_model=int(d.d_model),
         n_layers=int(d.n_layers),
         n_heads=int(d.n_heads),
@@ -234,18 +231,20 @@ def test_zero_init_invariant_preserves_v18_output():
     torch.manual_seed(67890)        # different seed on purpose; we copy weights below
     model_new = AnchorDenoiser(cfg_new).eval()
 
-    # New-only keys (must be exactly these three under the R22 design).
+    # New-only keys: just the two stage1_coarse_proj tensors. The
+    # null_stage1_coarse parameter was removed when CFG-drop for the
+    # stage1_coarse channel was deleted (stage1_coarse is treated as a
+    # deterministic Stage-1 output and is never dropped).
     ref_state = model_ref.state_dict()
     new_state = model_new.state_dict()
     extra_keys = set(new_state) - set(ref_state)
     assert extra_keys == {
-        "null_stage1_coarse",
         "v12_input_proj.stage1_coarse_proj.weight",
         "v12_input_proj.stage1_coarse_proj.bias",
     }, f"unexpected extra keys: {extra_keys}"
 
     # Verify the v18-checkpoint-loadable contract: ref's state dict loads
-    # into new with strict=False, leaving the 3 new keys at their (zero) init.
+    # into new with strict=False, leaving the 2 new keys at their (zero) init.
     missing, unexpected = model_new.load_state_dict(ref_state, strict=False)
     assert sorted(missing) == sorted(extra_keys), (
         f"unexpected missing keys: {missing}"
@@ -257,7 +256,6 @@ def test_zero_init_invariant_preserves_v18_output():
     with torch.no_grad():
         model_new.v12_input_proj.stage1_coarse_proj.weight.zero_()
         model_new.v12_input_proj.stage1_coarse_proj.bias.zero_()
-        model_new.null_stage1_coarse.zero_()
 
     # Synthetic forward — both models see identical other-channel inputs;
     # the new model additionally sees stage1_coarse, which gets multiplied
@@ -437,41 +435,6 @@ def test_object_traj_dim_9_build_uses_pose_only():
 # ---------------------------------------------------------------------------
 # Bonus — guard against v11 misuse of the new branch
 # ---------------------------------------------------------------------------
-
-
-def test_cfg_drop_stage1_coarse_replaces_route_with_null():
-    """When cfg_drop_stage1_coarse=True, dropped rows should receive the
-    learned null route before V12InputProjection sees the tensor.
-    """
-    cfg = _build_denoiser_config(
-        stage1_coarse_dim=23,
-        cfg_drop_stage1_coarse=True,
-    )
-    torch.manual_seed(0)
-    model = AnchorDenoiser(cfg).eval()
-    B, T = 2, 16
-    cond = _make_synthetic_cond(B, T, cfg, seed=0)
-    x_t = torch.randn(B, T, cfg.motion_dim)
-    t = torch.zeros(B, dtype=torch.long)
-    drop = torch.tensor([False, True])
-    captured: dict[str, torch.Tensor] = {}
-
-    def _capture(_module, args, kwargs):
-        captured["stage1_coarse"] = kwargs["stage1_coarse"].detach().clone()
-        return args, kwargs
-
-    handle = model.v12_input_proj.register_forward_pre_hook(
-        _capture, with_kwargs=True,
-    )
-    try:
-        with torch.no_grad():
-            model(x_t, t, cond, cond_drop_mask=drop)
-    finally:
-        handle.remove()
-
-    routed = captured["stage1_coarse"]
-    assert torch.equal(routed[0], cond["stage1_coarse"][0])
-    assert torch.equal(routed[1], torch.zeros_like(routed[1]))
 
 
 def test_plan_diagnostic_object_traj_contract_9d_and_24d():

@@ -8,7 +8,7 @@ Per the Codex post-review prompt (2026-05-26), this launcher:
   * Accepts both prompt-style aliases (`--group injection`, `--group content`,
     `--group coarse`, ..., `--group body`, `--group final`) AND the manifest's
     full group names (`A_injection`, `B_coarse`, ...).
-  * Runs path preflight: config / init checkpoint / selection JSON /
+  * Runs path preflight: config / selection JSON /
     stage1_coarse_cache_root / dataset roots. Missing entries fail clearly
     unless `--allow-missing-diag-inputs` is set (and even then only
     diagnostics are skipped — training preflight always errors hard).
@@ -163,9 +163,9 @@ def _preflight_variant(
 ) -> tuple[bool, list[str]]:
     """Return (ok, problems). Problems are human-readable strings.
 
-    Training preflight (config, init_checkpoint, dataset roots) is HARD —
-    failing here means we should not attempt training. Diagnostic preflight
-    (ckpt, selection_json) is soft when `allow_missing_diag_inputs=True`.
+    Training preflight (config, dataset roots) is HARD — failing here
+    means we should not attempt training. Diagnostic preflight (ckpt,
+    selection_json) is soft when `allow_missing_diag_inputs=True`.
     """
     import yaml
     problems: list[str] = []
@@ -174,16 +174,6 @@ def _preflight_variant(
         problems.append(f"config missing: {config_path}")
 
     if not skip_train:
-        init_ckpt = v.get("init_checkpoint", "")
-        init_path = ROOT / init_ckpt if init_ckpt else None
-        if not init_ckpt:
-            problems.append("init_checkpoint missing in manifest row")
-        elif init_path is not None and not init_path.exists():
-            problems.append(
-                f"init_checkpoint not on disk: {init_path} — "
-                "override via --init-checkpoint or ROUND29_INIT_CKPT, or "
-                "re-run the generator with the right --init-checkpoint."
-            )
         # Dataset roots — parse the config's data.datasets list and check
         # each root exists. Skipping this check would let training crash
         # at metadata-load time after burning preflight + smoke. Reuse
@@ -247,7 +237,7 @@ def _preflight_variant(
     hard = [p for p in problems if "(this is normal BEFORE training" not in p]
     if hard and not allow_missing_diag_inputs and skip_train:
         return False, problems
-    if any("config missing" in p or "init_checkpoint" in p for p in hard):
+    if any("config missing" in p for p in hard):
         if not allow_missing_diag_inputs:
             return False, problems
     return (len(hard) == 0 or allow_missing_diag_inputs), problems
