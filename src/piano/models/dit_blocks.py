@@ -136,13 +136,11 @@ class GlobalCondSummary(nn.Module):
 
 
 class ConditionedEncoderLayer(nn.Module):
-    """DiT/InterGen-style encoder block with per-block plan cross-attn.
+    """DiT encoder block: AdaLN-Zero self-attn + AdaLN-Zero MLP.
 
-    Three (or four) sub-blocks per layer:
-        (1) self-attn,        modulated by AdaLN-Zero (shift_msa, scale_msa, gate_msa)
-        (1.5) [v13] temporal Conv1D residual, zero-gated (use_temporal_conv=True)
-        (2) plan cross-attn,  UNMODULATED, output proj zero-init
-        (3) MLP,              modulated by AdaLN-Zero (shift_mlp, scale_mlp, gate_mlp)
+    Two sub-blocks per layer:
+        (1) self-attn,  modulated by AdaLN-Zero (shift_msa, scale_msa, gate_msa)
+        (2) MLP,        modulated by AdaLN-Zero (shift_mlp, scale_mlp, gate_mlp)
 
     AdaLN MLP per-block (DiT pattern): Linear(D, 6*D) producing
     (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp), each (B, D).
@@ -153,15 +151,7 @@ class ConditionedEncoderLayer(nn.Module):
         -> block is exact identity at step 0
     Combined with V12FinalLayer's zero-init linear, model predicts 0 at step 0.
 
-    v13 addition (per analyses/2026-05-11_v13_dynhead_temporalconv_design.md §3.2):
-    when use_temporal_conv=True, a TemporalConvResidual is applied to motion
-    tokens (skipping the prepended init_pose prefix token at index 0). The
-    residual gate is zero-init, so step-0 behavior is unchanged from v12.
-
-    Source: facebookresearch/DiT@models.py:101-122 (DiTBlock, 6-output AdaLN)
-            +  PixArt-alpha@diffusion/model/nets/PixArt.py:25-54 (cross-attn placement)
-            +  InterGen@models/blocks.py + layers.py (motion-domain validation)
-            +  Conformer / ConvNeXt for v13 local temporal coupling.
+    Source: facebookresearch/DiT@models.py:101-122 (DiTBlock, 6-output AdaLN).
     """
 
     def __init__(

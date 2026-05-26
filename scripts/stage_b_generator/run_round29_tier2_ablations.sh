@@ -251,6 +251,9 @@ print(b)" "${sel}"
                     DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
                     T0=$(date +%s)
                     echo "[T2] [GPU ${W}] START ${VID}/${KIND}  log: ${DIAG_LOG}"
+                    # `|| true` so `set -e` does not kill the worker subshell
+                    # on non-zero diag exit; we then read $? from PIPESTATUS.
+                    set +e
                     CUDA_VISIBLE_DEVICES="${W}" \
                         "${PY}" -u "${DIAG_SCRIPT}" \
                         --config "${CFG}" \
@@ -260,11 +263,16 @@ print(b)" "${sel}"
                         --bucket "${BUCKET}" \
                         >> "${DIAG_LOG}" 2>&1
                     RC=$?
+                    set -e
                     T1=$(date +%s)
                     if [[ ${RC} -eq 0 ]]; then
                         echo "[T2] [GPU ${W}] DONE  ${VID}/${KIND}  ($((T1 - T0))s)"
                     else
                         echo "[T2] [GPU ${W}] FAIL  ${VID}/${KIND}  rc=${RC} ($((T1 - T0))s)  log: ${DIAG_LOG}"
+                        # Echo the tail of the failing log to the launcher's
+                        # stdout so root cause is visible without grepping.
+                        echo "[T2] [GPU ${W}] tail of ${DIAG_LOG}:"
+                        tail -n 20 "${DIAG_LOG}" | sed "s/^/[T2] [GPU ${W}]   /"
                     fi
                 done
             ) &

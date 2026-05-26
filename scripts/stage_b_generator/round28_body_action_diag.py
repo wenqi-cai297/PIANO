@@ -52,16 +52,98 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 from plan_condition_diagnostics import (  # noqa: E402
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
+    extract_train_time_meta,
 )
 from anchor_realization_diagnostic import _fk_22joints  # noqa: E402
 
 from piano.data.dataset import collate_hoi  # noqa: E402
-from piano.data.interaction_hint import (  # noqa: E402
-    BODY_ACTION_KEY_JOINT_NAMES,
-    NUM_BODY_ACTION_JOINTS,
-    build_body_action_oracle_hint,
+from piano.utils.canonical_frame import (  # noqa: E402
+    _facing_angle_y,
+    y_rotation_matrix,
 )
 from piano.utils.clip_utils import load_clip_text_encoder  # noqa: E402
+
+
+# ----------------------------------------------------------------------
+# Body-action oracle hint (diag-local copy).
+#
+# This is a measurement-only construction lifted from the deleted
+# piano.data.interaction_hint.build_body_action_oracle_hint (Tier-1
+# cleanup, commit 79c894b). The function is not used by the model
+# anywhere in the R29 path, so it does not belong in src/. It stays
+# inline here so this diag still runs.
+# ----------------------------------------------------------------------
+
+# SMPL-22 joint indices.
+_LEFT_WRIST_IDX, _RIGHT_WRIST_IDX = 20, 21
+_LEFT_KNEE_IDX, _RIGHT_KNEE_IDX = 4, 5
+_NECK_IDX = 12
+_ROOT_IDX = 0
+
+BODY_ACTION_KEY_JOINT_INDICES: tuple[int, ...] = (
+    _LEFT_WRIST_IDX, _RIGHT_WRIST_IDX,
+    _LEFT_KNEE_IDX, _RIGHT_KNEE_IDX,
+    _NECK_IDX, _ROOT_IDX,         # pelvis must be LAST
+)
+BODY_ACTION_KEY_JOINT_NAMES: tuple[str, ...] = (
+    "left_wrist", "right_wrist", "left_knee", "right_knee", "neck", "pelvis",
+)
+NUM_BODY_ACTION_JOINTS: int = len(BODY_ACTION_KEY_JOINT_INDICES)  # 6
+HINT_DIM_BODY_ACTION: int = NUM_BODY_ACTION_JOINTS + NUM_BODY_ACTION_JOINTS * 3
+
+
+def build_body_action_oracle_hint(
+    joints_22: np.ndarray,
+    mask_mode: str = "all_on",
+    energy_threshold: float = 0.05,
+    joint_indices: tuple[int, ...] = BODY_ACTION_KEY_JOINT_INDICES,
+) -> np.ndarray:
+    """24D body-action hint (T, 24): mask[6] + delta_local[6, 3].
+
+    Root-yaw-canonical frame at t=0; pelvis-translated for non-pelvis
+    joints; pelvis is the displacement from frame 0 in the same frame.
+    Frame-0 invariant: hint[0, 6:24] == 0 by construction.
+    """
+    T = int(joints_22.shape[0])
+    J = len(joint_indices)
+    if J != NUM_BODY_ACTION_JOINTS:
+        raise ValueError(f"joint_indices must have length {NUM_BODY_ACTION_JOINTS}; got {J}")
+    if joints_22.shape != (T, 22, 3):
+        raise ValueError(f"joints_22 must be (T, 22, 3); got {joints_22.shape!r}")
+    if mask_mode not in {"all_on", "energy"}:
+        raise ValueError(f"mask_mode must be 'all_on' or 'energy'; got {mask_mode!r}")
+
+    joints = joints_22.astype(np.float32)
+    yaw0 = _facing_angle_y(joints[0])
+    R_root0_T = y_rotation_matrix(-yaw0)
+    pelvis_world = joints[:, _ROOT_IDX, :]
+
+    delta_local = np.zeros((T, J, 3), dtype=np.float32)
+    for j_pos, j_idx in enumerate(joint_indices[:-1]):
+        joint_world = joints[:, j_idx, :]
+        joint_rel = joint_world - pelvis_world
+        joint_local = joint_rel @ R_root0_T.T
+        delta_local[:, j_pos, :] = joint_local - joint_local[0:1, :]
+
+    pelvis_disp = pelvis_world - pelvis_world[0:1, :]
+    delta_local[:, -1, :] = pelvis_disp @ R_root0_T.T
+
+    if mask_mode == "all_on":
+        joint_mask = np.ones((J,), dtype=np.float32)
+    else:
+        energy = np.linalg.norm(delta_local, axis=-1).mean(axis=0)
+        joint_mask = (energy > float(energy_threshold)).astype(np.float32)
+    joint_mask_t = np.broadcast_to(joint_mask[None, :], (T, J)).astype(np.float32)
+
+    hint = np.concatenate(
+        [joint_mask_t, delta_local.reshape(T, J * 3)],
+        axis=-1,
+    ).astype(np.float32)
+    if hint.shape != (T, HINT_DIM_BODY_ACTION):
+        raise AssertionError(f"hint shape {hint.shape!r} != ({T}, {HINT_DIM_BODY_ACTION})")
+    if not np.isfinite(hint).all():
+        raise FloatingPointError("non-finite values in body-action hint")
+    return hint
 
 
 def _per_joint_metrics(
@@ -225,8 +307,10 @@ def main() -> int:
                         collate_fn=collate_hoi, num_workers=0)
 
     model, object_encoder, z_dims = _build_model(cfg, device)
+    train_meta: dict = {}
     if not args.use_gt_as_pred:
         state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        train_meta = extract_train_time_meta(state)
         model_state = state.get("model", state)
         model.load_state_dict(model_state)
         if "object_encoder" in state:
@@ -319,12 +403,16 @@ def main() -> int:
         "config": str(args.config),
         "ckpt": str(args.ckpt),
         "use_gt_as_pred": args.use_gt_as_pred,
+        "train_time": train_meta,
         "energy_threshold_m": args.energy_threshold,
         "n_clips_processed": n_processed,
         "aggregate": stats,
         "per_clip": per_clip_records,
     }, indent=2), "utf-8")
     print(f"wrote {out_json}")
+    if train_meta.get("train_wallclock_hms"):
+        print(f"  train wallclock: {train_meta['train_wallclock_hms']} "
+              f"({train_meta['train_wallclock_seconds']:.1f}s)")
     _write_summary_md(
         stats, out_md, args.ckpt, args.use_gt_as_pred,
         args.energy_threshold, n_processed,

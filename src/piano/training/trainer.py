@@ -253,12 +253,14 @@ def run_training_loop(
             f"best-ckpt key = {val_best_key!r}",
         )
     accelerator.print(f"  Output: {output_dir}")
+    train_start_wall = time.time()
     _append_metrics(
         "start",
         {
             "num_epochs": num_epochs,
             "batches_per_epoch": len(dataloader),
             "val_every_epochs": val_every_epochs if val_enabled else 0,
+            "train_started_at": train_start_wall,
         },
     )
 
@@ -408,6 +410,7 @@ def run_training_loop(
                     accelerator, model, optimizer, epoch, global_step, output_dir,
                     name="best_val", extra_modules=extra_modules,
                     extra_state_fn=extra_state_fn,
+                    train_start_wall=train_start_wall,
                 )
                 if accelerator.is_main_process:
                     accelerator.print(
@@ -472,6 +475,7 @@ def run_training_loop(
                         accelerator, model, optimizer, epoch, global_step, output_dir,
                         name="best_contact", extra_modules=extra_modules,
                         extra_state_fn=extra_state_fn,
+                        train_start_wall=train_start_wall,
                     )
                     if accelerator.is_main_process:
                         accelerator.print(
@@ -499,6 +503,7 @@ def run_training_loop(
                 accelerator, model, optimizer, epoch, global_step, output_dir,
                 extra_modules=extra_modules,
                 extra_state_fn=extra_state_fn,
+                train_start_wall=train_start_wall,
             )
 
     # Final save
@@ -506,9 +511,25 @@ def run_training_loop(
         accelerator, model, optimizer, num_epochs - 1, global_step, output_dir,
         name="final", extra_modules=extra_modules,
         extra_state_fn=extra_state_fn,
+        train_start_wall=train_start_wall,
     )
-    accelerator.print("Training complete.")
-    _append_metrics("complete", {"global_step": global_step})
+    train_end_wall = time.time()
+    train_wallclock_seconds = train_end_wall - train_start_wall
+    hh, rem = divmod(int(train_wallclock_seconds), 3600)
+    mm, ss = divmod(rem, 60)
+    accelerator.print(
+        f"Training complete. Wallclock: {hh:d}h{mm:02d}m{ss:02d}s "
+        f"({train_wallclock_seconds:.1f}s)",
+    )
+    _append_metrics(
+        "complete",
+        {
+            "global_step": global_step,
+            "train_started_at": train_start_wall,
+            "train_completed_at": train_end_wall,
+            "train_wallclock_seconds": train_wallclock_seconds,
+        },
+    )
 
 
 def _select_report_metrics(
@@ -627,6 +648,7 @@ def _save_checkpoint(
     name: str | None = None,
     extra_modules: dict[str, torch.nn.Module] | None = None,
     extra_state_fn: Callable[[], dict[str, Any]] | None = None,
+    train_start_wall: float | None = None,
 ) -> None:
     """Save model checkpoint (main process only).
 
@@ -635,6 +657,12 @@ def _save_checkpoint(
     top-level key alongside ``model``. Required for any stage whose
     inference path needs more than just the main ``model`` (Stage A:
     predictor + object_encoder).
+
+    ``train_start_wall`` is the ``time.time()`` value captured at the
+    start of training. When provided, the checkpoint payload also
+    carries ``train_started_at``, ``train_saved_at``, and
+    ``train_wallclock_seconds`` so downstream diag scripts can report
+    measured (not guessed) training duration.
     """
     if not accelerator.is_main_process:
         return
@@ -654,6 +682,11 @@ def _save_checkpoint(
             payload[mod_name] = accelerator.unwrap_model(mod).state_dict()
     if extra_state_fn is not None:
         payload.update(extra_state_fn())
+    if train_start_wall is not None:
+        now_wall = time.time()
+        payload["train_started_at"] = float(train_start_wall)
+        payload["train_saved_at"] = float(now_wall)
+        payload["train_wallclock_seconds"] = float(now_wall - train_start_wall)
 
     torch.save(payload, ckpt_path)
     accelerator.print(f"  Saved checkpoint: {ckpt_path}")

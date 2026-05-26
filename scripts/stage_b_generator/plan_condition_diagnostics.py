@@ -68,6 +68,39 @@ from piano.utils.io_utils import load_json
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint training-time metadata
+# ---------------------------------------------------------------------------
+
+
+def extract_train_time_meta(state: dict) -> dict[str, float | str | None]:
+    """Pull training-wallclock metadata out of a checkpoint payload.
+
+    Trainer (src/piano/training/trainer.py:_save_checkpoint) embeds
+    ``train_started_at`` / ``train_saved_at`` / ``train_wallclock_seconds``
+    in every checkpoint it writes. Older checkpoints (pre-2026-05-27)
+    do not have these fields; we return None for those.
+
+    Returns a flat dict suitable for splatting into a diag stats JSON:
+    ``{"train_started_at": ..., "train_saved_at": ...,
+       "train_wallclock_seconds": ..., "train_wallclock_hms": "1h23m45s"}``.
+    """
+    started_at = state.get("train_started_at")
+    saved_at = state.get("train_saved_at")
+    wall_sec = state.get("train_wallclock_seconds")
+    hms: str | None = None
+    if isinstance(wall_sec, (int, float)) and wall_sec >= 0:
+        hh, rem = divmod(int(wall_sec), 3600)
+        mm, ss = divmod(rem, 60)
+        hms = f"{hh:d}h{mm:02d}m{ss:02d}s"
+    return {
+        "train_started_at": float(started_at) if isinstance(started_at, (int, float)) else None,
+        "train_saved_at": float(saved_at) if isinstance(saved_at, (int, float)) else None,
+        "train_wallclock_seconds": float(wall_sec) if isinstance(wall_sec, (int, float)) else None,
+        "train_wallclock_hms": hms,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Plan variant constructors
 # ---------------------------------------------------------------------------
 
@@ -427,22 +460,9 @@ def _build_dataset(cfg, bucket: str, augment: bool) -> Subset | torch.utils.data
             surface_obj_pose=True,
             force_world_frame=bool(cfg.data.get("force_world_frame", False)),
             motion_representation=str(cfg.data.get("motion_representation", "motion_263")),
-            use_oracle_interaction_hint=bool(
-                cfg.data.get("use_oracle_interaction_hint", False)
-            ),
-            oracle_hint_variant=str(cfg.data.get("oracle_hint_variant", "full")),
             oracle_hint_fps=float(cfg.data.get("oracle_hint_fps", 20.0)),
             surface_temporal_aux_fields=bool(
                 cfg.data.get("surface_temporal_aux_fields", False)
-            ),
-            use_body_action_hint=bool(
-                cfg.data.get("use_body_action_hint", False)
-            ),
-            body_action_hint_mask_mode=str(
-                cfg.data.get("body_action_hint_mask_mode", "all_on")
-            ),
-            body_action_energy_threshold=float(
-                cfg.data.get("body_action_energy_threshold", 0.05)
             ),
             # Round-29 typed condition bundle (off by default; emits the
             # stage2_* keys when any family variant is non-zero).
@@ -491,75 +511,7 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         text_dim=int(cfg.model.denoiser.text_dim),
         object_token_dim=int(cfg.model.denoiser.object_token_dim),
         object_num_tokens=int(cfg.model.denoiser.object_num_tokens),
-        cond_motion_dim=int(cfg.model.denoiser.get("cond_motion_dim", 0)),
-        cond_motion_output_skip=bool(cfg.model.denoiser.get("cond_motion_output_skip", False)),
-        cfg_drop_cond_motion=bool(cfg.model.denoiser.get("cfg_drop_cond_motion", False)),
-        cond_motion_xt_inject=bool(cfg.model.denoiser.get("cond_motion_xt_inject", False)),
-        use_interaction_plan=bool(cfg.model.denoiser.get("use_interaction_plan", False)),
-        plan_k_max=int(cfg.model.denoiser.get("plan_k_max", 12)),
-        plan_s_max=int(cfg.model.denoiser.get("plan_s_max", 12)),
-        plan_num_anchor_types=int(cfg.model.denoiser.get("plan_num_anchor_types", 5)),
-        plan_num_parts=int(cfg.model.denoiser.get("plan_num_parts", 5)),
-        plan_use_segment_tokens=bool(cfg.model.denoiser.get("plan_use_segment_tokens", False)),
-        plan_use_context_hint=bool(cfg.model.denoiser.get("plan_use_context_hint", True)),
-        plan_d_hint=int(cfg.model.denoiser.get("plan_d_hint", 32)),
-        plan_d_time_embed=int(cfg.model.denoiser.get("plan_d_time_embed", 64)),
-        cfg_drop_plan=bool(cfg.model.denoiser.get("cfg_drop_plan", False)),
-        plan_per_part_tokens=bool(cfg.model.denoiser.get("plan_per_part_tokens", False)),
-        plan_context_hint_mode=str(cfg.model.denoiser.get("plan_context_hint_mode", "time_only")),
-        use_dit_block=bool(cfg.model.denoiser.get("use_dit_block", False)),
-        dit_block_use_plan_pool_in_cond=bool(
-            cfg.model.denoiser.get("dit_block_use_plan_pool_in_cond", True)
-        ),
-        use_v13_dynhead=bool(cfg.model.denoiser.get("use_v13_dynhead", False)),
-        v13_dynhead_gamma_init=float(cfg.model.denoiser.get("v13_dynhead_gamma_init", 0.1)),
-        v13_dynhead_learnable_gamma=bool(
-            cfg.model.denoiser.get("v13_dynhead_learnable_gamma", True)
-        ),
-        use_v13_temporal_conv=bool(cfg.model.denoiser.get("use_v13_temporal_conv", False)),
-        v13_temporal_conv_kernel=int(cfg.model.denoiser.get("v13_temporal_conv_kernel", 5)),
-        use_self_conditioning=bool(cfg.model.denoiser.get("use_self_conditioning", False)),
-        self_conditioning_prob=float(cfg.model.denoiser.get("self_conditioning_prob", 0.0)),
-        self_conditioning_mode=str(cfg.model.denoiser.get("self_conditioning_mode", "standard")),
-        self_conditioning_t_max=int(cfg.model.denoiser.get("self_conditioning_t_max", 700)),
-        self_conditioning_zero_init=bool(
-            cfg.model.denoiser.get("self_conditioning_zero_init", True)
-        ),
         stage1_coarse_dim=int(cfg.model.denoiser.get("stage1_coarse_dim", 0)),
-        cfg_drop_stage1_coarse=bool(
-            cfg.model.denoiser.get("cfg_drop_stage1_coarse", False)
-        ),
-        plan_xattn_relative_time_bias=bool(
-            cfg.model.denoiser.get("plan_xattn_relative_time_bias", False)
-        ),
-        plan_xattn_time_bias_init=float(
-            cfg.model.denoiser.get("plan_xattn_time_bias_init", 0.5)
-        ),
-        plan_tokens_force_null=bool(
-            cfg.model.denoiser.get("plan_tokens_force_null", False)
-        ),
-        use_oracle_interaction_hint=bool(
-            cfg.model.denoiser.get("use_oracle_interaction_hint", False)
-        ),
-        oracle_hint_dim=int(cfg.model.denoiser.get("oracle_hint_dim", 0)),
-        use_body_action_hint=bool(
-            cfg.model.denoiser.get("use_body_action_hint", False)
-        ),
-        body_action_hint_dim=int(
-            cfg.model.denoiser.get("body_action_hint_dim", 0)
-        ),
-        oracle_hint_injection_mode=str(
-            cfg.model.denoiser.get("oracle_hint_injection_mode", "input_add")
-        ),
-        oracle_hint_gate_bias_init=float(
-            cfg.model.denoiser.get("oracle_hint_gate_bias_init", -3.0)
-        ),
-        separate_hint_branches=bool(
-            cfg.model.denoiser.get("separate_hint_branches", True)
-        ),
-        zero_init_hint_adapters=bool(
-            cfg.model.denoiser.get("zero_init_hint_adapters", True)
-        ),
         # Round-29 typed condition injection. Required so diagnostic
         # scripts can load R29 ckpts (which carry r29_inject.* keys)
         # without falling back to strict=False (which would silently
@@ -749,33 +701,6 @@ def _build_cond(
     if use_text and clip_model is not None:
         text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
         cond["text"] = text_features.float()
-    if "oracle_interaction_hint" in batch:
-        cond["oracle_interaction_hint"] = (
-            batch["oracle_interaction_hint"].to(device).float()
-        )
-    elif (
-        model is not None
-        and getattr(model.denoiser, "oracle_hint_proj", None) is not None
-    ):
-        raise KeyError(
-            "Model was built with use_oracle_interaction_hint=True, but "
-            "batch['oracle_interaction_hint'] is missing. Set "
-            "data.use_oracle_interaction_hint=true in the diagnostic config."
-        )
-    if "body_action_hint" in batch:
-        cond["body_action_hint"] = (
-            batch["body_action_hint"].to(device).float()
-        )
-    elif (
-        model is not None
-        and getattr(model.denoiser, "body_action_hint_proj", None) is not None
-    ):
-        raise KeyError(
-            "Model was built with use_body_action_hint=True, but "
-            "batch['body_action_hint'] is missing. Set "
-            "data.use_body_action_hint=true in the diagnostic config."
-        )
-
     # Round-29 typed condition bundle. The dataset surfaces each of
     # stage2_coarse_extra / stage2_interaction / stage2_support /
     # stage2_body_refine iff the corresponding family is active in

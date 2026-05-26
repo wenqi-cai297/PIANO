@@ -170,7 +170,7 @@ data:
   overfit_n_clips: 0
   stage1_coarse_cache_root: "cache/stage1_coarse_v1_full"
   subset_indices_file: "{subset_file}"
-  surface_temporal_aux_fields: true
+  surface_temporal_aux_fields: false
   # R29 4-family content (same as a0 baseline: FULL-DENSE).
   r29_coarse_variant: "C41-current"
   r29_interaction_variant: "I3-contact-offset-masked"

@@ -62,6 +62,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 from plan_condition_diagnostics import (  # noqa: E402
+    extract_train_time_meta,
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
 )
 from anchor_realization_diagnostic import _aa_matrix, _fk_22joints  # noqa: E402
@@ -327,8 +328,10 @@ def main() -> int:
 
     # --- Model
     model, object_encoder, z_dims = _build_model(cfg, device)
+    train_meta: dict[str, Any] = {}
     if not args.use_gt_as_pred:
         state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        train_meta = extract_train_time_meta(state)
         model_state = state.get("model", state)
         model.load_state_dict(model_state)
         if "object_encoder" in state:
@@ -437,6 +440,7 @@ def main() -> int:
         "config": str(args.config),
         "ckpt": str(args.ckpt),
         "use_gt_as_pred": args.use_gt_as_pred,
+        "train_time": train_meta,
         "n_clips_processed": n_processed,
         "n_segments": len(rows),
         "min_segment_len": args.min_segment_len,
@@ -447,6 +451,9 @@ def main() -> int:
         "rows": rows,
     }, indent=2), "utf-8")
     print(f"wrote {out_json}")
+    if train_meta.get("train_wallclock_hms"):
+        print(f"  train wallclock: {train_meta['train_wallclock_hms']} "
+              f"({train_meta['train_wallclock_seconds']:.1f}s)")
     write_summary_md(stats, args.ckpt, out_md, args.use_gt_as_pred)
     print(f"wrote {out_md}")
     return 0
