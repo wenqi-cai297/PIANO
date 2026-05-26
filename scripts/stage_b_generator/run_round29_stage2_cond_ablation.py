@@ -243,14 +243,14 @@ def _preflight_variant(
 # ---------------------------------------------------------------------------
 
 def _train_command(
-    config: str, *, single_gpu: bool,
+    config: str, *, single_gpu: bool, num_processes: int,
 ) -> list[str]:
-    if single_gpu:
+    if single_gpu or num_processes <= 1:
         return [sys.executable, "-u", "src/piano/training/train_anchordiff.py",
                 "--config", config]
     return [
         "accelerate", "launch",
-        "--num_processes", "2",
+        "--num_processes", str(num_processes),
         "--multi_gpu",
         "--mixed_precision", "bf16",
         "src/piano/training/train_anchordiff.py",
@@ -334,7 +334,18 @@ def main() -> int:
     parser.add_argument("--allow-missing-diag-inputs", action="store_true",
                         help="Continue past missing diag ckpt / selection JSON.")
     parser.add_argument("--single-gpu", action="store_true",
-                        help="Run training on one GPU (no accelerate launch).")
+                        help="Run training on one GPU (no accelerate launch). "
+                             "Equivalent to --num-processes 1.")
+    parser.add_argument(
+        "--num-processes", type=int,
+        default=int(os.environ.get("ROUND29_NUM_PROCESSES", "0")),
+        help=(
+            "Number of accelerate processes (= number of GPUs to use). "
+            "Default: ROUND29_NUM_PROCESSES env var or auto-detect via "
+            "CUDA_VISIBLE_DEVICES / torch.cuda.device_count() (capped). "
+            "Pass 1 for single-GPU mode (equivalent to --single-gpu)."
+        ),
+    )
     parser.add_argument(
         "--diag-ckpt-name",
         default=os.environ.get("ROUND29_DIAG_CKPT_NAME", "final.pt"),
@@ -342,6 +353,16 @@ def main() -> int:
              "(under <output_dir>/). Default: final.pt.",
     )
     args = parser.parse_args()
+
+    # Auto-detect num_processes if not set explicitly.
+    if args.num_processes <= 0:
+        try:
+            import torch  # noqa: PLC0415
+            args.num_processes = max(1, torch.cuda.device_count())
+        except Exception:
+            args.num_processes = 1
+        print(f"[R29] auto-detected num_processes = {args.num_processes} "
+              f"(override via --num-processes or ROUND29_NUM_PROCESSES env)")
 
     manifest = _ensure_manifest()
     variants = _pick_variants(manifest, args.group, args.only)
@@ -404,7 +425,11 @@ def main() -> int:
         print("================================================================")
 
         # TRAIN
-        train_cmd = _train_command(v["config_path"], single_gpu=args.single_gpu)
+        train_cmd = _train_command(
+            v["config_path"],
+            single_gpu=args.single_gpu,
+            num_processes=args.num_processes,
+        )
         if args.skip_train:
             print(f"--skip-train: skipping training for {vid}")
         elif args.dry_run:

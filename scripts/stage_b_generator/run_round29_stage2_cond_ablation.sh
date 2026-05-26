@@ -22,6 +22,8 @@
 #
 # Environment overrides:
 #   ROUND29_SINGLE_GPU=1            run on a single GPU instead of accelerate launch
+#   ROUND29_NUM_PROCESSES=N         override accelerate --num_processes (default:
+#                                   auto-detect via nvidia-smi -L; falls back to 2)
 #   ROUND29_DIAG_CKPT_NAME=best_val.pt  diagnostic checkpoint filename
 #   ROUND29_INIT_CKPT=...           init checkpoint path (when regenerating configs)
 #
@@ -38,6 +40,16 @@ SKIP_EVAL=0
 SKIP_PREFLIGHT=0
 ALLOW_MISSING_DIAG=0
 SINGLE_GPU="${ROUND29_SINGLE_GPU:-0}"
+# Auto-detect GPU count via `nvidia-smi -L`. Override with --num-processes
+# or ROUND29_NUM_PROCESSES env. Falls back to 2 if nvidia-smi is missing.
+if [[ -n "${ROUND29_NUM_PROCESSES:-}" ]]; then
+    NUM_PROCESSES="${ROUND29_NUM_PROCESSES}"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    NUM_PROCESSES="$(nvidia-smi -L | wc -l)"
+    [[ "${NUM_PROCESSES}" -lt 1 ]] && NUM_PROCESSES=1
+else
+    NUM_PROCESSES=2
+fi
 DIAG_CKPT_NAME="${ROUND29_DIAG_CKPT_NAME:-final.pt}"
 MANIFEST="analyses/round29_stage2_cond_ablation_manifest.json"
 LOG_DIR="runs/round29_stage2_cond_ablation"
@@ -55,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
         --allow-missing-diag-inputs) ALLOW_MISSING_DIAG=1; shift ;;
         --diag-ckpt-name) DIAG_CKPT_NAME="$2"; shift 2 ;;
+        --num-processes) NUM_PROCESSES="$2"; shift 2 ;;
         --single-gpu)    SINGLE_GPU=1; shift ;;
         -h|--help)
             sed -n '1,33p' "$0"; exit 0 ;;
@@ -82,6 +95,8 @@ resolve_group() {
 }
 
 GROUPS_RESOLVED="$(resolve_group "${GROUP}")"
+
+echo "[R29] launcher config: NUM_PROCESSES=${NUM_PROCESSES}  SINGLE_GPU=${SINGLE_GPU}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}"
 
 # Generate manifest if missing.
 if [[ ! -f "${MANIFEST}" ]]; then
@@ -215,23 +230,21 @@ while IFS=' ' read -r VID GRP CFG OUTDIR SUBSET INIT_CKPT; do
     echo "================================================================"
 
     # TRAIN
+    # When ${NUM_PROCESSES} == 1, fall through to the single-GPU path so we
+    # don't pay the accelerate-launch overhead with no actual distribution.
     if [[ ${SKIP_TRAIN} -eq 0 ]]; then
-        if [[ ${DRY_RUN} -eq 1 ]]; then
-            if [[ "${SINGLE_GPU}" == "1" ]]; then
-                echo "[R29 DRY-RUN ${VID} TRAIN]"
-                echo "    \$ ${PY} -u src/piano/training/train_anchordiff.py --config ${CFG}"
-            else
-                echo "[R29 DRY-RUN ${VID} TRAIN]"
-                echo "    \$ accelerate launch --num_processes 2 --multi_gpu --mixed_precision bf16 src/piano/training/train_anchordiff.py --config ${CFG}"
-            fi
+        if [[ "${SINGLE_GPU}" == "1" || "${NUM_PROCESSES}" == "1" ]]; then
+            TRAIN_CMD=("${PY}" -u src/piano/training/train_anchordiff.py --config "${CFG}")
         else
-            if [[ "${SINGLE_GPU}" == "1" ]]; then
-                "${PY}" -u src/piano/training/train_anchordiff.py --config "${CFG}" 2>&1 | tee -a "${LOG}"
-            else
-                accelerate launch \
-                    --num_processes 2 --multi_gpu --mixed_precision bf16 \
-                    src/piano/training/train_anchordiff.py --config "${CFG}" 2>&1 | tee -a "${LOG}"
-            fi
+            TRAIN_CMD=(accelerate launch
+                --num_processes "${NUM_PROCESSES}" --multi_gpu --mixed_precision bf16
+                src/piano/training/train_anchordiff.py --config "${CFG}")
+        fi
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            echo "[R29 DRY-RUN ${VID} TRAIN]  (NUM_PROCESSES=${NUM_PROCESSES})"
+            echo "    \$ ${TRAIN_CMD[*]}"
+        else
+            "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"
         fi
     else
         echo "--skip-train: skipping training for ${VID}"

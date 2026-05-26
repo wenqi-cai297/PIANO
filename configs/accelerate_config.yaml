@@ -1,3 +1,9 @@
+# Default accelerate config used by ad-hoc
+# `accelerate launch --config_file configs/accelerate_config.yaml ...`
+# invocations. The R29 launchers (run_round29_*.sh / .py) pass
+# --num_processes on the command line (auto-detected via `nvidia-smi -L`,
+# overridable via ROUND29_NUM_PROCESSES env or --num-processes flag), so
+# this file's num_processes is only a fallback.
 compute_environment: LOCAL_MACHINE
 distributed_type: "MULTI_GPU"
 mixed_precision: "bf16"
