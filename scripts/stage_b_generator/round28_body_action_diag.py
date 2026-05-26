@@ -351,7 +351,6 @@ def main() -> int:
             with torch.no_grad():
                 pred_motion = model.sample(
                     cond=cond, seq_length=T, cfg_scale=args.cfg_scale,
-                    replacement="none", output_skip=False,
                 )
 
         rest_offsets = batch["rest_offsets"].to(device).float()
