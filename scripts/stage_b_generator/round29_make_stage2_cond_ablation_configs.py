@@ -55,20 +55,14 @@ DEFAULT_ANALYSES_DIR = ROOT / "analyses"
 DEFAULT_INIT_CKPT = (
     "runs/training/stageB_anchordiff_v27_stage2_anchoraware_FULL_DATA/final.pt"
 )
-# Two parallel selection JSONs per subset:
-#   *_train_indices_48*.json — int positions into the ConcatDataset; this
-#     is what the TRAINER consumes via `data.subset_indices_file`.
-#   *_eval_selection_*.json  — list of {subset, seq_id} dicts; this is
-#     what the DIAGNOSTIC scripts consume via `--selection-json`.
-# The two share the same 48-clip selection but are stored separately
-# because the trainer uses positional indices and the diag scripts look
-# up clips by (subset, seq_id). Mixing them produces either
-# `selection: 0 clips` (diag fed the int-indices file) or a KeyError
-# (trainer fed the selection file).
-DEFAULT_TRAIN_SUBSET_FILE = "analyses/round27_tier0_train_indices_48_balanced.json"
-DEFAULT_DIAG_SELECTION_FILE = "analyses/round27_tier0_eval_selection_balanced.json"
-BODY_ACTION_TRAIN_SUBSET_FILE = "analyses/round28_body_action_train_indices_48.json"
-BODY_ACTION_DIAG_SELECTION_FILE = "analyses/round28_body_action_eval_selection.json"
+# Selection JSON used by BOTH the trainer (via `data.subset_indices_file`,
+# which reads the `indices: [int]` field) AND the diag scripts (via
+# `--selection-json`, which after 2026-05-26 falls back to the `clips:
+# [{subset, seq_id}]` field that the train_indices builder also emits).
+# So one file per subset is enough; the dual-path split that lived here
+# briefly was unnecessary.
+DEFAULT_SUBSET_FILE = "analyses/round27_tier0_train_indices_48_balanced.json"
+BODY_ACTION_SUBSET_FILE = "analyses/round28_body_action_train_indices_48.json"
 
 # Default dataset root for THIS dev machine (Windows). The Linux server
 # overrides via --data-root or DATASETS_ROOT env so the generated YAML
@@ -585,15 +579,14 @@ def _render_yaml(
     v: Variant,
     resolved: dict[str, Any],
     *,
-    base_train_subset_file: str,
-    body_action_train_subset_file: str,
+    base_subset_file: str,
+    body_action_subset_file: str,
     init_checkpoint: str,
     data_root: str,
 ) -> str:
-    # The TRAINER consumes int-indices; pick the right train_indices file.
     subset_file = (
-        body_action_train_subset_file if v.subset_kind == "body_action"
-        else base_train_subset_file
+        body_action_subset_file if v.subset_kind == "body_action"
+        else base_subset_file
     )
     coarse_extra_dim = COARSE_VARIANT_DIMS[resolved["coarse_variant"]]
     interaction_dim = INTERACTION_VARIANT_DIMS[resolved["interaction_variant"]]
@@ -807,10 +800,8 @@ def _manifest_row(
     resolved: dict[str, Any],
     *,
     config_path: str,
-    base_train_subset_file: str,
-    body_action_train_subset_file: str,
-    base_diag_selection_file: str,
-    body_action_diag_selection_file: str,
+    base_subset_file: str,
+    body_action_subset_file: str,
     init_checkpoint: str,
 ) -> dict[str, Any]:
     cv = resolved["coarse_variant"]
@@ -819,11 +810,8 @@ def _manifest_row(
     bv = resolved["body_variant"]
     inj = resolved["injection_mode"]
     is_body = v.subset_kind == "body_action"
-    train_subset_file = (
-        body_action_train_subset_file if is_body else base_train_subset_file
-    )
-    diag_selection_file = (
-        body_action_diag_selection_file if is_body else base_diag_selection_file
+    subset_file = (
+        body_action_subset_file if is_body else base_subset_file
     )
     return {
         "variant_id": v.variant_id,
@@ -843,12 +831,9 @@ def _manifest_row(
             "body_refine": BODY_VARIANT_DIMS[bv],
         },
         "subset_kind": v.subset_kind,
-        # The trainer reads `subset_file` (int indices). Kept as the
-        # primary name for backward-compat with the launcher's preflight.
-        "subset_file": train_subset_file,
-        # The diag scripts read `diag_selection_file` (list of
-        # {subset, seq_id}).
-        "diag_selection_file": diag_selection_file,
+        # Single subset file shared by trainer (reads `indices`) AND
+        # diag scripts (read `clips`/`selected`/`candidates`).
+        "subset_file": subset_file,
         "num_epochs": v.num_epochs,
         # Codex review: per-variant training overrides exposed in the
         # manifest so summarizer/launcher can show what was actually run.
@@ -951,26 +936,21 @@ def main() -> int:
         help="Best injection mode (from Group A). Substituted into 'best'.",
     )
     parser.add_argument(
-        "--balanced-subset-file", default=DEFAULT_TRAIN_SUBSET_FILE,
+        "--balanced-subset-file", default=DEFAULT_SUBSET_FILE,
         help=(
-            "Train int-indices JSON for contact+gait variants (consumed "
-            "by the trainer's `data.subset_indices_file`)."
+            "Selection JSON for contact+gait variants. Consumed by "
+            "the trainer (reads `indices: [int]`) AND the diag scripts "
+            "(read `clips: [{subset, seq_id}]`). Generated by "
+            "round27_build_tier0_train_indices.py."
         ),
     )
     parser.add_argument(
-        "--body-action-subset-file", default=BODY_ACTION_TRAIN_SUBSET_FILE,
-        help="Train int-indices JSON for body-action variants.",
-    )
-    parser.add_argument(
-        "--balanced-diag-selection-file", default=DEFAULT_DIAG_SELECTION_FILE,
+        "--body-action-subset-file", default=BODY_ACTION_SUBSET_FILE,
         help=(
-            "Eval selection JSON (list of {subset, seq_id}) for contact+"
-            "gait variants. Consumed by diag scripts via --selection-json."
+            "Selection JSON for body-action variants. Same dual-purpose "
+            "as --balanced-subset-file. Generated by "
+            "round28_build_body_action_subset.py."
         ),
-    )
-    parser.add_argument(
-        "--body-action-diag-selection-file", default=BODY_ACTION_DIAG_SELECTION_FILE,
-        help="Eval selection JSON for body-action variants.",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -1019,14 +999,8 @@ def main() -> int:
     )
 
     init_ckpt = _to_posix_relpath(args.init_checkpoint, ROOT)
-    base_train_subset = _to_posix_relpath(args.balanced_subset_file, ROOT)
-    body_train_subset = _to_posix_relpath(args.body_action_subset_file, ROOT)
-    base_diag_selection = _to_posix_relpath(
-        args.balanced_diag_selection_file, ROOT,
-    )
-    body_diag_selection = _to_posix_relpath(
-        args.body_action_diag_selection_file, ROOT,
-    )
+    base_subset = _to_posix_relpath(args.balanced_subset_file, ROOT)
+    body_subset = _to_posix_relpath(args.body_action_subset_file, ROOT)
 
     rows: list[dict[str, Any]] = []
     written = 0
@@ -1045,8 +1019,8 @@ def main() -> int:
         out_path = config_dir / f"anchordiff_{v.variant_id}.yaml"
         content = _render_yaml(
             v, resolved,
-            base_train_subset_file=base_train_subset,
-            body_action_train_subset_file=body_train_subset,
+            base_subset_file=base_subset,
+            body_action_subset_file=body_subset,
             init_checkpoint=init_ckpt,
             data_root=args.data_root,
         )
@@ -1058,10 +1032,8 @@ def main() -> int:
         row = _manifest_row(
             v, resolved,
             config_path=canonical_cfg,
-            base_train_subset_file=base_train_subset,
-            body_action_train_subset_file=body_train_subset,
-            base_diag_selection_file=base_diag_selection,
-            body_action_diag_selection_file=body_diag_selection,
+            base_subset_file=base_subset,
+            body_action_subset_file=body_subset,
             init_checkpoint=init_ckpt,
         )
         rows.append(row)
@@ -1093,10 +1065,8 @@ def main() -> int:
                     },
                     "defaults": {
                         "init_checkpoint": init_ckpt,
-                        "balanced_subset_file": base_train_subset,
-                        "body_action_subset_file": body_train_subset,
-                        "balanced_diag_selection_file": base_diag_selection,
-                        "body_action_diag_selection_file": body_diag_selection,
+                        "balanced_subset_file": base_subset,
+                        "body_action_subset_file": body_subset,
                         "data_root": args.data_root,
                     },
                 },

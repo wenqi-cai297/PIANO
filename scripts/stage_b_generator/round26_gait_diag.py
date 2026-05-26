@@ -310,7 +310,14 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     sel_obj = json.loads(args.selection_json.read_text("utf-8"))
-    selection = sel_obj.get("selected", sel_obj.get("candidates", []))
+    selection = (
+        sel_obj.get("selected")
+        or sel_obj.get("candidates")
+        or sel_obj.get("clips")
+        or []
+    )
+    if not selection:
+        raise SystemExit(f"empty selection: {args.selection_json}")
     sel_pairs = {(e["subset"], e["seq_id"]) for e in selection}
     print(f"[gait] selection: {len(sel_pairs)} clips")
 

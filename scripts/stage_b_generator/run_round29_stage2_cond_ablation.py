@@ -188,34 +188,32 @@ def _preflight_variant(
                 problems.append(f"could not parse config to check dataset roots: {exc}")
 
     if not skip_eval:
-        # Diagnostic scripts need the (subset, seq_id) selection JSON.
-        diag_sel = v.get("diag_selection_file") or v.get("subset_file", "")
-        if not diag_sel:
-            problems.append(
-                "diag_selection_file (and subset_file) missing in manifest "
-                "row — re-run the generator."
-            )
+        sel_file = v.get("subset_file", "")
+        if not sel_file:
+            problems.append("subset_file missing in manifest row")
         else:
-            diag_sel_path = ROOT / diag_sel
-            if not diag_sel_path.exists():
-                problems.append(
-                    f"diag selection JSON not on disk: {diag_sel_path}"
-                )
+            sel_path = ROOT / sel_file
+            if not sel_path.exists():
+                problems.append(f"selection JSON not on disk: {sel_path}")
             else:
-                # Verify the file has non-empty `selected`/`candidates`.
+                # Diag needs `selected`/`candidates`/`clips` to be non-empty.
                 try:
-                    data = json.loads(diag_sel_path.read_text("utf-8"))
-                    sel_list = data.get("selected") or data.get("candidates") or []
+                    data = json.loads(sel_path.read_text("utf-8"))
+                    sel_list = (
+                        data.get("selected")
+                        or data.get("candidates")
+                        or data.get("clips")
+                        or []
+                    )
                     if not sel_list:
                         problems.append(
-                            f"diag selection JSON has empty selected list: "
-                            f"{diag_sel_path} — looks like a train-indices "
-                            f"file (int positions); diag needs the eval-"
-                            f"selection JSON (list of {{subset, seq_id}})."
+                            f"selection JSON has no usable {{subset, seq_id}} "
+                            f"list: {sel_path} (expected `selected`, "
+                            f"`candidates`, or `clips`)."
                         )
                 except Exception as exc:  # noqa: BLE001
                     problems.append(
-                        f"could not parse diag selection JSON {diag_sel_path}: {exc}"
+                        f"could not parse selection JSON {sel_path}: {exc}"
                     )
         # The diagnostic checkpoint sits inside the training output_dir.
         diag_ckpt = ROOT / v["output_dir"] / diag_ckpt_name
@@ -270,11 +268,11 @@ def _diag_commands(
     """
     config_path = v["config_path"]   # repo-relative
     output_dir = v["output_dir"]
-    # Diagnostic scripts need the (subset, seq_id) selection JSON, NOT
-    # the int-indices `subset_file` the trainer consumes. Fallback to
-    # `subset_file` only for backward-compat with very old manifest rows.
-    diag_selection = v.get("diag_selection_file") or v["subset_file"]
-    bucket = _selection_bucket(ROOT / diag_selection)
+    # Single subset file shared by trainer + diag — the diag scripts
+    # now read `clips` (which the train_indices builder emits) in
+    # addition to `selected`/`candidates`.
+    subset_file = v["subset_file"]
+    bucket = _selection_bucket(ROOT / subset_file)
     ckpt_path = f"{output_dir}/{diag_ckpt_name}"
 
     cmds: list[tuple[str, list[str], Path]] = []
@@ -284,7 +282,7 @@ def _diag_commands(
             sys.executable, "-u", script,
             "--config", config_path,
             "--ckpt", ckpt_path,
-            "--selection-json", diag_selection,
+            "--selection-json", subset_file,
             "--output-dir", str(out_dir.relative_to(ROOT).as_posix()),
             "--bucket", bucket,
         ]

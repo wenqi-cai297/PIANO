@@ -305,8 +305,16 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Selection
+    # Accept three legacy schemas: eval_selection uses `selected`,
+    # older diagnostic files used `candidates`, and the train_indices
+    # builders emit the same {subset, seq_id} pairs under `clips`.
     sel_obj = json.loads(args.selection_json.read_text("utf-8"))
-    selection = sel_obj.get("selected", sel_obj.get("candidates", []))
+    selection = (
+        sel_obj.get("selected")
+        or sel_obj.get("candidates")
+        or sel_obj.get("clips")
+        or []
+    )
     if not selection:
         raise SystemExit(f"empty selection: {args.selection_json}")
     sel_pairs = {(e["subset"], e["seq_id"]) for e in selection}
