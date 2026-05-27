@@ -122,23 +122,16 @@ def main() -> int:
             batch, model, object_encoder, clip_model, z_dims, cfg, device,
             stage1_norm=stage1_norm,
         )
-        plan_keys = [
-            "anchor_time", "anchor_part", "anchor_target_local",
-            "anchor_target_world", "anchor_type", "anchor_phase",
-            "anchor_support", "anchor_conf", "anchor_mask",
-            "segment_start", "segment_end", "segment_part",
-            "segment_target_summary_local", "segment_phase",
-            "segment_support", "segment_conf", "segment_mask",
-        ]
-        cond["interaction_plan"] = {
-            k: batch[f"plan_{k}"].to(device) for k in plan_keys
-        }
+        # NOTE: the old plan_anchor_* / plan_segment_* injection that this
+        # renderer used at R24 time was removed from the dataset + model
+        # together with the interaction_plan condition path. R27+ ckpts
+        # do not consume cond["interaction_plan"]; calling sample() with
+        # just _build_cond's output is correct.
 
         torch.manual_seed(args.seed)
         with torch.no_grad():
             pred_motion = model.sample(
                 cond=cond, seq_length=T, cfg_scale=args.cfg_scale,
-                replacement="none", output_skip=False,
             )                                                       # (1, T, 135)
 
         gt_motion = batch["motion"][:, :T].to(device).float()
