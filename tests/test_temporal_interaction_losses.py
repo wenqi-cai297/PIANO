@@ -1182,3 +1182,192 @@ def test_r29_contact_lock_gradient_flows():
     assert g is not None
     assert torch.isfinite(g).all()
 
+
+# ---------------- G1: phase-free gait losses ----------------
+#
+# Per analyses/2026-05-27_round29_next_ablation_execution_prompt_for_claude_code.md §G1.
+# All four losses are phase-invariant under L<->R swap and must not exhibit R2's
+# height-only loophole (a static one-foot-up solution).
+
+from piano.training.temporal_interaction_losses import (   # noqa: E402
+    loss_r29_gait_both_state_match,
+    loss_r29_gait_duty_cycle,
+    loss_r29_gait_soft_stance_velocity,
+    loss_r29_gait_transition_rate,
+)
+
+
+def _g1_cfg(min_walking_frames: int = 10) -> TemporalInteractionLossConfig:
+    cfg = _default_cfg()
+    cfg.r29_gait_antiphase_min_walking_frames = min_walking_frames
+    cfg.r29_gait_soft_stance_speed_threshold_mps = 0.30
+    cfg.r29_gait_soft_stance_speed_softness_mps = 0.10
+    return cfg
+
+
+def _make_s4_alternating(T: int = 40, *, walking_from: int = 4, period: int = 4) -> torch.Tensor:
+    """13-D S4 support, walking from `walking_from`, alternating L/R every
+    ``period`` frames during walking. Channel 4 = walking_mask.
+    """
+    out = torch.zeros(1, T, 13, dtype=torch.float32)
+    out[:, walking_from:, 4] = 1.0
+    for t in range(walking_from, T):
+        if ((t - walking_from) // period) % 2 == 0:
+            out[:, t, 0] = 1.0
+        else:
+            out[:, t, 1] = 1.0
+    return out
+
+
+def _make_walking_joints_alternating(
+    T: int = 40, *, walking_from: int = 4, period: int = 4, swing_height: float = 0.5,
+) -> torch.Tensor:
+    """Joints with alternating L/R swing matching target stance schedule.
+    Stance foot stays still on floor; swing foot lifts to ``swing_height``.
+    """
+    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
+    joints[:, :, LEFT_ANKLE_IDX, 0] = +0.1
+    joints[:, :, RIGHT_ANKLE_IDX, 0] = -0.1
+    for t in range(walking_from, T):
+        if ((t - walking_from) // period) % 2 == 0:
+            # L stance -> L low, R high.
+            joints[:, t, LEFT_ANKLE_IDX, 1] = 0.0
+            joints[:, t, RIGHT_ANKLE_IDX, 1] = swing_height
+        else:
+            joints[:, t, LEFT_ANKLE_IDX, 1] = swing_height
+            joints[:, t, RIGHT_ANKLE_IDX, 1] = 0.0
+    return joints
+
+
+def test_g1_soft_stance_velocity_zero_when_grounded_foot_still():
+    joints = _make_walking_joints_alternating(T=40)
+    support = _make_s4_alternating(T=40)
+    loss = loss_r29_gait_soft_stance_velocity(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert loss.item() < 1e-4, f"soft_stance_velocity should be 0 when still; got {loss.item()}"
+
+
+def test_g1_soft_stance_velocity_positive_when_grounded_foot_slides():
+    joints = _make_walking_joints_alternating(T=40)
+    pred = joints.clone()
+    # Slide both ankles +X during walking → grounded foot has positive xz speed.
+    for t in range(4, 40):
+        pred[:, t, LEFT_ANKLE_IDX, 0] += 0.2 * (t - 4)
+        pred[:, t, RIGHT_ANKLE_IDX, 0] += 0.2 * (t - 4)
+    support = _make_s4_alternating(T=40)
+    loss = loss_r29_gait_soft_stance_velocity(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert loss.item() > 0.1
+
+
+def test_g1_transition_rate_low_when_pred_matches_target_density():
+    """Pred soft-stance alternates at the same period as target → rate diff ≈ 0."""
+    T = 60
+    period = 4
+    joints = _make_walking_joints_alternating(T=T, period=period)
+    support = _make_s4_alternating(T=T, period=period)
+    loss = loss_r29_gait_transition_rate(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    # Should be small (matching density); allow some slack for the soft
+    # sigmoid edge transitions.
+    assert loss.item() < 0.2, f"transition_rate should be small; got {loss.item()}"
+
+
+def test_g1_transition_rate_positive_when_pred_is_constant():
+    """Pred soft-stance ≈ constant (both feet on floor) → rate diff > 0."""
+    T = 60
+    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
+    joints[:, :, LEFT_ANKLE_IDX, 0] = +0.1
+    joints[:, :, RIGHT_ANKLE_IDX, 0] = -0.1
+    # Both ankles flat on floor (y=0) the whole clip → grounded ≈ 1 always,
+    # alt = 0 always, transition density ≈ 0.
+    support = _make_s4_alternating(T=T)
+    loss = loss_r29_gait_transition_rate(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert loss.item() > 0.0
+
+
+def test_g1_duty_cycle_is_phase_invariant_under_lr_swap():
+    """Loss must be identical under L<->R swap in the prediction."""
+    T = 60
+    joints_A = _make_walking_joints_alternating(T=T, period=4)
+    # Swap L and R ankles in joints_B.
+    joints_B = joints_A.clone()
+    joints_B[:, :, LEFT_ANKLE_IDX, :] = joints_A[:, :, RIGHT_ANKLE_IDX, :]
+    joints_B[:, :, RIGHT_ANKLE_IDX, :] = joints_A[:, :, LEFT_ANKLE_IDX, :]
+    support = _make_s4_alternating(T=T, period=4)
+    loss_A = loss_r29_gait_duty_cycle(
+        pred_joints=joints_A, gt_joints=joints_A,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    loss_B = loss_r29_gait_duty_cycle(
+        pred_joints=joints_B, gt_joints=joints_A,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert math.isclose(loss_A.item(), loss_B.item(), abs_tol=1e-5), (
+        f"duty_cycle must be L<->R swap invariant; got A={loss_A.item()}, B={loss_B.item()}"
+    )
+
+
+def test_g1_both_state_match_penalises_all_both_swing():
+    """R2-style degeneracy: both feet airborne all the time → both_swing ≈ 1
+    while target both_swing ≈ 0 (alternating stance). Loss must be positive."""
+    T = 60
+    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
+    # Both ankles permanently lifted high → grounded ≈ 0 → both_swing ≈ 1.
+    joints[:, :, LEFT_ANKLE_IDX, 1] = 1.0
+    joints[:, :, RIGHT_ANKLE_IDX, 1] = 1.0
+    support = _make_s4_alternating(T=T, period=4)
+    loss = loss_r29_gait_both_state_match(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert loss.item() > 0.1, (
+        f"both_state_match must penalise all-both-swing; got {loss.item()}"
+    )
+
+
+def test_g1_both_state_match_low_when_pred_matches_target():
+    """Pred follows target alternation → both_stance and both_swing aggregates
+    match target → loss small."""
+    T = 60
+    joints = _make_walking_joints_alternating(T=T, period=4)
+    support = _make_s4_alternating(T=T, period=4)
+    loss = loss_r29_gait_both_state_match(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_g1_cfg(),
+    )
+    assert loss.item() < 0.05, f"both_state_match should be small; got {loss.item()}"
+
+
+def test_g1_losses_gradient_flows_to_pred_joints():
+    """All four G1 losses must have non-zero / finite gradient on pred_joints."""
+    T = 40
+    joints = _make_walking_joints_alternating(T=T, period=4)
+    support = _make_s4_alternating(T=T, period=4)
+    cfg = _g1_cfg()
+
+    for fn in (
+        loss_r29_gait_soft_stance_velocity,
+        loss_r29_gait_transition_rate,
+        loss_r29_gait_duty_cycle,
+        loss_r29_gait_both_state_match,
+    ):
+        pred = joints.clone().detach() + 0.01 * torch.randn_like(joints)
+        pred.requires_grad_(True)
+        loss = fn(
+            pred_joints=pred, gt_joints=joints,
+            stage2_support=support, cfg=cfg,
+        )
+        loss.backward()
+        assert pred.grad is not None
+        assert torch.isfinite(pred.grad).all(), f"{fn.__name__} produced non-finite grad"
+

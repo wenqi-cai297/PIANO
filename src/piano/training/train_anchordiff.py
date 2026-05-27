@@ -598,6 +598,11 @@ def build_anchordiff_step_fn(
         loss_r29_contact_lock_off = torch.zeros((), device=device, dtype=motion.dtype)
         loss_r29_contact_lock_drift = torch.zeros((), device=device, dtype=motion.dtype)
         loss_r29_contact_lock_track = torch.zeros((), device=device, dtype=motion.dtype)
+        # Round-29 next-baseline ablation (G1) — phase-free gait losses.
+        loss_r29_gait_soft_stance_v = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_r29_gait_trans_rate = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_r29_gait_duty = torch.zeros((), device=device, dtype=motion.dtype)
+        loss_r29_gait_both_state = torch.zeros((), device=device, dtype=motion.dtype)
         # Round-28 consistency losses (prompt §7.3 / §7.4).
         loss_hint_contact_cons = torch.zeros((), device=device, dtype=motion.dtype)
         loss_body_action_cons = torch.zeros((), device=device, dtype=motion.dtype)
@@ -629,6 +634,10 @@ def build_anchordiff_step_fn(
             or float(getattr(temporal_loss_cfg, "r29_contact_lock_offset_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "r29_contact_lock_segment_drift_weight", 0.0)) > 0.0
             or float(getattr(temporal_loss_cfg, "r29_contact_lock_tracking_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_gait_soft_stance_velocity_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_gait_transition_rate_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_gait_duty_cycle_weight", 0.0)) > 0.0
+            or float(getattr(temporal_loss_cfg, "r29_gait_both_state_match_weight", 0.0)) > 0.0
         ):
             from piano.training.temporal_interaction_losses import (
                 loss_body_action_consistency,
@@ -651,6 +660,10 @@ def build_anchordiff_step_fn(
                 loss_r29_contact_lock_offset,
                 loss_r29_contact_lock_segment_drift,
                 loss_r29_contact_lock_tracking,
+                loss_r29_gait_soft_stance_velocity,
+                loss_r29_gait_transition_rate,
+                loss_r29_gait_duty_cycle,
+                loss_r29_gait_both_state_match,
             )
 
             # Aux walking/foot_stance fields are required only for the
@@ -883,6 +896,47 @@ def build_anchordiff_step_fn(
                     pred_joints=jpf, gt_joints=jgf,
                     stage2_support=cond["stage2_support"].float(),
                     seq_mask=sm_f,
+                )
+
+            # Round-29 next-baseline ablation G1 — phase-free gait losses.
+            # Address R2's height-only loophole: foot is stance-like only when
+            # low AND slow. Match aggregate gait stats (transition rate, sorted
+            # duty cycle, both-state) without per-frame left/right alignment.
+            g1_active = (
+                float(getattr(temporal_loss_cfg, "r29_gait_soft_stance_velocity_weight", 0.0)) > 0.0
+                or float(getattr(temporal_loss_cfg, "r29_gait_transition_rate_weight", 0.0)) > 0.0
+                or float(getattr(temporal_loss_cfg, "r29_gait_duty_cycle_weight", 0.0)) > 0.0
+                or float(getattr(temporal_loss_cfg, "r29_gait_both_state_match_weight", 0.0)) > 0.0
+            )
+            if g1_active and "stage2_support" not in cond:
+                raise KeyError(
+                    "G1 phase-free gait losses require cond['stage2_support'] "
+                    "(walking_mask + L/R stance channels). Enable an S-family "
+                    "variant with dim>=5 via data.r29_support_variant."
+                )
+            if float(getattr(temporal_loss_cfg, "r29_gait_soft_stance_velocity_weight", 0.0)) > 0.0:
+                loss_r29_gait_soft_stance_v = loss_r29_gait_soft_stance_velocity(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, fps=float(fps), seq_mask=sm_f,
+                )
+            if float(getattr(temporal_loss_cfg, "r29_gait_transition_rate_weight", 0.0)) > 0.0:
+                loss_r29_gait_trans_rate = loss_r29_gait_transition_rate(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, fps=float(fps), seq_mask=sm_f,
+                )
+            if float(getattr(temporal_loss_cfg, "r29_gait_duty_cycle_weight", 0.0)) > 0.0:
+                loss_r29_gait_duty = loss_r29_gait_duty_cycle(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, fps=float(fps), seq_mask=sm_f,
+                )
+            if float(getattr(temporal_loss_cfg, "r29_gait_both_state_match_weight", 0.0)) > 0.0:
+                loss_r29_gait_both_state = loss_r29_gait_both_state_match(
+                    pred_joints=jpf, gt_joints=jgf,
+                    stage2_support=cond["stage2_support"].float(),
+                    cfg=temporal_loss_cfg, fps=float(fps), seq_mask=sm_f,
                 )
 
             # Round-29 failure-targeted ablation R4 / R5 — contact-lock
@@ -1145,6 +1199,11 @@ def build_anchordiff_step_fn(
                 + float(getattr(temporal_loss_cfg, "r29_contact_lock_offset_weight", 0.0)) * loss_r29_contact_lock_off
                 + float(getattr(temporal_loss_cfg, "r29_contact_lock_segment_drift_weight", 0.0)) * loss_r29_contact_lock_drift
                 + float(getattr(temporal_loss_cfg, "r29_contact_lock_tracking_weight", 0.0)) * loss_r29_contact_lock_track
+                # Round-29 next-baseline ablation G1 — phase-free gait losses.
+                + float(getattr(temporal_loss_cfg, "r29_gait_soft_stance_velocity_weight", 0.0)) * loss_r29_gait_soft_stance_v
+                + float(getattr(temporal_loss_cfg, "r29_gait_transition_rate_weight", 0.0)) * loss_r29_gait_trans_rate
+                + float(getattr(temporal_loss_cfg, "r29_gait_duty_cycle_weight", 0.0)) * loss_r29_gait_duty
+                + float(getattr(temporal_loss_cfg, "r29_gait_both_state_match_weight", 0.0)) * loss_r29_gait_both_state
                 if temporal_loss_cfg is not None else 0.0
             )
         )
@@ -1253,6 +1312,27 @@ def build_anchordiff_step_fn(
                 float(getattr(temporal_loss_cfg, "r29_contact_lock_tracking_weight", 0.0))
                 * loss_r29_contact_lock_track
             ).detach() if temporal_loss_cfg is not None else loss_r29_contact_lock_track.detach(),
+            # Round-29 next-baseline ablation G1 — phase-free gait.
+            "loss_r29_gait_soft_stance_velocity": loss_r29_gait_soft_stance_v.detach(),
+            "loss_r29_gait_transition_rate": loss_r29_gait_trans_rate.detach(),
+            "loss_r29_gait_duty_cycle": loss_r29_gait_duty.detach(),
+            "loss_r29_gait_both_state_match": loss_r29_gait_both_state.detach(),
+            "weighted_r29_gait_soft_stance_velocity": (
+                float(getattr(temporal_loss_cfg, "r29_gait_soft_stance_velocity_weight", 0.0))
+                * loss_r29_gait_soft_stance_v
+            ).detach() if temporal_loss_cfg is not None else loss_r29_gait_soft_stance_v.detach(),
+            "weighted_r29_gait_transition_rate": (
+                float(getattr(temporal_loss_cfg, "r29_gait_transition_rate_weight", 0.0))
+                * loss_r29_gait_trans_rate
+            ).detach() if temporal_loss_cfg is not None else loss_r29_gait_trans_rate.detach(),
+            "weighted_r29_gait_duty_cycle": (
+                float(getattr(temporal_loss_cfg, "r29_gait_duty_cycle_weight", 0.0))
+                * loss_r29_gait_duty
+            ).detach() if temporal_loss_cfg is not None else loss_r29_gait_duty.detach(),
+            "weighted_r29_gait_both_state_match": (
+                float(getattr(temporal_loss_cfg, "r29_gait_both_state_match_weight", 0.0))
+                * loss_r29_gait_both_state
+            ).detach() if temporal_loss_cfg is not None else loss_r29_gait_both_state.detach(),
             "weighted_stable_local_vel_cm": (
                 stable_local_vel_cm_weight * loss_stable_local_vel_cm
             ).detach(),
@@ -1715,6 +1795,26 @@ def main() -> None:
             ),
             r29_contact_lock_tracking_weight=float(
                 _tloss.get("r29_contact_lock_tracking_weight", 0.0)
+            ),
+            # Round-29 next-baseline ablation (G1) — phase-free gait. All
+            # default to zero so pre-G1 configs are behaviorally unchanged.
+            r29_gait_soft_stance_velocity_weight=float(
+                _tloss.get("r29_gait_soft_stance_velocity_weight", 0.0)
+            ),
+            r29_gait_transition_rate_weight=float(
+                _tloss.get("r29_gait_transition_rate_weight", 0.0)
+            ),
+            r29_gait_duty_cycle_weight=float(
+                _tloss.get("r29_gait_duty_cycle_weight", 0.0)
+            ),
+            r29_gait_both_state_match_weight=float(
+                _tloss.get("r29_gait_both_state_match_weight", 0.0)
+            ),
+            r29_gait_soft_stance_speed_threshold_mps=float(
+                _tloss.get("r29_gait_soft_stance_speed_threshold_mps", 0.30)
+            ),
+            r29_gait_soft_stance_speed_softness_mps=float(
+                _tloss.get("r29_gait_soft_stance_speed_softness_mps", 0.10)
             ),
             # Pulled from cfg.data (used by both the dataset's condition
             # builder and the R29 interaction-consistency loss; must match).

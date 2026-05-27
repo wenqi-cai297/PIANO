@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# Round-29 next-baseline ablations launcher (B0/B1/G1/G2/H1).
+#
+# Per analyses/2026-05-27_round29_next_ablation_execution_prompt_for_claude_code.md.
+#
+# 5 new train variants + R0 reference (not retrained):
+#   r29_nb_b0_no_r29_cond              no R29 C/I/S/B injection
+#   r29_nb_b1_c41_only                 only C41 extra (dim=18)
+#   r29_nb_g1_phasefree_gait_fixed     R0 cond + phase-free gait losses
+#   r29_nb_g2_strong_s4_oracle         R0 cond + strong S4 execution
+#   r29_nb_h1_r0_plus_oracle_full_hint R0 cond + full oracle interaction hint
+#
+# Schedule: bs=32 / accum=1 / 80 ep / heldout val / val_every=5 /
+# save_every=10 / warmup=250 (2× 5080 intended).
+#
+# Phase 1 (TRAIN): 5 new variants sequential, each uses all GPUs via accelerate.
+# Phase 2 (DIAG):  5 × 3 diag kinds × 2 subsets = 30 tasks parallel.
+# Phase 3 (SUMMARIZE): writes
+#   analyses/2026-05-27_round29_next_ablation_report.md
+#   Reads R0 reference stats from existing R29-FT diag dirs.
+# Phase 4 (PACK): tarballs manifest + NEW diag + report into
+#   analyses/round29_next_ablation_results_<stamp>.tar.gz
+#
+# Usage:
+#   bash scripts/stage_b_generator/run_round29_next_ablations.sh
+#   bash scripts/stage_b_generator/run_round29_next_ablations.sh --dry-run
+#   bash scripts/stage_b_generator/run_round29_next_ablations.sh \
+#       --only r29_nb_b0_no_r29_cond,r29_nb_h1_r0_plus_oracle_full_hint
+#   bash scripts/stage_b_generator/run_round29_next_ablations.sh --skip-train
+#
+# Environment overrides:
+#   DATASETS_ROOT=...                       dataset root (default = dev Windows path)
+#   ROUND29_NB_NUM_PROCESSES=N              accelerate --num_processes
+#   ROUND29_NB_PARALLEL_DIAG_WORKERS=N      diag workers (default: NUM_PROCESSES)
+#   ROUND29_NB_DIAG_CKPT_NAME=best_val.pt   diag ckpt filename (default: final.pt)
+#   ROUND29_NB_SINGLE_GPU=1                 force single-GPU train
+#   ROUND29_NB_ALLOW_PARTIAL=1              allow partial reports on failures
+#   ROUND29_NB_REGEN_CONFIGS=1              force manifest/config regeneration
+
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+ONLY=""
+DRY_RUN=0
+SKIP_TRAIN=0
+SKIP_EVAL=0
+SINGLE_GPU="${ROUND29_NB_SINGLE_GPU:-0}"
+DIAG_CKPT_NAME="${ROUND29_NB_DIAG_CKPT_NAME:-final.pt}"
+ALLOW_PARTIAL="${ROUND29_NB_ALLOW_PARTIAL:-0}"
+REGEN_CONFIGS="${ROUND29_NB_REGEN_CONFIGS:-0}"
+
+# Diag subsets — same 48-clip selections as R29 FT, so direct comparison.
+SELECTION_TRAIN="analyses/round27_tier0_train_indices_48_balanced.json"
+SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
+
+# R0 reference (existing R29-FT) — required by summarizer.
+R0_REF_VARIANT="r29_ft_r0_clean_a3_baseline"
+# Per-kind/bucket R0 reference stats live under:
+#   analyses/round29_r29_ft_r0_clean_a3_baseline_diag_<kind>_<bucket>/
+R0_REF_DIAG_GLOB_TEMPLATE="analyses/round29_${R0_REF_VARIANT}_diag_*"
+
+if [[ -n "${ROUND29_NB_NUM_PROCESSES:-}" ]]; then
+    NUM_PROCESSES="${ROUND29_NB_NUM_PROCESSES}"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    NUM_PROCESSES="$(nvidia-smi -L | wc -l)"
+    [[ "${NUM_PROCESSES}" -lt 1 ]] && NUM_PROCESSES=1
+else
+    NUM_PROCESSES=2
+fi
+PARALLEL_DIAG_WORKERS="${ROUND29_NB_PARALLEL_DIAG_WORKERS:-${NUM_PROCESSES}}"
+
+MANIFEST="analyses/round29_next_ablation_manifest.json"
+LOG_DIR="runs/round29_next_ablation"
+mkdir -p "${LOG_DIR}"
+if [[ -z "${PY:-}" ]]; then
+    if command -v python >/dev/null 2>&1; then
+        PY="python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PY="python3"
+    else
+        echo "[NB] FATAL: neither python nor python3 was found; set PY=/path/to/python" >&2
+        exit 127
+    fi
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --only)                  ONLY="$2"; shift 2 ;;
+        --dry-run)               DRY_RUN=1; shift ;;
+        --skip-train)            SKIP_TRAIN=1; shift ;;
+        --skip-eval)             SKIP_EVAL=1; shift ;;
+        --diag-ckpt-name)        DIAG_CKPT_NAME="$2"; shift 2 ;;
+        --num-processes)         NUM_PROCESSES="$2"; shift 2 ;;
+        --parallel-diag-workers) PARALLEL_DIAG_WORKERS="$2"; shift 2 ;;
+        --single-gpu)            SINGLE_GPU=1; shift ;;
+        --regen-configs)         REGEN_CONFIGS=1; shift ;;
+        -h|--help)
+            sed -n '1,40p' "$0"; exit 0 ;;
+        *)
+            echo "Unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+echo "[NB] NUM_PROCESSES=${NUM_PROCESSES}  PARALLEL_DIAG_WORKERS=${PARALLEL_DIAG_WORKERS}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}  ALLOW_PARTIAL=${ALLOW_PARTIAL}"
+
+# (1) Generate manifest + configs if missing or stale.
+GENERATOR="scripts/stage_b_generator/round29_make_next_ablation_configs.py"
+if [[ ${REGEN_CONFIGS} -eq 1 || ! -f "${MANIFEST}" || "${GENERATOR}" -nt "${MANIFEST}" || -n "${DATASETS_ROOT:-}" ]]; then
+    echo "[NB] Regenerating manifest/configs..."
+    GEN_ARGS=()
+    [[ -n "${DATASETS_ROOT:-}" ]] && GEN_ARGS+=(--data-root "${DATASETS_ROOT}")
+    "${PY}" "${GENERATOR}" "${GEN_ARGS[@]}"
+fi
+
+# (2) Pick TRAIN-able variants from manifest (skip the R0 reference row).
+PICK_SCRIPT='
+import json, sys
+m = json.load(open(sys.argv[1]))
+only = sys.argv[2]
+want_only = set(only.split(",")) if only else None
+for v in m["variants"]:
+    if not v.get("train", True): continue
+    if want_only is not None and v["variant_id"] not in want_only: continue
+    print(v["variant_id"], v["config_path"], v["output_dir"])
+'
+VARIANTS="$("${PY}" -c "${PICK_SCRIPT}" "${MANIFEST}" "${ONLY}")"
+
+if [[ -z "${VARIANTS}" ]]; then
+    echo "[NB] no train variants matched only='${ONLY}'"
+    exit 0
+fi
+
+echo "[NB] Train variants to process:"
+echo "${VARIANTS}"
+
+# (3) Preflight.
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    preflight_fail=0
+    while IFS=' ' read -r VID CFG OUTDIR; do
+        [[ -z "${VID}" ]] && continue
+        if [[ ! -e "${CFG}" ]]; then
+            echo "    [${VID}] missing config: ${CFG}"
+            preflight_fail=1
+        fi
+        if [[ ${SKIP_TRAIN} -eq 0 && -e "${CFG}" ]]; then
+            BAD="$("${PY}" -c "
+import sys, yaml
+from pathlib import Path
+cfg = yaml.safe_load(open(sys.argv[1]))
+for ds in (cfg.get('data', {}).get('datasets') or []):
+    root = ds.get('root', '')
+    if root and not Path(root).exists():
+        print(f\"{ds.get('name')}={root}\")
+" "${CFG}")"
+            if [[ -n "${BAD}" ]]; then
+                while IFS= read -r br; do
+                    echo "    [${VID}] dataset root not on disk: ${br}"
+                done <<< "${BAD}"
+                echo "    [${VID}]   -> re-run generator with --data-root <correct path> or export DATASETS_ROOT=..."
+                preflight_fail=1
+            fi
+        fi
+    done <<< "${VARIANTS}"
+    if [[ ${SKIP_EVAL} -eq 0 ]]; then
+        for sel in "${SELECTION_TRAIN}" "${SELECTION_VAL}"; do
+            if [[ ! -e "${sel}" ]]; then
+                echo "    missing diag selection JSON: ${sel}"
+                if [[ "${sel}" == "${SELECTION_VAL}" ]]; then
+                    echo "    -> generate it with: python scripts/stage_b_generator/round29_build_val_diag_subset.py --config configs/training/anchordiff_r29_ft_r0_clean_a3_baseline.yaml"
+                fi
+                preflight_fail=1
+            fi
+        done
+        # R0 reference diag stats must exist for the summarizer to compare against.
+        R0_REF_DIRS="$(ls -d ${R0_REF_DIAG_GLOB_TEMPLATE} 2>/dev/null || true)"
+        if [[ -z "${R0_REF_DIRS}" ]]; then
+            echo "    missing R0 reference diag dirs (${R0_REF_DIAG_GLOB_TEMPLATE})"
+            echo "    -> the summarizer compares B0/B1/G1/G2/H1 against R0; you must"
+            echo "       either (a) have the R29-FT R0 diag dirs already on disk, or"
+            echo "       (b) generate them via:"
+            echo "       bash scripts/stage_b_generator/run_round29_failure_targeted_ablations.sh --only ${R0_REF_VARIANT} --skip-train"
+            preflight_fail=1
+        else
+            R0_REF_COUNT="$(echo "${R0_REF_DIRS}" | wc -l)"
+            echo "[NB] R0 reference diag dirs: ${R0_REF_COUNT} found"
+        fi
+    fi
+    if [[ ${preflight_fail} -ne 0 ]]; then
+        echo "[NB] FATAL preflight failures."
+        exit 1
+    fi
+fi
+
+# (4) PHASE 1: TRAIN sequentially.
+TRAINED_OK=""
+while IFS=' ' read -r VID CFG OUTDIR; do
+    [[ -z "${VID}" ]] && continue
+    LOG="${LOG_DIR}/${VID}.log"
+    echo
+    echo "================================================================"
+    echo "[$(date '+%F %T')] TRAIN ${VID}"
+    echo "    config: ${CFG}"
+    echo "    output: ${OUTDIR}"
+    echo "    log:    ${LOG}"
+    echo "================================================================"
+
+    if [[ ${SKIP_TRAIN} -eq 0 ]]; then
+        if [[ "${SINGLE_GPU}" == "1" || "${NUM_PROCESSES}" == "1" ]]; then
+            TRAIN_CMD=("${PY}" -u src/piano/training/train_anchordiff.py --config "${CFG}")
+        else
+            TRAIN_CMD=(accelerate launch
+                --num_processes "${NUM_PROCESSES}" --multi_gpu --mixed_precision bf16
+                src/piano/training/train_anchordiff.py --config "${CFG}")
+        fi
+        if [[ ${DRY_RUN} -eq 1 ]]; then
+            echo "[NB DRY-RUN ${VID} TRAIN]"
+            echo "    \$ ${TRAIN_CMD[*]}"
+            TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR}"$'\n'
+        else
+            if "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"; then
+                TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR}"$'\n'
+            else
+                if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+                    echo "[NB] WARN: training failed for ${VID}; skipping diag"
+                else
+                    echo "[NB] FATAL: training failed for ${VID}; aborting full matrix."
+                    exit 1
+                fi
+            fi
+        fi
+    else
+        echo "--skip-train: skipping training for ${VID}"
+        TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR}"$'\n'
+    fi
+done <<< "${VARIANTS}"
+
+# (5) PHASE 2: DIAG parallel across GPUs (3 diag kinds × 2 subsets per variant).
+if [[ ${SKIP_EVAL} -eq 1 ]]; then
+    echo
+    echo "--skip-eval: skipping diag"
+elif [[ -z "${TRAINED_OK}" ]]; then
+    echo "[NB] No variants succeeded training; no diag to run."
+    if [[ "${ALLOW_PARTIAL}" != "1" ]]; then
+        exit 1
+    fi
+else
+    echo
+    echo "================================================================"
+    echo "[$(date '+%F %T')] DIAG PHASE (workers=${PARALLEL_DIAG_WORKERS})"
+    echo "================================================================"
+
+    TASK_QUEUE="$(mktemp -t nb_diag_tasks.XXXXXX)"
+    QUEUE_LOCK="${TASK_QUEUE}.lock"
+    FAIL_LOG="${TASK_QUEUE}.fail"
+    : > "${QUEUE_LOCK}"
+    : > "${FAIL_LOG}"
+    trap "rm -f '${TASK_QUEUE}' '${QUEUE_LOCK}' '${FAIL_LOG}'" EXIT
+
+    while IFS=' ' read -r VID CFG OUTDIR; do
+        [[ -z "${VID}" ]] && continue
+        CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
+        if [[ ! -e "${CKPT_PATH}" && ${DRY_RUN} -eq 0 ]]; then
+            if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+                echo "[NB] WARN: diag ckpt missing: ${CKPT_PATH} (skipped)"
+                continue
+            fi
+            echo "[NB] FATAL: diag ckpt missing: ${CKPT_PATH}"
+            exit 1
+        fi
+        for kind in sustained_contact gait body_action; do
+            case "${kind}" in
+                sustained_contact) DIAG_SCRIPT="scripts/stage_b_generator/round26_sustained_contact_diag.py" ;;
+                gait)              DIAG_SCRIPT="scripts/stage_b_generator/round26_gait_diag.py" ;;
+                body_action)       DIAG_SCRIPT="scripts/stage_b_generator/round28_body_action_diag.py" ;;
+            esac
+            for sublabel in train val; do
+                case "${sublabel}" in
+                    train) SUBSET_PATH="${SELECTION_TRAIN}" ;;
+                    val)   SUBSET_PATH="${SELECTION_VAL}" ;;
+                esac
+                OUT_DIR="analyses/round29_${VID}_diag_${kind}_${sublabel}"
+                mkdir -p "${OUT_DIR}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "${VID}" "${kind}_${sublabel}" "${DIAG_SCRIPT}" "${CFG}" "${CKPT_PATH}" "${SUBSET_PATH}" "${sublabel}" \
+                    >> "${TASK_QUEUE}"
+            done
+        done
+    done <<< "${TRAINED_OK}"
+
+    N_TASKS="$(wc -l < "${TASK_QUEUE}")"
+    if [[ "${N_TASKS}" -eq 0 && ${DRY_RUN} -eq 0 ]]; then
+        echo "[NB] FATAL: no diag tasks were queued."
+        exit 1
+    fi
+    echo "[NB] ${N_TASKS} diag tasks queued; launching ${PARALLEL_DIAG_WORKERS} GPU workers..."
+
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        IDX=0
+        while IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET; do
+            GPU=$((IDX % PARALLEL_DIAG_WORKERS))
+            OUT_DIR="analyses/round29_${VID}_diag_${KIND}"
+            echo "[NB DRY-RUN [GPU ${GPU}] ${VID} DIAG/${KIND}]"
+            echo "    \$ CUDA_VISIBLE_DEVICES=${GPU} ${PY} -u ${DIAG_SCRIPT} --config ${CFG} --ckpt ${CKPT_PATH} --selection-json ${SUBSET} --output-dir ${OUT_DIR} --bucket ${BUCKET}"
+            IDX=$((IDX + 1))
+        done < "${TASK_QUEUE}"
+    else
+        WORKER_PIDS=()
+        for ((W = 0; W < PARALLEL_DIAG_WORKERS; W++)); do
+            (
+                while true; do
+                    TASK_LINE="$(
+                        flock -x "${QUEUE_LOCK}" -c "
+                            line=\$(head -n 1 '${TASK_QUEUE}')
+                            if [[ -n \"\$line\" ]]; then
+                                sed -i '1d' '${TASK_QUEUE}'
+                                echo \"\$line\"
+                            fi
+                        "
+                    )"
+                    [[ -z "${TASK_LINE}" ]] && break
+                    IFS=$'\t' read -r VID KIND DIAG_SCRIPT CFG CKPT_PATH SUBSET BUCKET <<< "${TASK_LINE}"
+                    OUT_DIR="analyses/round29_${VID}_diag_${KIND}"
+                    DIAG_LOG="${LOG_DIR}/${VID}_diag_${KIND}.log"
+                    T0=$(date +%s)
+                    echo "[NB] [GPU ${W}] START ${VID}/${KIND}  log: ${DIAG_LOG}"
+                    : > "${DIAG_LOG}"
+                    set +e
+                    CUDA_VISIBLE_DEVICES="${W}" \
+                        "${PY}" -u "${DIAG_SCRIPT}" \
+                        --config "${CFG}" \
+                        --ckpt "${CKPT_PATH}" \
+                        --selection-json "${SUBSET}" \
+                        --output-dir "${OUT_DIR}" \
+                        --bucket "${BUCKET}" \
+                        > "${DIAG_LOG}" 2>&1
+                    RC=$?
+                    set -e
+                    T1=$(date +%s)
+                    if [[ ${RC} -eq 0 ]]; then
+                        echo "[NB] [GPU ${W}] DONE  ${VID}/${KIND}  ($((T1 - T0))s)"
+                    else
+                        flock -x "${QUEUE_LOCK}" -c "echo '${VID}/${KIND} rc=${RC}' >> '${FAIL_LOG}'"
+                        echo "[NB] [GPU ${W}] FAIL  ${VID}/${KIND}  rc=${RC} ($((T1 - T0))s)  log: ${DIAG_LOG}"
+                        echo "[NB] [GPU ${W}] tail of ${DIAG_LOG}:"
+                        tail -n 20 "${DIAG_LOG}" | sed "s/^/[NB] [GPU ${W}]   /"
+                    fi
+                done
+            ) &
+            WORKER_PIDS+=($!)
+        done
+        for pid in "${WORKER_PIDS[@]}"; do
+            wait "${pid}" || true
+        done
+        N_FAIL=$(wc -l < "${FAIL_LOG}" 2>/dev/null || echo 0)
+        if [[ ${N_FAIL} -gt 0 ]]; then
+            echo "[NB] ${N_FAIL}/${N_TASKS} diag tasks FAILED:"
+            sed 's/^/[NB]   /' "${FAIL_LOG}"
+            if [[ "${ALLOW_PARTIAL}" != "1" ]]; then
+                echo "[NB] FATAL: diag failures are not allowed in the full matrix."
+                exit 1
+            fi
+        else
+            echo "[NB] all ${N_TASKS} diag tasks succeeded."
+        fi
+    fi
+fi
+
+# (6) PHASE 3: SUMMARIZE.
+SUMMARY_MD="analyses/2026-05-27_round29_next_ablation_report.md"
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    echo
+    echo "[NB DRY-RUN] would run summarizer:"
+    echo "    \$ ${PY} scripts/stage_b_generator/round29_summarize_next_ablation.py --out ${SUMMARY_MD}"
+elif [[ ${SKIP_EVAL} -eq 0 ]]; then
+    echo
+    echo "================================================================"
+    echo "[$(date '+%F %T')] SUMMARIZE -> ${SUMMARY_MD}"
+    echo "================================================================"
+    if ! "${PY}" scripts/stage_b_generator/round29_summarize_next_ablation.py \
+        --out "${SUMMARY_MD}"; then
+        if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+            echo "[NB] WARN: summarizer failed; report may be partial"
+        else
+            echo "[NB] FATAL: summarizer failed."
+            exit 1
+        fi
+    fi
+fi
+
+# (7) PHASE 4: PACK.
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    STAMP="$(date +%Y%m%d_%H%M%S)"
+    PACK="analyses/round29_next_ablation_results_${STAMP}.tar.gz"
+    PACK_ITEMS=(analyses/round29_next_ablation_manifest.*)
+    if [[ ${SKIP_EVAL} -eq 0 ]]; then
+        PACK_ITEMS+=(analyses/round29_r29_nb_*_diag_* "${SUMMARY_MD}")
+    fi
+    if ! tar -czf "${PACK}" "${PACK_ITEMS[@]}"; then
+        if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+            echo "[NB] WARN: result pack failed: ${PACK}"
+        else
+            echo "[NB] FATAL: result pack failed: ${PACK}"
+            exit 1
+        fi
+    fi
+    echo "[NB] Packed ${PACK}"
+fi

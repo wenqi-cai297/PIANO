@@ -140,6 +140,21 @@ class TemporalInteractionLossConfig:
     r29_s4_stance_bce_weight: float = 0.0
     r29_s4_footstep_target_weight: float = 0.0
 
+    # Round-29 next-baseline ablation G1 — phase-free gait losses.
+    # Per analyses/2026-05-27_round29_next_ablation_execution_prompt_for_claude_code.md §G1:
+    # avoid R2's height-only loophole by combining ankle height with horizontal
+    # speed (a foot is "stance-like" only if low AND slow). Use S4 stance
+    # channels for target rates / duty / both-state without copying per-frame
+    # left/right phase. All four losses are phase-invariant under L<->R swap.
+    r29_gait_soft_stance_velocity_weight: float = 0.0
+    r29_gait_transition_rate_weight: float = 0.0
+    r29_gait_duty_cycle_weight: float = 0.0
+    r29_gait_both_state_match_weight: float = 0.0
+    r29_gait_soft_stance_speed_threshold_mps: float = 0.30
+    r29_gait_soft_stance_speed_softness_mps: float = 0.10
+    """Speed probability is ``sigmoid((threshold - speed_mps) / softness)``;
+    foot is "slow enough to be stance-like" when speed is below threshold."""
+
     # Round-29 failure-targeted ablation R4 / R5 — contact-lock losses.
     # Per prompt §R4: keep strong baseline absolute stabilizers, add
     # object-relative offset + segment-drift + tracking losses driven
@@ -1190,6 +1205,262 @@ def loss_r29_gait_antiphase_corr(
         pieces.append(F.relu(corr + 0.15))
     if not pieces:
         return l_y.new_zeros(())
+    return torch.stack(pieces).mean()
+
+
+# --------------------------------------------------------------------------- #
+# G1 — phase-free gait losses (no per-frame L/R alignment to GT).
+#
+# Per analyses/2026-05-27_round29_next_ablation_execution_prompt_for_claude_code.md
+# §G1: R2's one-foot-support loss has a height-only loophole — the model
+# satisfied it by keeping one foot constantly above the floor (frac_both_swing
+# = 0.872 on the val matrix). G1 combines ankle height with horizontal speed
+# so a foot is only "stance-like" when low AND slow, then derives transition
+# density / duty cycle / both-state from those soft stance probabilities.
+#
+# All four losses are phase-invariant: swapping L<->R for the prediction does
+# not change the loss, because the per-frame label of left vs right is never
+# compared. Only aggregate statistics (transition density, sorted duty cycle,
+# both-state) are matched to S4 targets.
+# --------------------------------------------------------------------------- #
+
+
+def _pred_soft_stance_prob(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor estimate
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """Soft stance probability per ankle. Returns ``(B, T, 2)``.
+
+        height_grounded = sigmoid((floor + threshold - ankle_y) / softness)
+        speed_prob      = sigmoid((threshold_mps - speed_mps) / softness_mps)
+        soft_stance     = height_grounded * speed_prob
+
+    Velocity is computed on XZ in metres/second (the same fps convention as
+    ``loss_r29_gait_pred_stance_velocity``). The shared helper lets the four
+    G1 losses share a single soft-stance tensor.
+    """
+    grounded = _pred_grounded_prob(
+        pred_joints, gt_joints, cfg, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    l_xz = pred_joints[..., LEFT_ANKLE_IDX, :][..., [0, 2]]                 # (B, T, 2)
+    r_xz = pred_joints[..., RIGHT_ANKLE_IDX, :][..., [0, 2]]
+    l_v = torch.zeros_like(l_xz)
+    r_v = torch.zeros_like(r_xz)
+    l_v[:, 1:] = (l_xz[:, 1:] - l_xz[:, :-1]) * float(fps)
+    r_v[:, 1:] = (r_xz[:, 1:] - r_xz[:, :-1]) * float(fps)
+    l_speed = l_v.pow(2).sum(-1).clamp_min(1e-12).sqrt()                    # (B, T)
+    r_speed = r_v.pow(2).sum(-1).clamp_min(1e-12).sqrt()
+    speed_mps = torch.stack([l_speed, r_speed], dim=-1)                     # (B, T, 2)
+    thr = float(cfg.r29_gait_soft_stance_speed_threshold_mps)
+    soft = float(cfg.r29_gait_soft_stance_speed_softness_mps)
+    speed_prob = torch.sigmoid((thr - speed_mps) / max(soft, 1e-6))         # (B, T, 2)
+    return grounded * speed_prob                                            # (B, T, 2)
+
+
+def loss_r29_gait_soft_stance_velocity(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """G1 — penalise horizontal speed weighted by height-grounded probability
+    only (not full soft-stance). Using full soft-stance would let the loss
+    hide by making speed high (which lowers the weight and the loss).
+
+        grounded = _pred_grounded_prob(...)                  # (B, T, 2)
+        v2       = ||delta_xz * fps||^2                      # (B, T, 2)
+        loss     = mean( walking * grounded * v2 )
+
+    This is similar to old ``loss_r29_gait_pred_stance_velocity`` but kept as
+    a separate named loss so the G1 bundle is auditable.
+    """
+    grounded = _pred_grounded_prob(
+        pred_joints, gt_joints, cfg, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1).unsqueeze(-1)                             # (B, T, 1)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype).unsqueeze(-1)
+
+    l_xz = pred_joints[..., LEFT_ANKLE_IDX, :][..., [0, 2]]
+    r_xz = pred_joints[..., RIGHT_ANKLE_IDX, :][..., [0, 2]]
+    l_v = torch.zeros_like(l_xz)
+    r_v = torch.zeros_like(r_xz)
+    l_v[:, 1:] = (l_xz[:, 1:] - l_xz[:, :-1]) * float(fps)
+    r_v[:, 1:] = (r_xz[:, 1:] - r_xz[:, :-1]) * float(fps)
+    v2 = torch.stack([l_v.pow(2).sum(-1), r_v.pow(2).sum(-1)], dim=-1)      # (B, T, 2)
+    weight = walking * grounded
+    num = (weight * v2).sum()
+    den = weight.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_gait_transition_rate(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """G1 — phase-free transition rate. Match how often L/R alternates without
+    aligning per-frame phase. Uses S4 stance channels as target.
+
+        pred_alt   = pred_soft_stance[..., 0] - pred_soft_stance[..., 1]
+        target_alt = target_stance[..., 0]   - target_stance[..., 1]
+        rate_proxy = mean( |alt[t] - alt[t-1]| ) over walking-adjacent frames
+        loss       = SmoothL1(pred_rate, target_rate.detach())
+
+    This encourages switching density without saying whether left or right
+    should step first.
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "loss_r29_gait_transition_rate requires stage2_support with at "
+            f"least 5 channels (got {stage2_support.shape[-1]})."
+        )
+    pred_soft = _pred_soft_stance_prob(
+        pred_joints, gt_joints, cfg, fps=fps, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    target = stage2_support[..., 0:2].to(pred_joints.dtype).clamp(0.0, 1.0)  # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                           # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+    if pred_soft.shape[1] < 2:
+        return pred_soft.new_zeros(())
+
+    pred_alt = pred_soft[..., 0] - pred_soft[..., 1]                        # (B, T)
+    target_alt = target[..., 0] - target[..., 1]                            # (B, T)
+    d_pred = (pred_alt[:, 1:] - pred_alt[:, :-1]).abs()                     # (B, T-1)
+    d_tgt = (target_alt[:, 1:] - target_alt[:, :-1]).abs()                  # (B, T-1)
+    # Walking-adjacent: both endpoints of the diff must be walking frames.
+    w_pair = walking[:, 1:] * walking[:, :-1]                               # (B, T-1)
+
+    pieces_pred: list[Tensor] = []
+    pieces_tgt: list[Tensor] = []
+    min_frames = int(cfg.r29_gait_antiphase_min_walking_frames)
+    B = pred_joints.shape[0]
+    for b in range(B):
+        m = w_pair[b] > 0.5
+        if int(m.sum()) < min_frames:
+            continue
+        pieces_pred.append(d_pred[b][m].mean())
+        pieces_tgt.append(d_tgt[b][m].mean())
+    if not pieces_pred:
+        return pred_soft.new_zeros(())
+    p = torch.stack(pieces_pred)
+    t = torch.stack(pieces_tgt).detach()
+    return F.smooth_l1_loss(p, t, reduction="mean")
+
+
+def loss_r29_gait_duty_cycle(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """G1 — duty-cycle match, phase-safe under L<->R swap.
+
+        pred_duty   = mean(pred_soft_stance over walking)           # (B, 2)
+        target_duty = mean(target_stance over walking)              # (B, 2)
+        loss        = SmoothL1(sort(pred_duty), sort(target_duty))
+
+    Sorting the 2-vector makes the comparison invariant to which foot the
+    model chose to plant longer.
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "loss_r29_gait_duty_cycle requires stage2_support with at "
+            f"least 5 channels (got {stage2_support.shape[-1]})."
+        )
+    pred_soft = _pred_soft_stance_prob(
+        pred_joints, gt_joints, cfg, fps=fps, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    target = stage2_support[..., 0:2].to(pred_joints.dtype).clamp(0.0, 1.0)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                           # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+    min_frames = int(cfg.r29_gait_antiphase_min_walking_frames)
+
+    pieces: list[Tensor] = []
+    B = pred_joints.shape[0]
+    for b in range(B):
+        m = walking[b] > 0.5
+        if int(m.sum()) < min_frames:
+            continue
+        pred_duty = pred_soft[b][m].mean(dim=0)                             # (2,)
+        tgt_duty = target[b][m].mean(dim=0).detach()                        # (2,)
+        pred_sorted, _ = torch.sort(pred_duty)
+        tgt_sorted, _ = torch.sort(tgt_duty)
+        pieces.append(F.smooth_l1_loss(pred_sorted, tgt_sorted, reduction="mean"))
+    if not pieces:
+        return pred_soft.new_zeros(())
+    return torch.stack(pieces).mean()
+
+
+def loss_r29_gait_both_state_match(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """G1 — both-state aggregate match (directly addresses R2's collapse to
+    ``frac_both_swing=0.872``).
+
+        pred_both_stance = mean(pL * pR)        on walking frames
+        pred_both_swing  = mean((1-pL)*(1-pR))  on walking frames
+        target_*         = same from S4 stance channels
+        loss             = SmoothL1([pred_both_stance, pred_both_swing],
+                                    [tgt_both_stance,  tgt_both_swing].detach())
+    """
+    if stage2_support.shape[-1] < 5:
+        raise ValueError(
+            "loss_r29_gait_both_state_match requires stage2_support with at "
+            f"least 5 channels (got {stage2_support.shape[-1]})."
+        )
+    pred_soft = _pred_soft_stance_prob(
+        pred_joints, gt_joints, cfg, fps=fps, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    target = stage2_support[..., 0:2].to(pred_joints.dtype).clamp(0.0, 1.0)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                           # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+    min_frames = int(cfg.r29_gait_antiphase_min_walking_frames)
+
+    pL = pred_soft[..., 0]
+    pR = pred_soft[..., 1]
+    tL = target[..., 0]
+    tR = target[..., 1]
+    pred_both_stance = pL * pR
+    pred_both_swing = (1.0 - pL) * (1.0 - pR)
+    tgt_both_stance = tL * tR
+    tgt_both_swing = (1.0 - tL) * (1.0 - tR)
+
+    pieces: list[Tensor] = []
+    B = pred_joints.shape[0]
+    for b in range(B):
+        m = walking[b] > 0.5
+        if int(m.sum()) < min_frames:
+            continue
+        p_agg = torch.stack([pred_both_stance[b][m].mean(),
+                             pred_both_swing[b][m].mean()])
+        t_agg = torch.stack([tgt_both_stance[b][m].mean(),
+                             tgt_both_swing[b][m].mean()]).detach()
+        pieces.append(F.smooth_l1_loss(p_agg, t_agg, reduction="mean"))
+    if not pieces:
+        return pred_soft.new_zeros(())
     return torch.stack(pieces).mean()
 
 
