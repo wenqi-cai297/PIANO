@@ -34,6 +34,8 @@
 #   ROUND29_FT_PARALLEL_DIAG_WORKERS=N      diag workers (default: NUM_PROCESSES)
 #   ROUND29_FT_DIAG_CKPT_NAME=best_val.pt   diag ckpt filename (default: final.pt)
 #   ROUND29_FT_SINGLE_GPU=1                 force single-GPU train
+#   ROUND29_FT_ALLOW_PARTIAL=1              allow partial reports on failures
+#   ROUND29_FT_REGEN_CONFIGS=1              force manifest/config regeneration
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -44,6 +46,8 @@ SKIP_TRAIN=0
 SKIP_EVAL=0
 SINGLE_GPU="${ROUND29_FT_SINGLE_GPU:-0}"
 DIAG_CKPT_NAME="${ROUND29_FT_DIAG_CKPT_NAME:-final.pt}"
+ALLOW_PARTIAL="${ROUND29_FT_ALLOW_PARTIAL:-0}"
+REGEN_CONFIGS="${ROUND29_FT_REGEN_CONFIGS:-0}"
 
 # Diag subsets — same 48-clip selections as R29 LSF, so cross-protocol
 # comparisons are directly possible.
@@ -84,6 +88,7 @@ while [[ $# -gt 0 ]]; do
         --num-processes)         NUM_PROCESSES="$2"; shift 2 ;;
         --parallel-diag-workers) PARALLEL_DIAG_WORKERS="$2"; shift 2 ;;
         --single-gpu)            SINGLE_GPU=1; shift ;;
+        --regen-configs)         REGEN_CONFIGS=1; shift ;;
         -h|--help)
             sed -n '1,40p' "$0"; exit 0 ;;
         *)
@@ -91,14 +96,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "[FT] NUM_PROCESSES=${NUM_PROCESSES}  PARALLEL_DIAG_WORKERS=${PARALLEL_DIAG_WORKERS}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}"
+echo "[FT] NUM_PROCESSES=${NUM_PROCESSES}  PARALLEL_DIAG_WORKERS=${PARALLEL_DIAG_WORKERS}  DIAG_CKPT_NAME=${DIAG_CKPT_NAME}  ALLOW_PARTIAL=${ALLOW_PARTIAL}"
 
 # (1) Generate manifest + configs if missing or stale.
-if [[ ! -f "${MANIFEST}" ]]; then
-    echo "[FT] Manifest missing — running config generator..."
+GENERATOR="scripts/stage_b_generator/round29_make_failure_targeted_ablation_configs.py"
+if [[ ${REGEN_CONFIGS} -eq 1 || ! -f "${MANIFEST}" || "${GENERATOR}" -nt "${MANIFEST}" || -n "${DATASETS_ROOT:-}" ]]; then
+    echo "[FT] Regenerating manifest/configs..."
     GEN_ARGS=()
     [[ -n "${DATASETS_ROOT:-}" ]] && GEN_ARGS+=(--data-root "${DATASETS_ROOT}")
-    "${PY}" scripts/stage_b_generator/round29_make_failure_targeted_ablation_configs.py "${GEN_ARGS[@]}"
+    "${PY}" "${GENERATOR}" "${GEN_ARGS[@]}"
 fi
 
 # (2) Pick variants from manifest.
@@ -195,7 +201,12 @@ while IFS=' ' read -r VID CFG OUTDIR; do
             if "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG}"; then
                 TRAINED_OK="${TRAINED_OK}${VID} ${CFG} ${OUTDIR}"$'\n'
             else
-                echo "[FT] WARN: training failed for ${VID}; skipping diag"
+                if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+                    echo "[FT] WARN: training failed for ${VID}; skipping diag"
+                else
+                    echo "[FT] FATAL: training failed for ${VID}; aborting full matrix."
+                    exit 1
+                fi
             fi
         fi
     else
@@ -210,6 +221,9 @@ if [[ ${SKIP_EVAL} -eq 1 ]]; then
     echo "--skip-eval: skipping diag"
 elif [[ -z "${TRAINED_OK}" ]]; then
     echo "[FT] No variants succeeded training; no diag to run."
+    if [[ "${ALLOW_PARTIAL}" != "1" ]]; then
+        exit 1
+    fi
 else
     echo
     echo "================================================================"
@@ -227,8 +241,12 @@ else
         [[ -z "${VID}" ]] && continue
         CKPT_PATH="${OUTDIR}/${DIAG_CKPT_NAME}"
         if [[ ! -e "${CKPT_PATH}" && ${DRY_RUN} -eq 0 ]]; then
-            echo "[FT] WARN: diag ckpt missing: ${CKPT_PATH} (skipped)"
-            continue
+            if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+                echo "[FT] WARN: diag ckpt missing: ${CKPT_PATH} (skipped)"
+                continue
+            fi
+            echo "[FT] FATAL: diag ckpt missing: ${CKPT_PATH}"
+            exit 1
         fi
         for kind in sustained_contact gait body_action; do
             case "${kind}" in
@@ -251,6 +269,10 @@ else
     done <<< "${TRAINED_OK}"
 
     N_TASKS="$(wc -l < "${TASK_QUEUE}")"
+    if [[ "${N_TASKS}" -eq 0 && ${DRY_RUN} -eq 0 ]]; then
+        echo "[FT] FATAL: no diag tasks were queued."
+        exit 1
+    fi
     echo "[FT] ${N_TASKS} diag tasks queued; launching ${PARALLEL_DIAG_WORKERS} GPU workers..."
 
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -314,6 +336,10 @@ else
         if [[ ${N_FAIL} -gt 0 ]]; then
             echo "[FT] ${N_FAIL}/${N_TASKS} diag tasks FAILED:"
             sed 's/^/[FT]   /' "${FAIL_LOG}"
+            if [[ "${ALLOW_PARTIAL}" != "1" ]]; then
+                echo "[FT] FATAL: diag failures are not allowed in the full matrix."
+                exit 1
+            fi
         else
             echo "[FT] all ${N_TASKS} diag tasks succeeded."
         fi
@@ -331,17 +357,32 @@ elif [[ ${SKIP_EVAL} -eq 0 ]]; then
     echo "================================================================"
     echo "[$(date '+%F %T')] SUMMARIZE -> ${SUMMARY_MD}"
     echo "================================================================"
-    "${PY}" scripts/stage_b_generator/round29_summarize_failure_targeted_ablation.py \
-        --out "${SUMMARY_MD}" || echo "[FT] WARN: summarizer failed; report may be partial"
+    if ! "${PY}" scripts/stage_b_generator/round29_summarize_failure_targeted_ablation.py \
+        --out "${SUMMARY_MD}"; then
+        if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+            echo "[FT] WARN: summarizer failed; report may be partial"
+        else
+            echo "[FT] FATAL: summarizer failed."
+            exit 1
+        fi
+    fi
 fi
 
 # (7) PHASE 4: PACK.
 if [[ ${DRY_RUN} -eq 0 ]]; then
     STAMP="$(date +%Y%m%d_%H%M%S)"
     PACK="analyses/round29_failure_targeted_ablation_results_${STAMP}.tar.gz"
-    tar -czf "${PACK}" \
-        analyses/round29_failure_targeted_ablation_manifest.* \
-        analyses/round29_r29_ft_*_diag_* \
-        "${SUMMARY_MD}" 2>/dev/null || true
+    PACK_ITEMS=(analyses/round29_failure_targeted_ablation_manifest.*)
+    if [[ ${SKIP_EVAL} -eq 0 ]]; then
+        PACK_ITEMS+=(analyses/round29_r29_ft_*_diag_* "${SUMMARY_MD}")
+    fi
+    if ! tar -czf "${PACK}" "${PACK_ITEMS[@]}"; then
+        if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+            echo "[FT] WARN: result pack failed: ${PACK}"
+        else
+            echo "[FT] FATAL: result pack failed: ${PACK}"
+            exit 1
+        fi
+    fi
     echo "[FT] Packed ${PACK}"
 fi

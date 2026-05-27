@@ -363,12 +363,12 @@ def _render_section_for_sublabel(a: Any, rows: dict, sublabel: str) -> None:
 def _decision_table(a: Any, rows: dict) -> None:
     a("## Automatic decision table")
     a("")
-    a("Compares each non-R0 variant against R0 on val-subset headline metrics.")
+    a("Compares each variant against the reference needed by its decision question.")
     a("Use this as a quick read; combine with the per-part + p95 + body tables")
     a("above before committing to a next mainline.")
     a("")
-    a("| variant | val drift_max mean (cm) Δ vs R0 | val %track<0.5 Δ vs R0 | val L_R_corr | val step_period_rate | val body delta_err Δ vs R0 |")
-    a("| --- | ---: | ---: | ---: | ---: | ---: |")
+    a("| variant | reference | val drift_max mean (cm) delta | val %track<0.5 delta | val L_R_corr | val step_period_rate | val body delta_err delta |")
+    a("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
 
     def _val(v: str, kind: str, key: str) -> float | None:
         row = rows.get(v, {}).get("val", {}).get(kind, {})
@@ -378,9 +378,10 @@ def _decision_table(a: Any, rows: dict) -> None:
         except (TypeError, ValueError):
             return None
 
-    r0_drift = _val("r29_ft_r0_clean_a3_baseline", "sustained_contact", "drift_max_mean_cm")
-    r0_track = _val("r29_ft_r0_clean_a3_baseline", "sustained_contact", "pct_track_frac_below_0.5")
-    r0_body = _val("r29_ft_r0_clean_a3_baseline", "body_action", "delta_err_cm_mean_overall")
+    reference_by_variant = {
+        "r29_ft_r3_oracle_s4_gait_loss": "r29_ft_r2_behavior_gait_loss",
+        "r29_ft_r5_allpart_interaction_lock": "r29_ft_r4_i3_contact_lock",
+    }
 
     def _delta(x: float | None, base: float | None) -> str:
         if x is None or base is None:
@@ -395,16 +396,20 @@ def _decision_table(a: Any, rows: dict) -> None:
     for v in VARIANTS:
         if v == "r29_ft_r0_clean_a3_baseline":
             continue
+        ref = reference_by_variant.get(v, "r29_ft_r0_clean_a3_baseline")
         drift = _val(v, "sustained_contact", "drift_max_mean_cm")
         track = _val(v, "sustained_contact", "pct_track_frac_below_0.5")
         lr = _val(v, "gait", "L_R_height_corr")
         step_rate = _val(v, "gait", "step_period_rate")
         body = _val(v, "body_action", "delta_err_cm_mean_overall")
+        ref_drift = _val(ref, "sustained_contact", "drift_max_mean_cm")
+        ref_track = _val(ref, "sustained_contact", "pct_track_frac_below_0.5")
+        ref_body = _val(ref, "body_action", "delta_err_cm_mean_overall")
         a(
-            f"| `{v}` | {_delta(drift, r0_drift)} | "
-            f"{_delta_pct(track, r0_track)} | "
+            f"| `{v}` | `{ref}` | {_delta(drift, ref_drift)} | "
+            f"{_delta_pct(track, ref_track)} | "
             f"{_fmt(lr, 3)} | {_pct(step_rate)} | "
-            f"{_delta(body, r0_body)} |"
+            f"{_delta(body, ref_body)} |"
         )
     a("")
     a("### Per-variant decision questions")

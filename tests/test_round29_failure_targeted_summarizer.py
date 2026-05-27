@@ -252,8 +252,8 @@ def test_summarizer_emits_per_part_drift_table(tmp_path: Path) -> None:
     assert "Sustained contact (per part" in report
 
 
-def test_summarizer_decision_table_compares_to_r0(tmp_path: Path) -> None:
-    """The auto decision table must surface R4's contact gain vs R0."""
+def test_summarizer_decision_table_uses_variant_references(tmp_path: Path) -> None:
+    """The auto decision table must use R0/R2/R4 references as designed."""
     results_root = tmp_path / "analyses"
     results_root.mkdir(parents=True)
     out_md = tmp_path / "report.md"
@@ -278,10 +278,11 @@ def test_summarizer_decision_table_compares_to_r0(tmp_path: Path) -> None:
     assert res.returncode == 0
     report = out_md.read_text(encoding="utf-8")
     assert "Automatic decision table" in report
-    # R4's negative delta (improvement) and R5's bigger improvement must
-    # both appear with sign.
+    assert "| `r29_ft_r3_oracle_s4_gait_loss` | `r29_ft_r2_behavior_gait_loss` |" in report
+    assert "| `r29_ft_r5_allpart_interaction_lock` | `r29_ft_r4_i3_contact_lock` |" in report
+    # R4 is -4.0 cm vs R0; R5 is -1.0 cm vs R4.
     assert "-4.00" in report or "-4.0" in report  # R4 drift Δ
-    assert "-5.00" in report or "-5.0" in report  # R5 drift Δ
+    assert "-1.00" in report or "-1.0" in report
     # Per-variant decision questions must be rendered.
     assert "is C41 extra" in report          # R1
     assert "contact-lock" in report          # R4

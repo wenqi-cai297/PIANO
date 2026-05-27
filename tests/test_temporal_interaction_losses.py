@@ -455,6 +455,22 @@ def test_r29_interaction_consistency_zero_when_pred_eq_gt():
     assert loss.item() < 1e-6
 
 
+def test_r29_interaction_consistency_zero_when_pred_eq_gt_soft_contact():
+    joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
+    T = contact_state.shape[1]
+    ramp = torch.linspace(0.55, 0.95, T, dtype=contact_state.dtype).reshape(1, T, 1)
+    soft_contact = contact_state.clone()
+    soft_contact[..., 0:2] = soft_contact[..., 0:2] * ramp
+    stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, soft_contact)
+    loss = loss_r29_interaction_consistency(
+        pred_joints=joints,
+        object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=stage2_int, cfg=_default_cfg(),
+    )
+    assert torch.isfinite(loss)
+    assert loss.item() < 1e-6
+
+
 def test_r29_interaction_consistency_positive_on_perturbation():
     joints, obj_pos, obj_rot, contact_state, _, _ = _make_clip()
     stage2_int = _build_i3_condition(joints, obj_pos, obj_rot, contact_state)
@@ -1040,6 +1056,27 @@ def test_r29_contact_lock_offset_zero_when_pred_eq_gt_i3():
         stage2_interaction=inter, cfg=_default_cfg(),
     )
     assert loss.item() < 1e-5
+
+
+def test_r29_contact_lock_zero_when_pred_eq_gt_i3_soft_contact():
+    """I3 stores offset * soft_contact; lock losses must recover offset."""
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    T = contact.shape[1]
+    ramp = torch.linspace(0.55, 0.95, T, dtype=contact.dtype).reshape(1, T, 1)
+    soft_contact = contact.clone()
+    soft_contact[..., 0:2] = soft_contact[..., 0:2] * ramp
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, soft_contact)
+
+    offset_loss = loss_r29_contact_lock_offset(
+        pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    drift_loss = loss_r29_contact_lock_segment_drift(
+        pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert offset_loss.item() < 1e-5
+    assert drift_loss.item() < 1e-5
 
 
 def test_r29_contact_lock_offset_positive_on_perturbation_i3():

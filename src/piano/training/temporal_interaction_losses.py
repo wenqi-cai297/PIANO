@@ -862,6 +862,14 @@ def loss_r29_interaction_consistency(
     target_offset = stage2_interaction[..., 2:8].reshape(
         *stage2_interaction.shape[:2], 2, 3,
     )                                                                       # (B, T, 2, 3)
+    # I3 stores masked_offset = offset_norm * hand_contact. The mask is
+    # applied separately below, so active soft-contact frames need the
+    # unmasked geometric target.
+    target_offset = torch.where(
+        hand_contact.unsqueeze(-1) > 0.0,
+        target_offset / hand_contact.clamp_min(1e-6).unsqueeze(-1),
+        torch.zeros_like(target_offset),
+    ).clamp(-1.0, 1.0)
 
     mask = (hand_contact > cfg.contact_threshold).to(dtype=pred_joints.dtype)
     if seq_mask is not None:
@@ -1284,8 +1292,9 @@ def _parse_i_channel(
 
     Returns:
         contacts        : (B, T, P)
-        target_offsets  : (B, T, P, 3)  (already normalised to [-1, 1] by the
-                          ``hand_offset_clamp_m`` divisor used by the builder)
+        target_offsets  : (B, T, P, 3). Active-contact frames are recovered
+                          from the builder's masked-offset layout back to the
+                          unmasked, normalised object-local offset in [-1, 1].
         part_indices    : tuple of SMPL joint indices for each part.
     """
     D = stage2_interaction.shape[-1]
@@ -1312,6 +1321,18 @@ def _parse_i_channel(
             "contact-lock losses support only I3 (dim=8) or I5 (dim=20); "
             f"got dim={D}."
         )
+
+    # I3/I5 store ``offset_norm * contact`` so inactive frames are exactly
+    # zero. The lock losses below already use ``contacts`` as the mask, so on
+    # active frames they must compare against the unmasked target. Otherwise
+    # soft pseudo-labels like contact=0.75 would incorrectly pull a GT-perfect
+    # prediction toward 0.75 * offset.
+    denom = contacts.clamp_min(1e-6).unsqueeze(-1)
+    offsets = torch.where(
+        contacts.unsqueeze(-1) > 0.0,
+        offsets / denom,
+        torch.zeros_like(offsets),
+    ).clamp(-1.0, 1.0)
     return contacts, offsets, part_idx
 
 
