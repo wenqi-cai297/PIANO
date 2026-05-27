@@ -43,7 +43,6 @@ from piano.data.stage2_oracle_conditions import (  # noqa: E402
 from piano.models.motion_anchordiff import (  # noqa: E402
     AnchorDenoiser,
     AnchorDenoiserConfig,
-    ZIntDims,
 )
 from piano.models.round29_cond_injection import (  # noqa: E402
     Round29CondInjectionConfig,
@@ -272,7 +271,6 @@ def check_model_forward() -> str:
     B, T, D = 1, 12, 64
     cfg = AnchorDenoiserConfig(
         motion_dim=135,
-        z_int=ZIntDims(num_parts=5, phase_classes=3, support_classes=3),
         object_traj_dim=9,
         init_pose_dim=66,
         text_dim=512,
@@ -295,7 +293,6 @@ def check_model_forward() -> str:
     model.eval()
 
     cond = {
-        "z_int": torch.zeros(B, T, cfg.z_int.total),
         "object_world_traj": torch.zeros(B, T, cfg.object_traj_dim),
         "init_pose": torch.zeros(B, cfg.init_pose_dim),
         "text": torch.zeros(B, 4, cfg.text_dim),
@@ -355,11 +352,10 @@ def check_strict_instantiate_configs(manifest_path: Path) -> dict[str, str]:
         return out
 
     # Lazy imports — strict mode is slow.
-    from piano.training.train_anchordiff import _build_dataset
+    from piano.inference.diagnostic_helpers import _build_dataset
     from piano.models.motion_anchordiff import (
         AnchorDenoiser,
         AnchorDenoiserConfig,
-        ZIntDims,
     )
 
     for v in targets:
@@ -377,14 +373,8 @@ def check_strict_instantiate_configs(manifest_path: Path) -> dict[str, str]:
         # (a) Instantiate model from config.
         try:
             d = cfg.model.denoiser
-            z_dims = ZIntDims(
-                num_parts=int(cfg.model.z_int.num_parts),
-                phase_classes=int(cfg.model.z_int.phase_classes),
-                support_classes=int(cfg.model.z_int.support_classes),
-            )
             denoiser_cfg = AnchorDenoiserConfig(
                 motion_dim=int(d.motion_dim),
-                z_int=z_dims,
                 object_traj_dim=int(d.object_traj_dim),
                 init_pose_dim=int(d.init_pose_dim),
                 text_dim=int(d.text_dim),

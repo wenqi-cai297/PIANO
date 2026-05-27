@@ -31,18 +31,7 @@ model:
     schedule: "cosine"
     prediction_target: "x0"
 
-  z_int:
-    num_parts: 5
-    phase_classes: 3
-    support_classes: 3
 
-  zero_z_int_for_stageB: true
-  zero_dense_contact_target_for_stageB: true
-  zero_contact_state_for_stageB: true
-  zero_contact_target_for_stageB: true
-  zero_phase_for_stageB: true
-  zero_support_for_stageB: true
-  zero_plan_target_for_stageB: false
 
   denoiser:
     motion_dim: 135
@@ -52,20 +41,6 @@ model:
     text_dim: 512
     object_token_dim: 256
     object_num_tokens: 128
-    use_interaction_plan: true
-    plan_k_max: 12
-    plan_s_max: 12
-    plan_num_anchor_types: 5
-    plan_num_parts: 5
-    plan_use_segment_tokens: false
-    plan_use_context_hint: true
-    plan_d_hint: 32
-    plan_d_time_embed: 64
-    cfg_drop_plan: false
-    plan_per_part_tokens: true
-    plan_context_hint_mode: "target_aware"
-    use_dit_block: true
-    dit_block_use_plan_pool_in_cond: false
     use_v13_dynhead: false
     use_v13_temporal_conv: false
     d_model: 512
@@ -74,10 +49,6 @@ model:
     ff_mult: 4
     dropout: 0.1
     stage1_coarse_dim: 23
-    cfg_drop_stage1_coarse: false
-    plan_xattn_relative_time_bias: true
-    plan_xattn_time_bias_init: 0.5
-    plan_tokens_force_null: true
     # Tier-0A3: full hint, D=13.
     use_oracle_interaction_hint: true
     oracle_hint_dim: 13
@@ -165,11 +136,6 @@ loss:
   anchor_weight: 0.0
   contact_threshold: 0.5
 
-  plan_anchor_weight: 0.0
-  plan_segment_weight: 0.0
-  plan_transition_vel_weight: 0.0
-  plan_transition_acc_weight: 0.0
-  plan_transition_window: 3
 
   stable_root_vel_weight: 0.5
   stable_root_acc_weight: 0.25

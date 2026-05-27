@@ -9,9 +9,8 @@ This captures the user-reported failure mode:
 
     "把箱子举高时，人的手只会跟着箱子往上抬一段，不会真的用手把箱子抬到对应的高度"
 
-A per-frame anchor metric (Round-24 / our `anchor_realization_diagnostic`)
-only samples one moment per anchor; it misses temporal drift within a
-contact window.
+A per-frame anchor metric (Round-24) only samples one moment per
+anchor; it misses temporal drift within a contact window.
 
 Per-segment metrics (units cm unless noted):
 
@@ -47,7 +46,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -58,14 +56,11 @@ from omegaconf import OmegaConf
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-_SCRIPTS = Path(__file__).resolve().parent
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-from plan_condition_diagnostics import (  # noqa: E402
+from piano.inference.diagnostic_helpers import (
     extract_train_time_meta,
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
+    _aa_matrix, _fk_22joints,
 )
-from anchor_realization_diagnostic import _aa_matrix, _fk_22joints  # noqa: E402
 
 from piano.data.dataset import collate_hoi  # noqa: E402
 from piano.utils.clip_utils import load_clip_text_encoder  # noqa: E402
@@ -327,7 +322,7 @@ def main() -> int:
                         collate_fn=collate_hoi, num_workers=0)
 
     # --- Model
-    model, object_encoder, z_dims = _build_model(cfg, device)
+    model, object_encoder = _build_model(cfg, device)
     train_meta: dict[str, Any] = {}
     if not args.use_gt_as_pred:
         state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -360,7 +355,7 @@ def main() -> int:
         n_processed += 1
 
         cond, T = _build_cond(
-            batch, model, object_encoder, clip_model, z_dims, cfg, device,
+            batch, model, object_encoder, clip_model, cfg, device,
             stage1_norm=stage1_norm,
         )
 

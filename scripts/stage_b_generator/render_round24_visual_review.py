@@ -1,10 +1,8 @@
-"""Round-24 quick visual review — render GT vs predicted motion side-by-side
-for N selected clips. Uses the R23 no-plan ckpt (v26-equivalent) by default.
+"""Quick visual review — render GT vs predicted motion side-by-side for
+N selected clips.
 
-Why minimal:
-    plan_condition_diagnostics.py also renders MP4 but runs the full 14-variant
-    DDPM sweep per clip (~5 min each). For a hand-review of N clips, we just
-    need GT + one sample, so ~30 s per clip.
+For a hand-review of N clips, we just need GT + one sample, so ~30 s
+per clip.
 
 Usage:
     conda run -n piano python scripts/stage_b_generator/render_round24_visual_review.py \\
@@ -22,17 +20,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Subset
 
-_SCRIPTS = Path(__file__).resolve().parent
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-from plan_condition_diagnostics import (  # noqa: E402
+from piano.inference.diagnostic_helpers import (
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
 )
 
@@ -89,7 +83,7 @@ def main() -> int:
     )
 
     # ---- Model + ckpt + text encoder ----
-    model, object_encoder, z_dims = _build_model(cfg, device)
+    model, object_encoder = _build_model(cfg, device)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model_state = state.get("model", state)
     model.load_state_dict(model_state)
@@ -119,14 +113,9 @@ def main() -> int:
             break
 
         cond, T = _build_cond(
-            batch, model, object_encoder, clip_model, z_dims, cfg, device,
+            batch, model, object_encoder, clip_model, cfg, device,
             stage1_norm=stage1_norm,
         )
-        # NOTE: the old plan_anchor_* / plan_segment_* injection that this
-        # renderer used at R24 time was removed from the dataset + model
-        # together with the interaction_plan condition path. R27+ ckpts
-        # do not consume cond["interaction_plan"]; calling sample() with
-        # just _build_cond's output is correct.
 
         torch.manual_seed(args.seed)
         with torch.no_grad():

@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -58,14 +57,10 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-_SCRIPTS = Path(__file__).resolve().parent
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-from plan_condition_diagnostics import (  # noqa: E402
+from piano.inference.diagnostic_helpers import (
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
-    extract_train_time_meta,
+    extract_train_time_meta, _fk_22joints,
 )
-from anchor_realization_diagnostic import _fk_22joints  # noqa: E402
 
 from piano.data.dataset import collate_hoi  # noqa: E402
 from piano.utils.clip_utils import load_clip_text_encoder  # noqa: E402
@@ -326,7 +321,7 @@ def main() -> int:
     loader = DataLoader(dataset, batch_size=1, shuffle=False,
                         collate_fn=collate_hoi, num_workers=0)
 
-    model, object_encoder, z_dims = _build_model(cfg, device)
+    model, object_encoder = _build_model(cfg, device)
     train_meta: dict[str, Any] = {}
     if not args.use_gt_as_pred:
         state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -360,7 +355,7 @@ def main() -> int:
         n_processed += 1
 
         cond, T = _build_cond(
-            batch, model, object_encoder, clip_model, z_dims, cfg, device,
+            batch, model, object_encoder, clip_model, cfg, device,
             stage1_norm=stage1_norm,
         )
 

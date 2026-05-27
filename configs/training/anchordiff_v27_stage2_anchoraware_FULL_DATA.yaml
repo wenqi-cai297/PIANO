@@ -9,10 +9,10 @@
 # Round-26 motion-faithful patch (applied 2026-05-24, see
 #   analyses/2026-05-24_round26_v27_motion_faithful_patch.md):
 #   - All loss terms whose TARGET is a pseudo-label-derived contact target
-#     are disabled (anchor_weight, plan_anchor_weight). Round-24 already
-#     showed those targets are structurally unreachable: even GT joints sit
-#     ~30 cm from object-surface contact targets, so the gradient pulls
-#     predictions away from GT.
+#     are disabled (anchor_weight). Round-24 already showed those targets
+#     are structurally unreachable: even GT joints sit ~30 cm from
+#     object-surface contact targets, so the gradient pulls predictions
+#     away from GT.
 #   - Loss terms whose TARGET is GT motion (anchor_joint_pos/vel, stable_*)
 #     remain enabled. Their masks are pseudo-label-derived but their targets
 #     are not, so they do not conflict with "fit GT motion".
@@ -36,20 +36,9 @@ model:
     schedule: "cosine"
     prediction_target: "x0"
 
-  z_int:
-    num_parts: 5
-    phase_classes: 3
-    support_classes: 3
 
-  # Keep the v26 clean condition contract: no dense GT z_int/contact target
+  # Keep the v26 clean condition contract: no dense GT contact target
   # route into Stage-2. The new endpoint losses are supervision only.
-  zero_z_int_for_stageB: true
-  zero_dense_contact_target_for_stageB: true
-  zero_contact_state_for_stageB: true
-  zero_contact_target_for_stageB: true
-  zero_phase_for_stageB: true
-  zero_support_for_stageB: true
-  zero_plan_target_for_stageB: false
 
   denoiser:
     motion_dim: 135
@@ -59,20 +48,6 @@ model:
     text_dim: 512
     object_token_dim: 256
     object_num_tokens: 128
-    use_interaction_plan: true
-    plan_k_max: 12
-    plan_s_max: 12
-    plan_num_anchor_types: 5
-    plan_num_parts: 5
-    plan_use_segment_tokens: false
-    plan_use_context_hint: true
-    plan_d_hint: 32
-    plan_d_time_embed: 64
-    cfg_drop_plan: false
-    plan_per_part_tokens: true
-    plan_context_hint_mode: "target_aware"
-    use_dit_block: true
-    dit_block_use_plan_pool_in_cond: false
     use_v13_dynhead: false
     use_v13_temporal_conv: false
     d_model: 512
@@ -81,11 +56,7 @@ model:
     ff_mult: 4
     dropout: 0.1
     stage1_coarse_dim: 23
-    cfg_drop_stage1_coarse: false
-    plan_xattn_relative_time_bias: true
-    plan_xattn_time_bias_init: 0.5
     # Keep plan tokens null to avoid changing the condition path in P0.
-    plan_tokens_force_null: true
 
   object_encoder:
     num_input_points: 1024
@@ -164,16 +135,6 @@ loss:
   # headwind against "fit GT motion".
   anchor_weight: 0.0
   contact_threshold: 0.5
-
-  # Round-26 motion-faithful patch: same broken-target issue as
-  # anchor_weight. Disabled. Plan tokens themselves stay null
-  # (plan_tokens_force_null: true above) so the model also can't see plan
-  # conditioning. Plan branch is now fully inert in v27.
-  plan_anchor_weight: 0.0
-  plan_segment_weight: 0.0
-  plan_transition_vel_weight: 0.0
-  plan_transition_acc_weight: 0.0
-  plan_transition_window: 3
 
   # Kept: stable-frame root/local-dynamics losses. Mask is pseudo-label
   # (support + pelvis_contact) but TARGET is GT root/local motion — no

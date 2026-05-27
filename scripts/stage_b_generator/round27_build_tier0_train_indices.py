@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -25,10 +24,7 @@ from typing import Any
 import numpy as np
 from omegaconf import OmegaConf
 
-_SCRIPTS = Path(__file__).resolve().parent
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-from plan_condition_diagnostics import _build_dataset  # noqa: E402
+from piano.inference.diagnostic_helpers import _build_dataset
 
 
 MANIPULATION_KEYWORDS = (

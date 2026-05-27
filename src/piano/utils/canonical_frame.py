@@ -1,8 +1,8 @@
 """Canonical-frame ↔ world-frame helpers for HumanML3D-style motion data.
 
-Stage B v0.2 introduced object pose channels into ``z_int``. The PIANO
+Object pose channels feed Stage B alongside the body motion. The PIANO
 backbone (MoMask) consumes HumanML3D-canonicalized motion (frame-0
-pelvis at XZ origin, frame-0 heading aligned with +Z), so for the new
+pelvis at XZ origin, frame-0 heading aligned with +Z), so for the
 object position channels to be in the **same frame as the body** they
 must be expressed in the body's canonical frame too. Per
 ``analyses/2026-04-27_object_conditioning_review.md`` §5.2, this

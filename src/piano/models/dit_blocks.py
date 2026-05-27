@@ -4,7 +4,7 @@ Per the v12 design doc (analyses/2026-05-11_v12_architecture_design_doc.md), thi
 module provides:
 
   modulate(x, shift, scale)            — DiT canonical AdaLN modulation helper
-  V12InputProjection                   — separate per-channel input projections (motion / z_int / obj_traj / plan_hint), summed
+  V12InputProjection                   — separate per-channel input projections (motion / obj_traj), summed
   GlobalCondSummary                    — per-sample (B, D) condition vector for AdaLN
   ConditionedEncoderLayer              — DiT/InterGen-style block: AdaLN-Zero self-attn + unmodulated plan cross-attn + AdaLN-Zero MLP
   V12FinalLayer                        — final readout with AdaLN-Zero + zero-init linear
@@ -56,17 +56,16 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 class V12InputProjection(nn.Module):
-    """Per-channel input projection: motion / z_int / obj_traj each get their
+    """Per-channel input projection: motion / obj_traj each get their
     own Linear(in_dim_i, d_model), summed.
 
-    Aux projections (zint, obj, stage1_coarse) are zero-init'd so step-0
+    Aux projections (obj, stage1_coarse) are zero-init'd so step-0
     output equals motion_proj(x_t) only.
     """
 
     def __init__(
         self,
         motion_dim: int,
-        zint_dim: int,
         obj_traj_dim: int,
         d_model: int,
         stage1_coarse_dim: int = 0,
@@ -74,7 +73,6 @@ class V12InputProjection(nn.Module):
         super().__init__()
         self.stage1_coarse_dim = int(stage1_coarse_dim)
         self.motion_proj = nn.Linear(motion_dim, d_model)
-        self.zint_proj = nn.Linear(zint_dim, d_model)
         self.obj_proj = nn.Linear(obj_traj_dim, d_model)
         if self.stage1_coarse_dim > 0:
             self.stage1_coarse_proj = nn.Linear(self.stage1_coarse_dim, d_model)
@@ -85,16 +83,11 @@ class V12InputProjection(nn.Module):
     def forward(
         self,
         x_t: Tensor,
-        z_int: Tensor,
         obj_traj: Tensor,
         stage1_coarse: Tensor | None = None,
     ) -> Tensor:
         """All inputs (B, T, *). Output (B, T, d_model)."""
-        h = (
-            self.motion_proj(x_t)
-            + self.zint_proj(z_int)
-            + self.obj_proj(obj_traj)
-        )
+        h = self.motion_proj(x_t) + self.obj_proj(obj_traj)
         if self.stage1_coarse_proj is not None:
             if stage1_coarse is None:
                 raise KeyError(
@@ -257,7 +250,7 @@ def initialize_weights_v12(
     nn.init.zeros_(input_proj.motion_proj.bias)
 
     # 2. Aux input projections zero-init (bandwidth allocation starts cold).
-    aux_projs = [input_proj.zint_proj, input_proj.obj_proj]
+    aux_projs = [input_proj.obj_proj]
     if getattr(input_proj, "stage1_coarse_proj", None) is not None:
         aux_projs.append(input_proj.stage1_coarse_proj)
     for proj in aux_projs:

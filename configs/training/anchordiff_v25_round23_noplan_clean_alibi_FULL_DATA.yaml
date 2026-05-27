@@ -1,21 +1,7 @@
-# Round-23 P1 no-plan ablation — paired companion to
-# anchordiff_v25_round23_clean_alibi_FULL_DATA.yaml.
-#
-# Only differences vs the with-plan config:
-#   - model.denoiser.plan_tokens_force_null = true
-#     (replaces plan_tokens + plan_hint with null embeddings inside
-#      _forward_v12, regardless of cond_drop_mask)
-#   - All plan-aware loss weights set to 0 (else the model would still
-#     receive plan info as SUPERVISION even though denied as CONDITIONING
-#     — would defeat the ablation).
-#
-# Decision-rule:
-#   - if with-plan run substantially beats no-plan on anchor_l2 /
-#     pos_full / plan_condition_diagnostics §7.4 gate → plan condition
-#     IS load-bearing; ALiBi + future architecture work justified.
-#   - if no-plan ≈ with-plan → plan is redundant at this scale; consider
-#     dropping the interaction_plan branch entirely in a simplified
-#     v26 mainline.
+# Round-23 P1 no-plan baseline (historical — plan condition branch was
+# deleted in the 2026-05-27 z_int + interaction_plan dead-path cleanup).
+# Kept as the "v26 mainline" ckpt origin: the file name and the
+# init_checkpoint path point at this run's final.pt.
 
 model:
   cfg_drop_prob: 0.15
@@ -25,19 +11,7 @@ model:
     schedule: "cosine"
     prediction_target: "x0"
 
-  z_int:
-    num_parts: 5
-    phase_classes: 3
-    support_classes: 3
-
-  # CLEAN contract (Round-22 audit §5.1): kill dense z_int + lifted target.
-  zero_z_int_for_stageB: true
-  zero_dense_contact_target_for_stageB: true
-  zero_contact_state_for_stageB: true
-  zero_contact_target_for_stageB: true
-  zero_phase_for_stageB: true
-  zero_support_for_stageB: true
-  zero_plan_target_for_stageB: false
+  # CLEAN contract (Round-22 audit §5.1): no dense lifted target route.
 
   denoiser:
     motion_dim: 135
@@ -47,20 +21,6 @@ model:
     text_dim: 512
     object_token_dim: 256
     object_num_tokens: 128
-    use_interaction_plan: true
-    plan_k_max: 12
-    plan_s_max: 12
-    plan_num_anchor_types: 5
-    plan_num_parts: 5
-    plan_use_segment_tokens: false
-    plan_use_context_hint: true
-    plan_d_hint: 32
-    plan_d_time_embed: 64
-    cfg_drop_plan: false
-    plan_per_part_tokens: true
-    plan_context_hint_mode: "target_aware"
-    use_dit_block: true
-    dit_block_use_plan_pool_in_cond: false
     use_v13_dynhead: false
     use_v13_temporal_conv: false
     d_model: 512
@@ -70,14 +30,10 @@ model:
     dropout: 0.1
     # Round-22: Stage-1 coarse oracle condition.
     stage1_coarse_dim: 23
-    cfg_drop_stage1_coarse: false
     # Round-23: ALiBi relative-time bias on plan cross-attention.
-    plan_xattn_relative_time_bias: true
-    plan_xattn_time_bias_init: 0.5
     # Round-23: no-plan ablation flag ON. Plan tokens + hint are
     # replaced by their learned null embeddings inside _forward_v12
     # — model gets no plan condition signal.
-    plan_tokens_force_null: true
 
   object_encoder:
     num_input_points: 1024
@@ -146,11 +102,6 @@ loss:
   # Round-23 no-plan ablation: zero all plan-aware loss weights so the
   # model isn't supervised against plan-anchor / plan-transition targets
   # while being denied plan conditioning.
-  plan_anchor_weight: 0.0
-  plan_segment_weight: 0.0
-  plan_transition_vel_weight: 0.0
-  plan_transition_acc_weight: 0.0
-  plan_transition_window: 3
   stable_root_vel_weight: 0.5
   stable_root_acc_weight: 0.25
   stable_support_erode: 4

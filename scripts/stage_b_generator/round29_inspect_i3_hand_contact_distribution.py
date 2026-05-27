@@ -31,10 +31,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-_SCRIPTS = Path(__file__).resolve().parent
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-from plan_condition_diagnostics import _build_dataset  # noqa: E402
+from piano.inference.diagnostic_helpers import _build_dataset
 
 from piano.data.dataset import collate_hoi  # noqa: E402
 from piano.utils.io_utils import load_json  # noqa: E402

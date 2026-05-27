@@ -1,8 +1,9 @@
 """PIANO-AnchorDiff: anchor-conditioned continuous motion diffusion.
 
-OMOMO-style anchor conditioning (z_int as primary per-frame channel)
-on top of an MDM-style transformer encoder denoiser, trained with
-classifier-free guidance dropout. Operates on HumanML3D motion_263.
+MDM-style transformer encoder denoiser conditioned on object trajectory,
+object point-cloud tokens, text (CLIP), initial pose, and (optionally)
+Stage-1 Coarse-v1 + Round-29 typed C/I/S/B condition extras. Trained
+with classifier-free guidance dropout. Operates on HumanML3D motion_263.
 
 Prediction parameterisation: **x₀-prediction** (sample-prediction).
 MDM, OMOMO, HOI-Dyn all use x₀; ε-prediction would force the anchor
@@ -409,52 +410,6 @@ class PositionalEncoding(nn.Module):
 
 
 # ============================================================================
-# Anchor (z_int) conditioning channel
-# ============================================================================
-
-
-@dataclass(slots=True)
-class ZIntDims:
-    """Per-frame channels of the z_int conditioning signal.
-
-    Default lays out 5 + 15 + 3 + 3 = 26 dims:
-        contact_state            : 5     (sigmoid)
-        contact_target_xyz_local : 5*3   (object-local coords)
-        phase                    : 3     (softmax)
-        support                  : 3     (softmax, hand_support collapsed)
-    """
-
-    num_parts: int = 5
-    phase_classes: int = 3
-    support_classes: int = 3
-
-    @property
-    def total(self) -> int:
-        return self.num_parts + self.num_parts * 3 + self.phase_classes + self.support_classes
-
-
-def pack_z_int(
-    contact_state: Tensor,
-    contact_target_xyz: Tensor,
-    phase_logits: Tensor,
-    support_logits: Tensor,
-    dims: ZIntDims,
-) -> Tensor:
-    """Pack Stage A outputs (or GT labels) into a flat (B, T, ZIntDims.total) tensor.
-
-    Inputs may be the raw GT one-hot/integer labels or sigmoid/softmax
-    outputs of Stage A — both shapes are supported as long as the last
-    dims match ``dims``.
-    """
-    B, T, _ = contact_state.shape
-    cs = contact_state.float().view(B, T, dims.num_parts)
-    cx = contact_target_xyz.float().view(B, T, dims.num_parts * 3)
-    ph = phase_logits.float().view(B, T, dims.phase_classes)
-    sp = support_logits.float().view(B, T, dims.support_classes)
-    return torch.cat([cs, cx, ph, sp], dim=-1)
-
-
-# ============================================================================
 # Denoiser
 # ============================================================================
 
@@ -462,7 +417,6 @@ def pack_z_int(
 @dataclass(slots=True)
 class AnchorDenoiserConfig:
     motion_dim: int = 263
-    z_int: ZIntDims = ZIntDims()
     object_traj_dim: int = 9     # 3 (pos) + 6 (rot6d)
     init_pose_dim: int = 22 * 3  # SMPL-22 joints
     text_dim: int = 512          # CLIP per-token feature dim
@@ -518,11 +472,9 @@ class AnchorDenoiser(nn.Module):
 
     Per-frame conditioning (concatenated to the projected motion before
     transformer):
-        - z_int (anchor)        : ZIntDims.total ≈ 26 dims
         - object_world_traj     : 9 dims (pos + rot6d)
-        - cond_motion_input     : (motion_dim + 1) dims, optional (CondMDI
-                                  keyframe-inpainting channel: clean motion
-                                  zeroed at non-observed frames + 1-D mask)
+        - stage1_coarse         : 23 dims, optional (Stage-1 Coarse-v1)
+        - r29 typed extras      : C/I/S/B per-family (optional)
     Sequence-level conditioning (cross-attention K/V):
         - text                  : CLIP per-token (B, 77, text_dim)
         - object_pc tokens      : (B, 128, object_token_dim)
@@ -532,9 +484,9 @@ class AnchorDenoiser(nn.Module):
 
     CFG dropout is applied independently per conditioning channel via
     ``cond_drop_mask`` (a (B,) bool tensor): if True for a sample,
-    z_int + object_traj + text + object_pc tokens are masked to a learned
-    null embedding for that sample. ``init_pose`` is preserved (it is a
-    deterministic scene fact).
+    object_traj + text + object_pc tokens are masked to a learned null
+    embedding for that sample. ``init_pose`` and ``stage1_coarse`` are
+    preserved (deterministic scene facts).
     """
 
     def __init__(self, cfg: AnchorDenoiserConfig) -> None:
@@ -574,10 +526,10 @@ class AnchorDenoiser(nn.Module):
             self.register_parameter("null_text", None)
         self.object_proj = nn.Linear(cfg.object_token_dim, cfg.d_model)
 
-        # Learned null embeddings for CFG dropout. Live channels in R29
-        # are object_world_traj and object_tokens (and text when on).
-        # z_int and stage1_coarse are never CFG-dropped (z_int is identically
-        # zero; stage1_coarse is a deterministic Stage-1 output).
+        # Learned null embeddings for CFG dropout. Live channels are
+        # object_world_traj and object_tokens (and text when on).
+        # stage1_coarse is never CFG-dropped (it is a deterministic
+        # Stage-1 output).
         self.null_obj_traj = nn.Parameter(torch.zeros(cfg.object_traj_dim))
         self.null_obj_tokens = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
 
@@ -600,7 +552,6 @@ class AnchorDenoiser(nn.Module):
         )
         self.v12_input_proj = V12InputProjection(
             motion_dim=cfg.motion_dim,
-            zint_dim=cfg.z_int.total,
             obj_traj_dim=cfg.object_traj_dim,
             d_model=cfg.d_model,
             stage1_coarse_dim=cfg.stage1_coarse_dim,
@@ -673,7 +624,6 @@ class AnchorDenoiser(nn.Module):
         B, T, _ = x_t.shape
         cfg = self.cfg
 
-        z_int: Tensor = cond["z_int"]                  # (B, T, zint_total)
         obj_traj: Tensor = cond["object_world_traj"]   # (B, T, 9)
         obj_tok: Tensor = cond["object_tokens"]        # (B, N_obj, object_token_dim)
         # init_pose and text are optional in R29 ablations.
@@ -681,7 +631,6 @@ class AnchorDenoiser(nn.Module):
         text_tok: Tensor | None = cond.get("text") if self.use_text else None
 
         # --- CFG drop: replace conditioning channels with null embeddings ---
-        # z_int is identically zero in R29; nothing to drop.
         # stage1_coarse is treated as a deterministic Stage-1 output and is
         # never CFG-dropped (it must always reach the denoiser at inference).
         obj_traj_eff = self._broadcast_drop(cond_drop_mask, obj_traj, self.null_obj_traj)
@@ -701,7 +650,6 @@ class AnchorDenoiser(nn.Module):
             stage1_coarse_eff = cond["stage1_coarse"]
         h = self.v12_input_proj(
             x_t=x_t,
-            z_int=z_int,
             obj_traj=obj_traj_eff,
             stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)
@@ -900,12 +848,12 @@ class MotionAnchorDiff(nn.Module):
         sampler: str = "ddpm",
     ) -> Tensor:
         """Generate motion from conditioning."""
-        B = cond["z_int"].shape[0]
+        B = cond["object_world_traj"].shape[0]
         shape = (B, seq_length, self.cfg.denoiser.motion_dim)
         if self.diffusion.objective == "rectified_flow" or sampler.startswith("rectified_flow"):
             return self.diffusion.rf_sample_loop(
                 self.denoiser, shape, cond, cfg_scale=cfg_scale,
-                device=cond["z_int"].device,
+                device=cond["object_world_traj"].device,
                 sampler_type=sampler if sampler.startswith("rectified_flow") else None,
             )
         return self.diffusion.p_sample_loop(

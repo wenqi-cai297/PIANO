@@ -1,8 +1,9 @@
 """Stage B (new): Train PIANO-AnchorDiff.
 
 Anchor-conditioned continuous motion diffusion. Replaces the closed
-MoMask Stage B track. Trained with GT ``z_int`` + classifier-free
-guidance dropout; inference uses Stage A v10 predicted ``z_int``.
+Stage B track trained with classifier-free guidance dropout. Operates on
+HumanML3D motion_135 with object-trajectory + object-pc + text + init_pose
++ Stage-1 Coarse-v1 + Round-29 typed C/I/S/B conditioning.
 
 Design source of truth:
     analyses/2026-05-08_piano_anchordiff_design.md
@@ -43,7 +44,6 @@ from piano.models.motion_anchordiff import (
     AnchorDiffConfig,
     DiffusionConfig,
     MotionAnchorDiff,
-    ZIntDims,
 )
 from piano.models.object_encoder import ObjectEncoder
 from piano.training.anchor_consistency_loss import (
@@ -193,7 +193,6 @@ def build_anchordiff_step_fn(
     object_encoder: ObjectEncoder,
     clip_model: torch.nn.Module | None,
     anchor_cfg: AnchorConsistencyConfig,
-    z_dims: ZIntDims,
     device: torch.device,
     motion_representation: str = "smpl_pose_135_plan",
     world_joint_velocity_weight: float = 0.0,
@@ -335,11 +334,6 @@ def build_anchordiff_step_fn(
         seq_idx = torch.arange(T, device=device).unsqueeze(0)
         seq_mask = (seq_idx < seq_len.unsqueeze(1)).float()        # (B, T)
 
-        # R29 cleanup: z_int is pre-allocated zero; the projection in the
-        # denoiser's V12InputProjection is still present (kept zero-init for
-        # ckpt compat) but consumes a fixed zero tensor.
-        z_int = torch.zeros(B, T, z_dims.total, device=device, dtype=motion.dtype)
-
         # --- Object trajectory channel. v1-v4a use object pose only
         # (3 COM + 6 rot6d). v4b appends the five body-part anchor targets
         # already transformed into world frame (5 * 3), so Stage A's
@@ -381,7 +375,6 @@ def build_anchordiff_step_fn(
             object_traj[..., 9:] = 0.0
 
         cond = {
-            "z_int": z_int,
             "object_world_traj": object_traj,
             "object_tokens": obj_tokens,
         }
@@ -1133,9 +1126,6 @@ def build_anchordiff_step_fn(
                 out["v12_input_proj_norm_motion"] = (
                     denoiser.v12_input_proj.motion_proj.weight.norm().detach()
                 )
-                out["v12_input_proj_norm_zint"] = (
-                    denoiser.v12_input_proj.zint_proj.weight.norm().detach()
-                )
                 out["v12_input_proj_norm_obj"] = (
                     denoiser.v12_input_proj.obj_proj.weight.norm().detach()
                 )
@@ -1286,14 +1276,8 @@ def main() -> None:
         )
 
     # --- Build model ---
-    z_dims = ZIntDims(
-        num_parts=int(cfg.model.z_int.num_parts),
-        phase_classes=int(cfg.model.z_int.phase_classes),
-        support_classes=int(cfg.model.z_int.support_classes),
-    )
     denoiser_cfg = AnchorDenoiserConfig(
         motion_dim=int(cfg.model.denoiser.motion_dim),
-        z_int=z_dims,
         object_traj_dim=int(cfg.model.denoiser.object_traj_dim),
         init_pose_dim=int(cfg.model.denoiser.init_pose_dim),
         text_dim=int(cfg.model.denoiser.text_dim),
@@ -1556,7 +1540,6 @@ def main() -> None:
     accelerator.print(
         "[StageB condition mode]\n"
         f"  object_traj_dim: {int(cfg.model.denoiser.object_traj_dim)}\n"
-        f"  z_int channels: forced to zero (Round-28 PLAN-only mode)\n"
         f"  dense contact-target portion of object_traj: forced to zero\n"
         f"  dense FK L_pos enabled: {_fk_pos_enabled}\n"
         f"  active-part endpoint losses: "
@@ -1584,7 +1567,6 @@ def main() -> None:
         object_encoder=object_encoder,
         clip_model=clip_model,
         anchor_cfg=anchor_cfg,
-        z_dims=z_dims,
         device=device,
         motion_representation=motion_representation,
         world_joint_velocity_weight=world_joint_velocity_weight,

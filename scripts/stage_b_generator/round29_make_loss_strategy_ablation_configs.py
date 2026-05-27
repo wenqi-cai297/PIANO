@@ -263,10 +263,6 @@ model:
     num_steps: 1000
     schedule: "cosine"
     prediction_target: "x0"
-  z_int:
-    num_parts: 5
-    phase_classes: 3
-    support_classes: 3
   denoiser:
     motion_dim: 135
     object_traj_dim: 9

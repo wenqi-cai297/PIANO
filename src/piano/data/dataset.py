@@ -443,9 +443,9 @@ class HOIDataset(Dataset):
         # v8 Rule C: zero hand contact when support==sitting + pelvis
         # has stable contact (sofa-sit incidental armrest contact that
         # would otherwise flicker as hands raise/lower). Applied to
-        # contact_state before any downstream use (z_int packing,
-        # anchor loss). Identical logic to keyframe_extraction so
-        # offline keyframes and online conditioning stay consistent.
+        # contact_state before any downstream use (anchor loss).
+        # Identical logic to keyframe_extraction so offline keyframes
+        # and online conditioning stay consistent.
         if (
             labels.get("contact_state") is not None
             and labels.get("support") is not None
@@ -1055,7 +1055,7 @@ class HOIDataset(Dataset):
         and the world-frame object pose. This is required for Stage B
         because the trainer feeds ``motion_263`` to the VQ encoder; if
         only joints/labels were mirrored the encoder would receive the
-        original-handedness tokens contradicting the mirrored z_int.
+        original-handedness tokens contradicting the mirrored motion.
         Caller must invoke this BEFORE
         :meth:`_compute_canonical_object_pose` so the canonical-frame
         pose derives from frame-0 of the (possibly mirrored) body.
