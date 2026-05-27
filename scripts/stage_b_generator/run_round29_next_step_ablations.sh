@@ -59,6 +59,10 @@ SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
 R0_REF_VARIANT="r29_ft_r0_clean_a3_baseline"
 B1_REF_VARIANT="r29_nb_b1_c41_only"
 G1_REF_VARIANT="r29_nb_g1_phasefree_gait_fixed"
+# G1 reference config + ckpt — required to generate the G1 soft-stance
+# reference diag that the summarizer needs as the gait anchor for A0/A1/A2.
+G1_REF_CFG="configs/training/anchordiff_${G1_REF_VARIANT}.yaml"
+G1_REF_CKPT="runs/training/stageB_anchordiff_${G1_REF_VARIANT}/${DIAG_CKPT_NAME}"
 # Invalid old H1 — must NOT be used as a valid contact-content reference.
 OLD_H1_VARIANT="r29_nb_h1_r0_plus_oracle_full_hint"
 
@@ -141,16 +145,69 @@ fi
 echo "[NS] Train variants to process:"
 echo "${VARIANTS}"
 
-# (3) Preflight.
-if [[ ${DRY_RUN} -eq 0 ]]; then
-    preflight_fail=0
-    while IFS=' ' read -r VID CFG OUTDIR; do
-        [[ -z "${VID}" ]] && continue
-        if [[ ! -e "${CFG}" ]]; then
-            echo "    [${VID}] missing config: ${CFG}"
+# (3) Preflight — split into "always run" and "not-dry-run only" checks.
+# Per Codex review (2026-05-28 fix prompt §4): dry-run must catch missing
+# launch prerequisites before the user starts a long tmux job.
+preflight_fail=0
+
+# --- Always-run checks (in dry-run too) ---
+# Train configs exist + no dead oracle_hint fields anywhere.
+while IFS=' ' read -r VID CFG OUTDIR; do
+    [[ -z "${VID}" ]] && continue
+    if [[ ! -e "${CFG}" ]]; then
+        echo "[NS PREFLIGHT FAIL] [${VID}] missing config: ${CFG}"
+        preflight_fail=1
+    elif grep -q "oracle_hint" "${CFG}" 2>/dev/null; then
+        echo "[NS PREFLIGHT FAIL] [${VID}] config contains dead oracle_hint fields: ${CFG}"
+        preflight_fail=1
+    fi
+done <<< "${VARIANTS}"
+
+# Selection JSONs + reference diag dirs + G1 ref config — required by the
+# diag phase and the summarizer; check in dry-run too so a doomed launch
+# is caught before the user starts a long tmux job.
+if [[ ${SKIP_EVAL} -eq 0 ]]; then
+    for sel in "${SELECTION_TRAIN}" "${SELECTION_VAL}"; do
+        if [[ ! -e "${sel}" ]]; then
+            echo "[NS PREFLIGHT FAIL] missing diag selection JSON: ${sel}"
             preflight_fail=1
         fi
-        if [[ ${SKIP_TRAIN} -eq 0 && -e "${CFG}" ]]; then
+    done
+    # Reference diag dirs for R0/B1/G1 (standard 6 dirs each = 3 kinds × 2 buckets).
+    REF_COUNT=0
+    for ref_vid in "${R0_REF_VARIANT}" "${B1_REF_VARIANT}" "${G1_REF_VARIANT}"; do
+        REF_DIRS="$(ls -d analyses/round29_${ref_vid}_diag_sustained_contact_train analyses/round29_${ref_vid}_diag_sustained_contact_val analyses/round29_${ref_vid}_diag_gait_train analyses/round29_${ref_vid}_diag_gait_val analyses/round29_${ref_vid}_diag_body_action_train analyses/round29_${ref_vid}_diag_body_action_val 2>/dev/null | wc -l)"
+        if [[ "${REF_DIRS}" -lt 6 ]]; then
+            echo "[NS PREFLIGHT FAIL] missing standard reference diag dirs for ${ref_vid} (need 6 {sustained_contact,gait,body_action} × {train,val}, found ${REF_DIRS})"
+            echo "    -> generate via the matching matrix's launcher with --only ${ref_vid} --skip-train"
+            preflight_fail=1
+        else
+            REF_COUNT=$((REF_COUNT + REF_DIRS))
+        fi
+    done
+    # G1 reference config required because we queue a G1 soft-stance diag
+    # against it (so the summarizer's G1 soft-stance row is non-empty).
+    if [[ ! -e "${G1_REF_CFG}" ]]; then
+        echo "[NS PREFLIGHT FAIL] G1 reference config missing: ${G1_REF_CFG}"
+        echo "    -> regenerate via the previous matrix:"
+        echo "       python scripts/stage_b_generator/round29_make_next_ablation_configs.py"
+        preflight_fail=1
+    fi
+    # Sanity: invalid old H1 — allowed on disk, just warn.
+    OLD_H1_DIRS="$(ls -d analyses/round29_${OLD_H1_VARIANT}_diag_* 2>/dev/null | wc -l)"
+    if [[ "${OLD_H1_DIRS}" -gt 0 ]]; then
+        echo "[NS] note: ${OLD_H1_DIRS} old H1 diag dirs present; summarizer will mark them INVALID (never used as decision reference)."
+    fi
+    echo "[NS] standard reference diag dirs total: ${REF_COUNT}"
+fi
+
+# --- Not-dry-run-only checks ---
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    # Dataset roots only matter if we will train.
+    if [[ ${SKIP_TRAIN} -eq 0 ]]; then
+        while IFS=' ' read -r VID CFG OUTDIR; do
+            [[ -z "${VID}" ]] && continue
+            [[ ! -e "${CFG}" ]] && continue
             BAD="$("${PY}" -c "
 import sys, yaml
 from pathlib import Path
@@ -162,50 +219,37 @@ for ds in (cfg.get('data', {}).get('datasets') or []):
 " "${CFG}")"
             if [[ -n "${BAD}" ]]; then
                 while IFS= read -r br; do
-                    echo "    [${VID}] dataset root not on disk: ${br}"
+                    echo "[NS PREFLIGHT FAIL] [${VID}] dataset root not on disk: ${br}"
                 done <<< "${BAD}"
                 echo "    [${VID}]   -> re-run generator with --data-root <correct path> or export DATASETS_ROOT=..."
                 preflight_fail=1
             fi
-        fi
-        # Guard: generated YAML must not contain dead oracle-hint fields.
-        if grep -q "oracle_hint" "${CFG}" 2>/dev/null; then
-            echo "    [${VID}] FATAL: config contains dead oracle_hint fields"
+        done <<< "${VARIANTS}"
+    fi
+    # G1 reference ckpt — needed because we queue the G1 soft-stance diag
+    # against it. WARN under ALLOW_PARTIAL=1, FATAL otherwise.
+    if [[ ${SKIP_EVAL} -eq 0 && ! -e "${G1_REF_CKPT}" ]]; then
+        if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+            echo "[NS PREFLIGHT WARN] G1 reference ckpt missing (ALLOW_PARTIAL=1): ${G1_REF_CKPT}"
+        else
+            echo "[NS PREFLIGHT FAIL] G1 reference ckpt missing: ${G1_REF_CKPT}"
+            echo "    -> server should already have it from the previous matrix; if not,"
+            echo "       regenerate via:"
+            echo "       bash scripts/stage_b_generator/run_round29_next_ablations.sh --only ${G1_REF_VARIANT}"
             preflight_fail=1
         fi
-    done <<< "${VARIANTS}"
-    if [[ ${SKIP_EVAL} -eq 0 ]]; then
-        for sel in "${SELECTION_TRAIN}" "${SELECTION_VAL}"; do
-            if [[ ! -e "${sel}" ]]; then
-                echo "    missing diag selection JSON: ${sel}"
-                preflight_fail=1
-            fi
-        done
-        # Reference diag dirs for R0/B1/G1 (required by summarizer).
-        REF_COUNT=0
-        for ref_vid in "${R0_REF_VARIANT}" "${B1_REF_VARIANT}" "${G1_REF_VARIANT}"; do
-            REF_DIRS="$(ls -d analyses/round29_${ref_vid}_diag_* 2>/dev/null | wc -l)"
-            if [[ "${REF_DIRS}" -lt 6 ]]; then
-                echo "    missing reference diag dirs for ${ref_vid} (need 6, found ${REF_DIRS})"
-                echo "    -> generate via the matching matrix's launcher with --only ${ref_vid} --skip-train"
-                preflight_fail=1
-            else
-                REF_COUNT=$((REF_COUNT + REF_DIRS))
-            fi
-        done
-        # Sanity: the invalid old H1 should NOT be on disk as if it were a valid ref.
-        # We do not error if it exists (it's allowed for historical browsing),
-        # but warn that the summarizer will mark it invalid_for_decision.
-        OLD_H1_DIRS="$(ls -d analyses/round29_${OLD_H1_VARIANT}_diag_* 2>/dev/null | wc -l)"
-        if [[ "${OLD_H1_DIRS}" -gt 0 ]]; then
-            echo "[NS] note: ${OLD_H1_DIRS} old H1 diag dirs present; summarizer will mark them INVALID."
-        fi
-        echo "[NS] reference diag dirs total: ${REF_COUNT}"
     fi
-    if [[ ${preflight_fail} -ne 0 ]]; then
-        echo "[NS] FATAL preflight failures."
-        exit 1
+else
+    # Dry-run: print informational WARN if G1 ckpt is missing but don't fail.
+    if [[ ${SKIP_EVAL} -eq 0 && ! -e "${G1_REF_CKPT}" ]]; then
+        echo "[NS PREFLIGHT WARN] G1 reference ckpt missing (dry-run): ${G1_REF_CKPT}"
+        echo "    (a real launch would FATAL unless ALLOW_PARTIAL=1)"
     fi
+fi
+
+if [[ ${preflight_fail} -ne 0 ]]; then
+    echo "[NS] FATAL preflight failures."
+    exit 1
 fi
 
 # (4) PHASE 1: TRAIN sequentially.
@@ -334,6 +378,44 @@ else
             fi
         done
     done <<< "${TRAINED_OK}"
+
+    # G1 reference soft-stance — required by summarizer as the gait anchor
+    # for A0/A1/A2. We use the existing G1 ref config + ckpt (NOT retraining).
+    # Skip if (a) ALLOW_PARTIAL=1 AND ckpt missing, or (b) the diag stats
+    # already exist on disk. Otherwise queue both buckets.
+    if [[ -e "${G1_REF_CFG}" ]]; then
+        G1_REF_CKPT_AVAIL=1
+        if [[ ! -e "${G1_REF_CKPT}" && ${DRY_RUN} -eq 0 ]]; then
+            if [[ "${ALLOW_PARTIAL}" == "1" ]]; then
+                echo "[NS] WARN: G1 reference ckpt missing (ALLOW_PARTIAL=1); skipping G1 soft-stance diag"
+                G1_REF_CKPT_AVAIL=0
+            else
+                echo "[NS] FATAL: G1 reference ckpt missing: ${G1_REF_CKPT}"
+                exit 1
+            fi
+        fi
+        if [[ ${G1_REF_CKPT_AVAIL} -eq 1 ]]; then
+            for sublabel in train val; do
+                case "${sublabel}" in
+                    train) SUBSET_PATH="${SELECTION_TRAIN}" ;;
+                    val)   SUBSET_PATH="${SELECTION_VAL}" ;;
+                esac
+                OUT_DIR="analyses/round29_${G1_REF_VARIANT}_diag_g1_soft_stance_${sublabel}"
+                # Skip if stats already exist on disk — we don't have to
+                # rerun a 48-clip diag against the same ckpt.
+                if [[ -e "${OUT_DIR}/g1_soft_stance_stats.json" && ${DRY_RUN} -eq 0 ]]; then
+                    echo "[NS] G1 ref soft-stance ${sublabel}: stats exist, reusing"
+                    continue
+                fi
+                mkdir -p "${OUT_DIR}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "${G1_REF_VARIANT}" "g1_soft_stance_${sublabel}" \
+                    "scripts/stage_b_generator/round29_g1_soft_stance_diag.py" \
+                    "${G1_REF_CFG}" "${G1_REF_CKPT}" "${SUBSET_PATH}" "${sublabel}" \
+                    >> "${TASK_QUEUE}"
+            done
+        fi
+    fi
 
     # Motion-repr floor (no ckpt). One task per bucket.
     if [[ -n "${REPR_FLOOR_CFG}" ]]; then

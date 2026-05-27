@@ -434,16 +434,38 @@ def _gather(
 
 
 def _missing_required_stats(
-    rows: dict, *, allow_partial: bool,
+    rows: dict, raw: dict, g1_soft: dict, repr_floor: dict,
 ) -> list[str]:
-    """Check that all required REFERENCE stats + all NEW-variant stats are
-    present. Fail loudly otherwise unless allow_partial."""
+    """Check that ALL decision-critical stats are present.
+
+    Per Codex 2026-05-28 fix prompt §2, the summarizer must fail by default
+    if any of the following are missing or invalid:
+
+      (1) Standard stats (sustained_contact / gait / body_action) for R0,
+          B1, G1, A0, A1, H1, A2 on train + val buckets.
+      (2) Representation floor stats for train + val, each with an
+          `interpretation.verdict`.
+      (3) G1 soft-stance for the G1 reference and for A0/A1/A2 on train +
+          val, each with `soft_aggregate.n_segments > 0` and all required
+          fields.
+      (4) Paired bootstrap: every required comparison in
+          `PAIRED_COMPARISONS` has `n_paired > 0` for both sustained-
+          contact drift and gait (L_R_height_corr + frac_both_swing).
+
+    Returns a list of human-readable missing-slot identifiers. Empty list
+    means everything is present.
+    """
     missing: list[str] = []
+
+    # --- (1) Standard stats for references + new variants.
     for v in REFERENCE_VARIANTS:
         for sub in SUBLABELS:
             for kind in KINDS:
-                if rows.get(v, {}).get(sub, {}).get(kind, {}).get("n_segments" if kind == "sustained_contact" else "n_walking_segments" if kind == "gait" else "delta_err_cm_mean_overall") is None:
-                    missing.append(f"{v}/{kind}_{sub}")
+                key = ("n_segments" if kind == "sustained_contact"
+                       else "n_walking_segments" if kind == "gait"
+                       else "delta_err_cm_mean_overall")
+                if rows.get(v, {}).get(sub, {}).get(kind, {}).get(key) is None:
+                    missing.append(f"standard:{v}/{kind}_{sub}")
     for v in NEW_VARIANTS:
         for sub in SUBLABELS:
             for kind in KINDS:
@@ -452,7 +474,78 @@ def _missing_required_stats(
                        else "n_walking_segments" if kind == "gait"
                        else "delta_err_cm_mean_overall")
                 if slot.get(key) is None:
-                    missing.append(f"{v}/{kind}_{sub}")
+                    missing.append(f"standard:{v}/{kind}_{sub}")
+
+    # --- (2) Representation floor stats, each with interpretation.verdict.
+    for sub in SUBLABELS:
+        floor = repr_floor.get(sub)
+        if floor is None:
+            missing.append(f"repr_floor:{sub} (missing stats JSON)")
+            continue
+        verdict = (floor.get("interpretation") or {}).get("verdict")
+        if not verdict:
+            missing.append(f"repr_floor:{sub} (missing interpretation.verdict)")
+
+    # --- (3) G1 soft-stance for G1 ref + A0/A1/A2 (variants with G1 losses).
+    g1_required_variants = (
+        "r29_nb_g1_phasefree_gait_fixed",   # G1 ref
+        "r29_ns_a0_c41_g1_loss_s4",
+        "r29_ns_a1_c41_s4_g1",
+        "r29_ns_a2_c41_i5_g1",
+    )
+    g1_required_fields = (
+        "constant_mid_rate", "soft_alt_std",
+        "soft_transition_density", "gt_transition_density",
+        "low_alt_amplitude_rate", "low_transition_rate",
+    )
+    for v in g1_required_variants:
+        for sub in SUBLABELS:
+            stats = (g1_soft.get(v, {}) or {}).get(sub)
+            if stats is None:
+                missing.append(f"g1_soft:{v}/{sub} (missing stats JSON)")
+                continue
+            agg = stats.get("soft_aggregate") or {}
+            n_seg = agg.get("n_segments", 0)
+            if not n_seg or int(n_seg) <= 0:
+                missing.append(f"g1_soft:{v}/{sub} (soft_aggregate.n_segments=0)")
+                continue
+            for fld in g1_required_fields:
+                if fld not in agg or agg[fld] is None:
+                    missing.append(f"g1_soft:{v}/{sub} (missing field {fld})")
+                    break
+
+    # --- (4) Paired bootstrap matching for every required comparison.
+    for variant, ref, label in PAIRED_COMPARISONS:
+        # Sustained-contact drift.
+        sc_deltas = _paired_drift_delta(
+            raw.get(variant, {}).get("sustained_contact_val"),
+            raw.get(ref, {}).get("sustained_contact_val"),
+        )
+        if not sc_deltas:
+            missing.append(
+                f"paired_bootstrap:{label}/sustained_contact (n_paired=0)"
+            )
+        # Gait L_R_height_corr.
+        gait_lr_deltas = _paired_gait_delta(
+            raw.get(variant, {}).get("gait_val"),
+            raw.get(ref, {}).get("gait_val"),
+            "L_R_height_corr",
+        )
+        if not gait_lr_deltas:
+            missing.append(
+                f"paired_bootstrap:{label}/gait_L_R_corr (n_paired=0)"
+            )
+        # Gait frac_both_swing.
+        gait_bs_deltas = _paired_gait_delta(
+            raw.get(variant, {}).get("gait_val"),
+            raw.get(ref, {}).get("gait_val"),
+            "frac_both_swing",
+        )
+        if not gait_bs_deltas:
+            missing.append(
+                f"paired_bootstrap:{label}/gait_both_swing (n_paired=0)"
+            )
+
     return missing
 
 
@@ -709,6 +802,148 @@ def _render_invalid_h1_warning(a: Any, results_root: Path) -> None:
     a("")
 
 
+def _gait_health_status(
+    variant: str,
+    rows: dict,
+    g1_soft: dict,
+    bucket: str = "val",
+) -> dict[str, Any]:
+    """Per Codex 2026-05-28 fix prompt §3: combine soft (G1 diag) and hard
+    (round26 gait diag) gates into a single health verdict per variant.
+
+    Returns dict with keys:
+      - hard_status: "healthy" | "degenerate"
+      - soft_status: "healthy" | "degenerate" | "missing"
+      - hard_reasons: list[str] of failing gates (empty if healthy)
+      - soft_reasons: list[str]
+      - overall_status: "healthy" | "degenerate" | "missing"
+    """
+    out: dict[str, Any] = {
+        "hard_status": "healthy", "soft_status": "missing",
+        "hard_reasons": [], "soft_reasons": [],
+        "overall_status": "missing",
+    }
+    # Hard gait gates from the gait_stats.json aggregate.
+    gait = rows.get(variant, {}).get(bucket, {}).get("gait", {})
+    fbs = gait.get("frac_both_swing")
+    fbst = gait.get("frac_both_stance")
+    tps = gait.get("transitions_per_sec")
+    hard_reasons: list[str] = []
+    try:
+        if fbs is not None and float(fbs) > DEGEN_FRAC_BOTH_SWING_MAX:
+            hard_reasons.append(
+                f"frac_both_swing={float(fbs):.3f} > {DEGEN_FRAC_BOTH_SWING_MAX}"
+            )
+    except (TypeError, ValueError):
+        pass
+    try:
+        if fbst is not None and float(fbst) < DEGEN_FRAC_BOTH_STANCE_MIN:
+            hard_reasons.append(
+                f"frac_both_stance={float(fbst):.3f} < {DEGEN_FRAC_BOTH_STANCE_MIN}"
+            )
+    except (TypeError, ValueError):
+        pass
+    try:
+        if tps is not None and float(tps) < DEGEN_TRANS_PER_SEC_MIN:
+            hard_reasons.append(
+                f"transitions_per_sec={float(tps):.3f} < {DEGEN_TRANS_PER_SEC_MIN}"
+            )
+    except (TypeError, ValueError):
+        pass
+    out["hard_reasons"] = hard_reasons
+    out["hard_status"] = "degenerate" if hard_reasons else "healthy"
+
+    # Soft G1 gates from the G1 soft-stance diag.
+    soft = (g1_soft.get(variant, {}) or {}).get(bucket)
+    if soft:
+        agg = soft.get("soft_aggregate") or {}
+        soft_reasons: list[str] = []
+        cmid = agg.get("constant_mid_rate")
+        alt_std = agg.get("soft_alt_std")
+        low_alt = agg.get("low_alt_amplitude_rate")
+        low_trans = agg.get("low_transition_rate")
+        try:
+            if cmid is not None and float(cmid) > 0.40:
+                soft_reasons.append(f"constant_mid_rate={float(cmid):.3f} > 0.40")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if alt_std is not None and float(alt_std) < 0.15:
+                soft_reasons.append(f"soft_alt_std={float(alt_std):.3f} < 0.15")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if low_alt is not None and float(low_alt) > 0.50:
+                soft_reasons.append(
+                    f"low_alt_amplitude_rate={float(low_alt):.3f} > 0.50"
+                )
+        except (TypeError, ValueError):
+            pass
+        try:
+            if low_trans is not None and float(low_trans) > 0.50:
+                soft_reasons.append(
+                    f"low_transition_rate={float(low_trans):.3f} > 0.50"
+                )
+        except (TypeError, ValueError):
+            pass
+        out["soft_reasons"] = soft_reasons
+        out["soft_status"] = "degenerate" if soft_reasons else "healthy"
+    # Overall: any degenerate → degenerate; missing soft + healthy hard → missing.
+    if out["hard_status"] == "degenerate" or out["soft_status"] == "degenerate":
+        out["overall_status"] = "degenerate"
+    elif out["soft_status"] == "missing":
+        out["overall_status"] = "missing"
+    else:
+        out["overall_status"] = "healthy"
+    return out
+
+
+def _render_gait_health_table(
+    a: Any, rows: dict, g1_soft: dict,
+) -> None:
+    """Emit a compact hard+soft gait-health table for G1 + A0/A1/A2."""
+    a("## Gait health gates (val)")
+    a("")
+    a("Hard gates from `gait_stats.json` aggregate; soft gates from G1 "
+      "soft-stance diag. Per Codex fix prompt §3, a variant is `healthy` "
+      "only if BOTH the hard and soft gates pass. Status `missing` means "
+      "the soft-stance diag has no stats — promotion cannot be decided.")
+    a("")
+    a("Hard gates (any failure → degenerate): "
+      "`frac_both_swing ≤ 0.70`, "
+      "`frac_both_stance ≥ 0.02`, "
+      "`transitions_per_sec ≥ 0.40`.")
+    a("")
+    a("Soft gates (any failure → degenerate): "
+      "`constant_mid_rate ≤ 0.40`, "
+      "`soft_alt_std ≥ 0.15`, "
+      "`low_alt_amplitude_rate ≤ 0.50`, "
+      "`low_transition_rate ≤ 0.50`.")
+    a("")
+    a("| variant | hard | soft | overall | reasons |")
+    a("| --- | :---: | :---: | :---: | --- |")
+    for v in (
+        "r29_nb_g1_phasefree_gait_fixed",
+        "r29_ns_a0_c41_g1_loss_s4",
+        "r29_ns_a1_c41_s4_g1",
+        "r29_ns_a2_c41_i5_g1",
+    ):
+        h = _gait_health_status(v, rows, g1_soft, bucket="val")
+        reasons = h["hard_reasons"] + h["soft_reasons"]
+        reasons_str = "; ".join(reasons) if reasons else "—"
+        emoji = {
+            "healthy": "✓", "degenerate": "⚠️", "missing": "—",
+        }
+        a(
+            f"| `{v}` | "
+            f"{emoji[h['hard_status']]} {h['hard_status']} | "
+            f"{emoji[h['soft_status']]} {h['soft_status']} | "
+            f"**{emoji[h['overall_status']]} {h['overall_status']}** | "
+            f"{reasons_str} |"
+        )
+    a("")
+
+
 def _render_decision_text(
     a: Any, rows: dict, g1_soft: dict, repr_floor: dict, raw: dict,
 ) -> None:
@@ -722,11 +957,22 @@ def _render_decision_text(
         except (TypeError, ValueError):
             return None
 
+    # Compute health statuses up front for all G1-loss variants.
+    health = {
+        v: _gait_health_status(v, rows, g1_soft, bucket="val")
+        for v in (
+            "r29_nb_g1_phasefree_gait_fixed",
+            "r29_ns_a0_c41_g1_loss_s4",
+            "r29_ns_a1_c41_s4_g1",
+            "r29_ns_a2_c41_i5_g1",
+        )
+    }
+
     # A0 verdict.
     a("### A0 (`r29_ns_a0_c41_g1_loss_s4`) mainline verdict")
     a("")
-    a("Promote A0 iff: contact/body near B1, gait near G1, and soft-stance "
-      "diagnostic is healthy (no constant-mid / low-alt-amplitude).")
+    a("Promote A0 ONLY IF: contact/body near B1, gait near G1, AND both "
+      "hard+soft gait health gates pass (see §Gait health gates).")
     a("")
     a0_drift = _val("r29_ns_a0_c41_g1_loss_s4", "sustained_contact", "drift_max_mean_cm")
     b1_drift = _val("r29_nb_b1_c41_only", "sustained_contact", "drift_max_mean_cm")
@@ -734,34 +980,68 @@ def _render_decision_text(
     g1_lr = _val("r29_nb_g1_phasefree_gait_fixed", "gait", "L_R_height_corr")
     a0_body = _val("r29_ns_a0_c41_g1_loss_s4", "body_action", "delta_err_cm_mean_overall")
     b1_body = _val("r29_nb_b1_c41_only", "body_action", "delta_err_cm_mean_overall")
-    a0_soft = (g1_soft.get("r29_ns_a0_c41_g1_loss_s4", {}) or {}).get("val")
-    a0_cmid = (a0_soft.get("soft_aggregate", {}).get("constant_mid_rate")
-               if a0_soft else None)
-    a0_alt_std = (a0_soft.get("soft_aggregate", {}).get("soft_alt_std")
-                  if a0_soft else None)
     a(f"- A0 val drift {_fmt(a0_drift, 2)} vs B1 {_fmt(b1_drift, 2)} cm")
     a(f"- A0 val L_R_corr {_fmt(a0_lr, 3)} vs G1 {_fmt(g1_lr, 3)}")
     a(f"- A0 val body delta_err {_fmt(a0_body, 2)} vs B1 {_fmt(b1_body, 2)} cm")
-    if a0_cmid is not None:
-        soft_healthy = (
-            (a0_cmid < 0.40) and (a0_alt_std is None or a0_alt_std > 0.15)
-        )
-        a(f"- A0 soft-stance constant_mid_rate {_fmt(a0_cmid, 3)}, soft_alt_std "
-          f"{_fmt(a0_alt_std, 3)} → {'healthy' if soft_healthy else '⚠️ degenerate'}")
+    a0_h = health["r29_ns_a0_c41_g1_loss_s4"]
+    a(f"- A0 hard gait: **{a0_h['hard_status']}**"
+      + (f" ({'; '.join(a0_h['hard_reasons'])})" if a0_h['hard_reasons'] else ""))
+    a(f"- A0 soft gait: **{a0_h['soft_status']}**"
+      + (f" ({'; '.join(a0_h['soft_reasons'])})" if a0_h['soft_reasons'] else ""))
+    if a0_h["overall_status"] == "degenerate":
+        a("- ⚠️ **A0 cannot be promoted: gait degeneracy present** "
+          "(failing gates listed above).")
+    elif a0_h["overall_status"] == "missing":
+        a("- ⚠️ A0 soft-stance diag missing — promotion gated until soft "
+          "diag is generated.")
     else:
-        a("- A0 soft-stance diagnostic missing (cannot judge degeneracy)")
+        a("- ✓ A0 passes both hard and soft gait gates.")
     a("")
 
     # A1 verdict.
     a("### A1 (`r29_ns_a1_c41_s4_g1`) S4-as-condition verdict")
     a("")
-    a("If A1 >> A0 on gait without contact regression → Stage-1.5 should "
-      "output an explicit support condition. If A1 ≈ A0 → S4 stays loss-only.")
+    a("If A1 >> A0 on gait without contact regression AND A1 passes both "
+      "gait gates → Stage-1.5 should output an explicit support condition. "
+      "If A1 ≈ A0 → S4 stays loss-only.")
     a("")
     a1_drift = _val("r29_ns_a1_c41_s4_g1", "sustained_contact", "drift_max_mean_cm")
     a1_lr = _val("r29_ns_a1_c41_s4_g1", "gait", "L_R_height_corr")
     a(f"- A1 val drift {_fmt(a1_drift, 2)} vs A0 {_fmt(a0_drift, 2)} cm")
     a(f"- A1 val L_R_corr {_fmt(a1_lr, 3)} vs A0 {_fmt(a0_lr, 3)}")
+    a1_h = health["r29_ns_a1_c41_s4_g1"]
+    a(f"- A1 hard gait: **{a1_h['hard_status']}**"
+      + (f" ({'; '.join(a1_h['hard_reasons'])})" if a1_h['hard_reasons'] else ""))
+    a(f"- A1 soft gait: **{a1_h['soft_status']}**"
+      + (f" ({'; '.join(a1_h['soft_reasons'])})" if a1_h['soft_reasons'] else ""))
+    if a1_h["overall_status"] == "degenerate":
+        a("- ⚠️ **A1 cannot be promoted: gait degeneracy present.**")
+    elif a1_h["overall_status"] == "missing":
+        a("- ⚠️ A1 soft-stance diag missing.")
+    a("")
+
+    # A2 verdict.
+    a("### A2 (`r29_ns_a2_c41_i5_g1`) combined-mainline verdict")
+    a("")
+    a("Promote A2 ONLY IF: contact ≥ H1, gait passes both gates, and no "
+      "body regression vs A0/G1.")
+    a("")
+    a2_drift = _val("r29_ns_a2_c41_i5_g1", "sustained_contact", "drift_max_mean_cm")
+    h1_drift = _val("r29_ns_h1_i5_upper_bound", "sustained_contact", "drift_max_mean_cm")
+    a2_lr = _val("r29_ns_a2_c41_i5_g1", "gait", "L_R_height_corr")
+    a(f"- A2 val drift {_fmt(a2_drift, 2)} vs H1 {_fmt(h1_drift, 2)} cm")
+    a(f"- A2 val L_R_corr {_fmt(a2_lr, 3)} vs A0 {_fmt(a0_lr, 3)}")
+    a2_h = health["r29_ns_a2_c41_i5_g1"]
+    a(f"- A2 hard gait: **{a2_h['hard_status']}**"
+      + (f" ({'; '.join(a2_h['hard_reasons'])})" if a2_h['hard_reasons'] else ""))
+    a(f"- A2 soft gait: **{a2_h['soft_status']}**"
+      + (f" ({'; '.join(a2_h['soft_reasons'])})" if a2_h['soft_reasons'] else ""))
+    if a2_h["overall_status"] == "degenerate":
+        a("- ⚠️ **A2 cannot be promoted: gait degeneracy present.**")
+    elif a2_h["overall_status"] == "missing":
+        a("- ⚠️ A2 soft-stance diag missing.")
+    else:
+        a("- ✓ A2 passes both hard and soft gait gates.")
     a("")
 
     # H1 verdict.
@@ -773,7 +1053,6 @@ def _render_decision_text(
       "is on the critical path. Do NOT write 'contact bottleneck is not "
       "condition content' unless H1 actually does not improve.")
     a("")
-    h1_drift = _val("r29_ns_h1_i5_upper_bound", "sustained_contact", "drift_max_mean_cm")
     r0_drift = _val("r29_ft_r0_clean_a3_baseline", "sustained_contact", "drift_max_mean_cm")
     h1_lh = _val("r29_ns_h1_i5_upper_bound", "sustained_contact", "part_left_hand_drift_max_mean")
     r0_lh = _val("r29_ft_r0_clean_a3_baseline", "sustained_contact", "part_left_hand_drift_max_mean")
@@ -820,10 +1099,14 @@ def _render_report(
     a("- **A2** `r29_ns_a2_c41_i5_g1` — C41 + I5 + G1 losses")
     a("")
     if missing:
-        a("⚠️ **Partial report** — the following stats were missing:")
+        a("⚠️ **Partial report** — required stats are missing. "
+          "**This report is NOT launch-decision-grade**; treat sections "
+          "with placeholder dashes as unresolved. The missing slots are:")
         a("")
-        for m in missing:
+        for m in missing[:50]:
             a(f"- `{m}`")
+        if len(missing) > 50:
+            a(f"- ...and {len(missing) - 50} more (truncated)")
         a("")
 
     _render_invalid_h1_warning(a, results_root)
@@ -833,6 +1116,7 @@ def _render_report(
 
     _render_paired_bootstrap(a, raw)
     _render_g1_soft_table(a, g1_soft)
+    _render_gait_health_table(a, rows, g1_soft)
     _render_repr_floor(a, repr_floor)
     _render_decision_text(a, rows, g1_soft, repr_floor, raw)
 
@@ -863,7 +1147,7 @@ def main() -> int:
 
     results_root = Path(args.results_root)
     rows, raw, g1_soft, repr_floor = _gather(results_root)
-    missing = _missing_required_stats(rows, allow_partial=args.allow_partial)
+    missing = _missing_required_stats(rows, raw, g1_soft, repr_floor)
     if missing and not args.allow_partial:
         msg = (
             "FATAL: required diag stats are missing — cannot summarize.\n"

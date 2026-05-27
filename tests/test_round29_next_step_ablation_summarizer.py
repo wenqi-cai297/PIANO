@@ -365,6 +365,308 @@ def test_invalid_old_h1_marked_when_diag_present(tmp_path: Path) -> None:
     assert "r29_nb_h1_r0_plus_oracle_full_hint" not in paired_section
 
 
+def test_missing_repr_floor_fails_by_default(tmp_path: Path) -> None:
+    """Per Codex fix prompt §2: missing repr_floor stats must FATAL."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL,
+          drift_by_variant={v: 8.0 for v in ALL},
+          include_repr_floor=False)  # ← no repr-floor seeded
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0, "missing repr_floor must FATAL by default"
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "repr_floor" in err.lower() or "fatal" in err.lower()
+
+
+def test_missing_repr_floor_verdict_fails_by_default(tmp_path: Path) -> None:
+    """repr_floor stats present but interpretation.verdict missing → FATAL."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL},
+          include_repr_floor=False)
+    # Seed a broken repr_floor with no `interpretation.verdict`.
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_repr_floor_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        broken = {"aggregate": {"n_clips": 5, "per_joint": {}}}
+        (d / "repr_floor_stats.json").write_text(
+            json.dumps(broken), encoding="utf-8",
+        )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "interpretation.verdict" in err or "repr_floor" in err.lower()
+
+
+def test_missing_g1_soft_for_g1_ref_fails_by_default(tmp_path: Path) -> None:
+    """G1 reference g1_soft stats are required — missing must FATAL."""
+    out_md = tmp_path / "report.md"
+    # Seed everything BUT the G1 reference soft-stance.
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL},
+          include_g1_soft=False)
+    # Now seed G1 soft only for A0/A1/A2 (not for G1 ref).
+    for v in ("r29_ns_a0_c41_g1_loss_s4", "r29_ns_a1_c41_s4_g1",
+              "r29_ns_a2_c41_i5_g1"):
+        for sub in SUBLABELS:
+            d = tmp_path / f"round29_{v}_diag_g1_soft_stance_{sub}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "g1_soft_stance_stats.json").write_text(
+                json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+            )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0, "missing G1 ref soft-stance must FATAL"
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "r29_nb_g1_phasefree_gait_fixed" in err
+    assert "g1_soft" in err
+
+
+def test_missing_g1_soft_for_a0_fails_by_default(tmp_path: Path) -> None:
+    """A0/A1/A2 g1_soft stats are required — missing any must FATAL."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL},
+          include_g1_soft=False)
+    # Seed G1 ref and A1/A2 but NOT A0.
+    for v in ("r29_nb_g1_phasefree_gait_fixed",
+              "r29_ns_a1_c41_s4_g1", "r29_ns_a2_c41_i5_g1"):
+        for sub in SUBLABELS:
+            d = tmp_path / f"round29_{v}_diag_g1_soft_stance_{sub}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "g1_soft_stance_stats.json").write_text(
+                json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+            )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "r29_ns_a0_c41_g1_loss_s4" in err
+    assert "g1_soft" in err
+
+
+def test_g1_soft_with_zero_n_segments_fails_by_default(tmp_path: Path) -> None:
+    """g1_soft stats present but n_segments=0 must FATAL."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL},
+          include_g1_soft=False)
+    # Seed all g1_soft variants but with n_segments=0.
+    broken_soft = _make_g1_soft_stats()
+    broken_soft["soft_aggregate"]["n_segments"] = 0
+    for v in ("r29_nb_g1_phasefree_gait_fixed",
+              "r29_ns_a0_c41_g1_loss_s4", "r29_ns_a1_c41_s4_g1",
+              "r29_ns_a2_c41_i5_g1"):
+        for sub in SUBLABELS:
+            d = tmp_path / f"round29_{v}_diag_g1_soft_stance_{sub}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "g1_soft_stance_stats.json").write_text(
+                json.dumps(broken_soft), encoding="utf-8",
+            )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "n_segments=0" in err
+
+
+def test_zero_paired_bootstrap_matches_fails_by_default(tmp_path: Path) -> None:
+    """If sustained_contact rows have no overlapping segment IDs between
+    a variant and its reference, paired bootstrap n_paired=0 → must FATAL."""
+    out_md = tmp_path / "report.md"
+    # Seed everyone with disjoint seq_id ranges so no paired matches exist.
+    # Use seq_offset so A0's rows have seq_ids 0..7 and B1's have 100..107.
+    # Helper accepts seq_offset; reuse the existing seed function for refs,
+    # then overwrite the new variants with offset.
+    _seed(tmp_path, REFERENCES, drift_by_variant={v: 8.0 for v in REFERENCES})
+    for v in NEW_VARIANTS:
+        for sub in SUBLABELS:
+            for kind in ("sustained_contact", "gait", "body_action"):
+                out_dir = tmp_path / f"round29_{v}_diag_{kind}_{sub}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                if kind == "sustained_contact":
+                    # Use seq_offset=100 so no key overlaps with references.
+                    data = _make_sustained_stats(drift_max_mean=8.0, seq_offset=100)
+                elif kind == "gait":
+                    data = _make_gait_stats(seq_offset=100)
+                else:
+                    data = _make_body_action_stats()
+                (out_dir / f"{kind}_stats.json").write_text(
+                    json.dumps(data), encoding="utf-8",
+                )
+        for sub in SUBLABELS:
+            if v.startswith("r29_ns_a"):
+                d = tmp_path / f"round29_{v}_diag_g1_soft_stance_{sub}"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "g1_soft_stance_stats.json").write_text(
+                    json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+                )
+    # Need repr_floor too.
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_repr_floor_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "repr_floor_stats.json").write_text(
+            json.dumps(_make_repr_floor_stats()), encoding="utf-8",
+        )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode != 0
+    err = (res.stderr or "") + (res.stdout or "")
+    assert "paired_bootstrap" in err
+    assert "n_paired=0" in err
+
+
+def test_gait_health_table_marks_degenerate_when_hard_both_swing_high(tmp_path: Path) -> None:
+    """Per fix prompt §3: hard frac_both_swing>0.70 must mark gait degenerate
+    in the health table, even if soft metrics look healthy."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, REFERENCES, drift_by_variant={v: 8.0 for v in REFERENCES})
+    # A0 with both_swing 0.85 (> 0.70 threshold). Soft is healthy.
+    for sub in SUBLABELS:
+        # sustained + body normal.
+        for kind in ("sustained_contact", "body_action"):
+            out_dir = tmp_path / f"round29_r29_ns_a0_c41_g1_loss_s4_diag_{kind}_{sub}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            data = (_make_sustained_stats(drift_max_mean=8.0)
+                    if kind == "sustained_contact"
+                    else _make_body_action_stats())
+            (out_dir / f"{kind}_stats.json").write_text(
+                json.dumps(data), encoding="utf-8",
+            )
+        # Gait with degenerate both_swing.
+        out_dir = tmp_path / f"round29_r29_ns_a0_c41_g1_loss_s4_diag_gait_{sub}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "gait_stats.json").write_text(
+            json.dumps(_make_gait_stats(pred_swing=0.85)),
+            encoding="utf-8",
+        )
+        # Healthy G1 soft.
+        d = tmp_path / f"round29_r29_ns_a0_c41_g1_loss_s4_diag_g1_soft_stance_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "g1_soft_stance_stats.json").write_text(
+            json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+        )
+    # A1/A2/H1 all healthy too.
+    for v in ("r29_ns_a1_c41_s4_g1", "r29_ns_h1_i5_upper_bound",
+              "r29_ns_a2_c41_i5_g1"):
+        for sub in SUBLABELS:
+            for kind in ("sustained_contact", "gait", "body_action"):
+                out_dir = tmp_path / f"round29_{v}_diag_{kind}_{sub}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                if kind == "sustained_contact":
+                    data = _make_sustained_stats(drift_max_mean=8.0)
+                elif kind == "gait":
+                    data = _make_gait_stats()
+                else:
+                    data = _make_body_action_stats()
+                (out_dir / f"{kind}_stats.json").write_text(
+                    json.dumps(data), encoding="utf-8",
+                )
+            if v.startswith("r29_ns_a"):
+                d = tmp_path / f"round29_{v}_diag_g1_soft_stance_{sub}"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "g1_soft_stance_stats.json").write_text(
+                    json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+                )
+    # G1 ref soft.
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_r29_nb_g1_phasefree_gait_fixed_diag_g1_soft_stance_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "g1_soft_stance_stats.json").write_text(
+            json.dumps(_make_g1_soft_stats()), encoding="utf-8",
+        )
+    # repr_floor.
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_repr_floor_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "repr_floor_stats.json").write_text(
+            json.dumps(_make_repr_floor_stats()), encoding="utf-8",
+        )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode == 0, res.stderr
+    report = out_md.read_text(encoding="utf-8")
+    # Health table must surface the degenerate hard state.
+    assert "Gait health gates" in report
+    # A0 hard reason listed.
+    health_section = report.split("Gait health gates")[1].split(
+        "Motion representation"
+    )[0]
+    assert "r29_ns_a0_c41_g1_loss_s4" in health_section
+    assert "frac_both_swing=0.850 > 0.7" in health_section
+    # Decision text says cannot be promoted.
+    decision = report.split("## Decision verdict")[1]
+    a0_section = decision.split("A0 (`r29_ns_a0_c41_g1_loss_s4`)")[1].split(
+        "A1 (`r29_ns_a1_c41_s4_g1`)"
+    )[0]
+    assert "cannot be promoted" in a0_section
+
+
+def test_gait_health_table_marks_degenerate_when_soft_constant_mid(tmp_path: Path) -> None:
+    """Per fix prompt §3: high constant_mid_rate marks soft degenerate."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL})
+    # Overwrite A0's G1-soft with high constant_mid_rate.
+    bad_soft = _make_g1_soft_stats(constant_mid_rate=0.65)
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_r29_ns_a0_c41_g1_loss_s4_diag_g1_soft_stance_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "g1_soft_stance_stats.json").write_text(
+            json.dumps(bad_soft), encoding="utf-8",
+        )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode == 0, res.stderr
+    report = out_md.read_text(encoding="utf-8")
+    health_section = report.split("Gait health gates")[1].split(
+        "Motion representation"
+    )[0]
+    assert "constant_mid_rate=0.650 > 0.40" in health_section
+    decision = report.split("## Decision verdict")[1]
+    a0_section = decision.split("A0 (`r29_ns_a0_c41_g1_loss_s4`)")[1].split(
+        "A1 (`r29_ns_a1_c41_s4_g1`)"
+    )[0]
+    assert "cannot be promoted" in a0_section
+
+
+def test_gait_health_table_marks_degenerate_when_low_transition_high(tmp_path: Path) -> None:
+    """Per fix prompt §3: low_transition_rate > 0.50 marks soft degenerate."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL})
+    bad_soft = _make_g1_soft_stats()
+    bad_soft["soft_aggregate"]["low_transition_rate"] = 0.75
+    for sub in SUBLABELS:
+        d = tmp_path / f"round29_r29_ns_a1_c41_s4_g1_diag_g1_soft_stance_{sub}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "g1_soft_stance_stats.json").write_text(
+            json.dumps(bad_soft), encoding="utf-8",
+        )
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode == 0, res.stderr
+    report = out_md.read_text(encoding="utf-8")
+    health_section = report.split("Gait health gates")[1].split(
+        "Motion representation"
+    )[0]
+    # A1 row should be marked degenerate via low_transition_rate.
+    assert "low_transition_rate=0.750 > 0.50" in health_section
+
+
+def test_gait_health_table_marks_healthy_when_all_gates_pass(tmp_path: Path) -> None:
+    """All gates pass → overall status is healthy."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, ALL, drift_by_variant={v: 8.0 for v in ALL})
+    res = _run_summarizer(tmp_path, out_md, allow_partial=False)
+    assert res.returncode == 0, res.stderr
+    report = out_md.read_text(encoding="utf-8")
+    health_section = report.split("Gait health gates")[1].split(
+        "Motion representation"
+    )[0]
+    # G1 ref + A0 + A1 + A2 should all be marked overall healthy in the table.
+    # The "overall" column appears between hard and soft as **healthy**.
+    assert health_section.count("healthy") >= 4
+
+
+def test_allow_partial_includes_explicit_not_launch_grade_warning(tmp_path: Path) -> None:
+    """Per fix prompt §2: --allow-partial reports must clearly state they
+    are not launch-decision-grade."""
+    out_md = tmp_path / "report.md"
+    _seed(tmp_path, NEW_VARIANTS,
+          drift_by_variant={v: 8.0 for v in NEW_VARIANTS})
+    res = _run_summarizer(tmp_path, out_md, allow_partial=True)
+    assert res.returncode == 0, res.stderr
+    report = out_md.read_text(encoding="utf-8")
+    assert "NOT launch-decision-grade" in report
+
+
 def test_decision_text_references_correct_comparisons(tmp_path: Path) -> None:
     out_md = tmp_path / "report.md"
     _seed(tmp_path, ALL,
