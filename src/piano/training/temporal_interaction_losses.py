@@ -121,6 +121,33 @@ class TemporalInteractionLossConfig:
     """Minimum ankle-above-floor height (metres) for a swing foot.
     Frames where the ankle is below this contribute relu(clearance - h)^2."""
 
+    # Round-29 failure-targeted ablation R2 — behavior-level gait losses.
+    # Per analyses/2026-05-27_round29_failure_targeted_ablation_prompt_for_claude_code.md
+    # §R2: use S4 only for walking_mask + validity, NOT for GT left/right
+    # phase target. Respects multimodal left/right equivalence.
+    r29_gait_one_foot_support_weight: float = 0.0
+    r29_gait_pred_stance_velocity_weight: float = 0.0
+    r29_gait_ankle_smooth_weight: float = 0.0
+    r29_gait_antiphase_corr_weight: float = 0.0
+    r29_gait_antiphase_min_walking_frames: int = 10
+    """Sequences with fewer walking frames than this contribute zero to
+    the antiphase-correlation loss (avoids meaningless 2-frame correlations)."""
+
+    # Round-29 failure-targeted ablation R3 — exact S4 execution losses.
+    # Per prompt §R3: BCE against stage2_support[..., 0:2] (left/right
+    # stance) + SmoothL1 against stage2_support[..., 9:13] (footstep
+    # target local XZ). Mask by walking_mask + seq_mask.
+    r29_s4_stance_bce_weight: float = 0.0
+    r29_s4_footstep_target_weight: float = 0.0
+
+    # Round-29 failure-targeted ablation R4 / R5 — contact-lock losses.
+    # Per prompt §R4: keep strong baseline absolute stabilizers, add
+    # object-relative offset + segment-drift + tracking losses driven
+    # by the I3 (R4) or I5 (R5) interaction condition.
+    r29_contact_lock_offset_weight: float = 0.0
+    r29_contact_lock_segment_drift_weight: float = 0.0
+    r29_contact_lock_tracking_weight: float = 0.0
+
     # Round-29 interaction-consistency normalization clamp. Must match
     # the value used by ``piano.data.stage2_oracle_conditions.build_interaction_condition``
     # (clamp before normalization → values in [-1, 1]). Configured via
@@ -984,3 +1011,491 @@ def _root0_world_to_canonical_yaw_matrix(pred_joints: Tensor) -> Tensor:
         ],
         dim=-2,
     )
+
+
+# ===========================================================================
+# Round-29 failure-targeted ablation losses (R2 behavior gait, R3 exact S4,
+# R4/R5 contact-lock). Per
+# ``analyses/2026-05-27_round29_failure_targeted_ablation_prompt_for_claude_code.md``.
+# ===========================================================================
+
+
+def _pred_grounded_prob(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor estimate
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """Soft grounded probability per ankle from the sample-specific floor.
+
+    ``grounded = sigmoid((floor_y + threshold - ankle_y) / softness)`` —
+    matches the convention in ``loss_gait_both_airborne`` /
+    ``loss_r29_swing_clearance``. Returns ``(B, T, 2)`` where the last
+    dim is (left, right).
+    """
+    floor_y = _per_clip_floor_y(gt_joints, seq_mask, cfg.floor_quantile)    # (B,)
+    threshold = float(cfg.grounded_threshold_above_floor_m)
+    softness = float(cfg.grounded_softness_m)
+    l_y = pred_joints[..., LEFT_ANKLE_IDX, 1]                              # (B, T)
+    r_y = pred_joints[..., RIGHT_ANKLE_IDX, 1]
+    L_g = torch.sigmoid((floor_y.unsqueeze(-1) + threshold - l_y) / softness)
+    R_g = torch.sigmoid((floor_y.unsqueeze(-1) + threshold - r_y) / softness)
+    return torch.stack([L_g, R_g], dim=-1)                                  # (B, T, 2)
+
+
+# --------------------------------------------------------------------------- #
+# R2 — behavior-level gait losses (no GT phase target).
+# --------------------------------------------------------------------------- #
+
+
+def loss_r29_gait_one_foot_support(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R2 — penalise both-airborne and both-stance on walking frames
+    without choosing which foot is which.
+
+        loss = mean( walking * (L_g + R_g - 1)^2 )
+
+    L_g / R_g are predicted grounded probabilities (sigmoid of ankle-
+    above-floor). This rewards exactly one foot on the ground per frame,
+    which is the necessary condition for walking gait, but never picks
+    left-first vs right-first (multimodal-safe).
+    """
+    grounded = _pred_grounded_prob(
+        pred_joints, gt_joints, cfg, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                           # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+    diff = (grounded.sum(dim=-1) - 1.0).pow(2)                              # (B, T)
+    num = (walking * diff).sum()
+    den = walking.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_gait_pred_stance_velocity(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    fps: float = 20.0,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R2 — penalise horizontal velocity of whatever foot the model
+    chose to plant (soft, via ``pred_grounded_prob``). Discourages
+    sliding without copying GT stance assignment.
+
+        weight  = walking * pred_grounded_prob[..., k]           (B, T, 2)
+        v_lr    = horizontal ankle velocity                       (B, T, 2)
+        loss    = mean( weight * ||v||^2 )
+    """
+    grounded = _pred_grounded_prob(
+        pred_joints, gt_joints, cfg, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1).unsqueeze(-1)                             # (B, T, 1)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype).unsqueeze(-1)
+
+    l_xz = pred_joints[..., LEFT_ANKLE_IDX, :][..., [0, 2]]                 # (B, T, 2)
+    r_xz = pred_joints[..., RIGHT_ANKLE_IDX, :][..., [0, 2]]
+    l_v = torch.zeros_like(l_xz)
+    r_v = torch.zeros_like(r_xz)
+    l_v[:, 1:] = (l_xz[:, 1:] - l_xz[:, :-1]) * float(fps)
+    r_v[:, 1:] = (r_xz[:, 1:] - r_xz[:, :-1]) * float(fps)
+    v2 = torch.stack([l_v.pow(2).sum(-1), r_v.pow(2).sum(-1)], dim=-1)      # (B, T, 2)
+
+    weight = walking * grounded                                              # (B, T, 2)
+    num = (weight * v2).sum()
+    den = weight.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_gait_ankle_smooth(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    stage2_support: Tensor,             # (B, T, >=5)
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R2 — SmoothL1 on ankle acceleration during walking. Targets
+    ankle twist / flicker without copying GT.
+
+        accel[t] = ankle[t+1] - 2*ankle[t] + ankle[t-1]    (B, T-2, 2, 3)
+        loss     = mean( walking * SmoothL1(accel, 0) ) over T-2 frames
+    """
+    l_xyz = pred_joints[..., LEFT_ANKLE_IDX, :]                             # (B, T, 3)
+    r_xyz = pred_joints[..., RIGHT_ANKLE_IDX, :]
+    ankles = torch.stack([l_xyz, r_xyz], dim=-2)                            # (B, T, 2, 3)
+    if ankles.shape[1] < 3:
+        return ankles.new_zeros(())
+    accel = ankles[:, 2:] - 2.0 * ankles[:, 1:-1] + ankles[:, :-2]          # (B, T-2, 2, 3)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                           # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+    # Walking weight for accel[t] uses walking[t+1] (center frame).
+    w = walking[:, 1:-1].unsqueeze(-1).unsqueeze(-1)                        # (B, T-2, 1, 1)
+    diff = F.smooth_l1_loss(accel, torch.zeros_like(accel), reduction="none")  # (B, T-2, 2, 3)
+    diff = diff.sum(dim=-1, keepdim=True)                                   # (B, T-2, 2, 1)
+    num = (diff * w).sum()
+    # Denominator: count (frame, foot) pairs that are within the walking mask.
+    den = (w.expand_as(diff) > 0).to(diff.dtype).sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_gait_antiphase_corr(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R2 — masked correlation of L/R ankle height during walking.
+
+    Penalise ``relu(corr + 0.15)`` so corr <= -0.15 is accepted.
+    Sequences with fewer than ``cfg.r29_gait_antiphase_min_walking_frames``
+    walking frames contribute zero.
+    """
+    B, T = pred_joints.shape[:2]
+    l_y = pred_joints[..., LEFT_ANKLE_IDX, 1]                              # (B, T)
+    r_y = pred_joints[..., RIGHT_ANKLE_IDX, 1]
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1)                                          # (B, T)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype)
+
+    min_frames = int(cfg.r29_gait_antiphase_min_walking_frames)
+    pieces: list[Tensor] = []
+    for b in range(B):
+        m = walking[b] > 0.5
+        if int(m.sum()) < min_frames:
+            continue
+        l = l_y[b][m]                                                       # (n,)
+        r = r_y[b][m]
+        l_c = l - l.mean()
+        r_c = r - r.mean()
+        denom = (l_c.pow(2).sum().clamp_min(1e-9) * r_c.pow(2).sum().clamp_min(1e-9)).sqrt()
+        corr = (l_c * r_c).sum() / denom
+        pieces.append(F.relu(corr + 0.15))
+    if not pieces:
+        return l_y.new_zeros(())
+    return torch.stack(pieces).mean()
+
+
+# --------------------------------------------------------------------------- #
+# R3 — exact S4 execution losses.
+# --------------------------------------------------------------------------- #
+
+
+def loss_r29_s4_stance_bce(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for floor
+    stage2_support: Tensor,             # (B, T, >=5)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R3 — Binary cross-entropy between predicted grounded prob and
+    the S4 left/right stance target, masked by walking + seq.
+
+        pred_grounded = sigmoid((floor_y + threshold - ankle_y) / softness)
+        target        = stage2_support[..., 0:2]
+        loss          = mean_over_walking_frames( BCE(pred_grounded, target) )
+    """
+    if stage2_support.shape[-1] < 13:
+        raise ValueError(
+            "loss_r29_s4_stance_bce requires S4 layout (dim >= 13); got "
+            f"dim={stage2_support.shape[-1]}."
+        )
+    grounded = _pred_grounded_prob(
+        pred_joints, gt_joints, cfg, seq_mask=seq_mask,
+    )                                                                       # (B, T, 2)
+    target = stage2_support[..., 0:2].to(pred_joints.dtype).clamp(0.0, 1.0)  # (B, T, 2)
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1).unsqueeze(-1)                              # (B, T, 1)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype).unsqueeze(-1)
+
+    eps = 1e-6
+    g = grounded.clamp(eps, 1.0 - eps)
+    bce = -(target * torch.log(g) + (1.0 - target) * torch.log(1.0 - g))    # (B, T, 2)
+    num = (walking * bce).sum()
+    den = (walking.expand_as(bce) > 0).to(bce.dtype).sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_s4_footstep_target(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    gt_joints: Tensor,                  # (B, T, 22, 3) — for pelvis_0 + yaw_0
+    stage2_support: Tensor,             # (B, T, >=13)
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R3 — SmoothL1 between predicted ankle local XZ (root0-yaw
+    canonical, normalised /3.0) and the S4 footstep-target channel.
+
+    Matches the coordinate convention in
+    ``stage2_oracle_conditions._footstep_target_local_xz``: pelvis at
+    frame 0 + yaw at frame 0 as the canonical frame. We use GT for the
+    frame-0 pelvis + yaw (oracle conditions), so the loss differentiates
+    purely through ``pred_joints[..., ankle_idx, :]``.
+    """
+    if stage2_support.shape[-1] < 13:
+        raise ValueError(
+            "loss_r29_s4_footstep_target requires S4 layout (dim >= 13); got "
+            f"dim={stage2_support.shape[-1]}."
+        )
+    R_T0 = _root0_world_to_canonical_yaw_matrix(gt_joints)                  # (B, 3, 3)
+    pelvis_0 = gt_joints[:, 0, ROOT_IDX, :]                                 # (B, 3)
+    l_xyz = pred_joints[..., LEFT_ANKLE_IDX, :]                             # (B, T, 3)
+    r_xyz = pred_joints[..., RIGHT_ANKLE_IDX, :]
+    ankles = torch.stack([l_xyz, r_xyz], dim=-2)                            # (B, T, 2, 3)
+    rel = ankles - pelvis_0[:, None, None, :]                               # (B, T, 2, 3)
+    # local = R_T0 @ (ankle - pelvis_0). einsum over the world dim.
+    local = torch.einsum("bij,btfj->btfi", R_T0, rel)                       # (B, T, 2, 3)
+    pred_xz = local[..., [0, 2]]                                            # (B, T, 2, 2)
+    pred_xz_norm = (pred_xz.clamp(-3.0, 3.0) / 3.0).reshape(
+        *pred_xz.shape[:2], 4,
+    )                                                                       # (B, T, 4)
+    target = stage2_support[..., 9:13].to(pred_joints.dtype)                # (B, T, 4)
+
+    walking = _r29_walking_mask_from_support(stage2_support).to(pred_joints.dtype)
+    walking = walking.squeeze(-1).unsqueeze(-1)                              # (B, T, 1)
+    if seq_mask is not None:
+        walking = walking * seq_mask.to(pred_joints.dtype).unsqueeze(-1)
+
+    diff = F.smooth_l1_loss(pred_xz_norm, target, reduction="none")          # (B, T, 4)
+    diff = diff.sum(dim=-1, keepdim=True)                                    # (B, T, 1)
+    num = (walking * diff).sum()
+    den = (walking.expand_as(diff) > 0).to(diff.dtype).sum().clamp_min(1.0)
+    return num / den
+
+
+# --------------------------------------------------------------------------- #
+# R4 / R5 — contact-lock losses (generalised over I3 dim=8 / I5 dim=20).
+# --------------------------------------------------------------------------- #
+
+
+def _parse_i_channel(
+    stage2_interaction: Tensor,         # (B, T, 8) for I3 or (B, T, 20) for I5
+) -> tuple[Tensor, Tensor, tuple[int, ...]]:
+    """Extract per-part contact + per-part target offset from an I-channel.
+
+    Returns:
+        contacts        : (B, T, P)
+        target_offsets  : (B, T, P, 3)  (already normalised to [-1, 1] by the
+                          ``hand_offset_clamp_m`` divisor used by the builder)
+        part_indices    : tuple of SMPL joint indices for each part.
+    """
+    D = stage2_interaction.shape[-1]
+    if D == 8:
+        # I3 layout: 2 contact + 2*3 = 6 offset. Parts: L_wrist, R_wrist.
+        contacts = stage2_interaction[..., 0:2]
+        offsets = stage2_interaction[..., 2:8].reshape(
+            *stage2_interaction.shape[:2], 2, 3,
+        )
+        part_idx = (LEFT_WRIST_IDX, RIGHT_WRIST_IDX)
+    elif D == 20:
+        # I5 layout: 5 contact + 5*3 = 15 offset.
+        # Parts: L_wrist, R_wrist, L_ankle, R_ankle, pelvis.
+        contacts = stage2_interaction[..., 0:5]
+        offsets = stage2_interaction[..., 5:20].reshape(
+            *stage2_interaction.shape[:2], 5, 3,
+        )
+        part_idx = (
+            LEFT_WRIST_IDX, RIGHT_WRIST_IDX,
+            LEFT_ANKLE_IDX, RIGHT_ANKLE_IDX, ROOT_IDX,
+        )
+    else:
+        raise ValueError(
+            "contact-lock losses support only I3 (dim=8) or I5 (dim=20); "
+            f"got dim={D}."
+        )
+    return contacts, offsets, part_idx
+
+
+def _pred_part_object_local_offset(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    object_positions: Tensor,           # (B, T, 3)
+    object_rotations: Tensor,           # (B, T, 3) axis-angle
+    part_indices: tuple[int, ...],
+    clamp_m: float,
+) -> Tensor:
+    """Compute predicted per-part object-local offset normalised to [-1, 1].
+
+    Mirrors ``_hand_object_local_offset`` / ``_allpart_object_local_offset``
+    on the dataset side. Returns ``(B, T, P, 3)``.
+    """
+    R_obj = _axis_angle_to_matrix_t(object_rotations.to(pred_joints.dtype))  # (B, T, 3, 3)
+    R_T = R_obj.transpose(-1, -2)                                            # (B, T, 3, 3)
+    parts_world = torch.stack(
+        [pred_joints[..., idx, :] for idx in part_indices], dim=-2,
+    )                                                                        # (B, T, P, 3)
+    delta = parts_world - object_positions.unsqueeze(-2)                     # (B, T, P, 3)
+    rel = torch.einsum("btij,btpj->btpi", R_T, delta)                        # (B, T, P, 3)
+    return (rel.clamp(-clamp_m, clamp_m) / float(clamp_m))                   # (B, T, P, 3)
+
+
+def loss_r29_contact_lock_offset(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    object_positions: Tensor,           # (B, T, 3)
+    object_rotations: Tensor,           # (B, T, 3) axis-angle
+    stage2_interaction: Tensor,         # (B, T, 8) or (B, T, 20)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+    hand_offset_clamp_m: float = 2.0,
+) -> Tensor:
+    """R4 / R5 — SmoothL1 between predicted per-part object-local offset
+    and the I-channel target offset, masked to contact frames.
+
+    Generalises ``loss_r29_interaction_consistency`` to both I3 (2 parts)
+    and I5 (5 parts). Uses the I-channel ``contacts`` as the mask
+    (self-contained on the R29 condition; no dataset contact_state needed).
+    """
+    contacts, target_offsets, part_idx = _parse_i_channel(stage2_interaction)
+    pred_norm = _pred_part_object_local_offset(
+        pred_joints, object_positions, object_rotations,
+        part_indices=part_idx, clamp_m=float(hand_offset_clamp_m),
+    )                                                                        # (B, T, P, 3)
+
+    mask = (contacts > float(cfg.contact_threshold)).to(pred_joints.dtype)   # (B, T, P)
+    if seq_mask is not None:
+        sm = seq_mask.to(pred_joints.dtype).unsqueeze(-1)                    # (B, T, 1)
+        mask = mask * sm
+    mask3 = mask.unsqueeze(-1)                                               # (B, T, P, 1)
+    diff = F.smooth_l1_loss(pred_norm, target_offsets, reduction="none")     # (B, T, P, 3)
+    diff = diff.sum(dim=-1, keepdim=True)                                    # (B, T, P, 1)
+    num = (diff * mask3).sum()
+    den = mask3.sum().clamp_min(1.0)
+    return num / den
+
+
+def loss_r29_contact_lock_segment_drift(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    object_positions: Tensor,           # (B, T, 3)
+    object_rotations: Tensor,           # (B, T, 3) axis-angle
+    stage2_interaction: Tensor,         # (B, T, 8) or (B, T, 20)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+    hand_offset_clamp_m: float = 2.0,
+) -> Tensor:
+    """R4 / R5 — Per-segment relative drift loss. For each contiguous
+    contact segment per part, compare:
+
+        pred_delta = pred_rel[t] - pred_rel[t0]
+        gt_delta   = target_rel[t] - target_rel[t0]
+        SmoothL1(pred_delta, gt_delta)
+
+    averaged over (segment-frame, part). Loops over batch + part because
+    segment boundaries vary per clip; T <= 196 and training-only, cheap.
+    """
+    contacts, target_offsets, part_idx = _parse_i_channel(stage2_interaction)
+    pred_norm = _pred_part_object_local_offset(
+        pred_joints, object_positions, object_rotations,
+        part_indices=part_idx, clamp_m=float(hand_offset_clamp_m),
+    )                                                                        # (B, T, P, 3)
+
+    B, T, P = contacts.shape
+    contact_bool = (contacts > float(cfg.contact_threshold))                 # (B, T, P)
+    if seq_mask is not None:
+        sm = seq_mask.bool() if seq_mask.dtype == torch.bool else seq_mask > 0.5
+        contact_bool = contact_bool & sm.unsqueeze(-1)
+
+    num = pred_joints.new_zeros(())
+    den_count: int = 0
+    for b in range(B):
+        for p in range(P):
+            active = contact_bool[b, :, p]
+            if int(active.sum()) < 2:
+                continue
+            # Walk contiguous True runs.
+            run_start = -1
+            t0_pred: Tensor | None = None
+            t0_tgt: Tensor | None = None
+            for t in range(T):
+                if active[t]:
+                    if run_start < 0:
+                        run_start = t
+                        t0_pred = pred_norm[b, t, p]
+                        t0_tgt = target_offsets[b, t, p]
+                    else:
+                        d_pred = pred_norm[b, t, p] - t0_pred
+                        d_tgt = target_offsets[b, t, p] - t0_tgt
+                        num = num + F.smooth_l1_loss(
+                            d_pred, d_tgt, reduction="sum",
+                        )
+                        den_count += 1
+                else:
+                    run_start = -1
+                    t0_pred = None
+                    t0_tgt = None
+    den = max(den_count * 3, 1)                                              # 3 = xyz dims
+    return num / float(den)
+
+
+def loss_r29_contact_lock_tracking(
+    pred_joints: Tensor,                # (B, T, 22, 3)
+    object_positions: Tensor,           # (B, T, 3)
+    stage2_interaction: Tensor,         # (B, T, 8) or (B, T, 20)
+    cfg: TemporalInteractionLossConfig,
+    seq_mask: Tensor | None = None,
+) -> Tensor:
+    """R4 / R5 — Per-segment object-motion projection. For each contact
+    segment per part, penalise the gap between how far the predicted
+    part moved in the object's motion direction vs how far the object
+    moved (with a small margin).
+
+        u            = obj_disp / |obj_disp|              segment-level direction
+        pred_align   = (pred_part[t1] - pred_part[t0]) · u
+        target_align = |obj_disp|                          (assume part should
+                                                            follow object 1:1)
+        penalty      = relu(target_align - pred_align - margin) ** 2
+
+    Only scored on segments where |obj_disp| > tracking_min_obj_disp_m
+    (skips near-stationary segments where tracking is undefined).
+    """
+    contacts, _, part_idx = _parse_i_channel(stage2_interaction)
+    parts_world = torch.stack(
+        [pred_joints[..., idx, :] for idx in part_idx], dim=-2,
+    )                                                                        # (B, T, P, 3)
+    B, T, P = contacts.shape
+    contact_bool = (contacts > float(cfg.contact_threshold))                 # (B, T, P)
+    if seq_mask is not None:
+        sm = seq_mask.bool() if seq_mask.dtype == torch.bool else seq_mask > 0.5
+        contact_bool = contact_bool & sm.unsqueeze(-1)
+
+    margin = float(cfg.tracking_margin_m)
+    min_disp = float(cfg.tracking_min_obj_disp_m)
+    num = pred_joints.new_zeros(())
+    den_count: int = 0
+    for b in range(B):
+        for p in range(P):
+            active = contact_bool[b, :, p]
+            if int(active.sum()) < 2:
+                continue
+            # Find each contiguous True run and score (t0, t1=last frame
+            # in run). Only one penalty per segment (segment-level).
+            run_start = -1
+            last = -1
+            for t in range(T):
+                if active[t]:
+                    if run_start < 0:
+                        run_start = t
+                    last = t
+                if not active[t] or t == T - 1:
+                    if run_start >= 0 and last > run_start:
+                        obj_disp = object_positions[b, last] - object_positions[b, run_start]
+                        disp_norm = obj_disp.norm()
+                        if float(disp_norm) > min_disp:
+                            u = obj_disp / disp_norm.clamp_min(1e-6)
+                            pred_disp = parts_world[b, last, p] - parts_world[b, run_start, p]
+                            pred_align = (pred_disp * u).sum()
+                            target_align = disp_norm
+                            penalty = F.relu(target_align - pred_align - margin).pow(2)
+                            num = num + penalty
+                            den_count += 1
+                    if not active[t]:
+                        run_start = -1
+                        last = -1
+    return num / float(max(den_count, 1))

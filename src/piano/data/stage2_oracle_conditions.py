@@ -107,7 +107,23 @@ INTERACTION_VARIANT_DIMS: dict[str, int] = {
     "I2-offset-masked": 6,
     "I3-contact-offset-masked": 8,
     "I4-contact-offset-unmasked": 8,
+    # R29 failure-targeted ablation R5 (per
+    # ``analyses/2026-05-27_round29_failure_targeted_ablation_prompt_for_claude_code.md`` §R5):
+    # all 5 contact parts (L hand, R hand, L foot, R foot, pelvis) instead
+    # of hands-only I3. 5 contact channels + 5 parts × 3 = 20D.
+    "I5-allpart-contact-offset-masked": 20,
 }
+
+# Part-to-joint mapping for I5 (matches contact_state column order).
+# Same body_part_indices used by piano.utils.smpl_utils.BODY_PART_INDICES.
+ALLPART_CONTACT_JOINT_INDICES: tuple[int, ...] = (
+    LEFT_WRIST_IDX,    # 0 left_hand
+    RIGHT_WRIST_IDX,   # 1 right_hand
+    LEFT_ANKLE_IDX,    # 2 left_foot
+    RIGHT_ANKLE_IDX,   # 3 right_foot
+    ROOT_IDX,          # 4 pelvis
+)
+NUM_ALLPART_CONTACT: int = len(ALLPART_CONTACT_JOINT_INDICES)  # 5
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +368,36 @@ def _hand_object_local_offset(
     return rel.astype(np.float32, copy=False), rel_norm.astype(np.float32, copy=False)
 
 
+def _allpart_object_local_offset(
+    joints_22: np.ndarray,
+    object_positions: np.ndarray,
+    object_rotations: np.ndarray,
+    offset_clamp_m: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Object-local offset for the 5 contact parts (L hand, R hand, L foot,
+    R foot, pelvis).
+
+    Generalises ``_hand_object_local_offset`` from 2 hand joints to all 5
+    contact-bearing joints. Returns ``(rel, rel_norm)`` where ``rel`` is the
+    raw object-local position and ``rel_norm`` is clamped to ``±clamp_m`` and
+    divided by ``clamp_m`` to land in ``[-1, 1]``.
+
+    Note: the prompt asked us to keep the config key name
+    ``r29_hand_offset_clamp_m`` and reuse it for all 5 parts (no broad rename).
+    """
+    T = int(joints_22.shape[0])
+    R_obj = axis_angle_to_matrix_np(object_rotations.astype(np.float32))   # (T, 3, 3)
+    R_obj_T = R_obj.transpose(0, 2, 1)
+    parts_world = np.stack(
+        [joints_22[:, idx, :] for idx in ALLPART_CONTACT_JOINT_INDICES],
+        axis=1,
+    ).astype(np.float32)                                                    # (T, 5, 3)
+    obj_pos = object_positions[:, None, :].astype(np.float32)               # (T, 1, 3)
+    rel = np.einsum("tij,thj->thi", R_obj_T, parts_world - obj_pos).astype(np.float32)
+    rel_norm = np.clip(rel, -offset_clamp_m, offset_clamp_m) / offset_clamp_m
+    return rel.astype(np.float32, copy=False), rel_norm.astype(np.float32, copy=False)
+
+
 def build_interaction_condition(
     joints_22: np.ndarray,
     object_positions: np.ndarray | None,
@@ -360,11 +406,18 @@ def build_interaction_condition(
     variant: str,
     hand_offset_clamp_m: float = 2.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Build interaction channel for ``variant`` ∈ {I0..I4}.
+    """Build interaction channel for ``variant`` ∈ {I0..I5}.
 
     All non-I0 variants require ``object_positions``, ``object_rotations``,
     ``contact_state`` to be present. The caller (dataset) is responsible
     for guarding via ``data.use_interaction_condition`` / variant.
+
+    I5-allpart (R29 failure-targeted ablation): all 5 contact parts
+    (L hand, R hand, L foot, R foot, pelvis) instead of hands-only I3.
+    Layout: ``[contacts (5), offsets_masked (5×3 = 15)]`` → 20D.
+    Per-part contact mask gates each part's offset to zero on non-contact
+    frames (same masking semantics as I3). ``hand_offset_clamp_m`` is
+    reused as the universal clamp for all 5 parts.
     """
     if variant not in INTERACTION_VARIANT_DIMS:
         raise ValueError(
@@ -385,32 +438,49 @@ def build_interaction_condition(
             "object_rotations, and contact_state (got at least one None)."
         )
 
-    hand_contact = np.clip(
-        contact_state[:, [0, 1]].astype(np.float32), 0.0, 1.0,
-    )                                                                       # (T, 2)
-    contact_mask = (hand_contact > 0.5).astype(np.float32)                  # (T, 2)
-
     pieces: list[np.ndarray] = []
-    if variant == "I1-contact":
-        pieces.append(hand_contact)
-    else:
-        # I2/I3/I4 need offset.
-        _, rel_norm = _hand_object_local_offset(
+    if variant == "I5-allpart-contact-offset-masked":
+        # 5-part contact (L hand, R hand, L foot, R foot, pelvis).
+        # Reuse hand_offset_clamp_m as the universal clamp per prompt §R5.
+        all_contact = np.clip(
+            contact_state[:, 0:NUM_ALLPART_CONTACT].astype(np.float32), 0.0, 1.0,
+        )                                                                   # (T, 5)
+        _, rel_norm5 = _allpart_object_local_offset(
             joints_22, object_positions, object_rotations,
-            hand_offset_clamp_m=hand_offset_clamp_m,
-        )                                                                   # (T, 2, 3)
-        if variant == "I2-offset-masked":
-            offset = rel_norm * hand_contact[:, :, None]
-            pieces.append(offset.reshape(T, 6))
-        elif variant == "I3-contact-offset-masked":
-            offset = rel_norm * hand_contact[:, :, None]
-            pieces.append(hand_contact)
-            pieces.append(offset.reshape(T, 6))
-        elif variant == "I4-contact-offset-unmasked":
-            pieces.append(hand_contact)
-            pieces.append(rel_norm.reshape(T, 6))
+            offset_clamp_m=hand_offset_clamp_m,
+        )                                                                   # (T, 5, 3)
+        offset_masked = rel_norm5 * all_contact[:, :, None]                 # (T, 5, 3)
+        pieces.append(all_contact)
+        pieces.append(offset_masked.reshape(T, NUM_ALLPART_CONTACT * 3))
+        # info-dict aggregates differ from I1-I4; computed below.
+        contact_mask = (all_contact > 0.5).astype(np.float32)               # (T, 5)
+        hand_contact_for_info = all_contact[:, :2]                           # backward-compat
+    else:
+        # I1/I2/I3/I4 — hands only.
+        hand_contact_for_info = np.clip(
+            contact_state[:, [0, 1]].astype(np.float32), 0.0, 1.0,
+        )                                                                   # (T, 2)
+        contact_mask = (hand_contact_for_info > 0.5).astype(np.float32)     # (T, 2)
+        if variant == "I1-contact":
+            pieces.append(hand_contact_for_info)
         else:
-            raise AssertionError(f"unreachable I-variant {variant!r}")
+            # I2/I3/I4 need offset.
+            _, rel_norm = _hand_object_local_offset(
+                joints_22, object_positions, object_rotations,
+                hand_offset_clamp_m=hand_offset_clamp_m,
+            )                                                               # (T, 2, 3)
+            if variant == "I2-offset-masked":
+                offset = rel_norm * hand_contact_for_info[:, :, None]
+                pieces.append(offset.reshape(T, 6))
+            elif variant == "I3-contact-offset-masked":
+                offset = rel_norm * hand_contact_for_info[:, :, None]
+                pieces.append(hand_contact_for_info)
+                pieces.append(offset.reshape(T, 6))
+            elif variant == "I4-contact-offset-unmasked":
+                pieces.append(hand_contact_for_info)
+                pieces.append(rel_norm.reshape(T, 6))
+            else:
+                raise AssertionError(f"unreachable I-variant {variant!r}")
 
     out = np.concatenate(pieces, axis=-1) if pieces else np.zeros((T, 0), dtype=np.float32)
     if out.shape != (T, dim):
@@ -429,6 +499,14 @@ def build_interaction_condition(
         right_contact_frac=float(contact_mask[:, 1].mean()),
         max_abs=float(np.abs(out).max() if out.size else 0.0),
     )
+    if variant == "I5-allpart-contact-offset-masked":
+        # Additional per-part contact fractions (foot + pelvis) so smoke
+        # tests / condition_stats can sanity-check the new channels.
+        info.update(
+            left_foot_contact_frac=float(contact_mask[:, 2].mean()),
+            right_foot_contact_frac=float(contact_mask[:, 3].mean()),
+            pelvis_contact_frac=float(contact_mask[:, 4].mean()),
+        )
     return out.astype(np.float32, copy=False), info
 
 

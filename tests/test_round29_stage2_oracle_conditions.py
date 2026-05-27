@@ -149,6 +149,91 @@ def test_interaction_requires_object_when_not_i0(
         )
 
 
+# ---------------- I5 all-part (R29 failure-targeted ablation R5) ----------------
+
+
+def test_interaction_i5_shape_and_layout(
+    synth_joints: np.ndarray,
+    synth_object: tuple[np.ndarray, np.ndarray],
+    synth_contact: np.ndarray,
+) -> None:
+    """I5 must be 20D = 5 contact + 5 parts × 3 = 5 + 15."""
+    obj_pos, obj_rot = synth_object
+    T = synth_joints.shape[0]
+    arr, info = build_interaction_condition(
+        synth_joints, obj_pos, obj_rot, synth_contact,
+        variant="I5-allpart-contact-offset-masked",
+    )
+    assert arr.shape == (T, 20)
+    # First 5 channels are the per-part contact (clipped from contact_state).
+    assert np.allclose(arr[:, 0:5], np.clip(synth_contact[:, 0:5], 0.0, 1.0))
+    # Remaining 15 channels are masked object-local offset for 5 parts × 3.
+    assert np.isfinite(arr).all()
+    assert "left_foot_contact_frac" in info
+    assert "right_foot_contact_frac" in info
+    assert "pelvis_contact_frac" in info
+
+
+def test_interaction_i5_offset_masked_to_zero_when_not_in_contact(
+    synth_joints: np.ndarray,
+    synth_object: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """All-zero contact_state ⇒ all 15 offset channels identically zero."""
+    obj_pos, obj_rot = synth_object
+    contact = np.zeros((synth_joints.shape[0], 5), dtype=np.float32)
+    arr, _ = build_interaction_condition(
+        synth_joints, obj_pos, obj_rot, contact,
+        variant="I5-allpart-contact-offset-masked",
+    )
+    # First 5 (contact) are zero, last 15 (masked offset) must also be zero.
+    assert np.abs(arr).max() == 0.0
+
+
+def test_interaction_i5_contact_order_matches_contact_state(
+    synth_joints: np.ndarray,
+    synth_object: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """Per prompt §R5: contact channel order must match contact_state
+    column order — 0 L_hand, 1 R_hand, 2 L_foot, 3 R_foot, 4 pelvis."""
+    obj_pos, obj_rot = synth_object
+    T = synth_joints.shape[0]
+    contact = np.zeros((T, 5), dtype=np.float32)
+    # Set only column 2 (left_foot) to 1.0 across all frames.
+    contact[:, 2] = 1.0
+    arr, _ = build_interaction_condition(
+        synth_joints, obj_pos, obj_rot, contact,
+        variant="I5-allpart-contact-offset-masked",
+    )
+    # Only L_foot's offset slice should be non-zero. Slice for part i is
+    # arr[:, 5 + 3i : 5 + 3i + 3]. L_foot is part 2 → slice [11:14].
+    for part_i in range(5):
+        s = slice(5 + 3 * part_i, 5 + 3 * (part_i + 1))
+        if part_i == 2:
+            # L_foot must be non-zero on at least some frames (object-local
+            # offset between left ankle and the object).
+            assert np.abs(arr[:, s]).max() > 0.0, "L_foot offset zeroed wrongly"
+        else:
+            assert np.abs(arr[:, s]).max() == 0.0, (
+                f"part {part_i} leaked offset under L_foot-only contact"
+            )
+
+
+def test_interaction_i5_dim_in_registry() -> None:
+    """Sanity: INTERACTION_VARIANT_DIMS must register I5 at 20D."""
+    assert INTERACTION_VARIANT_DIMS["I5-allpart-contact-offset-masked"] == 20
+
+
+def test_interaction_i5_requires_object_and_contact(
+    synth_joints: np.ndarray,
+    synth_contact: np.ndarray,
+) -> None:
+    with pytest.raises(ValueError):
+        build_interaction_condition(
+            synth_joints, None, None, synth_contact,
+            variant="I5-allpart-contact-offset-masked",
+        )
+
+
 # ---------------- Support ----------------
 
 def test_support_variant_dims(synth_joints: np.ndarray) -> None:

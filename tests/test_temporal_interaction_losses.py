@@ -737,3 +737,411 @@ def test_r29_swing_clearance_low_dim_raises():
         )
 
 
+# ===========================================================================
+# Round-29 failure-targeted ablation (R2/R3/R4/R5).
+# ===========================================================================
+
+from piano.training.temporal_interaction_losses import (   # noqa: E402
+    loss_r29_contact_lock_offset,
+    loss_r29_contact_lock_segment_drift,
+    loss_r29_contact_lock_tracking,
+    loss_r29_gait_ankle_smooth,
+    loss_r29_gait_antiphase_corr,
+    loss_r29_gait_one_foot_support,
+    loss_r29_gait_pred_stance_velocity,
+    loss_r29_s4_footstep_target,
+    loss_r29_s4_stance_bce,
+)
+
+
+def _make_s4_support(T: int = 20, *, walking_from: int = 4) -> torch.Tensor:
+    """Build a synthetic 13-D S4 support channel (B=1, T)."""
+    out = torch.zeros(1, T, 13, dtype=torch.float32)
+    # walking_mask (channel 4) ON from walking_from to end.
+    out[:, walking_from:, 4] = 1.0
+    # GT stance (channels 0:2) alternating L/R every 4 frames during walking,
+    # so the BCE target is well-defined.
+    for t in range(walking_from, T):
+        if ((t - walking_from) // 4) % 2 == 0:
+            out[:, t, 0] = 1.0   # L stance
+        else:
+            out[:, t, 1] = 1.0   # R stance
+    # ankle height norm (channels 2:4) = 0; phase sincos (5:9) = 0;
+    # footstep target XZ (9:13) = small constant just so loss is non-trivial.
+    out[:, walking_from:, 9] = 0.1  # L target x_norm
+    out[:, walking_from:, 11] = -0.1  # R target x_norm
+    return out
+
+
+# ---------------- R2: behavior-level gait ----------------
+
+
+def test_r29_gait_one_foot_support_zero_for_perfect_alternation():
+    """Perfect alternation = one foot grounded per frame → loss ≈ 0."""
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    # Force pred grounded prob ≈ (1, 0) alternating: left ankle on floor,
+    # right ankle in the air, every other frame.
+    pred = joints.clone()
+    for t in range(4, T):
+        if (t - 4) % 2 == 0:
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 0.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 1.0  # well above floor
+        else:
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 1.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 0.0
+    loss = loss_r29_gait_one_foot_support(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() < 0.05, f"one_foot_support should be ~0; got {loss.item()}"
+
+
+def test_r29_gait_one_foot_support_positive_when_both_airborne():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    # Both ankles lifted high during walking → grounded ≈ 0 → (0+0-1)^2 = 1.
+    pred = joints.clone()
+    pred[:, 4:, LEFT_ANKLE_IDX, 1] = 1.0
+    pred[:, 4:, RIGHT_ANKLE_IDX, 1] = 1.0
+    loss = loss_r29_gait_one_foot_support(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.5
+
+
+def test_r29_gait_pred_stance_velocity_zero_when_grounded_foot_still():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    # Pred = GT (ankles still on floor at constant x, z).
+    loss = loss_r29_gait_pred_stance_velocity(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() < 1e-4
+
+
+def test_r29_gait_pred_stance_velocity_positive_when_grounded_foot_slides():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    pred = joints.clone()
+    # Slide both ankles +X during walking (still on floor → grounded ≈ 1).
+    for t in range(4, T):
+        pred[:, t, LEFT_ANKLE_IDX, 0] += 0.2 * (t - 4)
+        pred[:, t, RIGHT_ANKLE_IDX, 0] += 0.2 * (t - 4)
+    loss = loss_r29_gait_pred_stance_velocity(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.1
+
+
+def test_r29_gait_ankle_smooth_zero_for_static_ankles():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    loss = loss_r29_gait_ankle_smooth(
+        pred_joints=joints, stage2_support=support,
+    )
+    assert loss.item() < 1e-4
+
+
+def test_r29_gait_ankle_smooth_positive_under_jitter():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    pred = joints.clone()
+    # Sinusoidal high-frequency jitter on left ankle during walking.
+    for t in range(4, T):
+        pred[:, t, LEFT_ANKLE_IDX, 1] += 0.05 * ((-1) ** t)
+    loss = loss_r29_gait_ankle_smooth(
+        pred_joints=pred, stage2_support=support,
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_gait_antiphase_corr_accepts_anti_phase():
+    """corr <= -0.15 should give zero penalty."""
+    T = 40
+    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
+    # L ankle height = sin(t), R ankle height = -sin(t) → corr = -1.
+    t = torch.arange(T, dtype=torch.float32)
+    joints[:, :, LEFT_ANKLE_IDX, 1] = torch.sin(0.5 * t)
+    joints[:, :, RIGHT_ANKLE_IDX, 1] = -torch.sin(0.5 * t)
+    support = _make_s4_support(T, walking_from=4)
+    loss = loss_r29_gait_antiphase_corr(
+        pred_joints=joints, stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() < 1e-4
+
+
+def test_r29_gait_antiphase_corr_penalises_in_phase():
+    """corr ≈ +1 → penalty = relu(1 + 0.15) ≈ 1.15."""
+    T = 40
+    joints = torch.zeros(1, T, 22, 3, dtype=torch.float32)
+    t = torch.arange(T, dtype=torch.float32)
+    joints[:, :, LEFT_ANKLE_IDX, 1] = torch.sin(0.5 * t)
+    joints[:, :, RIGHT_ANKLE_IDX, 1] = torch.sin(0.5 * t)
+    support = _make_s4_support(T, walking_from=4)
+    loss = loss_r29_gait_antiphase_corr(
+        pred_joints=joints, stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() > 1.0
+
+
+def test_r29_gait_antiphase_skips_when_too_few_walking_frames():
+    joints = torch.zeros(1, 12, 22, 3, dtype=torch.float32)
+    support = torch.zeros(1, 12, 13, dtype=torch.float32)
+    # Walking_mask only ON for 3 frames (< min 10).
+    support[:, 0:3, 4] = 1.0
+    loss = loss_r29_gait_antiphase_corr(
+        pred_joints=joints, stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() == 0.0
+
+
+# ---------------- R3: exact S4 execution ----------------
+
+
+def test_r29_s4_stance_bce_low_when_pred_matches_target():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    pred = joints.clone()
+    # Drive ankles to match the S4 target: when L_stance target=1, L ankle
+    # on floor; when R_stance target=1, R ankle on floor; the other lifts.
+    for t in range(4, T):
+        if support[0, t, 0] > 0.5:   # L stance
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 0.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 1.0
+        else:                          # R stance
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 1.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 0.0
+    loss = loss_r29_s4_stance_bce(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    # BCE at saturated sigmoid ≈ -log(eps) bounded; should be small (≲ 1.0).
+    assert loss.item() < 1.0
+
+
+def test_r29_s4_stance_bce_high_when_pred_opposite_target():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    pred = joints.clone()
+    # Opposite assignment.
+    for t in range(4, T):
+        if support[0, t, 0] > 0.5:
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 1.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 0.0
+        else:
+            pred[:, t, LEFT_ANKLE_IDX, 1] = 0.0
+            pred[:, t, RIGHT_ANKLE_IDX, 1] = 1.0
+    loss = loss_r29_s4_stance_bce(
+        pred_joints=pred, gt_joints=joints,
+        stage2_support=support, cfg=_default_cfg(),
+    )
+    assert loss.item() > 1.0
+
+
+def test_r29_s4_stance_bce_requires_dim_13():
+    joints, _, _, _, _, _ = _make_clip()
+    bad = torch.zeros(joints.shape[0], joints.shape[1], 5, dtype=joints.dtype)
+    with pytest.raises(ValueError, match="S4 layout"):
+        loss_r29_s4_stance_bce(
+            pred_joints=joints, gt_joints=joints,
+            stage2_support=bad, cfg=_default_cfg(),
+        )
+
+
+def test_r29_s4_footstep_target_zero_when_pred_at_target():
+    """Run with target = pred's actual ankle XZ in canonical frame → ≈ 0."""
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    # Set target = ankle position in canonical frame (pelvis_0 at origin,
+    # yaw_0 from neutral → identity matrix). Ankle X = 0.1 / -0.1, Z = 0.
+    # In _make_clip pelvis is at origin and joints flat; canonical = world.
+    # ankle XZ / 3 = (0.0333, 0) and (-0.0333, 0).
+    support_aligned = support.clone()
+    support_aligned[:, :, 9] = 0.1 / 3.0    # L target x
+    support_aligned[:, :, 10] = 0.0          # L target z
+    support_aligned[:, :, 11] = -0.1 / 3.0  # R target x
+    support_aligned[:, :, 12] = 0.0          # R target z
+    loss = loss_r29_s4_footstep_target(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support_aligned,
+    )
+    assert loss.item() < 1e-3, f"footstep loss should be ~0 when aligned; got {loss.item()}"
+
+
+def test_r29_s4_footstep_target_positive_when_pred_off_target():
+    joints, _, _, _, _, _ = _make_clip()
+    T = joints.shape[1]
+    support = _make_s4_support(T, walking_from=4)
+    # Targets at large positive X, but pred ankles stay at the small
+    # baseline positions → SmoothL1 > 0.
+    support_far = support.clone()
+    support_far[:, :, 9] = 0.9   # L target x_norm far from pred's 0.033
+    support_far[:, :, 11] = 0.9  # R target x_norm
+    loss = loss_r29_s4_footstep_target(
+        pred_joints=joints, gt_joints=joints,
+        stage2_support=support_far,
+    )
+    assert loss.item() > 0.01
+
+
+def test_r29_s4_footstep_requires_dim_13():
+    joints, _, _, _, _, _ = _make_clip()
+    bad = torch.zeros(joints.shape[0], joints.shape[1], 5, dtype=joints.dtype)
+    with pytest.raises(ValueError, match="S4 layout"):
+        loss_r29_s4_footstep_target(
+            pred_joints=joints, gt_joints=joints, stage2_support=bad,
+        )
+
+
+# ---------------- R4 / R5: contact-lock ----------------
+
+
+def _make_i3_channel(joints, obj_pos, obj_rot, contact_state) -> torch.Tensor:
+    """Mirror the dataset's I3 builder for a torch tensor (no clamp/3 norm).
+
+    The dataset emits: [hand_contact (2), masked_offset_normed (6)].
+    Synthesised by computing the GT offset under the same convention used
+    by ``loss_r29_contact_lock_offset``.
+    """
+    from piano.training.temporal_interaction_losses import (
+        _axis_angle_to_matrix_t, _wrist_object_local, _wrist_world_pred_gt,
+    )
+    clamp_m = 2.0
+    R_obj = _axis_angle_to_matrix_t(obj_rot.float())
+    pw, _ = _wrist_world_pred_gt(joints, joints)
+    rel = _wrist_object_local(pw, obj_pos.float(), R_obj)              # (B, T, 2, 3)
+    rel_norm = (rel.clamp(-clamp_m, clamp_m) / clamp_m)
+    hand_contact = contact_state[..., 0:2]                              # (B, T, 2)
+    offset_masked = rel_norm * hand_contact.unsqueeze(-1)
+    return torch.cat(
+        [hand_contact, offset_masked.reshape(*offset_masked.shape[:2], 6)],
+        dim=-1,
+    )                                                                   # (B, T, 8)
+
+
+def test_r29_contact_lock_offset_zero_when_pred_eq_gt_i3():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    loss = loss_r29_contact_lock_offset(
+        pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() < 1e-5
+
+
+def test_r29_contact_lock_offset_positive_on_perturbation_i3():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    pred = joints.clone()
+    pred[:, :, LEFT_WRIST_IDX, 0] += 0.3   # shift wrist off target
+    pred[:, :, RIGHT_WRIST_IDX, 0] -= 0.3
+    loss = loss_r29_contact_lock_offset(
+        pred_joints=pred, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.01
+
+
+def test_r29_contact_lock_offset_handles_i5_dim_20():
+    """I5 has 5-part contact + 5*3 offset = 20D. Loss must accept it."""
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    B, T = joints.shape[:2]
+    # Build a synthetic 20-D I5 channel: all-zero contact + zero offset
+    # → mask all-zero → loss = 0 (empty-mask).
+    i5 = torch.zeros(B, T, 20, dtype=torch.float32)
+    loss = loss_r29_contact_lock_offset(
+        pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=i5, cfg=_default_cfg(),
+    )
+    assert loss.item() == 0.0
+
+
+def test_r29_contact_lock_offset_wrong_dim_raises():
+    joints, obj_pos, obj_rot, _, _, _ = _make_clip()
+    B, T = joints.shape[:2]
+    bad = torch.zeros(B, T, 6, dtype=torch.float32)
+    with pytest.raises(ValueError, match="I3.*I5"):
+        loss_r29_contact_lock_offset(
+            pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+            stage2_interaction=bad, cfg=_default_cfg(),
+        )
+
+
+def test_r29_contact_lock_segment_drift_zero_when_pred_eq_gt():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    loss = loss_r29_contact_lock_segment_drift(
+        pred_joints=joints, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() < 1e-5
+
+
+def test_r29_contact_lock_segment_drift_positive_under_pred_drift():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    pred = joints.clone()
+    # Make pred's wrist drift away from object monotonically during contact.
+    for t in range(joints.shape[1]):
+        pred[:, t, LEFT_WRIST_IDX, 0] += 0.02 * t
+    loss = loss_r29_contact_lock_segment_drift(
+        pred_joints=pred, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_contact_lock_tracking_zero_when_pred_follows_object():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    # Pred wrist exactly follows obj — pred_align == target_align → penalty 0.
+    loss = loss_r29_contact_lock_tracking(
+        pred_joints=joints, object_positions=obj_pos,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() < 1e-4
+
+
+def test_r29_contact_lock_tracking_positive_when_pred_stays_still():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    pred = joints.clone()
+    # Freeze the wrist at frame 0 — pred doesn't track the moving object.
+    for t in range(joints.shape[1]):
+        pred[:, t, LEFT_WRIST_IDX, :] = pred[:, 0, LEFT_WRIST_IDX, :]
+        pred[:, t, RIGHT_WRIST_IDX, :] = pred[:, 0, RIGHT_WRIST_IDX, :]
+    loss = loss_r29_contact_lock_tracking(
+        pred_joints=pred, object_positions=obj_pos,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    assert loss.item() > 0.0
+
+
+def test_r29_contact_lock_gradient_flows():
+    joints, obj_pos, obj_rot, contact, _, _ = _make_clip()
+    inter = _make_i3_channel(joints, obj_pos, obj_rot, contact)
+    pred = joints.clone().detach().requires_grad_(True)
+    loss = loss_r29_contact_lock_offset(
+        pred_joints=pred, object_positions=obj_pos, object_rotations=obj_rot,
+        stage2_interaction=inter, cfg=_default_cfg(),
+    )
+    loss.backward()
+    g = pred.grad
+    # Some hand-frame gradient must be non-zero (loss is non-trivial on
+    # the synthetic perturbed pred). At minimum, no NaN.
+    assert g is not None
+    assert torch.isfinite(g).all()
+
