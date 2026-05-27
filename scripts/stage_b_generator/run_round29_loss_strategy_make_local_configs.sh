@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-DATASETS_ROOT=${DATASETS_ROOT:-/media/gpu-server-1/4TB_for_data/Cai/datasets/InterAct/piano_official_process_4}
+DATASETS_ROOT=${DATASETS_ROOT:-/media/8TB_data/Cai/datasets/InterAct/piano_official_process_4}
 WIN_ROOT="E:/Project/Datasets/InterAct/piano_official_process_4"
 
 if [[ ! -d "${DATASETS_ROOT}/chairs" ]]; then
