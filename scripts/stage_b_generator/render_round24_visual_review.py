@@ -67,10 +67,16 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---- Selection filter ----
+    # Two schemas in the wild:
+    #   - old (R27 tier0_eval_selection_balanced.json): {"selected": [...], "n_clips": N}
+    #   - new (R27 build_tier0_train_indices.py output, used by R29
+    #     build_val_diag_subset): {"clips": [...], "n_found": N, "indices": [...]}
+    # Both list dicts with {"subset", "seq_id", ...}; we accept either.
     sel_pairs = None
     if args.selection_json.exists():
         sel = json.loads(args.selection_json.read_text("utf-8"))
-        sel_pairs = {(e["subset"], e["seq_id"]) for e in sel.get("selected", [])}
+        entries = sel.get("selected") or sel.get("clips") or []
+        sel_pairs = {(e["subset"], e["seq_id"]) for e in entries}
         print(f"[viz] selection JSON: {len(sel_pairs)} clips")
 
     # ---- Dataset ----

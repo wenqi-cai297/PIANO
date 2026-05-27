@@ -112,7 +112,7 @@ for V in "${VARIANTS[@]}"; do
     fi
 done
 
-SEL_N=$(python -c "import json; print(json.load(open('${SEL_JSON}')).get('n_clips') or len(json.load(open('${SEL_JSON}')).get('selected', [])))")
+SEL_N=$(python -c "import json; d=json.load(open('${SEL_JSON}')); print(d.get('n_clips') or d.get('n_found') or len(d.get('selected') or d.get('clips') or []))")
 echo "Selection: ${SEL_N} clips available; rendering first ${N_CLIPS} from ${BUCKET} bucket"
 echo "Variants: ${VARIANTS[*]}"
 
