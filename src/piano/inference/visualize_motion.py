@@ -254,19 +254,45 @@ def render_motion_video(
         fig, update, frames=T, interval=1000 / fps, blit=False, repeat=False,
     )
 
-    # Save: try ffmpeg first for mp4, fall back to pillow for gif
+    # Save. Prefer ffmpeg (mp4) — pillow's GIF writer does NOT correctly
+    # capture matplotlib 3D scatter ``_offsets3d`` updates and produces a
+    # GIF where every frame is identical (the final pose, repeated T times).
+    # That silently turns a long render into useless output, so we now
+    # FAIL LOUDLY on the fallback path instead of writing a broken GIF.
+    # Set ``PIANO_ALLOW_BROKEN_GIF_FALLBACK=1`` to opt back into the
+    # historical behaviour (only useful for code-path smoke tests).
     suffix = output_path.suffix.lower()
+    import os as _os
+    allow_broken = _os.environ.get(
+        "PIANO_ALLOW_BROKEN_GIF_FALLBACK", "0"
+    ) == "1"
     try:
         if suffix == ".mp4":
             anim.save(str(output_path), writer="ffmpeg", fps=fps, dpi=dpi)
         else:
+            # Explicit .gif requested by the caller — historical path.
             anim.save(str(output_path), writer="pillow", fps=fps, dpi=dpi)
     except Exception as e:
-        # ffmpeg unavailable — fall back to gif
-        gif_path = output_path.with_suffix(".gif")
-        print(f"  [warn] {e}; falling back to {gif_path}")
-        anim.save(str(gif_path), writer="pillow", fps=fps, dpi=dpi)
-        output_path = gif_path
+        if allow_broken:
+            gif_path = output_path.with_suffix(".gif")
+            print(f"  [warn] {e}; PIANO_ALLOW_BROKEN_GIF_FALLBACK=1, "
+                  f"writing (likely static) GIF anyway to {gif_path}")
+            anim.save(str(gif_path), writer="pillow", fps=fps, dpi=dpi)
+            output_path = gif_path
+        else:
+            plt.close(fig)
+            raise RuntimeError(
+                f"render_motion_video failed and ffmpeg fallback is "
+                f"disabled. Original error: {e}\n"
+                f"On the server, install ffmpeg into the active conda env:\n"
+                f"    conda install -y -n piano -c conda-forge ffmpeg\n"
+                f"or, if you genuinely want the historical (broken) GIF "
+                f"fallback for a code-path smoke test, set\n"
+                f"    PIANO_ALLOW_BROKEN_GIF_FALLBACK=1\n"
+                f"in the environment. NOTE: PIL gif fallback writes a "
+                f"single static frame repeated T times — it does NOT show "
+                f"the motion."
+            ) from e
     finally:
         plt.close(fig)
 

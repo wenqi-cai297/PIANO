@@ -105,6 +105,22 @@ fi
 
 # ---------- preflight ----------
 PREFLIGHT_FAIL=0
+
+# ffmpeg must be in the piano conda env. Without it the renderer falls
+# back to a PIL GIF writer that silently writes 196 identical frames
+# (the final pose) for matplotlib 3D scatter, producing a "video" that
+# does not show motion. Catch this here so the launch does not waste
+# 10-25 minutes producing useless output.
+if ! conda run --no-capture-output -n piano python -c "import shutil,sys; sys.exit(0 if shutil.which('ffmpeg') else 1)" 2>/dev/null; then
+    echo "[A1-VIS PREFLIGHT FAIL] ffmpeg not on PATH inside the piano conda env."
+    echo "    The PIL GIF fallback silently produces a static 'video' for 3D"
+    echo "    scatter animations. Install ffmpeg first:"
+    echo "        conda install -y -n piano -c conda-forge ffmpeg"
+    echo "    (or set PIANO_ALLOW_BROKEN_GIF_FALLBACK=1 to opt back into the"
+    echo "     historical broken behaviour for a code-path smoke test.)"
+    PREFLIGHT_FAIL=1
+fi
+
 for V in "${VARIANTS[@]}"; do
     CFG="configs/training/anchordiff_${V}.yaml"
     CKPT="runs/training/stageB_anchordiff_${V}/${CKPT_NAME}"
