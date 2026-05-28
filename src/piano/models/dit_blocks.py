@@ -107,20 +107,55 @@ class V12InputProjection(nn.Module):
 class GlobalCondSummary(nn.Module):
     """Produces a single per-sample (B, D) condition vector for AdaLN.
 
-    After the R29 cleanup the only input is the diffusion timestep
-    embedding (the plan-pool branch was removed alongside the interaction
-    plan tokens). Per-frame information flows through V12InputProjection.
+    Two modes:
+
+    1. **R28 / pre-PB1 default** (``use_cond_summary_mlp=False``): the only
+       input is the diffusion timestep embedding (R29 cleanup removed the
+       plan-pool branch). ``forward(t_emb)`` returns ``t_emb`` unchanged.
+       Per-frame information flows through ``V12InputProjection``.
+
+    2. **PB1 path** (``use_cond_summary_mlp=True``): the parent passes a
+       pooled R29 cond summary (B, D) alongside ``t_emb``; we project it
+       through a SiLU + Linear(D, D) MLP whose final Linear is
+       zero-initialised and add to ``t_emb`` before returning. Zero-init
+       guarantees that step-0 output equals ``t_emb`` exactly — so the
+       PB1 model with this branch ON has the same step-0 forward as a
+       PB1 model with the branch OFF (which itself equals the A1
+       baseline forward when both are trained from scratch with the
+       same seed).
+
+    State-dict compatibility: ``cond_summary_mlp`` is only created when
+    ``use_cond_summary_mlp=True``. When False (the historical / R28
+    default), the module has no parameters and loads cleanly from old
+    ckpts that never saw this branch.
     """
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, *, use_cond_summary_mlp: bool = False) -> None:
         super().__init__()
-        # No parameters — kept as a Module for state_dict compatibility
-        # with the historical name.
+        # Historical placeholder; kept for state_dict compatibility with
+        # the pre-PB1 ckpts (which had ``plan_pool_mlp = None`` as a
+        # registered attribute).
         self.plan_pool_mlp = None
+        self.use_cond_summary_mlp = bool(use_cond_summary_mlp)
+        if self.use_cond_summary_mlp:
+            # 2-layer MLP. Final Linear zero-init -> the cond_summary
+            # branch contributes 0 at init (PB1 invariant).
+            self.cond_summary_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            nn.init.zeros_(self.cond_summary_mlp[-1].weight)
+            nn.init.zeros_(self.cond_summary_mlp[-1].bias)
+        else:
+            self.cond_summary_mlp = None
 
-    def forward(self, t_emb: Tensor) -> Tensor:
-        """t_emb: (B, D). Returns (B, D)."""
-        return t_emb
+    def forward(
+        self, t_emb: Tensor, cond_summary: Tensor | None = None,
+    ) -> Tensor:
+        """t_emb: (B, D). cond_summary: (B, D) or None. Returns (B, D)."""
+        if cond_summary is None or self.cond_summary_mlp is None:
+            return t_emb
+        return t_emb + self.cond_summary_mlp(cond_summary)
 
 
 # ---------------------------------------------------------------------------

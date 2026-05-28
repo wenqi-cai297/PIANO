@@ -453,6 +453,26 @@ class AnchorDenoiserConfig:
     r29_per_family_modes: dict | None = None
     r29_zero_init_adapters: bool = True
 
+    # PB1 — AdaLN-cond branch (per Codex review §4.3 / §4.4 of
+    # analyses/2026-05-29_round29_cond_injection_prior_codex_review_for_claude_code.md).
+    # When ``r29_use_cond_adaln=True``, GlobalCondSummary gains a
+    # zero-init Linear that adds a pooled R29 cond summary to the AdaLN
+    # control vector. ``r29_adaln_families`` selects which active
+    # families feed the pool; ``r29_adaln_pool`` chooses the pooling
+    # method:
+    #   - "mean":                 mean over T, then mean across families.
+    #   - "support_walking_mean": walking_mask-weighted mean of the
+    #                             support family (S4 dim 4 = walking_mask).
+    # Phase 0 verdict (analyses/2026-05-29_round29_cond_usage_verdict.md):
+    # A1 uses S4 actively but non-temporally with sub-linear scale
+    # response (lin = 0.70). AdaLN-S4 with support_walking_mean is the
+    # textbook fix for this regime. C41 deliberately stays OUT of the
+    # pool — Codex §4.4 — because it is a spatial scaffold and pooling
+    # destroys spatial structure.
+    r29_use_cond_adaln: bool = False
+    r29_adaln_families: tuple | list | None = None
+    r29_adaln_pool: str = "mean"
+
     d_model: int = 512
     n_layers: int = 8
     n_heads: int = 4
@@ -556,7 +576,10 @@ class AnchorDenoiser(nn.Module):
             d_model=cfg.d_model,
             stage1_coarse_dim=cfg.stage1_coarse_dim,
         )
-        self.v12_cond_summary = GlobalCondSummary(d_model=cfg.d_model)
+        self.v12_cond_summary = GlobalCondSummary(
+            d_model=cfg.d_model,
+            use_cond_summary_mlp=bool(cfg.r29_use_cond_adaln),
+        )
         self.v12_blocks = nn.ModuleList([
             ConditionedEncoderLayer(
                 d_model=cfg.d_model,
@@ -654,11 +677,30 @@ class AnchorDenoiser(nn.Module):
             stage1_coarse=stage1_coarse_eff,
         )                                                                # (B, T, D)
 
+        # ─── PB1: precompute per-family embeddings so AdaLN pool + input-add
+        #         lane share one projection pass. No-op when r29_inject is
+        #         off; cheap when on (it is what apply_input_injection used
+        #         to do internally on first call).
+        r29_cond_summary: Tensor | None = None
+        if self.r29_inject is not None:
+            self.r29_inject.compute_family_embeddings(cond)
+            if cfg.r29_use_cond_adaln:
+                families = cfg.r29_adaln_families or ()
+                r29_cond_summary = self.r29_inject.pool_cond_summary(
+                    families=families,
+                    cond=cond,
+                    pool=cfg.r29_adaln_pool,
+                )                                                        # (B, D)
+
         # ─── §4.4 Global condition vector for AdaLN (per-sample) ───
-        # c = t_emb only (R29 dropped the plan-pool branch).
-        c = self.v12_cond_summary(t_emb=t_emb)                           # (B, D)
+        # When PB1 is off this is t_emb unchanged (R28 / A1 behaviour).
+        # When PB1 is on this is t_emb + cond_summary_mlp(r29_cond_summary),
+        # with the MLP final Linear zero-init so the contribution starts at 0.
+        c = self.v12_cond_summary(t_emb=t_emb, cond_summary=r29_cond_summary)  # (B, D)
 
         # ─── Round-29: typed condition family input injection ───
+        # apply_input_injection now reuses the cache populated above
+        # (no double projection pass).
         if self.r29_inject is not None:
             h = self.r29_inject.apply_input_injection(h, cond, c_summary=c)
 

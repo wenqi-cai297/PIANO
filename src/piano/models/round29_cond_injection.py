@@ -238,34 +238,26 @@ class Round29CondInjectionModule(nn.Module):
         return dict(self._last_stats)
 
     # ------------------------------------------------------------------
-    # Forward — input-add stage
+    # Forward — family-embedding compute (PB1 / PB2 prerequisite)
     # ------------------------------------------------------------------
 
-    def apply_input_injection(
+    def compute_family_embeddings(
         self,
-        h: Tensor,                  # (B, T, D)
         cond: dict[str, Tensor],    # keyed by "stage2_<family>"
-        c_summary: Tensor | None,
-    ) -> Tensor:
-        """Compute per-family embeddings, cache them for per-layer
-        adapters, and return the modified residual stream ``h``.
+    ) -> dict[str, Tensor]:
+        """Project each active family's typed cond tensor into the d_model
+        embedding space and cache it under ``self._cond_emb_cache``.
 
-        For each active family:
-            family mode 'input_add'           -> h += proj(cond)
-            family mode 'gated_input'         -> h += sigmoid(gate([c; emb])) * emb
-            family mode 'input_add_adapter'   -> h += proj(cond)
-                                                 (adapter delta added per-block later)
-            family mode 'adapter_only'        -> h unchanged (adapter only)
+        Must be called BEFORE ``apply_input_injection`` (PB1 / PB2 path:
+        the parent caches family embeddings once and consumes them from
+        both AdaLN pool and the input-add lane). When ``apply_input_injection``
+        is called directly (legacy code path), it triggers this internally
+        to preserve behaviour.
 
-        ``cond`` keys are the TYPED bundle keys:
-            cond['stage2_coarse_extra'], cond['stage2_interaction'],
-            cond['stage2_support'],     cond['stage2_body_refine']
-
-        Missing keys for active families raise KeyError.
+        Returns the same dict, primarily so callers can introspect/test.
         """
         self._cond_emb_cache = {}
         self._last_stats = {}
-
         for f in self.cfg.active_families():
             key = f"stage2_{f}"
             if key not in cond:
@@ -285,6 +277,133 @@ class Round29CondInjectionModule(nn.Module):
             self._cond_emb_cache[f] = emb
             self._set_stat(f"{f}_hint_norm", self._mean_norm(x))
             self._set_stat(f"{f}_emb_norm", self._mean_norm(emb))
+        return self._cond_emb_cache
+
+    def pool_cond_summary(
+        self,
+        families: Iterable[str],
+        cond: dict[str, Tensor],
+        pool: str = "mean",
+    ) -> Tensor:
+        """Pool cached per-family (B, T, D) embeddings into a single
+        per-sample (B, D) vector for AdaLN (PB1).
+
+        Allowed pool modes:
+          - ``"mean"``: mean over T, then mean across the requested
+            families.
+          - ``"support_walking_mean"``: walking_mask-weighted mean of the
+            ``support`` family embedding over T. ``walking_mask`` is S4
+            dim 4 (see ``configs/training/anchordiff_r29_*`` S4 layout).
+            Denominator is clamped to ≥ 1.0 so a clip with zero walking
+            frames produces a zero vector instead of NaN. If
+            ``support`` is not active or the support family lacks a
+            recognisable walking_mask channel (dim < 5), falls back to
+            ``mean`` over the available family list and records a
+            warning stat.
+
+        Returns (B, D). When ``families`` is empty or no requested family
+        is active, returns a zero vector with the right shape inferred
+        from the first cached embedding (or raises if nothing is
+        cached — that means ``compute_family_embeddings`` was not
+        called).
+        """
+        cache = self._cond_emb_cache
+        if not cache:
+            raise RuntimeError(
+                "pool_cond_summary called before compute_family_embeddings; "
+                "AnchorDenoiser.forward must call compute_family_embeddings "
+                "first in PB1 path."
+            )
+        requested = [f for f in families if f in cache]
+        if pool == "support_walking_mean":
+            if "support" in requested:
+                support_emb = cache["support"]                           # (B, T, D)
+                support_key = "stage2_support"
+                support_x = cond.get(support_key)
+                if (
+                    support_x is not None
+                    and support_x.dim() == 3
+                    and support_x.shape[-1] >= 5
+                ):
+                    w = support_x[..., 4]                                # (B, T)
+                    w = w.to(dtype=support_emb.dtype)
+                    denom = w.sum(dim=1, keepdim=True).clamp_min(1.0)    # (B, 1)
+                    weighted = (support_emb * w.unsqueeze(-1)).sum(dim=1)  # (B, D)
+                    pooled = weighted / denom                            # (B, D)
+                    self._set_stat(
+                        "adaln_support_walking_frac_mean",
+                        w.float().mean(),
+                    )
+                    return pooled
+                # Fallback: support active but dim < 5 (no walking_mask
+                # channel) — record warning + fall through to mean over
+                # support only.
+                self._set_stat(
+                    "adaln_support_walking_mean_fallback",
+                    torch.tensor(1.0, device=support_emb.device),
+                )
+                return support_emb.mean(dim=1)
+            # Fallback: pool mode asked for support but support isn't
+            # active. Record warning, fall through to ``mean`` over
+            # whatever requested families ARE cached.
+            if cache:
+                ref = next(iter(cache.values()))
+                self._set_stat(
+                    "adaln_support_walking_mean_fallback",
+                    torch.tensor(1.0, device=ref.device),
+                )
+        # ``mean`` (or fallback from support_walking_mean): mean over T
+        # then mean across families.
+        if not requested:
+            ref = next(iter(cache.values()))
+            return torch.zeros(
+                ref.shape[0], ref.shape[-1],
+                device=ref.device, dtype=ref.dtype,
+            )
+        pooled_per_family = [cache[f].mean(dim=1) for f in requested]    # list of (B, D)
+        return torch.stack(pooled_per_family, dim=0).mean(dim=0)         # (B, D)
+
+    # ------------------------------------------------------------------
+    # Forward — input-add stage
+    # ------------------------------------------------------------------
+
+    def apply_input_injection(
+        self,
+        h: Tensor,                  # (B, T, D)
+        cond: dict[str, Tensor],    # keyed by "stage2_<family>"
+        c_summary: Tensor | None,
+    ) -> Tensor:
+        """Compute per-family embeddings (if not already cached), use them
+        for per-layer adapters, and return the modified residual stream ``h``.
+
+        For each active family:
+            family mode 'input_add'           -> h += proj(cond)
+            family mode 'gated_input'         -> h += sigmoid(gate([c; emb])) * emb
+            family mode 'input_add_adapter'   -> h += proj(cond)
+                                                 (adapter delta added per-block later)
+            family mode 'adapter_only'        -> h unchanged (adapter only)
+
+        ``cond`` keys are the TYPED bundle keys:
+            cond['stage2_coarse_extra'], cond['stage2_interaction'],
+            cond['stage2_support'],     cond['stage2_body_refine']
+
+        Missing keys for active families raise KeyError.
+
+        Cache reuse: when the parent module has already called
+        ``compute_family_embeddings(cond)`` earlier this forward pass
+        (PB1 / PB2 path), the cache is already populated and we reuse it
+        directly — saves one projection pass. When called standalone
+        (legacy path), we populate it ourselves.
+        """
+        active = self.cfg.active_families()
+        cache_complete = (
+            self._cond_emb_cache and all(f in self._cond_emb_cache for f in active)
+        )
+        if not cache_complete:
+            self.compute_family_embeddings(cond)
+
+        for f in active:
+            emb = self._cond_emb_cache[f]
 
             mode = self.cfg.effective_mode(f)
             if mode == "input_add":

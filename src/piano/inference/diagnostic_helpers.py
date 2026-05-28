@@ -209,6 +209,18 @@ def _build_model(cfg, device: torch.device) -> tuple[MotionAnchorDiff, ObjectEnc
         r29_zero_init_adapters=bool(
             cfg.model.denoiser.get("r29_zero_init_adapters", True)
         ),
+        # PB1 — AdaLN-cond branch (Codex §4.3 / §4.4).
+        r29_use_cond_adaln=bool(
+            cfg.model.denoiser.get("r29_use_cond_adaln", False)
+        ),
+        r29_adaln_families=(
+            list(cfg.model.denoiser.get("r29_adaln_families"))
+            if cfg.model.denoiser.get("r29_adaln_families") is not None
+            else None
+        ),
+        r29_adaln_pool=str(
+            cfg.model.denoiser.get("r29_adaln_pool", "mean")
+        ),
         d_model=int(cfg.model.denoiser.d_model),
         n_layers=int(cfg.model.denoiser.n_layers),
         n_heads=int(cfg.model.denoiser.n_heads),
