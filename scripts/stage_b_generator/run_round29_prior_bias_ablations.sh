@@ -168,6 +168,21 @@ if [[ ${SKIP_EVAL} -eq 0 ]]; then
         echo "       python scripts/stage_b_generator/round29_make_next_step_ablation_configs.py"
         preflight_fail=1
     fi
+    # Diag scripts must be on disk BEFORE training starts (no point in
+    # training 3.5 h and then crashing on a typo'd path).
+    DIAG_SCRIPTS=(
+        "scripts/stage_b_generator/round26_sustained_contact_diag.py"
+        "scripts/stage_b_generator/round26_gait_diag.py"
+        "scripts/stage_b_generator/round28_body_action_diag.py"
+        "scripts/stage_b_generator/round29_g1_soft_stance_diag.py"
+        "scripts/stage_b_generator/round29_cond_usage_probe.py"
+    )
+    for ds in "${DIAG_SCRIPTS[@]}"; do
+        if [[ ! -e "${ds}" ]]; then
+            echo "[PB PREFLIGHT FAIL] diag script not found: ${ds}"
+            preflight_fail=1
+        fi
+    done
 fi
 
 if [[ ${DRY_RUN} -eq 0 && ${SKIP_TRAIN} -eq 0 ]]; then
@@ -293,10 +308,14 @@ else
         case "${KIND}" in
             sustained_contact) SCRIPT="scripts/stage_b_generator/round26_sustained_contact_diag.py" ;;
             gait)              SCRIPT="scripts/stage_b_generator/round26_gait_diag.py" ;;
-            body_action)       SCRIPT="scripts/stage_b_generator/round26_body_action_diag.py" ;;
+            body_action)       SCRIPT="scripts/stage_b_generator/round28_body_action_diag.py" ;;
             g1_soft_stance)    SCRIPT="scripts/stage_b_generator/round29_g1_soft_stance_diag.py" ;;
             *) echo "[PB DIAG] unknown kind ${KIND}"; return 1 ;;
         esac
+        if [[ ! -e "${SCRIPT}" ]]; then
+            echo "[PB DIAG FAIL] diag script not found: ${SCRIPT}"
+            return 1
+        fi
 
         echo "[PB DIAG START] ${VID} ${KIND} ${BUCKET}"
         if [[ ${DRY_RUN} -eq 1 ]]; then
