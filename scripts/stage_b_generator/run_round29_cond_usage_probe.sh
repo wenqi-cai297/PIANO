@@ -230,7 +230,10 @@ fi
 
 # ---------- pack ----------
 STAMP=$(date +%Y%m%d_%H%M%S)
-TARBALL="round29_cond_usage_probe_${STAMP}.tar.gz"
+# Drop the tarball into analyses/ to match the convention of every other
+# R29 result tarball (round29_next_step_*, round29_failure_targeted_*, ...).
+# .gitignore already covers *.tar.gz repo-wide; this keeps the repo root tidy.
+TARBALL="analyses/round29_cond_usage_probe_${STAMP}.tar.gz"
 echo
 echo "================================================================"
 echo "[$(date '+%F %T')] PACK -> ${TARBALL}"
@@ -249,6 +252,6 @@ done
 echo "Logs:    ${LOG_DIR}/probe_*.log"
 echo "Tarball: ${TARBALL}"
 echo
-echo "scp back:  scp <server>:$(pwd)/${TARBALL} ."
+echo "scp back:  scp <server>:$(pwd)/${TARBALL} ./analyses/"
 echo "Then on local:  tar -xzf ${TARBALL} -C analyses/"
 echo "================================================================"
