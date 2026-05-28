@@ -166,6 +166,26 @@ def _per_subset_dataset_roots(cfg: Any) -> dict[str, Path]:
     return out
 
 
+def _valid_length_from_batch(batch: "dict[str, Any]") -> int:
+    """Return valid clip length from legacy seq_mask or current seq_len."""
+    if "seq_mask" in batch:
+        seq_mask = batch["seq_mask"][0]
+        if hasattr(seq_mask, "bool"):
+            valid_T = int(seq_mask.bool().sum().item())
+        else:
+            valid_T = int(np.asarray(seq_mask).astype(bool).sum())
+    elif "seq_len" in batch:
+        seq_len = batch["seq_len"][0]
+        valid_T = int(seq_len.item() if hasattr(seq_len, "item") else seq_len)
+    else:
+        raise KeyError("batch must contain either 'seq_mask' or 'seq_len'")
+
+    motion = batch.get("motion")
+    if motion is not None and hasattr(motion, "shape") and len(motion.shape) >= 2:
+        valid_T = min(valid_T, int(motion.shape[1]))
+    return max(valid_T, 0)
+
+
 def _run_clip(
     batch: "dict[str, Any]",   # values are torch.Tensor in the real path
     subset_roots: dict[str, Path],
@@ -174,8 +194,7 @@ def _run_clip(
     when the raw NPZ is unavailable."""
     subset = batch["subset"][0]
     seq_id = batch["seq_id"][0]
-    seq_mask = batch["seq_mask"][0].bool()
-    valid_T = int(seq_mask.sum().item())
+    valid_T = _valid_length_from_batch(batch)
     if valid_T < 2:
         return None
 

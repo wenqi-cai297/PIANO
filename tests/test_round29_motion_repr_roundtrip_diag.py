@@ -21,7 +21,7 @@ sys.path.insert(0, str(SCRIPTS))
 from round29_motion_repr_roundtrip_diag import (  # noqa: E402
     PerClipRow, SMPL_JOINT_NAMES, PART_TO_JOINT_IDX,
     _per_joint_error_cm, _per_part_contact_floor,
-    _percentile, _aggregate, _interpretation,
+    _percentile, _aggregate, _interpretation, _valid_length_from_batch,
 )
 
 
@@ -84,6 +84,31 @@ def test_per_part_contact_floor_computes_active_part():
 def test_percentile_handles_empty():
     assert np.isnan(_percentile(np.array([]), 50))
     assert _percentile(np.array([10.0]), 50) == pytest.approx(10.0)
+
+
+def test_valid_length_from_seq_len_fallback():
+    batch = {
+        "seq_len": np.array([37]),
+        "motion": np.zeros((1, 196, 135), dtype=np.float32),
+    }
+    assert _valid_length_from_batch(batch) == 37
+
+
+def test_valid_length_prefers_legacy_seq_mask():
+    batch = {
+        "seq_mask": np.array([[1] * 12 + [0] * 8], dtype=bool),
+        "seq_len": np.array([99]),
+        "motion": np.zeros((1, 20, 135), dtype=np.float32),
+    }
+    assert _valid_length_from_batch(batch) == 12
+
+
+def test_valid_length_clamps_to_motion_length():
+    batch = {
+        "seq_len": np.array([99]),
+        "motion": np.zeros((1, 20, 135), dtype=np.float32),
+    }
+    assert _valid_length_from_batch(batch) == 20
 
 
 def test_aggregate_empty_returns_placeholder():
