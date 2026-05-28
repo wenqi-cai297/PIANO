@@ -224,9 +224,54 @@ def _per_joint_delta_cm(
     return err_m * 100.0
 
 
+def _aa_to_rotation_matrix_np(aa: np.ndarray) -> np.ndarray:
+    """Rodrigues, numpy version. ``aa`` shape (..., 3) → R shape (..., 3, 3).
+
+    Mirrors ``piano.training.anchor_consistency_loss._aa_to_rotation_matrix``
+    but stays in numpy so the probe stays importable without torch.
+    """
+    theta = np.linalg.norm(aa, axis=-1, keepdims=True)
+    theta_safe = np.maximum(theta, 1e-12)
+    k = aa / theta_safe
+    K = np.zeros(aa.shape[:-1] + (3, 3), dtype=aa.dtype)
+    kx = k[..., 0]; ky = k[..., 1]; kz = k[..., 2]
+    K[..., 0, 1] = -kz; K[..., 0, 2] = ky
+    K[..., 1, 0] = kz;  K[..., 1, 2] = -kx
+    K[..., 2, 0] = -ky; K[..., 2, 1] = kx
+    eye = np.broadcast_to(np.eye(3, dtype=aa.dtype), K.shape)
+    sin_t = np.sin(theta)[..., None]
+    cos_t = np.cos(theta)[..., None]
+    return eye + sin_t * K + (1.0 - cos_t) * (K @ K)
+
+
+def _lift_object_local_to_world_np(
+    target_local: np.ndarray,      # (T, P, 3) object-local frame
+    obj_pos_world: np.ndarray,     # (T, 3) world translation
+    obj_rot_world_aa: np.ndarray,  # (T, 3) axis-angle world rotation
+) -> np.ndarray:
+    """Map an object-local target into world frame using the same SE(3)
+    the trainer uses (see ``lift_object_local_to_world`` in
+    ``src/piano/training/anchor_consistency_loss.py``).
+
+    Returns (T, P, 3) in world frame, metres.
+
+    Per Phase 0 review §N1: the dataset emits ``contact_target_xyz`` in
+    object-local frame (see ``src/piano/data/dataset.py:820-826`` —
+    "closest-surface-point on the mesh in object-local frame"), and the
+    trainer rotates it to world before any loss
+    (``src/piano/training/train_anchordiff.py:493``). The probe was
+    previously computing ``wrist_world − target_local`` directly, which
+    is geometrically nonsense and produced biased sc% values.
+    """
+    R = _aa_to_rotation_matrix_np(obj_rot_world_aa)              # (T, 3, 3)
+    # einsum gives (T, P, 3) = R @ target_local along the last axis.
+    rotated = np.einsum("tij,tpj->tpi", R, target_local)
+    return rotated + obj_pos_world[:, None, :]                   # (T, P, 3)
+
+
 def _proxy_sustained_contact_cm(
     joints: np.ndarray,                      # (T, 22, 3) world frame, metres
-    contact_target_xyz: np.ndarray,          # (T, 2, 3) world frame, metres
+    contact_target_xyz: np.ndarray,          # (T, 2, 3) world frame, metres — must be rotated upstream via _lift_object_local_to_world_np
     contact_state: np.ndarray,               # (T, 5) contact mask [L_hand, R_hand, L_foot, R_foot, pelvis]
     contact_threshold: float = 0.5,
 ) -> float:
@@ -236,6 +281,10 @@ def _proxy_sustained_contact_cm(
     This is the cheapest proxy of the sustained_contact diag's drift metric
     that fits in the per-perturbation loop without re-running the full
     segment detector. Lower = wrist closer to contact target = better contact.
+
+    The caller MUST pass ``contact_target_xyz`` already lifted into world
+    frame — the dataset stores it in object-local frame. See
+    ``_lift_object_local_to_world_np``.
     """
     T = min(joints.shape[0], contact_target_xyz.shape[0], contact_state.shape[0])
     if T < 1:
@@ -304,18 +353,45 @@ def _proxy_body_action_motion_energy_cm(
     return float(np.sqrt((speed_m ** 2).mean()) * 100.0)
 
 
-def _fractional_change(base: float, pert: float) -> float:
-    """|pert − base| / max(|base|, eps). NaN-safe. Returns NaN if either
-    input is NaN or if base is too small to define a meaningful fraction.
+# Per-proxy minimum baseline magnitudes for `_fractional_change`. Baselines
+# below these floors are treated as degenerate (proxy meaningless on that
+# clip) and return NaN rather than producing exploding fractions.
+#
+# - sustained_contact (cm): 0.01 cm = 0.1 mm wrist-vs-target distance. A
+#   baseline below this is in the noise floor of FK reconstruction and the
+#   fractional change is meaningless.
+# - gait (cm/s): 0.05 cm/s mean |L-R| ankle speed difference. Below this
+#   the clip has effectively no gait signal (stationary or both feet
+#   moving identically).
+# - body_action (cm/frame): 0.05 cm/frame = 0.5 mm/frame whole-body RMS
+#   velocity. A model that produces this little motion is in a degenerate
+#   "frozen pose" regime; doubling near-zero noise should not register as
+#   a 1000% change. Without this floor, baselines around 1e-6 cm/frame
+#   produced fractional changes > 2000 % under time_shuffle (see
+#   analyses/2026-05-29_round29_cond_usage_probe_code_review_v2.md, §N2).
+_FRACTIONAL_CHANGE_MIN_BASELINE = {
+    "sustained_contact_cm": 0.01,
+    "gait_cm_per_s": 0.05,
+    "body_action_cm_per_frame": 0.05,
+}
+
+
+def _fractional_change(
+    base: float, pert: float, *, min_baseline: float = 1e-6,
+) -> float:
+    """|pert − base| / max(|base|, min_baseline). NaN-safe. Returns NaN if
+    either input is NaN or if ``|base| < min_baseline`` (proxy degenerate
+    on this clip).
+
+    ``min_baseline`` defaults to 1e-6 for back-compat; callers should pass
+    the proxy-specific floor from ``_FRACTIONAL_CHANGE_MIN_BASELINE`` so
+    that an effectively-zero baseline does not produce an exploded ratio.
     """
     if not math.isfinite(base) or not math.isfinite(pert):
         return float("nan")
-    denom = max(abs(base), 1e-6)
-    if abs(base) < 1e-6:
-        # Baseline is degenerate (e.g. zero contact frames in this clip
-        # but non-zero in the perturbed sample). Avoid dividing by ~0.
+    if abs(base) < min_baseline:
         return float("nan")
-    return float(abs(pert - base) / denom)
+    return float(abs(pert - base) / abs(base))
 
 
 def compute_clip_delta(
@@ -357,13 +433,22 @@ def compute_clip_delta(
         sc_pert = _proxy_sustained_contact_cm(
             pert_joints, contact_target_xyz, contact_state,
         )
-        sc_rel = _fractional_change(sc_base, sc_pert)
+        sc_rel = _fractional_change(
+            sc_base, sc_pert,
+            min_baseline=_FRACTIONAL_CHANGE_MIN_BASELINE["sustained_contact_cm"],
+        )
     gait_base = _proxy_gait_velocity_score(base_joints, walking_mask, fps=fps)
     gait_pert = _proxy_gait_velocity_score(pert_joints, walking_mask, fps=fps)
-    gait_rel = _fractional_change(gait_base, gait_pert)
+    gait_rel = _fractional_change(
+        gait_base, gait_pert,
+        min_baseline=_FRACTIONAL_CHANGE_MIN_BASELINE["gait_cm_per_s"],
+    )
     body_base = _proxy_body_action_motion_energy_cm(base_joints)
     body_pert = _proxy_body_action_motion_energy_cm(pert_joints)
-    body_rel = _fractional_change(body_base, body_pert)
+    body_rel = _fractional_change(
+        body_base, body_pert,
+        min_baseline=_FRACTIONAL_CHANGE_MIN_BASELINE["body_action_cm_per_frame"],
+    )
     return mean_cm, p95_cm, key_joint, sc_rel, gait_rel, body_rel
 
 
@@ -1006,13 +1091,43 @@ def main() -> int:
 
         # Extract per-clip task-metric inputs ONCE (avoid CPU↔GPU shuttle
         # on every perturbation). All shapes truncated to valid_T.
+        #
+        # Per Phase 0 review §N1: contact_target_xyz is emitted by the
+        # dataset in OBJECT-LOCAL frame (see
+        # ``src/piano/data/dataset.py:820-826``). The trainer rotates it
+        # to world via ``lift_object_local_to_world`` before any loss.
+        # We MUST do the same here, otherwise the sc% proxy mixes
+        # world-frame wrist with object-local target and produces biased
+        # distances. Requires ``object_positions`` (B,T,3) and
+        # ``object_rotations`` (B,T,3 axis-angle) in the batch, same as
+        # ``diagnostic_helpers._build_cond``.
         contact_target_xyz_np: np.ndarray | None = None
         contact_state_np: np.ndarray | None = None
         walking_mask_np: np.ndarray | None = None
         if "contact_target_xyz" in batch:
-            contact_target_xyz_np = batch[
+            target_local = batch[
                 "contact_target_xyz"
-            ][0, :valid_T].cpu().numpy()
+            ][0, :valid_T].cpu().numpy()                # (T, P, 3)
+            if (
+                "object_positions" not in batch
+                or "object_rotations" not in batch
+            ):
+                raise KeyError(
+                    "round29_cond_usage_probe: batch has "
+                    "'contact_target_xyz' but is missing "
+                    "'object_positions' / 'object_rotations' — cannot "
+                    "lift target to world frame. Update the dataset to "
+                    "surface both."
+                )
+            obj_pos_world_np = batch[
+                "object_positions"
+            ][0, :valid_T].cpu().numpy()                # (T, 3)
+            obj_rot_world_aa_np = batch[
+                "object_rotations"
+            ][0, :valid_T].cpu().numpy()                # (T, 3) axis-angle
+            contact_target_xyz_np = _lift_object_local_to_world_np(
+                target_local, obj_pos_world_np, obj_rot_world_aa_np,
+            )
         if "contact_state" in batch:
             contact_state_np = batch[
                 "contact_state"

@@ -30,9 +30,11 @@ from round29_cond_usage_probe import (  # noqa: E402
     THRESH_TEMPORALLY_USED_FRACTION,
     THRESH_WEAK_KEY_CM,
     THRESH_WEAK_RELATIVE,
+    _aa_to_rotation_matrix_np,
     _apply_perturbation,
     _derange_indices,
     _fractional_change,
+    _lift_object_local_to_world_np,
     _proxy_body_action_motion_energy_cm,
     _proxy_gait_velocity_score,
     _proxy_sustained_contact_cm,
@@ -237,6 +239,121 @@ def test_proxy_body_action_positive_when_moving():
     assert out == pytest.approx(5.0, abs=1e-4)
 
 
+def test_aa_to_rotation_matrix_np_identity_on_zero():
+    """Zero axis-angle → identity rotation. (Rodrigues at θ=0.)"""
+    aa = np.zeros((4, 3), dtype=np.float64)
+    R = _aa_to_rotation_matrix_np(aa)
+    assert R.shape == (4, 3, 3)
+    eye = np.broadcast_to(np.eye(3), (4, 3, 3))
+    assert np.allclose(R, eye, atol=1e-8)
+
+
+def test_aa_to_rotation_matrix_np_90deg_around_z():
+    """90° around Z maps (1,0,0) → (0,1,0)."""
+    aa = np.array([[0.0, 0.0, np.pi / 2]], dtype=np.float64)
+    R = _aa_to_rotation_matrix_np(aa)[0]
+    v = np.array([1.0, 0.0, 0.0])
+    out = R @ v
+    assert np.allclose(out, [0.0, 1.0, 0.0], atol=1e-7)
+
+
+def test_lift_object_local_to_world_np_identity_pose():
+    """Zero rotation + zero translation → world == local (pure passthrough)."""
+    T, P = 5, 2
+    target_local = np.random.RandomState(0).randn(T, P, 3).astype(np.float64)
+    pos = np.zeros((T, 3), dtype=np.float64)
+    aa = np.zeros((T, 3), dtype=np.float64)
+    out = _lift_object_local_to_world_np(target_local, pos, aa)
+    assert out.shape == (T, P, 3)
+    assert np.allclose(out, target_local, atol=1e-8)
+
+
+def test_lift_object_local_to_world_np_translation_only():
+    """Zero rotation + non-zero translation → world = local + pos broadcast."""
+    T, P = 3, 2
+    target_local = np.array(
+        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]] * T, dtype=np.float64
+    )
+    pos = np.array(
+        [[10.0, 20.0, 30.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -3.0]],
+        dtype=np.float64,
+    )
+    aa = np.zeros((T, 3), dtype=np.float64)
+    out = _lift_object_local_to_world_np(target_local, pos, aa)
+    expected = target_local + pos[:, None, :]
+    assert np.allclose(out, expected, atol=1e-8)
+
+
+def test_lift_object_local_to_world_np_rotation_only():
+    """90° around Z + zero translation: local (1,0,0) → world (0,1,0)."""
+    T = 1
+    target_local = np.array([[[1.0, 0.0, 0.0]]], dtype=np.float64)   # (1, 1, 3)
+    pos = np.zeros((T, 3), dtype=np.float64)
+    aa = np.array([[0.0, 0.0, np.pi / 2]], dtype=np.float64)
+    out = _lift_object_local_to_world_np(target_local, pos, aa)
+    assert out.shape == (T, 1, 3)
+    assert np.allclose(out[0, 0], [0.0, 1.0, 0.0], atol=1e-7)
+
+
+def test_lift_object_local_to_world_np_matches_anchor_consistency_loss():
+    """Numpy implementation must match the torch reference used by the
+    trainer (``piano.training.anchor_consistency_loss.lift_object_local_to_world``)
+    for random poses.
+    """
+    import torch  # local import — keeps the rest of the module torch-free.
+    from piano.training.anchor_consistency_loss import lift_object_local_to_world
+
+    rng = np.random.RandomState(42)
+    T, P = 8, 2
+    target_local_np = rng.randn(T, P, 3).astype(np.float64)
+    pos_np = rng.randn(T, 3).astype(np.float64)
+    aa_np = (rng.randn(T, 3) * 0.7).astype(np.float64)              # bounded but non-trivial
+
+    out_np = _lift_object_local_to_world_np(target_local_np, pos_np, aa_np)
+
+    # Torch reference expects (B, T, P, 3); wrap with a singleton batch.
+    target_t = torch.from_numpy(target_local_np).unsqueeze(0)
+    pos_t = torch.from_numpy(pos_np).unsqueeze(0)
+    aa_t = torch.from_numpy(aa_np).unsqueeze(0)
+    out_t = lift_object_local_to_world(target_t, pos_t, aa_t)[0].numpy()
+
+    assert np.allclose(out_np, out_t, atol=1e-7)
+
+
+def test_proxy_sustained_contact_cm_uses_world_frame():
+    """Per N1: the proxy must see world-frame target. With wrist at world
+    origin and target_local = (1, 0, 0), then:
+      - identity pose → distance = 1 m = 100 cm
+      - +5 m world translation → distance = sqrt(5² + 6²) m ≠ 100 cm
+
+    If the caller forgets to rotate target into world, the proxy would
+    compute 1 m for both cases (silently wrong). The test pins that the
+    proxy is reading world-frame numbers directly.
+    """
+    T = 4
+    joints = np.zeros((T, 22, 3), dtype=np.float32)                  # all joints at world origin
+    contact_state = np.zeros((T, 5), dtype=np.float32)
+    contact_state[:, 0] = 1.0                                        # left hand in contact
+
+    # Identity pose: rotated target = local target = (1, 0, 0).
+    target_local = np.tile(np.array([[1.0, 0.0, 0.0]]), (T, 2, 1)).astype(np.float64)
+    pos_id = np.zeros((T, 3), dtype=np.float64)
+    aa_id = np.zeros((T, 3), dtype=np.float64)
+    world_id = _lift_object_local_to_world_np(target_local, pos_id, aa_id).astype(
+        np.float32
+    )
+    d_id = _proxy_sustained_contact_cm(joints, world_id, contact_state)
+    assert d_id == pytest.approx(100.0, abs=1e-3)                    # 1 m → 100 cm
+
+    # Translated by (5, 5, 0): world target = (6, 5, 0).
+    pos_tr = np.tile(np.array([[5.0, 5.0, 0.0]]), (T, 1)).astype(np.float64)
+    world_tr = _lift_object_local_to_world_np(target_local, pos_tr, aa_id).astype(
+        np.float32
+    )
+    d_tr = _proxy_sustained_contact_cm(joints, world_tr, contact_state)
+    assert d_tr == pytest.approx(np.linalg.norm([6.0, 5.0, 0.0]) * 100.0, abs=1e-3)
+
+
 def test_fractional_change_zero_when_identical():
     assert _fractional_change(5.0, 5.0) == pytest.approx(0.0)
 
@@ -257,6 +374,28 @@ def test_fractional_change_returns_absolute_ratio():
     assert _fractional_change(10.0, 13.0) == pytest.approx(0.3, abs=1e-6)
     assert _fractional_change(10.0, 7.0) == pytest.approx(0.3, abs=1e-6)
     assert _fractional_change(-10.0, -13.0) == pytest.approx(0.3, abs=1e-6)
+
+
+def test_fractional_change_respects_per_proxy_min_baseline():
+    """Per-N2: baselines below the per-proxy floor → NaN, not exploding ratio.
+
+    With the default 1e-6 floor, a 1.5e-6 baseline and 0.035 perturbation
+    produced ~23000 (= 2 300 000 %) in the original run — see
+    analyses/2026-05-29_round29_cond_usage_probe_code_review_v2.md §N2.
+    With min_baseline=0.05 the same call must return NaN, while a healthy
+    baseline (1.0 cm/frame) and a 50%-larger perturbation must still
+    return 0.5.
+    """
+    # Tiny baseline + body_action floor (0.05 cm/frame) → NaN (degenerate).
+    assert np.isnan(
+        _fractional_change(1.5e-6, 0.035, min_baseline=0.05)
+    )
+    # Tiny baseline + default 1e-6 floor → still computes (back-compat).
+    assert _fractional_change(1.5e-6, 0.035) > 1000
+    # Healthy baseline + body_action floor → standard ratio.
+    assert _fractional_change(1.0, 1.5, min_baseline=0.05) == pytest.approx(
+        0.5, abs=1e-6
+    )
 
 
 # --------------------------------------------------------------------------- #
