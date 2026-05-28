@@ -321,6 +321,7 @@ def _process_subset(
     max_root_xz_p95_m: float,
     max_walking_frac: float,
     ub_vel_threshold_mps: float,
+    max_contact_any_frac: float,
     fps: float,
 ) -> tuple[list[ClipFeatures], dict[str, _BucketStats]]:
     """Scan one subset's metadata_clean.json and classify every clip.
@@ -356,7 +357,7 @@ def _process_subset(
         b.total += 1
         is_ild = (
             feat.is_stationary(max_root_xz_p95_m, max_walking_frac)
-            and not feat.has_significant_contact()
+            and not feat.has_significant_contact(max_contact_any_frac)
             and feat.has_upper_body_motion(ub_vel_threshold_mps)
         )
         if is_ild:
@@ -437,7 +438,8 @@ def _write_stats_md(
       f"{thresholds['max_root_xz_p95_m']*100:.1f} cm AND walking-frame frac "
       f"< {thresholds['max_walking_frac']*100:.1f} %")
     a(f"- `has_significant_contact` = ≥ 1 hand 0→1 transition OR "
-      f"hand-contact frame fraction > 30 %")
+      f"hand-contact frame fraction > "
+      f"{thresholds['max_contact_any_frac']*100:.0f} %")
     a(f"- `has_upper_body_motion` = keyword match OR "
       f"non-walking upper-body velocity RMS > "
       f"{thresholds['ub_vel_threshold_mps']*100:.1f} cm/s")
@@ -485,9 +487,23 @@ def main() -> int:
                         help="Trainer config (mirrors dataset roots + subject_split)")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("analyses/round30_ild"))
-    parser.add_argument("--max-root-xz-p95-m", type=float, default=0.05)
-    parser.add_argument("--max-walking-frac", type=float, default=0.05)
+    # Defaults calibrated against the 2026-05-29 contact-distribution
+    # probe (analyses/round30_ild_diagnosis_*.tar.gz). Sitting clips in
+    # the chairs subset typically have root XZ p95 in [5, 30] cm (the
+    # chair itself slides slightly while the person sits) and
+    # walking_frac in [5, 25] % because ``derive_walking_mask_from_gt``
+    # is unsmoothed and registers brief root jitter as walking. The
+    # original (5 cm, 5 %) thresholds were calibrated against a clean
+    # locomotion dataset and excluded every real sitting+idle clip.
+    parser.add_argument("--max-root-xz-p95-m", type=float, default=0.30)
+    parser.add_argument("--max-walking-frac", type=float, default=0.25)
     parser.add_argument("--ub-vel-threshold-mps", type=float, default=0.03)
+    # Maximum hand-vs-object contact fraction for a clip to count as ILD.
+    # The R30 contact-distribution probe showed that chair clips where
+    # one hand rests on the head / face / lap have contact_any_frac in
+    # [0, 50 %] (one hand on chair armrest, one hand off). 0.60 keeps
+    # those clips while excluding continuous box-lifting / object-carry.
+    parser.add_argument("--max-contact-any-frac", type=float, default=0.60)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--selection-seed", type=int, default=42)
     parser.add_argument(
@@ -573,6 +589,7 @@ def main() -> int:
             max_root_xz_p95_m=args.max_root_xz_p95_m,
             max_walking_frac=args.max_walking_frac,
             ub_vel_threshold_mps=args.ub_vel_threshold_mps,
+            max_contact_any_frac=args.max_contact_any_frac,
             fps=args.fps,
         )
         # Re-bucket by subject if subject_split is enabled.
@@ -592,7 +609,7 @@ def main() -> int:
                 b.total += 1
                 is_ild = (
                     f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-                    and not f.has_significant_contact()
+                    and not f.has_significant_contact(args.max_contact_any_frac)
                     and f.has_upper_body_motion(args.ub_vel_threshold_mps)
                 )
                 if is_ild:
@@ -641,14 +658,14 @@ def main() -> int:
         f for f in all_features
         if f.split == "train"
         and f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-        and not f.has_significant_contact()
+        and not f.has_significant_contact(args.max_contact_any_frac)
         and f.has_upper_body_motion(args.ub_vel_threshold_mps)
     ]
     val_ild = [
         f for f in all_features
         if f.split == "val"
         and f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-        and not f.has_significant_contact()
+        and not f.has_significant_contact(args.max_contact_any_frac)
         and f.has_upper_body_motion(args.ub_vel_threshold_mps)
     ]
 
@@ -686,6 +703,7 @@ def main() -> int:
             "max_root_xz_p95_m": args.max_root_xz_p95_m,
             "max_walking_frac": args.max_walking_frac,
             "ub_vel_threshold_mps": args.ub_vel_threshold_mps,
+            "max_contact_any_frac": args.max_contact_any_frac,
         },
         train_ild_frac=train_frac,
         val_ild_frac=val_frac,

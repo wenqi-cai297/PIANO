@@ -258,10 +258,19 @@ def test_is_not_ild_with_persistent_contact_no_event():
     assert f.has_significant_contact()
 
 
-def test_persistent_contact_threshold_is_30pct():
-    """Just under threshold → not significant; just over → significant."""
+def test_persistent_contact_threshold_default_is_30pct():
+    """Default has_significant_contact() boundary (no CLI override): 30 %."""
     assert not _feat(contact_events=0, contact_any=0.25).has_significant_contact()
     assert _feat(contact_events=0, contact_any=0.35).has_significant_contact()
+
+
+def test_persistent_contact_threshold_respects_override():
+    """Caller can pass max_contact_any_frac to relax the cut. With 0.60
+    (the round30 CLI default after the 2026-05-29 contact-distribution
+    probe), a clip at 40 % hand-contact stays out of significant_contact."""
+    f = _feat(contact_events=0, contact_any=0.40)
+    assert not f.has_significant_contact(0.60)
+    assert f.has_significant_contact(0.30)   # would be excluded under stricter cut
 
 
 def test_keyword_alone_qualifies_as_upper_body_motion():
