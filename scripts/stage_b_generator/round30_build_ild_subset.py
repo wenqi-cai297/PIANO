@@ -7,16 +7,20 @@ fires off the train ILD fraction.
 
 A clip ∈ ILD iff ALL of:
   * is_stationary       : root XZ p95 < 0.05 m AND walking-frame frac < 5%
-  * not has_contact_event : no 0→1 hand-contact transition (allows clips
-                             that have stable contact, e.g. seat contact,
-                             but excludes clips where contact is being
-                             acquired or released — the model already
-                             gets enough signal there)
+  * not has_significant_contact : no 0→1 hand-contact transition AND
+                             hand-contact frame fraction ≤ 30 %. Earlier
+                             versions only checked event_count > 0, which
+                             let through clips where the hand starts
+                             already in contact and stays that way
+                             (neuraldome box-lifting: contact_any_frac=1.0
+                             but event_count=0). Those clips are continuous
+                             manipulation, which C/I/S already cover —
+                             they are NOT idle local detail.
   * has_upper_body_motion : keyword regex match OR upper-body velocity
                              RMS > 0.03 m/s on non-walking frames
 
 A clip ∈ control iff:
-  * (not is_stationary) OR has_contact_event
+  * (not is_stationary) OR has_significant_contact
 The control set is then size-matched per subset to the ILD set so paired
 metric comparisons remain stratified.
 
@@ -119,8 +123,25 @@ class ClipFeatures:
             and self.walking_frac < max_walking_frac
         )
 
-    def has_contact_event(self) -> bool:
-        return self.contact_event_count > 0
+    def has_significant_contact(
+        self, max_contact_any_frac: float = 0.30,
+    ) -> bool:
+        """Return True if EITHER the clip has a hand-contact 0→1 transition
+        (an event the model already gets a lot of training signal on) OR the
+        clip is in a persistent-contact regime (``contact_any_frac`` exceeds
+        ``max_contact_any_frac``).
+
+        The original filter used ``contact_event_count > 0`` only, which let
+        through clips where the hand starts already in contact and stays
+        that way (e.g. neuraldome's "lifts the box with both of their hands"
+        — contact_any_frac=1.0 but event_count=0). Those clips are NOT idle
+        local detail; they're continuous manipulation, which is exactly the
+        regime C/I/S already cover. Excluding them tightens ILD.
+        """
+        return (
+            self.contact_event_count > 0
+            or self.contact_any_frac > max_contact_any_frac
+        )
 
     def has_upper_body_motion(self, vel_threshold_mps: float) -> bool:
         return self.keyword_hit or self.upper_body_vel_rms_mps > vel_threshold_mps
@@ -335,7 +356,7 @@ def _process_subset(
         b.total += 1
         is_ild = (
             feat.is_stationary(max_root_xz_p95_m, max_walking_frac)
-            and not feat.has_contact_event()
+            and not feat.has_significant_contact()
             and feat.has_upper_body_motion(ub_vel_threshold_mps)
         )
         if is_ild:
@@ -415,7 +436,8 @@ def _write_stats_md(
     a(f"- `is_stationary` thresholds: root XZ p95 < "
       f"{thresholds['max_root_xz_p95_m']*100:.1f} cm AND walking-frame frac "
       f"< {thresholds['max_walking_frac']*100:.1f} %")
-    a(f"- `has_contact_event` = ≥ 1 hand 0→1 transition")
+    a(f"- `has_significant_contact` = ≥ 1 hand 0→1 transition OR "
+      f"hand-contact frame fraction > 30 %")
     a(f"- `has_upper_body_motion` = keyword match OR "
       f"non-walking upper-body velocity RMS > "
       f"{thresholds['ub_vel_threshold_mps']*100:.1f} cm/s")
@@ -510,12 +532,17 @@ def main() -> int:
             seed=int(subj_cfg.seed),
         )
         # We don't filter here — we annotate `split` per clip later using
-        # the subject's bucket. Easier path: build a (subset, subject_id)
-        # → bucket lookup and rewrite feat.split on the fly.
-        subj_to_bucket: dict[tuple[str, str], str] = {}
+        # the subject's bucket. ``build_subject_split`` returns NAMESPACED
+        # string ids of the form ``"{subset}/{raw_id}"`` (see
+        # src/piano/data/split.py:106-108), so the lookup key must also be
+        # the namespaced string, NOT a (subset, sid) tuple. An earlier
+        # version of this script used a tuple key and silently failed
+        # every lookup, leaving every clip with split='train' from the
+        # metadata default — train ended up 100 % of the data and val=0.
+        subj_to_bucket: dict[str, str] = {}
         for bucket in ("train", "val"):
             for k in splits[bucket]:
-                subj_to_bucket[k] = bucket
+                subj_to_bucket[str(k)] = bucket
     else:
         subj_to_bucket = {}
 
@@ -553,8 +580,11 @@ def main() -> int:
             from piano.data.split import extract_subject_id
             for f in feats:
                 sid = extract_subject_id(subset_name, f.seq_id)
-                if sid is not None and (subset_name, sid) in subj_to_bucket:
-                    f.split = subj_to_bucket[(subset_name, sid)]
+                if sid is None:
+                    continue
+                ns_key = f"{subset_name}/{sid}"
+                if ns_key in subj_to_bucket:
+                    f.split = subj_to_bucket[ns_key]
             # Recompute buckets with new splits.
             buckets = {"train": _BucketStats(), "val": _BucketStats()}
             for f in feats:
@@ -562,7 +592,7 @@ def main() -> int:
                 b.total += 1
                 is_ild = (
                     f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-                    and not f.has_contact_event()
+                    and not f.has_significant_contact()
                     and f.has_upper_body_motion(args.ub_vel_threshold_mps)
                 )
                 if is_ild:
@@ -611,14 +641,14 @@ def main() -> int:
         f for f in all_features
         if f.split == "train"
         and f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-        and not f.has_contact_event()
+        and not f.has_significant_contact()
         and f.has_upper_body_motion(args.ub_vel_threshold_mps)
     ]
     val_ild = [
         f for f in all_features
         if f.split == "val"
         and f.is_stationary(args.max_root_xz_p95_m, args.max_walking_frac)
-        and not f.has_contact_event()
+        and not f.has_significant_contact()
         and f.has_upper_body_motion(args.ub_vel_threshold_mps)
     ]
 

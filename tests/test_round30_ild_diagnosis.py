@@ -234,7 +234,7 @@ def _feat(
 def test_is_ild_canonical_positive():
     f = _feat(root_xz=0.02, walking=0.01, contact_events=0, ub_vel=0.05)
     assert f.is_stationary(0.05, 0.05)
-    assert not f.has_contact_event()
+    assert not f.has_significant_contact()
     assert f.has_upper_body_motion(0.03)
 
 
@@ -245,7 +245,23 @@ def test_is_not_ild_when_walking():
 
 def test_is_not_ild_with_contact_event():
     f = _feat(contact_events=1)
-    assert f.has_contact_event()
+    assert f.has_significant_contact()
+
+
+def test_is_not_ild_with_persistent_contact_no_event():
+    """Regression on the first server run: neuraldome 'lifts the box with
+    both hands' had contact_event_count=0 but contact_any_frac=1.0 (hand
+    is in contact for the entire clip). That should be EXCLUDED from ILD
+    — it's continuous manipulation, not idle local detail.
+    """
+    f = _feat(contact_events=0, contact_any=1.0)
+    assert f.has_significant_contact()
+
+
+def test_persistent_contact_threshold_is_30pct():
+    """Just under threshold → not significant; just over → significant."""
+    assert not _feat(contact_events=0, contact_any=0.25).has_significant_contact()
+    assert _feat(contact_events=0, contact_any=0.35).has_significant_contact()
 
 
 def test_keyword_alone_qualifies_as_upper_body_motion():
@@ -298,6 +314,33 @@ def test_stratified_match_caps_at_pool_size():
     rng = np.random.default_rng(0)
     control = _stratified_size_match_control(feats, ild_keys, target, rng)
     assert len(control) == 2   # only c1, c2 left
+
+
+# --------------------------------------------------------------------------- #
+# build_subject_split return format — pin against round30 split lookup bug
+# --------------------------------------------------------------------------- #
+
+
+def test_build_subject_split_returns_namespaced_string_keys():
+    """The first server run had subj_to_bucket misuse: keys were inserted
+    as (subset, sid) tuples but build_subject_split actually returns
+    namespaced strings "{subset}/{sid}". The lookup silently failed and
+    val ended up with 0 clips. This test pins the actual return format so
+    a future regression on either side is caught locally.
+    """
+    from piano.data.split import build_subject_split
+
+    keys = [
+        ("chairs", "Sub0001"), ("chairs", "Sub0002"),
+        ("imhd", "songzn"), ("omomo_correct_v2", "sub10"),
+    ]
+    splits = build_subject_split(keys, train_pct=85, val_pct=15, seed=42)
+    assert "train" in splits and "val" in splits
+    # Every element is a "{subset}/{sid}" string, NOT a tuple.
+    all_ids = splits["train"] | splits["val"]
+    for k in all_ids:
+        assert isinstance(k, str), f"split id {k!r} is not str"
+        assert "/" in k, f"split id {k!r} is not namespaced as 'subset/sid'"
 
 
 # --------------------------------------------------------------------------- #
