@@ -55,27 +55,106 @@ class Stage1Variant:
     dropout: float = ARCH_DROPOUT
     use_text: bool = True
 
-    # Loss weights.
+    # Loss weights — baseline (V0) values.
     w_x0: float = 1.0
     w_vel: float = 1.0
     # yaw_smooth on z-scored sin/cos channels is dubious (atan2 of
     # normalised values does not return a valid angle). Keep at 0 by
     # default; flip on only after verifying behaviour on a 48-clip overfit.
     w_yaw_smooth: float = 0.0
+    # R31 V2 ablation losses (all OFF by default, on for the
+    # corresponding variant).
+    w_rot6d_ortho: float = 0.0       # L1
+    w_fk_pos: float = 0.0            # L2
+    w_height_fk: float = 0.0         # L3
+    w_self_consistency: float = 0.0  # L4
+    vel_rot6d_weight: float = 1.0    # L5 (rot6d-weighted velocity)
     use_min_snr_weighting: bool = True
     min_snr_gamma: float = 5.0
 
     val_best_key: str = "mse_x0"
 
 
+# ─── R31 V2 ablation matrix — 6 variants ──────────────────────────────────
+# Diagnosis from R31 V0: rot6d channels [9:21] are off the SO(3)
+# manifold; FK-derived height channels [21:22] are independent of
+# rot6d. Both produce body_action direction_cos -0.5 in downstream
+# PB1 diag. Loss design per
+# analyses/2026-05-30_round31_v2_stage1_loss_ablation.md.
+
 VARIANTS: list[Stage1Variant] = [
+    # V0: baseline (control — re-train original loss budget for noise floor).
     Stage1Variant(
-        variant_id="stage1_traj_v0",
+        variant_id="stage1_v2_v0_baseline",
         purpose=(
-            "Stage-1 v0: 23-D stage1_coarse generator. DiT-Zero + PixArt "
-            "cross-attn family, d_model=256 n_layers=4 (≈3 M params). "
-            "From scratch, full data, 80 ep, seed 42, bs=64."
+            "V0 baseline (control): w_x0=1, w_vel=1, no new losses. "
+            "Re-train to control for stochastic variation vs the original "
+            "stage1_traj_v0 run."
         ),
+    ),
+    # V1: rot6d orthogonality only.
+    Stage1Variant(
+        variant_id="stage1_v2_v1_ortho",
+        purpose=(
+            "V1: + L1 rot6d_ortho (w=0.05). Tests whether enforcing "
+            "||a1||=||a2||=1, <a1,a2>=0 on pelvis+spine3 rot6d alone "
+            "fixes the direction_cos regression."
+        ),
+        w_rot6d_ortho=0.05,
+    ),
+    # V2: FK position loss only.
+    Stage1Variant(
+        variant_id="stage1_v2_v2_fk_pos",
+        purpose=(
+            "V2: + L2 fk_pos (w=0.1). Tests whether dense FK position "
+            "loss on head/neck/shoulders (driven by pred pelvis+spine3 "
+            "rot6d, GT for other 20 joints) fixes the cascade."
+        ),
+        w_fk_pos=0.1,
+    ),
+    # V3: rot6d full (L1+L2+L3+L5).
+    Stage1Variant(
+        variant_id="stage1_v2_v3_rot6d_full",
+        purpose=(
+            "V3: + L1+L2+L3+L5 (rot6d ortho 0.05, fk_pos 0.1, "
+            "height_fk 0.05, vel rot6d weight 2.0). All rot6d-targeted "
+            "fixes."
+        ),
+        w_rot6d_ortho=0.05,
+        w_fk_pos=0.1,
+        w_height_fk=0.05,
+        vel_rot6d_weight=2.0,
+    ),
+    # V4: kinematic full (V3 + L4 self-consistency + L6 yaw_smooth).
+    Stage1Variant(
+        variant_id="stage1_v2_v4_kinematic_full",
+        purpose=(
+            "V4: V3 + L4 self_consistency (0.05) + L6 yaw_smooth (0.02). "
+            "Adds intra-23-D consistency (root_local diff vs vel, "
+            "yaw diff vs yaw_vel) and yaw 2nd-derivative smoothness."
+        ),
+        w_yaw_smooth=0.02,
+        w_rot6d_ortho=0.05,
+        w_fk_pos=0.1,
+        w_height_fk=0.05,
+        w_self_consistency=0.05,
+        vel_rot6d_weight=2.0,
+    ),
+    # V5: capacity + kinematic_full.
+    Stage1Variant(
+        variant_id="stage1_v2_v5_capacity_kinematic",
+        purpose=(
+            "V5: V4 + 3× capacity (d_model=384, n_layers=6, ~10 M). "
+            "Tests whether the regression is partly capacity-bound."
+        ),
+        d_model=384,
+        n_layers=6,
+        w_yaw_smooth=0.02,
+        w_rot6d_ortho=0.05,
+        w_fk_pos=0.1,
+        w_height_fk=0.05,
+        w_self_consistency=0.05,
+        vel_rot6d_weight=2.0,
     ),
 ]
 
@@ -185,6 +264,12 @@ loss:
   w_x0: {v.w_x0}
   w_vel: {v.w_vel}
   w_yaw_smooth: {v.w_yaw_smooth}
+  # R31 V2 ablation losses (default 0 = OFF):
+  w_rot6d_ortho: {v.w_rot6d_ortho}
+  w_fk_pos: {v.w_fk_pos}
+  w_height_fk: {v.w_height_fk}
+  w_self_consistency: {v.w_self_consistency}
+  vel_rot6d_weight: {v.vel_rot6d_weight}
   use_min_snr_weighting: {use_min_snr}
   min_snr_gamma: {v.min_snr_gamma}
 
@@ -222,6 +307,11 @@ def _manifest_row(v: Stage1Variant) -> dict:
         "loss": {
             "w_x0": v.w_x0, "w_vel": v.w_vel,
             "w_yaw_smooth": v.w_yaw_smooth,
+            "w_rot6d_ortho": v.w_rot6d_ortho,
+            "w_fk_pos": v.w_fk_pos,
+            "w_height_fk": v.w_height_fk,
+            "w_self_consistency": v.w_self_consistency,
+            "vel_rot6d_weight": v.vel_rot6d_weight,
             "use_min_snr_weighting": v.use_min_snr_weighting,
             "min_snr_gamma": v.min_snr_gamma,
         },
@@ -265,15 +355,17 @@ def main() -> int:
         f"InterAct train set, from scratch, seed 42, {SCHEDULE_NUM_EPOCHS} ep, "
         f"bs={SCHEDULE_BATCH_SIZE} / accum={SCHEDULE_ACCUM_STEPS} (2× 5080).",
         "",
-        "## Variants",
+        "## Variants (R31 V2 ablation matrix)",
         "",
-        "| variant | arch | loss weights |",
-        "|---|---|---|",
+        "| variant | arch | L1 ortho | L2 fk_pos | L3 height_fk | L4 self_cons | L5 vel_rot6d | L6 yaw_sm |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for v in VARIANTS:
         md_lines.append(
-            f"| `{v.variant_id}` | d_model={v.d_model} L={v.n_layers} | "
-            f"w_x0={v.w_x0} w_vel={v.w_vel} w_yaw_sm={v.w_yaw_smooth} |"
+            f"| `{v.variant_id}` | "
+            f"d_model={v.d_model} L={v.n_layers} | "
+            f"{v.w_rot6d_ortho} | {v.w_fk_pos} | {v.w_height_fk} | "
+            f"{v.w_self_consistency} | {v.vel_rot6d_weight} | {v.w_yaw_smooth} |"
         )
     md_lines.append("")
 

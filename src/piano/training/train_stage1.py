@@ -30,7 +30,6 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 
 from piano.data.dataset import collate_hoi
-from piano.models.object_encoder import ObjectEncoder
 from piano.data.stage1_coarse_oracle import (
     extract_coarse_v1_batched,
     load_stage1_coarse_norm,
@@ -40,10 +39,25 @@ from piano.models.motion_anchordiff import (
     GaussianDiffusion,
     _extract,
 )
+from piano.models.object_encoder import ObjectEncoder
 from piano.models.stage1_trajectory import (
     STAGE1_COARSE_DIM,
     Stage1Denoiser,
     Stage1DenoiserConfig,
+)
+from piano.training.stage1_losses import (
+    CH_HEAD_HEIGHT,
+    CH_PELVIS_ROT6D,
+    CH_SHOULDER_H,
+    CH_SPINE3_ROT6D,
+    fk_height_consistency_loss,
+    fk_pelvis_spine_pos_loss,
+    kinematic_self_consistency_loss,
+    rot6d_ortho_loss,
+)
+from piano.training.smpl_kinematics import (
+    fk_from_global_rotations,
+    rotation_6d_to_matrix,
 )
 from piano.training.train_anchordiff import _build_dataset
 from piano.training.trainer import (
@@ -71,6 +85,14 @@ def build_stage1_step_fn(
     w_x0: float = 1.0,
     w_vel: float = 1.0,
     w_yaw_smooth: float = 0.02,
+    # R31 V2 ablation losses (default 0 = OFF, V0 baseline behaviour).
+    w_rot6d_ortho: float = 0.0,
+    w_fk_pos: float = 0.0,
+    w_height_fk: float = 0.0,
+    w_self_consistency: float = 0.0,
+    # rot6d-weighted velocity loss: multiplies channels [9:21] of the
+    # vel-MSE term by ``vel_rot6d_weight`` (default 1.0 = baseline).
+    vel_rot6d_weight: float = 1.0,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -94,6 +116,7 @@ def build_stage1_step_fn(
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
         motion = batch["motion"].to(device)                    # (B, T, 135)
         rest_offsets = batch["rest_offsets"].to(device).float()  # (B, 22, 3)
+        gt_joints = batch["joints"].to(device).float()         # (B, T, 22, 3)
         object_pc = batch["object_pc"].to(device)
         seq_len = batch["seq_len"].to(device)                  # (B,)
 
@@ -188,7 +211,16 @@ def build_stage1_step_fn(
             vel_pred = x0_pred[:, 1:] - x0_pred[:, :-1]         # (B, T-1, 23)
             vel_gt = x0[:, 1:] - x0[:, :-1]
             vel_mask = seq_mask[:, 1:] * seq_mask[:, :-1]       # (B, T-1)
-            vel_mse = ((vel_pred - vel_gt).pow(2).sum(-1) * vel_mask).sum() / vel_mask.sum().clamp_min(1.0)
+            vel_per_dim = (vel_pred - vel_gt).pow(2)            # (B, T-1, 23)
+            if vel_rot6d_weight != 1.0:
+                # Re-weight the rot6d channels [9:21] in the velocity MSE.
+                channel_w = torch.ones(
+                    23, device=device, dtype=vel_per_dim.dtype,
+                )
+                channel_w[CH_PELVIS_ROT6D] = float(vel_rot6d_weight)
+                channel_w[CH_SPINE3_ROT6D] = float(vel_rot6d_weight)
+                vel_per_dim = vel_per_dim * channel_w.view(1, 1, -1)
+            vel_mse = (vel_per_dim.sum(-1) * vel_mask).sum() / vel_mask.sum().clamp_min(1.0)
         else:
             vel_mse = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
@@ -210,10 +242,106 @@ def build_stage1_step_fn(
         else:
             yaw_sm = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
+        # ─── Loss 4-7 (R31 V2 ablation losses) ───
+        # All operate on the RAW (un-z-scored) prediction. Compute once
+        # (avoid re-allocating per loss term).
+        need_raw = (
+            w_rot6d_ortho > 0 or w_fk_pos > 0 or w_height_fk > 0
+            or w_self_consistency > 0
+        )
+        if need_raw:
+            x0_raw = x0_pred * stage1_coarse_std_t + stage1_coarse_mean_t   # (B, T, 23)
+        else:
+            x0_raw = None
+
+        # L1: rot6d orthogonality.
+        if w_rot6d_ortho > 0 and x0_raw is not None:
+            mask_3d = seq_mask                                              # (B, T)
+            pelvis_rot6d = x0_raw[..., CH_PELVIS_ROT6D]                     # (B, T, 6)
+            spine3_rot6d = x0_raw[..., CH_SPINE3_ROT6D]                     # (B, T, 6)
+            ortho_loss = (
+                rot6d_ortho_loss(pelvis_rot6d, mask=mask_3d)
+                + rot6d_ortho_loss(spine3_rot6d, mask=mask_3d)
+            )
+        else:
+            ortho_loss = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        # L2: FK position loss on neck/head/shoulders driven by pelvis +
+        # spine3 predicted rotations. Requires raw root_world (= root_local
+        # + GT frame-0 root_world).
+        if w_fk_pos > 0 and x0_raw is not None:
+            root_local_pred = x0_raw[..., :3]                               # (B, T, 3)
+            root_world_t0 = motion[:, :1, 132:135].float()                  # (B, 1, 3)
+            # root_local channel order is (x, z, y) per the oracle convention.
+            # motion[..., 132:135] is also (x, y, z). The oracle stores the
+            # channels in oracle-order; we need to reconstruct the world
+            # position by adding the same-order frame-0. Since both are
+            # frame-0-relative + frame-0 absolute in the same channel order
+            # respectively, the absolute pelvis world is consistent.
+            #
+            # CAUTION: stage1_coarse_oracle.py stores channels as
+            # (x, z, y) but motion[..., 132:135] is (x, y, z). To recover
+            # world pelvis we map (x_local, z_local, y_local) → (x, y, z)
+            # and add to motion[..., 132:135].
+            root_local_world_order = torch.stack(
+                [
+                    root_local_pred[..., 0],
+                    root_local_pred[..., 2],   # y is at slot 2 in oracle
+                    root_local_pred[..., 1],   # z is at slot 1 in oracle
+                ], dim=-1,
+            )                                                                # (B, T, 3) in (x, y, z) world order
+            root_world_pred = root_local_world_order + root_world_t0
+            fk_pos = fk_pelvis_spine_pos_loss(
+                pelvis_rot6d_pred=x0_raw[..., CH_PELVIS_ROT6D],
+                spine3_rot6d_pred=x0_raw[..., CH_SPINE3_ROT6D],
+                root_world_pred=root_world_pred,
+                gt_motion_135=motion,
+                rest_offsets=rest_offsets,
+                gt_joints=gt_joints,
+                seq_mask=seq_mask,
+            )
+        else:
+            fk_pos = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        # L3: height-FK consistency.
+        if w_height_fk > 0 and x0_raw is not None:
+            root_local_pred = x0_raw[..., :3]
+            root_world_t0 = motion[:, :1, 132:135].float()
+            root_local_world_order = torch.stack(
+                [
+                    root_local_pred[..., 0],
+                    root_local_pred[..., 2],
+                    root_local_pred[..., 1],
+                ], dim=-1,
+            )
+            root_world_pred = root_local_world_order + root_world_t0
+            height_fk = fk_height_consistency_loss(
+                head_height_pred=x0_raw[..., CH_HEAD_HEIGHT],
+                shoulder_h_pred=x0_raw[..., CH_SHOULDER_H],
+                pelvis_rot6d_pred=x0_raw[..., CH_PELVIS_ROT6D],
+                spine3_rot6d_pred=x0_raw[..., CH_SPINE3_ROT6D],
+                root_world_pred=root_world_pred,
+                gt_motion_135=motion,
+                rest_offsets=rest_offsets,
+                seq_mask=seq_mask,
+            )
+        else:
+            height_fk = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        # L4: kinematic self-consistency (diff/vel + yaw).
+        if w_self_consistency > 0 and x0_raw is not None:
+            self_cons = kinematic_self_consistency_loss(x0_raw, seq_mask)
+        else:
+            self_cons = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
             + w_yaw_smooth * yaw_sm
+            + w_rot6d_ortho * ortho_loss
+            + w_fk_pos * fk_pos
+            + w_height_fk * height_fk
+            + w_self_consistency * self_cons
         )
 
         return {
@@ -222,6 +350,10 @@ def build_stage1_step_fn(
             "mse_x0_unweighted": mse_x0_unweighted.detach(),
             "vel_mse": vel_mse.detach(),
             "yaw_smooth": yaw_sm.detach(),
+            "rot6d_ortho": ortho_loss.detach(),
+            "fk_pos": fk_pos.detach(),
+            "height_fk": height_fk.detach(),
+            "self_consistency": self_cons.detach(),
         }
 
     return step_fn
@@ -401,6 +533,12 @@ def main() -> None:
         w_x0=float(cfg.loss.w_x0),
         w_vel=float(cfg.loss.w_vel),
         w_yaw_smooth=float(cfg.loss.w_yaw_smooth),
+        # R31 V2 ablation losses (default 0 if config doesn't specify).
+        w_rot6d_ortho=float(cfg.loss.get("w_rot6d_ortho", 0.0)),
+        w_fk_pos=float(cfg.loss.get("w_fk_pos", 0.0)),
+        w_height_fk=float(cfg.loss.get("w_height_fk", 0.0)),
+        w_self_consistency=float(cfg.loss.get("w_self_consistency", 0.0)),
+        vel_rot6d_weight=float(cfg.loss.get("vel_rot6d_weight", 1.0)),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -412,8 +550,16 @@ def main() -> None:
         batch = next(iter(train_loader))
         out = step_fn(model, batch, global_step=0)
         accelerator.print(
-            f"loss = {out['loss'].item():.4f}  mse_x0 = {out['mse_x0'].item():.4f}  "
-            f"vel = {out['vel_mse'].item():.4f}  yaw_sm = {out['yaw_smooth'].item():.4e}"
+            f"loss = {out['loss'].item():.4f}  "
+            f"mse_x0 = {out['mse_x0'].item():.4f}  "
+            f"vel = {out['vel_mse'].item():.4f}  "
+            f"yaw_sm = {out['yaw_smooth'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R31V2 — ortho={out['rot6d_ortho'].item():.4e}  "
+            f"fk_pos={out['fk_pos'].item():.4e}  "
+            f"height_fk={out['height_fk'].item():.4e}  "
+            f"self_cons={out['self_consistency'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")
