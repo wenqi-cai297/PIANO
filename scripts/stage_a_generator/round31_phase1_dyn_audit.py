@@ -138,17 +138,30 @@ def _per_clip_stats(arr: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+PSD_NPERSEG: int = 64
+"""Fixed Welch nperseg so freqs vector length (= nperseg//2 + 1 = 33) is
+identical across clips of different T. Clips shorter than nperseg are
+zero-padded by scipy (and emit a UserWarning we filter out)."""
+
+
 def _psd_per_group(arr: np.ndarray, fps: float = 20.0) -> dict[str, dict[str, np.ndarray]]:
     """Welch PSD per channel group. Returns dict keyed by group name.
 
-    Each value is {"freqs": (F,), "psd_sum": (F,) — summed over channels
-    in the group, "total_energy": float}."""
+    Each value is {"freqs": (33,), "psd_sum": (33,) — summed over channels
+    in the group, "total_energy": float}. nperseg fixed at PSD_NPERSEG to
+    guarantee freqs length is identical across clips."""
     out: dict[str, dict[str, np.ndarray]] = {}
-    nper = min(arr.shape[0], 64)
+    T = arr.shape[0]
+    if T < PSD_NPERSEG:
+        # Zero-pad up to nperseg so scipy doesn't shrink the freq grid.
+        pad = np.zeros((PSD_NPERSEG - T, arr.shape[1]), dtype=arr.dtype)
+        block_arr = np.concatenate([arr, pad], axis=0)
+    else:
+        block_arr = arr
     for name, (lo, hi) in CHANNEL_GROUPS.items():
-        block = arr[:, lo:hi]                                  # (T, n_ch)
+        block = block_arr[:, lo:hi]                                  # (T, n_ch)
         freqs, psd = sp_signal.welch(
-            block, fs=fps, nperseg=nper, axis=0,
+            block, fs=fps, nperseg=PSD_NPERSEG, axis=0,
         )                                                       # psd (F, n_ch)
         psd_sum = psd.sum(axis=-1)                              # (F,)
         out[name] = {
