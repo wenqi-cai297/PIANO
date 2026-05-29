@@ -30,7 +30,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 
 from piano.data.dataset import collate_hoi
-from piano.data.object_encoder import ObjectEncoder
+from piano.models.object_encoder import ObjectEncoder
 from piano.data.stage1_coarse_oracle import (
     extract_coarse_v1_batched,
     load_stage1_coarse_norm,
