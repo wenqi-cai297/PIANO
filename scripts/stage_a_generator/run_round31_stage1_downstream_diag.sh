@@ -26,11 +26,19 @@
 #   ROUND31_DS_NUM_PROCESSES=N           (unused — sampling is single-GPU per bucket)
 #   ROUND31_DS_ALLOW_PARTIAL=1           don't FATAL on missing diag kinds
 #   ROUND31_DS_SEED=42                   sampling seed
-#   ROUND31_DS_CFG_SCALE=1.0             CFG scale at sample time
-#   ROUND31_DS_SAMPLER=ddim_eta0         DDIM or DDPM sampler
+#   ROUND31_DS_CFG_SCALE=1.0             default CFG (overridden by next two if set)
+#   ROUND31_DS_STAGE1_CFG_SCALE=...      CFG at Stage-1 sample time (Stage-1's knob)
+#   ROUND31_DS_PB1_CFG_SCALE=...         CFG at PB1 diag time (PB1's knob, keep 1.0
+#                                        to compare apples-to-apples vs PB1 oracle)
+#   ROUND31_DS_SAMPLER=ddim_eta0         sampler at Stage-1 sample time only
+#                                        (PB1 diag side uses model.sample() default,
+#                                        no per-diag sampler knob.)
+#   ROUND31_DS_STAGE1_SAMPLER=...        explicit alias for Stage-1 sampler
 #   ROUND31_DS_STAGE1_CKPT=...           override default Stage-1 ckpt path
 #   ROUND31_DS_PB1_CKPT=...              override default PB1 ckpt path
 #   ROUND31_DS_BUCKETS="train val"       which buckets to run
+#   ROUND31_DS_OUT_TAG=""                tag appended to output dirs (allows multiple
+#                                        sweep runs without clobbering each other)
 #
 # Prerequisites:
 #   - Stage-1 trained: runs/training/stage1_traj_v0/final.pt
@@ -48,17 +56,22 @@ SKIP_DIAG=0
 ALLOW_PARTIAL="${ROUND31_DS_ALLOW_PARTIAL:-0}"
 SEED="${ROUND31_DS_SEED:-42}"
 CFG_SCALE="${ROUND31_DS_CFG_SCALE:-1.0}"
+STAGE1_CFG_SCALE="${ROUND31_DS_STAGE1_CFG_SCALE:-${CFG_SCALE}}"
+PB1_CFG_SCALE="${ROUND31_DS_PB1_CFG_SCALE:-${CFG_SCALE}}"
 SAMPLER="${ROUND31_DS_SAMPLER:-ddim_eta0}"
+STAGE1_SAMPLER="${ROUND31_DS_STAGE1_SAMPLER:-${SAMPLER}}"
 STAGE1_CFG="${ROUND31_DS_STAGE1_CFG:-configs/training/stage1_traj_v0.yaml}"
 STAGE1_CKPT="${ROUND31_DS_STAGE1_CKPT:-runs/training/stage1_traj_v0/final.pt}"
 PB1_VARIANT="r29_pb_a1_adaln_s4"
 PB1_CFG="configs/training/anchordiff_${PB1_VARIANT}.yaml"
 PB1_CKPT="${ROUND31_DS_PB1_CKPT:-runs/training/stageB_anchordiff_${PB1_VARIANT}/final.pt}"
 BUCKETS_STR="${ROUND31_DS_BUCKETS:-train val}"
+OUT_TAG="${ROUND31_DS_OUT_TAG:-}"
 SELECTION_TRAIN="analyses/round27_tier0_train_indices_48_balanced.json"
 SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
-SUB_DIR_ROOT="analyses/round31_stage1_substitute_conds"
-LOG_DIR="runs/round31_stage1_downstream"
+SUB_DIR_ROOT="analyses/round31_stage1_substitute_conds${OUT_TAG}"
+DIAG_DIR_ROOT="analyses/round31_stage1_downstream_diag${OUT_TAG}"
+LOG_DIR="runs/round31_stage1_downstream${OUT_TAG}"
 mkdir -p "${LOG_DIR}"
 
 while [[ $# -gt 0 ]]; do
@@ -87,24 +100,31 @@ BUCKETS=(${BUCKETS_STR})
 
 echo "[DS31] STAGE1_CKPT=${STAGE1_CKPT}"
 echo "[DS31] PB1_CKPT=${PB1_CKPT}"
-echo "[DS31] BUCKETS=${BUCKETS[*]}  SAMPLER=${SAMPLER}  SEED=${SEED}  CFG_SCALE=${CFG_SCALE}"
+echo "[DS31] BUCKETS=${BUCKETS[*]}  SEED=${SEED}"
+echo "[DS31] Stage-1 sample: cfg=${STAGE1_CFG_SCALE} sampler=${STAGE1_SAMPLER}"
+echo "[DS31] PB1     diag  : cfg=${PB1_CFG_SCALE} sampler=model.sample-default"
+echo "[DS31] OUT_TAG=${OUT_TAG}  SUB_DIR=${SUB_DIR_ROOT}  DIAG_DIR=${DIAG_DIR_ROOT}"
 
 # ─── Preflight ────────────────────────────────────────────────────────
+# Under --dry-run we tolerate missing ckpts/selections so the script can be
+# invoked from a laptop to sanity-check env passthrough.
 preflight_fail=0
 for p in "${STAGE1_CFG}" "${PB1_CFG}"; do
     [[ ! -e "${p}" ]] && { echo "[DS31 PREFLIGHT FAIL] missing config: ${p}"; preflight_fail=1; }
 done
-for p in "${STAGE1_CKPT}" "${PB1_CKPT}"; do
-    [[ ! -e "${p}" ]] && { echo "[DS31 PREFLIGHT FAIL] missing ckpt: ${p}"; preflight_fail=1; }
-done
-for b in "${BUCKETS[@]}"; do
-    case "${b}" in
-        train) sel="${SELECTION_TRAIN}" ;;
-        val)   sel="${SELECTION_VAL}"   ;;
-        *) echo "[DS31 PREFLIGHT FAIL] unknown bucket: ${b}"; preflight_fail=1; continue ;;
-    esac
-    [[ ! -e "${sel}" ]] && { echo "[DS31 PREFLIGHT FAIL] missing selection: ${sel}"; preflight_fail=1; }
-done
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    for p in "${STAGE1_CKPT}" "${PB1_CKPT}"; do
+        [[ ! -e "${p}" ]] && { echo "[DS31 PREFLIGHT FAIL] missing ckpt: ${p}"; preflight_fail=1; }
+    done
+    for b in "${BUCKETS[@]}"; do
+        case "${b}" in
+            train) sel="${SELECTION_TRAIN}" ;;
+            val)   sel="${SELECTION_VAL}"   ;;
+            *) echo "[DS31 PREFLIGHT FAIL] unknown bucket: ${b}"; preflight_fail=1; continue ;;
+        esac
+        [[ ! -e "${sel}" ]] && { echo "[DS31 PREFLIGHT FAIL] missing selection: ${sel}"; preflight_fail=1; }
+    done
+fi
 for s in scripts/stage_b_generator/round26_sustained_contact_diag.py \
          scripts/stage_b_generator/round26_gait_diag.py \
          scripts/stage_b_generator/round28_body_action_diag.py \
@@ -143,8 +163,8 @@ for b in "${BUCKETS[@]}"; do
         --bucket "${b}"
         --out-dir "${SUB_DIR}"
         --seed "${SEED}"
-        --cfg-scale "${CFG_SCALE}"
-        --sampler "${SAMPLER}")
+        --cfg-scale "${STAGE1_CFG_SCALE}"
+        --sampler "${STAGE1_SAMPLER}")
     if [[ ${DRY_RUN} -eq 1 ]]; then
         echo "[DS31 DRY-RUN]"
         echo "    \$ ${SAMPLE_CMD[*]}"
@@ -167,7 +187,7 @@ run_diag() {
         g1_soft_stance)    SCRIPT="scripts/stage_b_generator/round29_g1_soft_stance_diag.py" ;;
         *) echo "[DS31 DIAG] unknown kind ${KIND}"; return 1 ;;
     esac
-    OUT_DIR="analyses/round31_stage1_downstream_diag/${KIND}_${BUCKET}"
+    OUT_DIR="${DIAG_DIR_ROOT}/${KIND}_${BUCKET}"
     LOG="${LOG_DIR}/diag_${KIND}_${BUCKET}.log"
     mkdir -p "${OUT_DIR}"
 
@@ -177,7 +197,7 @@ run_diag() {
         --output-dir "${OUT_DIR}"
         --bucket "${BUCKET}"
         --substitute-conds-dir "${SUB_DIR}"
-        --cfg-scale "${CFG_SCALE}" --seed "${SEED}")
+        --cfg-scale "${PB1_CFG_SCALE}" --seed "${SEED}")
     echo "[DS31 DIAG START] ${KIND} ${BUCKET}"
     if [[ ${DRY_RUN} -eq 1 ]]; then
         echo "    \$ ${CMD[*]}"
@@ -211,7 +231,7 @@ fi
 # ─── Phase 3: Pack ───────────────────────────────────────────────────
 if [[ ${DRY_RUN} -eq 0 ]]; then
     STAMP=$(date +%Y%m%d_%H%M%S)
-    TARBALL="analyses/round31_stage1_downstream_results_${STAMP}.tar.gz"
+    TARBALL="analyses/round31_stage1_downstream_results${OUT_TAG}_${STAMP}.tar.gz"
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PACK -> ${TARBALL}"
@@ -219,7 +239,7 @@ if [[ ${DRY_RUN} -eq 0 ]]; then
     PACK_TARGETS=()
     for b in "${BUCKETS[@]}"; do
         for KIND in sustained_contact gait body_action g1_soft_stance; do
-            D="analyses/round31_stage1_downstream_diag/${KIND}_${b}"
+            D="${DIAG_DIR_ROOT}/${KIND}_${b}"
             [[ -d "${D}" ]] && PACK_TARGETS+=("${D}")
         done
     done
