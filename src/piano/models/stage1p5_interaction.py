@@ -158,9 +158,8 @@ class Stage1p5Denoiser(nn.Module):
         )
         self.obj_norm = nn.LayerNorm(cfg.d_model)
         self.null_obj_tokens = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-
-        # obj_traj never CFG-dropped (same as Stage-1).
-        self.null_obj_traj = nn.Parameter(torch.zeros(cfg.object_traj_dim))
+        # NOTE: obj_traj is NEVER CFG-dropped (same as Stage-1) — no
+        # null_obj_traj parameter, see Stage1Denoiser for the rationale.
 
         # ---- V12 core (input proj + cond summary + DiT stack) ----
         self.v12_input_proj = V12InputProjection(

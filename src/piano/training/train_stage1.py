@@ -257,7 +257,11 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config)
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # find_unused_parameters=True: defensive, matches Stage-2's trainer.
+    # When use_text=False the text path is dead, and any future cond drop
+    # variant could surface other unused branches; True avoids deadlock /
+    # error on the per-iter DDP all-reduce.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.get(
             "gradient_accumulation_steps", 1,

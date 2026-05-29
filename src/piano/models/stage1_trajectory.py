@@ -122,12 +122,10 @@ class Stage1Denoiser(nn.Module):
         )
         self.obj_norm = nn.LayerNorm(cfg.d_model)
         self.null_obj_tokens = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-
-        # ``obj_traj`` is NEVER CFG-dropped (design §"CFG dropout"). Without
-        # it the model cannot decide trajectory. We still expose a buffer
-        # for shape compatibility with the AnchorDenoiser interface but
-        # never use it.
-        self.null_obj_traj = nn.Parameter(torch.zeros(cfg.object_traj_dim))
+        # NOTE: obj_traj is NEVER CFG-dropped (design §"CFG dropout"), so
+        # there is no null_obj_traj parameter. Registering one would make
+        # DDP with find_unused_parameters=False error on the per-iter
+        # all-reduce since it would never see a grad.
 
         # ---- V12 core (input proj + cond summary + DiT stack + final) ----
         self.v12_input_proj = V12InputProjection(

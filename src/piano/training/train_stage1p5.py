@@ -294,7 +294,8 @@ def main() -> None:
 
     cfg = OmegaConf.load(args.config)
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # find_unused_parameters=True: matches Stage-2 trainer (defensive).
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.get(
             "gradient_accumulation_steps", 1,
