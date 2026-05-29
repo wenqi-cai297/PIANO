@@ -322,12 +322,72 @@ def _build_object_traj_for_cfg(
 # ---------------------------------------------------------------------------
 
 
+def load_substitute_conds_for_clip(
+    substitute_dir: "Path | str | None",
+    subset: str, seq_id: str, T: int, device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    """Read a Stage-1 / Stage-1.5 sample cache for one clip, ready to
+    pass as the ``substitute_conds`` kwarg of ``_build_cond``.
+
+    Layout (per ``piano.inference.sample_substitute_conds``)::
+
+        <substitute_dir>/<subset>/<seq_id>.npz
+            keys: stage1_coarse | stage2_coarse_extra | stage2_support
+
+    Returns a (1, T, D) torch tensor per key, truncated to T.
+    Returns ``None`` if substitute_dir is None or no clip file exists.
+    Raises FileNotFoundError if substitute_dir is given but the per-clip
+    file is missing — we don't want silent fall-through to oracle.
+    """
+    if substitute_dir is None:
+        return None
+    import numpy as np
+    from pathlib import Path
+    p = Path(substitute_dir) / subset / f"{seq_id}.npz"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"substitute_conds: missing per-clip cache for "
+            f"({subset!r}, {seq_id!r}): {p}. Sample it first via "
+            "scripts/stage_a_generator/sample_substitute_conds_cli.py."
+        )
+    data = np.load(p)
+    out: dict[str, torch.Tensor] = {}
+    for k in ("stage1_coarse", "stage2_coarse_extra", "stage2_support"):
+        if k in data.files:
+            arr = data[k]                                        # (T_cached, D)
+            if arr.shape[0] < T:
+                raise ValueError(
+                    f"substitute_conds[{k!r}] has T={arr.shape[0]} < diag T={T} "
+                    f"for ({subset!r}, {seq_id!r}); resample with the same "
+                    "max_seq_length as the diagnostic config."
+                )
+            out[k] = (
+                torch.from_numpy(arr[:T]).to(device).float().unsqueeze(0)
+            )                                                    # (1, T, D)
+    return out
+
+
 def _build_cond(
     batch: dict, model: MotionAnchorDiff, object_encoder: ObjectEncoder,
     clip_model, cfg, device: torch.device,
     stage1_norm: tuple[torch.Tensor, torch.Tensor] | None = None,
+    substitute_conds: dict[str, "torch.Tensor"] | None = None,
 ) -> tuple[dict, int]:
-    """Mirror the trainer's cond construction for diagnostic / inference."""
+    """Mirror the trainer's cond construction for diagnostic / inference.
+
+    When ``substitute_conds`` is supplied (R31/R32 downstream-coupling
+    diag), the dict's keys override the oracle-extracted cond values
+    inside this function. Allowed substitution keys:
+
+      - ``stage1_coarse`` (B, T, stage1_coarse_dim) z-scored
+      - ``stage2_coarse_extra`` (B, T, 18)  raw
+      - ``stage2_support`` (B, T, 13)  raw
+
+    Each substitute tensor must already be on ``device`` and shaped to
+    match the batch's T. The substitution happens at the very end so the
+    oracle code paths still run (e.g. validation, error messages remain
+    consistent with the trainer); the result is then overwritten.
+    """
     motion = batch["motion"].to(device)
     joints = batch["joints"].to(device)
     object_pc = batch["object_pc"].to(device)
@@ -402,6 +462,31 @@ def _build_cond(
                 f"stage1_coarse_dim={stage1_coarse_dim}"
             )
         cond["stage1_coarse"] = (coarse_raw - mean_t) / std_t
+
+    # ── Substitute conds (R31/R32 downstream-coupling diag) ───────────────
+    # After all oracle paths have populated cond, overwrite the keys the
+    # caller wants replaced with model-sampled values.
+    if substitute_conds is not None:
+        allowed = {"stage1_coarse", "stage2_coarse_extra", "stage2_support"}
+        for k, v in substitute_conds.items():
+            if k not in allowed:
+                raise ValueError(
+                    f"substitute_conds: key {k!r} not in {sorted(allowed)}"
+                )
+            if k not in cond:
+                raise KeyError(
+                    f"substitute_conds: key {k!r} requested but the diagnostic "
+                    "config did not surface this oracle cond (so substitution "
+                    "would be silently discarded by the model). Check the "
+                    "config's r29_<family>_variant / stage1_coarse_dim."
+                )
+            tv = v.to(device).float()
+            if tv.shape[0] != cond[k].shape[0] or tv.shape[1] < cond[k].shape[1]:
+                raise ValueError(
+                    f"substitute_conds[{k!r}] shape {tuple(tv.shape)} "
+                    f"incompatible with oracle shape {tuple(cond[k].shape)}"
+                )
+            cond[k] = tv[:, : cond[k].shape[1]]
     return cond, T
 
 

@@ -60,6 +60,7 @@ from piano.inference.diagnostic_helpers import (
     extract_train_time_meta,
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
     _aa_matrix, _fk_22joints,
+    load_substitute_conds_for_clip,
 )
 
 from piano.data.dataset import collate_hoi  # noqa: E402
@@ -290,6 +291,16 @@ def main() -> int:
     parser.add_argument("--bucket", default="val", choices=["train", "val"])
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--substitute-conds-dir", type=Path, default=None,
+        help=(
+            "Optional directory of per-clip .npz files (subset/seq_id.npz) "
+            "that override oracle cond keys (stage1_coarse / "
+            "stage2_coarse_extra / stage2_support). Produced by "
+            "scripts/stage_a_generator/sample_substitute_conds_cli.py. "
+            "Used for R31/R32 downstream-coupling diag."
+        ),
+    )
     parser.add_argument("--min-segment-len", type=int, default=MIN_SEGMENT_LEN_DEFAULT)
     parser.add_argument("--use-gt-as-pred", action="store_true",
                         help="Sanity mode: use GT motion as the 'prediction' so all drift "
@@ -354,9 +365,14 @@ def main() -> int:
             continue
         n_processed += 1
 
+        T_for_sub = int(batch["motion"].shape[1])
+        substitute_conds = load_substitute_conds_for_clip(
+            args.substitute_conds_dir, subset, seq_id, T_for_sub, device,
+        )
         cond, T = _build_cond(
             batch, model, object_encoder, clip_model, cfg, device,
             stage1_norm=stage1_norm,
+            substitute_conds=substitute_conds,
         )
 
         gt_motion = batch["motion"][:, :T].to(device).float()

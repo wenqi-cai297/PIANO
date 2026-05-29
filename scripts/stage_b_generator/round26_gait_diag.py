@@ -60,6 +60,7 @@ from torch.utils.data import DataLoader
 from piano.inference.diagnostic_helpers import (
     _build_cond, _build_dataset, _build_model, _stage1_norm_for_cfg,
     extract_train_time_meta, _fk_22joints,
+    load_substitute_conds_for_clip,
 )
 
 from piano.data.dataset import collate_hoi  # noqa: E402
@@ -289,6 +290,13 @@ def main() -> int:
     parser.add_argument("--bucket", default="val", choices=["train", "val"])
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--substitute-conds-dir", type=Path, default=None,
+        help=(
+            "Optional dir of per-clip .npz that override oracle cond keys; "
+            "used for R31/R32 downstream-coupling diag."
+        ),
+    )
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--walk-speed-m", type=float,
                         default=ROOT_WALK_SPEED_M_PER_FRAME_DEFAULT)
@@ -354,9 +362,14 @@ def main() -> int:
             continue
         n_processed += 1
 
+        T_for_sub = int(batch["motion"].shape[1])
+        substitute_conds = load_substitute_conds_for_clip(
+            args.substitute_conds_dir, subset, seq_id, T_for_sub, device,
+        )
         cond, T = _build_cond(
             batch, model, object_encoder, clip_model, cfg, device,
             stage1_norm=stage1_norm,
+            substitute_conds=substitute_conds,
         )
 
         gt_motion = batch["motion"][:, :T].to(device).float()
