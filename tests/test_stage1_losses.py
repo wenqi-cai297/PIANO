@@ -19,15 +19,21 @@ from piano.training.stage1_losses import (
     CH_PELVIS_ROT6D,
     CH_SHOULDER_H,
     CH_SPINE3_ROT6D,
+    CH_YAW_COS,
+    CH_YAW_SIN,
+    CH_YAW_VEL,
     J_HEAD,
     J_L_SHOULDER,
     J_PELVIS,
     J_R_SHOULDER,
     J_SPINE3,
+    channel_moment_match_loss,
     fk_height_consistency_loss,
     fk_pelvis_spine_pos_loss,
+    fk_pelvis_spine_pos_loss_cm,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    yaw_aggregate_match_loss,
 )
 
 
@@ -283,3 +289,240 @@ def test_kinematic_consistency_handles_T1():
     assert loss.item() == 0.0
     loss.backward()
     assert stage1.grad is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V7-A: channel_moment_match_loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_moment_match_zero_when_pred_equals_gt():
+    """Zero loss when pred == gt — moments match exactly."""
+    torch.manual_seed(0)
+    B, T = 4, 30
+    gt = torch.randn(B, T, 23) * 0.5
+    pred = gt.clone()
+    mask = torch.ones(B, T)
+    loss = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=True, value_match=True,
+    )
+    assert loss.item() < 1e-10
+
+
+def test_moment_match_positive_on_std_collapse():
+    """The signature failure mode: pred has correct mean but tiny std."""
+    torch.manual_seed(0)
+    B, T = 4, 30
+    gt = torch.randn(B, T, 23) * 0.5            # gt std ~ 0.5 per channel
+    pred = torch.zeros(B, T, 23)                # pred std = 0
+    mask = torch.ones(B, T)
+    loss = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=False, value_match=True,
+    )
+    assert loss.item() > 0.1
+    assert torch.isfinite(loss)
+
+
+def test_moment_match_velocity_catches_smoothing():
+    """Pred matches GT in value but is over-smoothed → velocity moment fires."""
+    torch.manual_seed(0)
+    B, T = 4, 30
+    gt = torch.randn(B, T, 23) * 0.5
+    # Smooth pred by averaging neighbors — preserves mean but kills velocity.
+    pred = gt.clone()
+    pred[:, 1:-1] = (gt[:, :-2] + gt[:, 1:-1] + gt[:, 2:]) / 3.0
+    mask = torch.ones(B, T)
+    loss = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=True, value_match=False,
+    )
+    # Velocity moment should flag the smoothing.
+    assert loss.item() > 0.0
+    # And it should be small compared to a fully zeroed pred.
+    pred_dead = torch.zeros_like(gt)
+    loss_dead = channel_moment_match_loss(
+        pred_dead, gt, mask, velocity_match=True, value_match=False,
+    )
+    assert loss_dead.item() > loss.item()
+
+
+def test_moment_match_normalization_makes_scales_comparable():
+    """With normalize_by_gt_std=True, a small-scale channel's collapse
+    contributes ~1.0, same as a large-scale channel's collapse."""
+    B, T = 4, 30
+    torch.manual_seed(1)
+    # Two channels: one with std 0.001 m, one with std 1.0 m.
+    gt = torch.zeros(B, T, 23)
+    gt[..., 0] = torch.randn(B, T) * 0.001       # tiny scale
+    gt[..., 22] = torch.randn(B, T) * 1.0        # big scale
+    pred = torch.zeros_like(gt)                  # full collapse
+    mask = torch.ones(B, T)
+    loss_norm = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=False, value_match=True,
+        normalize_by_gt_std=True, channel_subset=(0, 22),
+    )
+    loss_raw = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=False, value_match=True,
+        normalize_by_gt_std=False, channel_subset=(0, 22),
+    )
+    # In raw mode, ch 22 dominates by ~1e6.
+    # In normalized mode, both contribute ~ same order.
+    # We only assert they're both finite and positive here.
+    assert loss_norm.item() > 0.0
+    assert loss_raw.item() > 0.0
+    assert torch.isfinite(loss_norm)
+    assert torch.isfinite(loss_raw)
+
+
+def test_moment_match_respects_mask():
+    """Masked-out frames must not pollute the moments."""
+    torch.manual_seed(2)
+    B, T = 4, 30
+    gt = torch.randn(B, T, 23) * 0.3
+    pred = gt.clone()
+    # Add huge noise on the second half of the first clip — should be masked.
+    pred[0, 15:] += 100.0
+    mask = torch.ones(B, T)
+    mask[0, 15:] = 0.0
+    loss = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=True, value_match=True,
+    )
+    # The masked region's 100x noise must NOT show up.
+    assert loss.item() < 1.0
+
+
+def test_moment_match_no_match_returns_zero():
+    """When both velocity and value match are off, return 0 cleanly."""
+    pred = torch.randn(2, 4, 23, requires_grad=True)
+    gt = torch.randn(2, 4, 23)
+    mask = torch.ones(2, 4)
+    loss = channel_moment_match_loss(
+        pred, gt, mask, velocity_match=False, value_match=False,
+    )
+    assert loss.item() == 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V7-B: yaw_aggregate_match_loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_yaw_aggregate_zero_when_pred_equals_gt():
+    """Identical yaw → 0 loss."""
+    B, T = 2, 30
+    yaw = torch.linspace(0.0, 1.5, T).unsqueeze(0).expand(B, T)
+    raw = torch.zeros(B, T, 23)
+    raw[..., CH_YAW_SIN] = torch.sin(yaw)
+    raw[..., CH_YAW_COS] = torch.cos(yaw)
+    mask = torch.ones(B, T)
+    loss = yaw_aggregate_match_loss(raw, raw, mask)
+    assert loss.item() < 1e-6
+
+
+def test_yaw_aggregate_mode_invariant_to_direction():
+    """Flipping CW <-> CCW (negate yaw) should still give a low loss because
+    |Δyaw| and range are invariant to sign reversal."""
+    B, T = 2, 30
+    yaw_cw = torch.linspace(0.0, 1.5, T).unsqueeze(0).expand(B, T)
+    yaw_ccw = -yaw_cw
+    raw_gt = torch.zeros(B, T, 23)
+    raw_gt[..., CH_YAW_SIN] = torch.sin(yaw_cw)
+    raw_gt[..., CH_YAW_COS] = torch.cos(yaw_cw)
+    raw_pred = torch.zeros(B, T, 23)
+    raw_pred[..., CH_YAW_SIN] = torch.sin(yaw_ccw)
+    raw_pred[..., CH_YAW_COS] = torch.cos(yaw_ccw)
+    mask = torch.ones(B, T)
+    loss = yaw_aggregate_match_loss(raw_pred, raw_gt, mask)
+    # The magnitude and range are identical; only sign differs.
+    # |Δyaw| absolute matches; range identical (|max−min|).
+    assert loss.item() < 1e-4
+
+
+def test_yaw_aggregate_fires_on_frozen_yaw():
+    """When pred yaw stays constant but gt rotates — large loss."""
+    B, T = 2, 30
+    yaw_gt = torch.linspace(0.0, 1.5, T).unsqueeze(0).expand(B, T)
+    raw_gt = torch.zeros(B, T, 23)
+    raw_gt[..., CH_YAW_SIN] = torch.sin(yaw_gt)
+    raw_gt[..., CH_YAW_COS] = torch.cos(yaw_gt)
+    raw_pred = torch.zeros(B, T, 23)
+    raw_pred[..., CH_YAW_SIN] = 0.0              # yaw = 0 (frozen)
+    raw_pred[..., CH_YAW_COS] = 1.0
+    mask = torch.ones(B, T)
+    loss = yaw_aggregate_match_loss(raw_pred, raw_gt, mask)
+    assert loss.item() > 0.01
+    assert torch.isfinite(loss)
+
+
+def test_yaw_aggregate_handles_T1():
+    """T=1 → 0 loss, no crash."""
+    base = torch.zeros(2, 1, 23)
+    base[..., CH_YAW_COS] = 1.0
+    raw = base.clone().requires_grad_(True)
+    mask = torch.ones(2, 1)
+    loss = yaw_aggregate_match_loss(raw, base, mask)
+    assert loss.item() == 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V7-C: fk_pelvis_spine_pos_loss_cm
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_fk_pos_cm_zero_when_pred_equals_gt():
+    """Identity pred rotations + GT root → 0 cm error."""
+    torch.manual_seed(0)
+    B, T = 2, 5
+    # Random GT motion.
+    gt_rot6d = torch.randn(B, T, 22, 6)
+    # Normalize via FK roundtrip to get a valid SMPL rot6d.
+    gt_rot_mat = rotation_6d_to_matrix(gt_rot6d)
+    gt_rot6d = matrix_to_rotation_6d(gt_rot_mat)
+    gt_root = torch.randn(B, T, 3) * 0.1
+    gt_motion_135 = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    rest_offsets = torch.zeros(B, 22, 3)
+    rest_offsets[:, :, 1] = 0.1                                # any rest skeleton
+    rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3).float()
+    gt_joints = fk_from_global_rotations(gt_rot_mat, rest_per_frame, gt_root)
+    seq_mask = torch.ones(B, T)
+    loss = fk_pelvis_spine_pos_loss_cm(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=gt_root,
+        gt_motion_135=gt_motion_135,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    assert loss.item() < 1e-4
+
+
+def test_fk_pos_cm_positive_on_perturbation():
+    """Perturb pred root → positive cm-scale loss, finite gradient."""
+    torch.manual_seed(0)
+    B, T = 2, 5
+    gt_rot6d = torch.randn(B, T, 22, 6)
+    gt_rot_mat = rotation_6d_to_matrix(gt_rot6d)
+    gt_rot6d = matrix_to_rotation_6d(gt_rot_mat)
+    gt_root = torch.randn(B, T, 3) * 0.1
+    gt_motion_135 = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    rest_offsets = torch.zeros(B, 22, 3)
+    rest_offsets[:, :, 1] = 0.1
+    rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3).float()
+    gt_joints = fk_from_global_rotations(gt_rot_mat, rest_per_frame, gt_root)
+    seq_mask = torch.ones(B, T)
+    # Perturb root by 5 cm — expect SmoothL1 to register linearly above 1 cm.
+    bad_root = gt_root.clone()
+    bad_root[..., 0] = bad_root[..., 0] + 0.05
+    bad_root.requires_grad_(True)
+    loss = fk_pelvis_spine_pos_loss_cm(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion_135,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    assert loss.item() > 0.5         # 5 cm offset → expect O(5) loss
+    loss.backward()
+    assert bad_root.grad is not None

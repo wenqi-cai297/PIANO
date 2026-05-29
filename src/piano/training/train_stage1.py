@@ -50,10 +50,13 @@ from piano.training.stage1_losses import (
     CH_PELVIS_ROT6D,
     CH_SHOULDER_H,
     CH_SPINE3_ROT6D,
+    channel_moment_match_loss,
     fk_height_consistency_loss,
     fk_pelvis_spine_pos_loss,
+    fk_pelvis_spine_pos_loss_cm,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    yaw_aggregate_match_loss,
 )
 from piano.training.smpl_kinematics import (
     fk_from_global_rotations,
@@ -90,6 +93,17 @@ def build_stage1_step_fn(
     w_fk_pos: float = 0.0,
     w_height_fk: float = 0.0,
     w_self_consistency: float = 0.0,
+    # R31 V7 anti-mode-collapse losses (default 0 = OFF, V0 baseline).
+    # V7-A: per-channel (mean,std) matching of finite-diff magnitudes.
+    w_moment_velocity: float = 0.0,
+    # V7-A': per-channel (mean,std) matching of raw values.
+    w_moment_value: float = 0.0,
+    # V7-B: aggregate yaw transition rate + cumulative range matching.
+    w_yaw_aggregate: float = 0.0,
+    # V7-C: cm-space SmoothL1 FK pos (PB1 L_pos scale; do NOT combine with
+    # the L2 ``w_fk_pos`` term in the same run, they shadow each other).
+    w_fk_pos_cm: float = 0.0,
+    fk_pos_cm_beta: float = 1.0,
     # rot6d-weighted velocity loss: multiplies channels [9:21] of the
     # vel-MSE term by ``vel_rot6d_weight`` (default 1.0 = baseline).
     vel_rot6d_weight: float = 1.0,
@@ -242,17 +256,22 @@ def build_stage1_step_fn(
         else:
             yaw_sm = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
-        # ─── Loss 4-7 (R31 V2 ablation losses) ───
-        # All operate on the RAW (un-z-scored) prediction. Compute once
-        # (avoid re-allocating per loss term).
+        # ─── Loss 4-7 (R31 V2 ablation losses) + V7 anti-collapse losses ─
+        # All operate on the RAW (un-z-scored) prediction (and, for V7-A,
+        # the matching raw GT). Compute once (avoid re-allocating per
+        # loss term).
         need_raw = (
             w_rot6d_ortho > 0 or w_fk_pos > 0 or w_height_fk > 0
             or w_self_consistency > 0
+            or w_moment_velocity > 0 or w_moment_value > 0
+            or w_yaw_aggregate > 0 or w_fk_pos_cm > 0
         )
         if need_raw:
             x0_raw = x0_pred * stage1_coarse_std_t + stage1_coarse_mean_t   # (B, T, 23)
+            x0_gt_raw = coarse_v1_raw                                        # (B, T, 23) un-z-scored GT
         else:
             x0_raw = None
+            x0_gt_raw = None
 
         # L1: rot6d orthogonality.
         if w_rot6d_ortho > 0 and x0_raw is not None:
@@ -334,6 +353,61 @@ def build_stage1_step_fn(
         else:
             self_cons = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
+        # ─── V7-A: per-channel moment match (velocity + optional value) ─
+        # Mirrors PB1's stable_local_speed_moment (train_anchordiff.py:1106).
+        # Directly penalises std collapse on finite-diff magnitudes.
+        if (w_moment_velocity > 0 or w_moment_value > 0) and x0_raw is not None:
+            moment_match = channel_moment_match_loss(
+                stage1_raw_pred=x0_raw,
+                stage1_raw_gt=x0_gt_raw,
+                seq_mask=seq_mask,
+                velocity_match=(w_moment_velocity > 0),
+                value_match=(w_moment_value > 0),
+            )
+        else:
+            moment_match = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        # Use the larger of the two weights so a single combined weight
+        # scales the helper (the helper sums value + velocity terms
+        # internally). The variants we ship use only one of them at a time.
+        w_moment_match = max(float(w_moment_velocity), float(w_moment_value))
+
+        # ─── V7-B: yaw aggregate-statistic match (transition rate + range) ─
+        # Mirrors PB1's gait transition_rate / duty_cycle pattern.
+        if w_yaw_aggregate > 0 and x0_raw is not None:
+            yaw_agg = yaw_aggregate_match_loss(
+                stage1_raw_pred=x0_raw,
+                stage1_raw_gt=x0_gt_raw,
+                seq_mask=seq_mask,
+            )
+        else:
+            yaw_agg = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        # ─── V7-C: cm-space SmoothL1 FK pos (PB1 L_pos scale weights) ───
+        # Reuses the same predicted root_world derivation as L2/L3.
+        if w_fk_pos_cm > 0 and x0_raw is not None:
+            root_local_pred = x0_raw[..., :3]
+            root_world_t0 = motion[:, :1, 132:135].float()
+            root_local_world_order = torch.stack(
+                [
+                    root_local_pred[..., 0],
+                    root_local_pred[..., 2],
+                    root_local_pred[..., 1],
+                ], dim=-1,
+            )
+            root_world_pred = root_local_world_order + root_world_t0
+            fk_pos_cm = fk_pelvis_spine_pos_loss_cm(
+                pelvis_rot6d_pred=x0_raw[..., CH_PELVIS_ROT6D],
+                spine3_rot6d_pred=x0_raw[..., CH_SPINE3_ROT6D],
+                root_world_pred=root_world_pred,
+                gt_motion_135=motion,
+                rest_offsets=rest_offsets,
+                gt_joints=gt_joints,
+                seq_mask=seq_mask,
+                beta_cm=float(fk_pos_cm_beta),
+            )
+        else:
+            fk_pos_cm = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
@@ -342,6 +416,9 @@ def build_stage1_step_fn(
             + w_fk_pos * fk_pos
             + w_height_fk * height_fk
             + w_self_consistency * self_cons
+            + w_moment_match * moment_match
+            + w_yaw_aggregate * yaw_agg
+            + w_fk_pos_cm * fk_pos_cm
         )
 
         return {
@@ -354,6 +431,9 @@ def build_stage1_step_fn(
             "fk_pos": fk_pos.detach(),
             "height_fk": height_fk.detach(),
             "self_consistency": self_cons.detach(),
+            "moment_match": moment_match.detach(),
+            "yaw_aggregate": yaw_agg.detach(),
+            "fk_pos_cm": fk_pos_cm.detach(),
         }
 
     return step_fn
@@ -538,6 +618,12 @@ def main() -> None:
         w_fk_pos=float(cfg.loss.get("w_fk_pos", 0.0)),
         w_height_fk=float(cfg.loss.get("w_height_fk", 0.0)),
         w_self_consistency=float(cfg.loss.get("w_self_consistency", 0.0)),
+        # R31 V7 anti-collapse losses (default 0 if config doesn't specify).
+        w_moment_velocity=float(cfg.loss.get("w_moment_velocity", 0.0)),
+        w_moment_value=float(cfg.loss.get("w_moment_value", 0.0)),
+        w_yaw_aggregate=float(cfg.loss.get("w_yaw_aggregate", 0.0)),
+        w_fk_pos_cm=float(cfg.loss.get("w_fk_pos_cm", 0.0)),
+        fk_pos_cm_beta=float(cfg.loss.get("fk_pos_cm_beta", 1.0)),
         vel_rot6d_weight=float(cfg.loss.get("vel_rot6d_weight", 1.0)),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
@@ -560,6 +646,11 @@ def main() -> None:
             f"fk_pos={out['fk_pos'].item():.4e}  "
             f"height_fk={out['height_fk'].item():.4e}  "
             f"self_cons={out['self_consistency'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R31V7 — moment={out['moment_match'].item():.4e}  "
+            f"yaw_agg={out['yaw_aggregate'].item():.4e}  "
+            f"fk_pos_cm={out['fk_pos_cm'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")
