@@ -49,6 +49,11 @@ from piano.models.stage1p5_interaction import (
     Stage1p5Denoiser,
     Stage1p5DenoiserConfig,
 )
+from piano.training.stage1_losses import channel_moment_match_loss
+from piano.training.stage1p5_losses import (
+    c41_wrist_frame0_consistency_loss,
+    phase_unit_circle_loss,
+)
 from piano.training.train_anchordiff import _build_dataset
 from piano.training.trainer import (
     build_scheduler,
@@ -74,6 +79,20 @@ def build_stage1p5_step_fn(
     w_s4_stance: float = 0.5,
     w_s4_phase: float = 0.05,
     w_s4_walking: float = 0.5,
+    # R32 V7 anti-bug losses (default 0 = OFF, V0 baseline behaviour).
+    # V7-A: per-channel (mean, std) match on raw values and/or finite-diff
+    # magnitudes; mirrors R31's anti-collapse loss but applied to the full
+    # 31-D Stage-1.5 output.
+    w_v7_moment_velocity: float = 0.0,
+    w_v7_moment_value: float = 0.0,
+    # V7-B: phase unit-circle + angle consistency. V0 has a weak
+    # ``w_s4_phase`` term for unit-norm only; V7-B uses these stronger
+    # variants. When V7-B is active, set V0's ``w_s4_phase`` to 0 in
+    # the config to avoid double counting.
+    w_v7_phase_unit_norm: float = 0.0,
+    w_v7_phase_angle: float = 0.0,
+    # V7-D: C41 wrist frame-0 invariant violation (audit B5; rms_at_t0 5cm).
+    w_v7_c41_frame0_wrist: float = 0.0,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -250,6 +269,46 @@ def build_stage1p5_step_fn(
         else:
             walking_bce = torch.zeros((), device=device, dtype=mse_s4.dtype)
 
+        # ─── R32 V7-A: per-channel moment match on full 31-D output ───
+        # Direct attack on B1+B2 (wrist + footstep vel under-articulation).
+        if (w_v7_moment_velocity > 0 or w_v7_moment_value > 0):
+            moment_match = channel_moment_match_loss(
+                stage1_raw_pred=x0_pred,
+                stage1_raw_gt=x0,
+                seq_mask=seq_mask,
+                velocity_match=(w_v7_moment_velocity > 0),
+                value_match=(w_v7_moment_value > 0),
+                channel_subset=None,           # ALL 31 channels
+                normalize_by_gt_std=True,
+            )
+        else:
+            moment_match = torch.zeros((), device=device, dtype=mse_s4.dtype)
+        # The helper sums value + velocity terms internally; use the larger
+        # of the two weights as the outer multiplier.
+        w_v7_moment_match = max(
+            float(w_v7_moment_velocity), float(w_v7_moment_value),
+        )
+
+        # ─── R32 V7-B: phase unit-circle + angle consistency ───
+        # Direct attack on B3 (phase pair lost geometric consistency).
+        if w_v7_phase_unit_norm > 0 or w_v7_phase_angle > 0:
+            phase_v7 = phase_unit_circle_loss(
+                s4_pred=s4_pred,
+                s4_gt=s4_gt,
+                seq_mask=seq_mask,
+                unit_norm_weight=float(w_v7_phase_unit_norm),
+                angle_weight=float(w_v7_phase_angle),
+            )
+        else:
+            phase_v7 = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        # ─── R32 V7-D: C41 wrist frame-0 invariant ──
+        # Direct attack on B5 (rms_at_t0 = 5.3 cm).
+        if w_v7_c41_frame0_wrist > 0:
+            c41_frame0 = c41_wrist_frame0_consistency_loss(c41_pred)
+        else:
+            c41_frame0 = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
         loss = (
             w_x0_c41 * mse_c41
             + w_x0_s4 * mse_s4
@@ -257,6 +316,11 @@ def build_stage1p5_step_fn(
             + w_s4_stance * stance_bce
             + w_s4_phase * phase_unit
             + w_s4_walking * walking_bce
+            + w_v7_moment_match * moment_match
+            # V7-B helper takes its own unit_norm_weight + angle_weight
+            # already scaled internally — outer multiplier is 1.0.
+            + 1.0 * phase_v7
+            + w_v7_c41_frame0_wrist * c41_frame0
         )
 
         return {
@@ -267,6 +331,9 @@ def build_stage1p5_step_fn(
             "s4_stance_bce": stance_bce.detach(),
             "s4_phase_unit": phase_unit.detach(),
             "s4_walking_bce": walking_bce.detach(),
+            "v7_moment_match": moment_match.detach(),
+            "v7_phase": phase_v7.detach(),
+            "v7_c41_frame0_wrist": c41_frame0.detach(),
         }
 
     return step_fn
@@ -434,6 +501,12 @@ def main() -> None:
         w_s4_stance=float(cfg.loss.w_s4_stance),
         w_s4_phase=float(cfg.loss.w_s4_phase),
         w_s4_walking=float(cfg.loss.w_s4_walking),
+        # R32 V7 anti-bug losses (default 0 if config doesn't specify).
+        w_v7_moment_velocity=float(cfg.loss.get("w_v7_moment_velocity", 0.0)),
+        w_v7_moment_value=float(cfg.loss.get("w_v7_moment_value", 0.0)),
+        w_v7_phase_unit_norm=float(cfg.loss.get("w_v7_phase_unit_norm", 0.0)),
+        w_v7_phase_angle=float(cfg.loss.get("w_v7_phase_angle", 0.0)),
+        w_v7_c41_frame0_wrist=float(cfg.loss.get("w_v7_c41_frame0_wrist", 0.0)),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -448,6 +521,17 @@ def main() -> None:
             f"loss = {out['loss'].item():.4f}  "
             f"mse_c41 = {out['mse_c41'].item():.4f}  "
             f"mse_s4 = {out['mse_s4'].item():.4f}"
+        )
+        accelerator.print(
+            f"  V0   — jl={out['c41_joint_limit'].item():.4e}  "
+            f"stance={out['s4_stance_bce'].item():.4e}  "
+            f"phase={out['s4_phase_unit'].item():.4e}  "
+            f"walking={out['s4_walking_bce'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R32V7 — moment={out['v7_moment_match'].item():.4e}  "
+            f"phase_v7={out['v7_phase'].item():.4e}  "
+            f"c41_f0_wrist={out['v7_c41_frame0_wrist'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")
