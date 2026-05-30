@@ -17,10 +17,13 @@ from piano.training.stage1p5_losses import (
     CH_S4_PHASE_R_COS,
     CH_S4_PHASE_R_SIN,
     C41_DIM,
+    R34_C41_WRIST_SLICE,
     S4_DIM,
     TOTAL_DIM,
+    apply_stage1_coarse_cond_aug,
     c41_wrist_frame0_consistency_loss,
     phase_unit_circle_loss,
+    wrist_lowband_rfft_loss,
 )
 
 
@@ -245,3 +248,159 @@ def test_moment_match_zero_on_31d_when_pred_equals_gt():
         velocity_match=True, value_match=True,
     )
     assert loss.item() < 1e-10
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R34 — wrist low-band rFFT loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_r34_wrist_lowband_slice_matches_audit():
+    """R34_C41_WRIST_SLICE must match the wrist channel locations used
+    by the Phase 1 audit (channels [0:6] = left+right wrist Δxyz)."""
+    assert R34_C41_WRIST_SLICE == slice(0, 6)
+
+
+def test_r34_wrist_lowband_zero_when_pred_equals_gt():
+    """rFFT MSE on identical pred + gt should be exactly 0."""
+    B, T = 2, 196
+    torch.manual_seed(0)
+    c41 = torch.randn(B, T, 18)
+    mask = torch.ones(B, T)
+    loss = wrist_lowband_rfft_loss(c41, c41, mask, fps=20.0, cutoff_hz=1.0)
+    assert loss.item() < 1e-7
+
+
+def test_r34_wrist_lowband_positive_on_random_perturbation():
+    B, T = 2, 196
+    torch.manual_seed(0)
+    pred = torch.randn(B, T, 18)
+    gt = torch.randn(B, T, 18)
+    mask = torch.ones(B, T)
+    loss = wrist_lowband_rfft_loss(pred, gt, mask, fps=20.0, cutoff_hz=1.0)
+    assert loss.item() > 0.0
+    assert torch.isfinite(loss)
+
+
+def test_r34_wrist_lowband_only_grad_on_wrist_channels():
+    """Gradient must NOT leak into non-wrist channels [6:18]."""
+    B, T = 2, 196
+    torch.manual_seed(0)
+    pred = torch.randn(B, T, 18, requires_grad=True)
+    gt = torch.randn(B, T, 18)
+    mask = torch.ones(B, T)
+    loss = wrist_lowband_rfft_loss(pred, gt, mask, fps=20.0, cutoff_hz=1.0)
+    loss.backward()
+    assert pred.grad is not None
+    wrist_grad = pred.grad[..., 0:6].abs().sum().item()
+    nonwrist_grad = pred.grad[..., 6:18].abs().sum().item()
+    assert wrist_grad > 0.0
+    assert nonwrist_grad == 0.0
+
+
+def test_r34_wrist_lowband_only_targets_low_band():
+    """Pred = GT in low band but different in high band → loss ~= 0.
+
+    Construct a signal whose 0-1 Hz DFT bins match GT exactly, and
+    differ only at higher freqs. The low-band rFFT MSE should be 0.
+    """
+    B, T, C = 1, 196, 18
+    fps = 20.0
+    cutoff = 1.0
+    torch.manual_seed(0)
+    gt = torch.randn(B, T, C)
+    # Add a pure 5 Hz sinusoid to the wrist channels only, in pred only,
+    # so the low-band rFFT MSE on the wrist [0:6] is unchanged.
+    t = torch.arange(T, dtype=torch.float32) / fps
+    high_freq = torch.sin(2 * math.pi * 5.0 * t).view(1, T, 1).expand(B, T, 6)
+    pred = gt.clone()
+    pred[..., 0:6] = pred[..., 0:6] + 10.0 * high_freq
+    mask = torch.ones(B, T)
+    loss = wrist_lowband_rfft_loss(pred, gt, mask, fps=fps, cutoff_hz=cutoff)
+    # 5 Hz is well above the 1 Hz cutoff; the low-band MSE must be ~0.
+    assert loss.item() < 1e-4, (
+        f"high-frequency perturbation should not enter low-band loss, "
+        f"got {loss.item()}"
+    )
+
+
+def test_r34_wrist_lowband_mask_zeros_padding():
+    """seq_mask must zero out padding so the FFT spectra match between
+    pred and gt in the padding region. Use mask that zeros half the
+    sequence — the in-window content should drive the loss only."""
+    B, T = 1, 100
+    torch.manual_seed(0)
+    pred = torch.randn(B, T, 18)
+    gt = torch.randn(B, T, 18)
+    mask = torch.zeros(B, T)
+    mask[:, :50] = 1.0   # valid first half only
+    loss_masked = wrist_lowband_rfft_loss(pred, gt, mask, fps=20.0, cutoff_hz=1.0)
+    # Also compute against a version where pred[..., 0:6][:, 50:] is set to gt's
+    # value (so the masked region contributes equally in both cases): the
+    # loss should be unchanged.
+    pred_eq_pad = pred.clone()
+    pred_eq_pad[:, 50:, :] = gt[:, 50:, :]
+    loss_eq_pad = wrist_lowband_rfft_loss(pred_eq_pad, gt, mask, fps=20.0, cutoff_hz=1.0)
+    assert abs(loss_masked.item() - loss_eq_pad.item()) < 1e-6
+
+
+def test_r34_wrist_lowband_wrong_shape_raises():
+    with pytest.raises(ValueError):
+        wrist_lowband_rfft_loss(
+            torch.zeros(2, 196, 18), torch.zeros(2, 196, 17),
+            torch.ones(2, 196),
+        )
+    with pytest.raises(ValueError):
+        wrist_lowband_rfft_loss(
+            torch.zeros(2, 196, 18, 1), torch.zeros(2, 196, 18, 1),
+            torch.ones(2, 196),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R34 — conditioning augmentation
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_r34_cond_aug_identity_when_sigma_max_zero():
+    z = torch.randn(4, 50, 23)
+    out = apply_stage1_coarse_cond_aug(z, sigma_max=0.0, training=True)
+    assert torch.equal(z, out)
+
+
+def test_r34_cond_aug_identity_in_eval():
+    z = torch.randn(4, 50, 23)
+    out = apply_stage1_coarse_cond_aug(z, sigma_max=0.5, training=False)
+    assert torch.equal(z, out)
+
+
+def test_r34_cond_aug_per_sample_sigma_at_most_sigma_max():
+    """σ ~ U[0, sigma_max] per batch item; noise std per sample ≤ sigma_max."""
+    B, T, C = 64, 100, 23
+    z = torch.zeros(B, T, C)   # zero base so out - z = noise
+    torch.manual_seed(0)
+    out = apply_stage1_coarse_cond_aug(z, sigma_max=0.1, training=True)
+    noise = out - z
+    per_sample_std = noise.flatten(1).std(dim=1)
+    # With T*C=2300 samples per row, the empirical std should be very
+    # close to the row's σ ≤ sigma_max=0.1; allow 5% finite-sample slack.
+    assert per_sample_std.max().item() <= 0.105
+
+
+def test_r34_cond_aug_changes_per_batch_item():
+    """σ is sampled per batch item, so two rows in the same forward pass
+    must (almost surely) have different noise variance."""
+    B, T, C = 4, 100, 23
+    z = torch.zeros(B, T, C)
+    torch.manual_seed(0)
+    out = apply_stage1_coarse_cond_aug(z, sigma_max=0.5, training=True)
+    per_row_std = (out - z).flatten(1).std(dim=1)
+    # All 4 rows having exactly equal std is probability zero for σ~U[0, 0.5].
+    assert per_row_std.unique().numel() == B
+
+
+def test_r34_cond_aug_wrong_shape_raises():
+    with pytest.raises(ValueError):
+        apply_stage1_coarse_cond_aug(
+            torch.zeros(4, 100), sigma_max=0.1, training=True,
+        )

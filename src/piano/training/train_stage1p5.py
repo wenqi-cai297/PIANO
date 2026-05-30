@@ -51,8 +51,10 @@ from piano.models.stage1p5_interaction import (
 )
 from piano.training.stage1_losses import channel_moment_match_loss
 from piano.training.stage1p5_losses import (
+    apply_stage1_coarse_cond_aug,
     c41_wrist_frame0_consistency_loss,
     phase_unit_circle_loss,
+    wrist_lowband_rfft_loss,
 )
 from piano.training.train_anchordiff import _build_dataset
 from piano.training.trainer import (
@@ -93,6 +95,12 @@ def build_stage1p5_step_fn(
     w_v7_phase_angle: float = 0.0,
     # V7-D: C41 wrist frame-0 invariant violation (audit B5; rms_at_t0 5cm).
     w_v7_c41_frame0_wrist: float = 0.0,
+    # R34 — wrist low-band rFFT loss + cond augmentation.
+    # Both default to off so all V0/V7/R33 configs train unchanged.
+    w_r34_wrist_lowband: float = 0.0,
+    r34_wrist_lowband_cutoff_hz: float = 1.0,
+    r34_wrist_lowband_fps: float = 20.0,
+    r34_cond_aug_sigma_max: float = 0.0,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -169,6 +177,15 @@ def build_stage1p5_step_fn(
             motion=motion, rest_offsets=rest_offsets,
         )
         coarse_v1 = (coarse_v1_raw - stage1_coarse_mean_t) / stage1_coarse_std_t
+        # R34 — conditioning augmentation (Ho 2021 §3.3 non-truncated mode).
+        # Applied on Z-SCORED stage1_coarse only; sigma is NOT fed to the
+        # model (no architecture change). Identity when sigma_max <= 0 or
+        # model is in eval mode.
+        coarse_v1 = apply_stage1_coarse_cond_aug(
+            coarse_v1,
+            sigma_max=float(r34_cond_aug_sigma_max),
+            training=bool(_model.training),
+        )
 
         cond: dict[str, Tensor] = {
             "object_world_traj": object_traj,
@@ -309,6 +326,23 @@ def build_stage1p5_step_fn(
         else:
             c41_frame0 = torch.zeros((), device=device, dtype=mse_s4.dtype)
 
+        # ─── R34: wrist low-band rFFT loss ──
+        # Targets the audit's low-band PSD attenuation observation
+        # (wrist [0:6] low-band ratio 0.45–0.50 vs GT). Operates on RAW
+        # C41 in the time-FFT domain over the full T axis; padding zeroed
+        # via seq_mask before FFT in the helper. Causally justified only
+        # after D1-V2 or D2-G3 verdict (see analyses/2026-05-31_…/02 + 03).
+        if w_r34_wrist_lowband > 0:
+            r34_lowband = wrist_lowband_rfft_loss(
+                c41_pred=c41_pred,
+                c41_gt=c41_gt,
+                seq_mask=seq_mask,
+                fps=float(r34_wrist_lowband_fps),
+                cutoff_hz=float(r34_wrist_lowband_cutoff_hz),
+            )
+        else:
+            r34_lowband = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
         loss = (
             w_x0_c41 * mse_c41
             + w_x0_s4 * mse_s4
@@ -321,6 +355,7 @@ def build_stage1p5_step_fn(
             # already scaled internally — outer multiplier is 1.0.
             + 1.0 * phase_v7
             + w_v7_c41_frame0_wrist * c41_frame0
+            + w_r34_wrist_lowband * r34_lowband
         )
 
         return {
@@ -334,6 +369,7 @@ def build_stage1p5_step_fn(
             "v7_moment_match": moment_match.detach(),
             "v7_phase": phase_v7.detach(),
             "v7_c41_frame0_wrist": c41_frame0.detach(),
+            "r34_wrist_lowband": r34_lowband.detach(),
         }
 
     return step_fn
@@ -510,6 +546,17 @@ def main() -> None:
         w_v7_phase_unit_norm=float(cfg.loss.get("w_v7_phase_unit_norm", 0.0)),
         w_v7_phase_angle=float(cfg.loss.get("w_v7_phase_angle", 0.0)),
         w_v7_c41_frame0_wrist=float(cfg.loss.get("w_v7_c41_frame0_wrist", 0.0)),
+        # R34 — wrist low-band rFFT loss + conditioning augmentation.
+        w_r34_wrist_lowband=float(cfg.loss.get("w_r34_wrist_lowband", 0.0)),
+        r34_wrist_lowband_cutoff_hz=float(
+            cfg.loss.get("r34_wrist_lowband_cutoff_hz", 1.0),
+        ),
+        r34_wrist_lowband_fps=float(
+            cfg.loss.get("r34_wrist_lowband_fps", 20.0),
+        ),
+        r34_cond_aug_sigma_max=float(
+            cfg.loss.get("r34_cond_aug_sigma_max", 0.0),
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -535,6 +582,9 @@ def main() -> None:
             f"  R32V7 — moment={out['v7_moment_match'].item():.4e}  "
             f"phase_v7={out['v7_phase'].item():.4e}  "
             f"c41_f0_wrist={out['v7_c41_frame0_wrist'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R34   — wrist_lowband={out['r34_wrist_lowband'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

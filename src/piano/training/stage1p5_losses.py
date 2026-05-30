@@ -161,6 +161,125 @@ def c41_wrist_frame0_consistency_loss(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# R34: targeted wrist low-band rFFT loss
+# ──────────────────────────────────────────────────────────────────────────
+
+# C41 wrist channels (R34 low-band loss target) — same slice as CH_C41_WRIST.
+# Re-aliased here so call sites can be explicit about R34 vs V7-D usage.
+R34_C41_WRIST_SLICE = slice(0, 6)
+
+
+def wrist_lowband_rfft_loss(
+    c41_pred: Tensor,                 # (B, T, 18)
+    c41_gt: Tensor,                   # (B, T, 18)
+    seq_mask: Tensor,                 # (B, T) float {0, 1}
+    *,
+    fps: float = 20.0,
+    cutoff_hz: float = 1.0,
+) -> Tensor:
+    """R34 — low-frequency complex FFT MSE on C41 wrist channels.
+
+    Implementation per brief §7.2:
+
+        L = MSE(rFFT(pred_wrist).real[mask], rFFT(gt_wrist).real[mask])
+          + MSE(rFFT(pred_wrist).imag[mask], rFFT(gt_wrist).imag[mask])
+
+    where ``mask`` selects frequencies ``freqs <= cutoff_hz`` along the
+    time axis at the given fps. Operates only on C41 wrist channels
+    ``[0:6]`` so this loss does not interfere with non-wrist channels.
+
+    Args:
+        c41_pred: (B, T, 18) — predicted C41 (raw, NOT z-scored).
+        c41_gt:   (B, T, 18) — GT C41.
+        seq_mask: (B, T)  — 1.0 inside the valid window, 0.0 in padding.
+
+    Returns
+    -------
+    Scalar (float). The rFFT is taken over the full T axis (including
+    padding), so the mask is used to zero out padding before FFT, mirroring
+    the standard "convolve with valid window" trick. We zero the padding
+    region of BOTH pred and GT so the FFT spectra match in the same
+    domain.
+    """
+    if c41_pred.shape != c41_gt.shape:
+        raise ValueError(
+            f"shape mismatch: pred {c41_pred.shape} vs gt {c41_gt.shape}"
+        )
+    if c41_pred.ndim != 3:
+        raise ValueError(f"expected (B, T, C); got {c41_pred.shape}")
+    B, T, _ = c41_pred.shape
+    if seq_mask.shape != (B, T):
+        raise ValueError(
+            f"seq_mask shape {tuple(seq_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    pw = c41_pred[..., R34_C41_WRIST_SLICE]                          # (B, T, 6)
+    gw = c41_gt[..., R34_C41_WRIST_SLICE]
+    mask = seq_mask.unsqueeze(-1).to(pw.dtype)                       # (B, T, 1)
+    pw = pw * mask
+    gw = gw * mask
+
+    freqs = torch.fft.rfftfreq(T, d=1.0 / fps).to(pw.device)         # (n_freqs,)
+    low_mask = freqs <= cutoff_hz                                    # bool (n_freqs,)
+
+    pred_fft = torch.fft.rfft(pw.float(), dim=1)                     # (B, n_freqs, 6)
+    gt_fft = torch.fft.rfft(gw.float(), dim=1)
+
+    pred_low = pred_fft[:, low_mask, :]
+    gt_low = gt_fft[:, low_mask, :]
+
+    loss_real = F.mse_loss(pred_low.real, gt_low.real)
+    loss_imag = F.mse_loss(pred_low.imag, gt_low.imag)
+    return loss_real + loss_imag
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R34: conditioning augmentation on z-scored stage1_coarse
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def apply_stage1_coarse_cond_aug(
+    stage1_coarse_z: Tensor,
+    sigma_max: float = 0.0,
+    *,
+    training: bool = True,
+) -> Tensor:
+    """R34 — per-sample Gaussian noise on z-scored stage1_coarse cond.
+
+    Implementation per brief §7.3:
+
+        sigma ~ U[0, sigma_max]    (one σ per batch item, broadcast over T, C)
+        coarse_aug = coarse_z + sigma * eps,   eps ~ N(0, I)
+
+    Sigma is NOT passed to the model (first-day non-truncated mode from
+    Ho 2021 §3.3); architecture is unchanged. When training is False or
+    sigma_max <= 0, this is the identity.
+
+    Args:
+        stage1_coarse_z: (B, T, 23) — already z-scored.
+        sigma_max: float >= 0 — upper bound of per-batch σ.
+        training: bool — when False, no aug.
+
+    Returns
+    -------
+    Tensor of the same shape as ``stage1_coarse_z``.
+    """
+    if sigma_max <= 0.0 or not training:
+        return stage1_coarse_z
+    if stage1_coarse_z.ndim != 3:
+        raise ValueError(
+            f"expected (B, T, C); got {stage1_coarse_z.shape}"
+        )
+    B = stage1_coarse_z.shape[0]
+    sigma = torch.rand(
+        (B, 1, 1),
+        device=stage1_coarse_z.device,
+        dtype=stage1_coarse_z.dtype,
+    ) * float(sigma_max)
+    noise = torch.randn_like(stage1_coarse_z) * sigma
+    return stage1_coarse_z + noise
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Convenience re-export for the trainer
 # ──────────────────────────────────────────────────────────────────────────
 
