@@ -192,7 +192,7 @@ class GlobalCondSummary(nn.Module):
 class ConditionedEncoderLayer(nn.Module):
     """DiT encoder block: AdaLN-Zero self-attn + AdaLN-Zero MLP.
 
-    Two sub-blocks per layer:
+    Two sub-blocks per layer (DiT default):
         (1) self-attn,  modulated by AdaLN-Zero (shift_msa, scale_msa, gate_msa)
         (2) MLP,        modulated by AdaLN-Zero (shift_mlp, scale_mlp, gate_mlp)
 
@@ -206,10 +206,29 @@ class ConditionedEncoderLayer(nn.Module):
     Combined with V12FinalLayer's zero-init linear, model predicts 0 at step 0.
 
     Source: facebookresearch/DiT@models.py:101-122 (DiTBlock, 6-output AdaLN).
+
+    R33 — optional per-block cross-attention sub-layer
+    ---------------------------------------------------
+    When ``enable_obj_xattn=True``, a 3rd sub-block is inserted between
+    self-attn and MLP::
+
+        (1) self-attn,   AdaLN-Zero on c
+        (1.5) obj_xattn, AdaLN-Zero on c  — cross-attn over object_tokens
+        (2) MLP,         AdaLN-Zero on c
+
+    DiT-XL ICCV-2023 style (Peebles & Xie). A SECOND AdaLN MLP
+    (``adaLN_modulation_xattn``) supplies (shift, scale, gate) for the
+    cross-attn sub-block, separately initialised to zero so the
+    cross-attn contribution starts at 0 (model is exact-identity at
+    step 0). The original 6-output ``adaLN_modulation`` keeps its
+    state-dict layout unchanged, so V0/V7/V8 ckpts trained without
+    ``enable_obj_xattn`` still load cleanly into the same class.
     """
 
     def __init__(
         self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.1,
+        *,
+        enable_obj_xattn: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
@@ -228,12 +247,39 @@ class ConditionedEncoderLayer(nn.Module):
             nn.Linear(d_model, 6 * d_model, bias=True),
         )
 
+        # R33 — per-block cross-attention sub-layer.
+        self.enable_obj_xattn = bool(enable_obj_xattn)
+        if self.enable_obj_xattn:
+            self.norm_xattn = nn.LayerNorm(
+                d_model, elementwise_affine=False, eps=1e-6,
+            )
+            self.obj_xattn = nn.MultiheadAttention(
+                d_model, n_heads, dropout=dropout, batch_first=True,
+            )
+            # AdaLN-Zero modulation for the cross-attn sub-block
+            # (separate from the 6-output one to preserve state_dict
+            # of variants trained without obj_xattn).
+            self.adaLN_modulation_xattn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(d_model, 3 * d_model, bias=True),
+            )
+            # The final Linear of the xattn AdaLN is zero-init'd in
+            # initialize_weights_v12.
+        else:
+            self.norm_xattn = None
+            self.obj_xattn = None
+            self.adaLN_modulation_xattn = None
+
     def forward(
         self,
-        x: Tensor,                      # (B, T, D)  motion tokens (including prepended init_pose_tok)
-        c: Tensor,                      # (B, D)     global AdaLN condition vector (per sample)
+        x: Tensor,                      # (B, T, D)  motion tokens
+        c: Tensor,                      # (B, D)     global AdaLN condition vector
+        obj_kv: Tensor | None = None,    # (B, N_obj, D) object key/value (R33)
     ) -> Tensor:
-        """DiT-style block: AdaLN-Zero self-attn + AdaLN-Zero MLP."""
+        """DiT-style block. With ``enable_obj_xattn``, an AdaLN-Zero
+        cross-attn sub-block over ``obj_kv`` is inserted between self-attn
+        and MLP. ``obj_kv`` is required when ``enable_obj_xattn`` is True.
+        """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )  # each (B, D)
@@ -242,6 +288,20 @@ class ConditionedEncoderLayer(nn.Module):
         h = modulate(self.norm1(x), shift_msa, scale_msa)            # (B, T, D)
         attn_out, _ = self.self_attn(h, h, h, need_weights=False)
         x = x + gate_msa.unsqueeze(1) * attn_out
+
+        # (1.5) Cross-attention with AdaLN-Zero (R33 only)
+        if self.enable_obj_xattn:
+            if obj_kv is None:
+                raise ValueError(
+                    "ConditionedEncoderLayer.enable_obj_xattn=True but "
+                    "obj_kv was not supplied to forward()."
+                )
+            shift_x, scale_x, gate_x = (
+                self.adaLN_modulation_xattn(c).chunk(3, dim=-1)
+            )
+            h_x = modulate(self.norm_xattn(x), shift_x, scale_x)
+            xattn_out, _ = self.obj_xattn(h_x, obj_kv, obj_kv, need_weights=False)
+            x = x + gate_x.unsqueeze(1) * xattn_out
 
         # (2) MLP with AdaLN-Zero
         h = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -324,6 +384,11 @@ def initialize_weights_v12(
     for block in blocks:
         nn.init.zeros_(block.adaLN_modulation[-1].weight)
         nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        # R33 — zero-init the optional per-block cross-attn AdaLN so its
+        # contribution starts at 0 (step-0 identity invariant preserved).
+        if getattr(block, "adaLN_modulation_xattn", None) is not None:
+            nn.init.zeros_(block.adaLN_modulation_xattn[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation_xattn[-1].bias)
 
     # 5. Final layer: AdaLN-Zero + zero-init linear -> step-0 output is 0.
     nn.init.zeros_(final_layer.adaLN_modulation[-1].weight)

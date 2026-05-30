@@ -414,6 +414,9 @@ def main() -> None:
         dropout=float(cfg.model.denoiser.dropout),
         max_seq_length=int(cfg.data.max_seq_length),
         use_text=bool(cfg.model.denoiser.get("use_text", True)),
+        enable_per_block_obj_xattn=bool(
+            cfg.model.denoiser.get("enable_per_block_obj_xattn", False),
+        ),
     )
     if denoiser_cfg.motion_dim != STAGE1P5_TOTAL_DIM:
         raise ValueError(

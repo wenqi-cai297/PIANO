@@ -113,6 +113,9 @@ def _build_stage1p5_model(cfg, device: torch.device) -> tuple[Stage1p5Denoiser, 
         dropout=float(d.dropout),
         max_seq_length=int(cfg.data.max_seq_length),
         use_text=bool(d.get("use_text", True)),
+        enable_per_block_obj_xattn=bool(
+            d.get("enable_per_block_obj_xattn", False),
+        ),
     )
     model = Stage1p5Denoiser(denoiser_cfg).to(device)
     encoder = ObjectEncoder(

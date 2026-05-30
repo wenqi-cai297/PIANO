@@ -75,6 +75,14 @@ class Stage1p5DenoiserConfig:
 
     use_text: bool = True
 
+    # R33 — per-block object cross-attention. When True, each
+    # ConditionedEncoderLayer gets an AdaLN-Zero cross-attn sub-layer
+    # over ``cond["object_tokens"]`` between self-attn and MLP. The
+    # end-of-encoder ``obj_xattn`` is kept (we don't strip it) so the
+    # only change vs the V0/V7 architecture is the per-block channel.
+    # Zero-init AdaLN means step-0 forward is bit-identical to V0/V7.
+    enable_per_block_obj_xattn: bool = False
+
 
 class _SplitReadout(nn.Module):
     """Final readout that emits (C41, S4) separately, both AdaLN-Zero gated.
@@ -177,9 +185,11 @@ class Stage1p5Denoiser(nn.Module):
                 n_heads=cfg.n_heads,
                 ff_mult=cfg.ff_mult,
                 dropout=cfg.dropout,
+                enable_obj_xattn=bool(cfg.enable_per_block_obj_xattn),
             )
             for _ in range(cfg.n_layers)
         ])
+        self.use_per_block_obj_xattn = bool(cfg.enable_per_block_obj_xattn)
         # Use a stand-in V12FinalLayer just so initialize_weights_v12
         # can zero-init the AdaLN of every DiT block + input proj. We
         # then DROP it and use the split readout instead.
@@ -252,11 +262,23 @@ class Stage1p5Denoiser(nn.Module):
         # Positional encoding.
         seq = self.pos_enc(h)
 
+        # R33 — pre-compute object key/value once (shared between
+        # per-block obj_xattn and end-of-encoder obj_xattn). The
+        # ``object_proj`` Linear is identical for both, so this is a
+        # cheap one-time projection. CFG drop applies uniformly.
+        obj_kv = self.object_proj(obj_tok)
+        obj_kv = self._broadcast_drop(
+            cond_drop_mask, obj_kv, self.null_obj_tokens,
+        )
+
         # DiT stack.
         for block in self.v12_blocks:
-            seq = block(seq, c)
+            if self.use_per_block_obj_xattn:
+                seq = block(seq, c, obj_kv=obj_kv)
+            else:
+                seq = block(seq, c)
 
-        # Cross-attention: text + object.
+        # Cross-attention: text + object (end-of-encoder).
         if self.use_text:
             if text_tok is None:
                 raise KeyError(
@@ -271,10 +293,6 @@ class Stage1p5Denoiser(nn.Module):
             )
             seq = self.text_norm(seq + text_attn)
 
-        obj_kv = self.object_proj(obj_tok)
-        obj_kv = self._broadcast_drop(
-            cond_drop_mask, obj_kv, self.null_obj_tokens,
-        )
         obj_attn, _ = self.obj_xattn(seq, obj_kv, obj_kv, need_weights=False)
         seq = self.obj_norm(seq + obj_attn)
 
