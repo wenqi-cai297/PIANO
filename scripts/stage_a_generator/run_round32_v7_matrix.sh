@@ -281,8 +281,12 @@ while IFS=' ' read -r VID CFG OUTDIR; do
         rm -rf "${DIAG_DIR_ROOT}"
 
         # The R32 downstream-diag launcher uses different env vars from
-        # R31's. We pass the V7 variant cfg + ckpt explicitly.
+        # R31's. We pass the V7 variant cfg + ckpt explicitly so that any
+        # variant whose architecture differs from V0 (e.g. future Stage-
+        # 1.5 ablations that flip ``enable_per_block_obj_xattn``) can
+        # construct the right denoiser before loading the ckpt.
         set +e
+        ROUND32_DS_STAGE1P5_CFG="${CFG}" \
         ROUND32_DS_STAGE1P5_CKPT="${FINAL}" \
         ROUND32_DS_PB1_CKPT="${PB1_CKPT}" \
         ROUND32_DS_BUCKETS="${BUCKETS_STR}" \

@@ -271,6 +271,7 @@ while IFS=' ' read -r VID CFG OUTDIR; do
         rm -rf "${DIAG_DIR_ROOT}"
 
         set +e
+        ROUND32_DS_STAGE1P5_CFG="${CFG}" \
         ROUND32_DS_STAGE1P5_CKPT="${FINAL}" \
         ROUND32_DS_PB1_CKPT="${PB1_CKPT}" \
         ROUND32_DS_BUCKETS="${BUCKETS_STR}" \
