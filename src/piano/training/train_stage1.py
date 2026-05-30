@@ -50,12 +50,17 @@ from piano.training.stage1_losses import (
     CH_PELVIS_ROT6D,
     CH_SHOULDER_H,
     CH_SPINE3_ROT6D,
+    INIT_POSE_F2_DIM,
+    build_init_pose_f1,
+    build_init_pose_f2,
     channel_moment_match_loss,
     fk_height_consistency_loss,
     fk_pelvis_spine_pos_loss,
     fk_pelvis_spine_pos_loss_cm,
+    frame0_consistency_loss,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    wrist_fk_supervision_loss,
     yaw_aggregate_match_loss,
 )
 from piano.training.smpl_kinematics import (
@@ -104,6 +109,21 @@ def build_stage1_step_fn(
     # the L2 ``w_fk_pos`` term in the same run, they shadow each other).
     w_fk_pos_cm: float = 0.0,
     fk_pos_cm_beta: float = 1.0,
+    # R31 V8 — wrist FK supervision (extends V7-C's target chain to wrist).
+    w_wrist_fk_pos: float = 0.0,
+    wrist_fk_target_joints: tuple[int, ...] | None = None,
+    wrist_fk_joint_weights: tuple[float, ...] | None = None,
+    wrist_fk_contact_mode: str = "off",          # off | reweight | hard
+    wrist_fk_contact_weight: float = 4.0,
+    wrist_fk_add_velocity: bool = False,
+    wrist_fk_velocity_weight: float = 0.5,
+    wrist_fk_beta_cm: float = 1.0,
+    # R31 V8 — frame-0 consistency loss (applied on Stage-1 t=0 prediction).
+    # Used together with denoiser config init_pose_dim > 0 (F1 or F2 mode).
+    w_init_pose_consistency: float = 0.0,
+    # R31 V8 — denoiser-injected init_pose mode (0 = OFF, 14 = F2,
+    # 135 = F1). Must match cfg.model.denoiser.init_pose_dim.
+    init_pose_dim: int = 0,
     # rot6d-weighted velocity loss: multiplies channels [9:21] of the
     # vel-MSE term by ``vel_rot6d_weight`` (default 1.0 = baseline).
     vel_rot6d_weight: float = 1.0,
@@ -179,6 +199,29 @@ def build_stage1_step_fn(
         }
         if text_features is not None:
             cond["text"] = text_features
+
+        # R31 V8 — init_pose injection (F1 = 135-D raw, F2 = 14-D z-scored).
+        init_pose_targets_z: Tensor | None = None
+        if init_pose_dim == 135:
+            cond["init_pose"] = build_init_pose_f1(motion)            # (B, 135)
+        elif init_pose_dim == 14:
+            cond["init_pose"] = build_init_pose_f2(
+                coarse_v1_raw, stage1_coarse_mean_t, stage1_coarse_std_t,
+            )                                                          # (B, 14)
+            init_pose_targets_z = cond["init_pose"]
+        elif init_pose_dim != 0:
+            raise ValueError(
+                f"init_pose_dim must be 0, 14, or 135; got {init_pose_dim}."
+            )
+        # When init_pose_dim == 14 but cfg didn't enable consistency loss,
+        # init_pose_targets_z is still useful (computed once). When the
+        # weight is 0 the loss term short-circuits.
+        if init_pose_dim == 0 and w_init_pose_consistency > 0:
+            # User error: consistency loss requires F2 targets. Compute
+            # them from coarse_v1_raw without registering them in cond.
+            init_pose_targets_z = build_init_pose_f2(
+                coarse_v1_raw, stage1_coarse_mean_t, stage1_coarse_std_t,
+            )
 
         # ─── Diffusion forward (x₀-prediction) ───
         # x_t = sqrt(α_t) * x_0 + sqrt(1-α_t) * noise; predict x_0.
@@ -265,6 +308,7 @@ def build_stage1_step_fn(
             or w_self_consistency > 0
             or w_moment_velocity > 0 or w_moment_value > 0
             or w_yaw_aggregate > 0 or w_fk_pos_cm > 0
+            or w_wrist_fk_pos > 0
         )
         if need_raw:
             x0_raw = x0_pred * stage1_coarse_std_t + stage1_coarse_mean_t   # (B, T, 23)
@@ -384,7 +428,8 @@ def build_stage1_step_fn(
 
         # ─── V7-C: cm-space SmoothL1 FK pos (PB1 L_pos scale weights) ───
         # Reuses the same predicted root_world derivation as L2/L3.
-        if w_fk_pos_cm > 0 and x0_raw is not None:
+        if (w_fk_pos_cm > 0 or w_wrist_fk_pos > 0) and x0_raw is not None:
+            # Compute root_world_pred once and reuse for V7-C and V8.
             root_local_pred = x0_raw[..., :3]
             root_world_t0 = motion[:, :1, 132:135].float()
             root_local_world_order = torch.stack(
@@ -395,6 +440,10 @@ def build_stage1_step_fn(
                 ], dim=-1,
             )
             root_world_pred = root_local_world_order + root_world_t0
+        else:
+            root_world_pred = None
+
+        if w_fk_pos_cm > 0 and x0_raw is not None:
             fk_pos_cm = fk_pelvis_spine_pos_loss_cm(
                 pelvis_rot6d_pred=x0_raw[..., CH_PELVIS_ROT6D],
                 spine3_rot6d_pred=x0_raw[..., CH_SPINE3_ROT6D],
@@ -408,6 +457,43 @@ def build_stage1_step_fn(
         else:
             fk_pos_cm = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
+        # ─── V8 — wrist FK supervision (extends V7-C target chain) ───
+        if w_wrist_fk_pos > 0 and x0_raw is not None:
+            contact_state = batch.get("contact_state", None)
+            if contact_state is not None:
+                contact_state = contact_state.to(device).float()
+            wrist_kwargs: dict = dict(
+                pelvis_rot6d_pred=x0_raw[..., CH_PELVIS_ROT6D],
+                spine3_rot6d_pred=x0_raw[..., CH_SPINE3_ROT6D],
+                root_world_pred=root_world_pred,
+                gt_motion_135=motion,
+                rest_offsets=rest_offsets,
+                gt_joints=gt_joints,
+                seq_mask=seq_mask,
+                contact_state=contact_state,
+                contact_mask_mode=str(wrist_fk_contact_mode),
+                contact_active_weight=float(wrist_fk_contact_weight),
+                add_velocity=bool(wrist_fk_add_velocity),
+                velocity_weight=float(wrist_fk_velocity_weight),
+                beta_cm=float(wrist_fk_beta_cm),
+            )
+            if wrist_fk_target_joints is not None:
+                wrist_kwargs["target_joints"] = tuple(int(j) for j in wrist_fk_target_joints)
+            if wrist_fk_joint_weights is not None:
+                wrist_kwargs["joint_weights"] = tuple(float(w) for w in wrist_fk_joint_weights)
+            wrist_fk = wrist_fk_supervision_loss(**wrist_kwargs)
+        else:
+            wrist_fk = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        # ─── V8 — frame-0 consistency on the 14 channels Stage-1 outputs ───
+        if w_init_pose_consistency > 0 and init_pose_targets_z is not None:
+            init_pose_cons = frame0_consistency_loss(
+                stage1_pred_zscored=x0_pred,
+                init_pose_targets_zscored=init_pose_targets_z,
+            )
+        else:
+            init_pose_cons = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
@@ -419,6 +505,8 @@ def build_stage1_step_fn(
             + w_moment_match * moment_match
             + w_yaw_aggregate * yaw_agg
             + w_fk_pos_cm * fk_pos_cm
+            + w_wrist_fk_pos * wrist_fk
+            + w_init_pose_consistency * init_pose_cons
         )
 
         return {
@@ -434,6 +522,8 @@ def build_stage1_step_fn(
             "moment_match": moment_match.detach(),
             "yaw_aggregate": yaw_agg.detach(),
             "fk_pos_cm": fk_pos_cm.detach(),
+            "wrist_fk": wrist_fk.detach(),
+            "init_pose_consistency": init_pose_cons.detach(),
         }
 
     return step_fn
@@ -526,6 +616,7 @@ def main() -> None:
         dropout=float(cfg.model.denoiser.dropout),
         max_seq_length=int(cfg.data.max_seq_length),
         use_text=bool(cfg.model.denoiser.get("use_text", True)),
+        init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
     )
     if denoiser_cfg.motion_dim != STAGE1_COARSE_DIM:
         raise ValueError(
@@ -624,6 +715,21 @@ def main() -> None:
         w_yaw_aggregate=float(cfg.loss.get("w_yaw_aggregate", 0.0)),
         w_fk_pos_cm=float(cfg.loss.get("w_fk_pos_cm", 0.0)),
         fk_pos_cm_beta=float(cfg.loss.get("fk_pos_cm_beta", 1.0)),
+        # R31 V8 — wrist FK supervision + init_pose F1/F2 + frame-0 consistency.
+        w_wrist_fk_pos=float(cfg.loss.get("w_wrist_fk_pos", 0.0)),
+        wrist_fk_target_joints=tuple(
+            cfg.loss.get("wrist_fk_target_joints", [])
+        ) or None,
+        wrist_fk_joint_weights=tuple(
+            cfg.loss.get("wrist_fk_joint_weights", [])
+        ) or None,
+        wrist_fk_contact_mode=str(cfg.loss.get("wrist_fk_contact_mode", "off")),
+        wrist_fk_contact_weight=float(cfg.loss.get("wrist_fk_contact_weight", 4.0)),
+        wrist_fk_add_velocity=bool(cfg.loss.get("wrist_fk_add_velocity", False)),
+        wrist_fk_velocity_weight=float(cfg.loss.get("wrist_fk_velocity_weight", 0.5)),
+        wrist_fk_beta_cm=float(cfg.loss.get("wrist_fk_beta_cm", 1.0)),
+        w_init_pose_consistency=float(cfg.loss.get("w_init_pose_consistency", 0.0)),
+        init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
         vel_rot6d_weight=float(cfg.loss.get("vel_rot6d_weight", 1.0)),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
@@ -651,6 +757,10 @@ def main() -> None:
             f"  R31V7 — moment={out['moment_match'].item():.4e}  "
             f"yaw_agg={out['yaw_aggregate'].item():.4e}  "
             f"fk_pos_cm={out['fk_pos_cm'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R31V8 — wrist_fk={out['wrist_fk'].item():.4e}  "
+            f"init_pose_cons={out['init_pose_consistency'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

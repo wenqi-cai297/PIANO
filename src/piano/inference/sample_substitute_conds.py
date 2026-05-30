@@ -86,6 +86,7 @@ def _build_stage1_model(cfg, device: torch.device) -> tuple[Stage1Denoiser, Obje
         dropout=float(d.dropout),
         max_seq_length=int(cfg.data.max_seq_length),
         use_text=bool(d.get("use_text", True)),
+        init_pose_dim=int(d.get("init_pose_dim", 0)),
     )
     model = Stage1Denoiser(denoiser_cfg).to(device)
     encoder = ObjectEncoder(
@@ -220,12 +221,14 @@ def _build_cond_for_upstream(
     device: torch.device,
     upstream_dir: Path | None = None,
     stage1_norm: tuple[torch.Tensor, torch.Tensor] | None = None,
+    init_pose_dim: int = 0,
 ) -> tuple[dict, int]:
     """Build the cond dict the upstream model itself consumes at sample time.
 
     For Stage-1 this is just object_world_traj + object_tokens + optional
-    text. For Stage-1.5 it additionally needs stage1_coarse — either the
-    oracle z-scored version or the Stage-1 sample from upstream_dir.
+    text + (R31 V8) optional init_pose. For Stage-1.5 it additionally
+    needs stage1_coarse — either the oracle z-scored version or the
+    Stage-1 sample from upstream_dir.
     """
     motion = batch["motion"].to(device)
     object_pc = batch["object_pc"].to(device)
@@ -240,6 +243,34 @@ def _build_cond_for_upstream(
     if clip_model is not None:
         text_features, _ = encode_text_per_token(clip_model, batch["text"], device)
         cond["text"] = text_features.float()
+
+    # R31 V8 — Stage-1 init_pose injection.
+    # init_pose_dim == 135 (F1): full motion_135 frame-0 slice, raw.
+    # init_pose_dim == 14  (F2): pelvis_rot6d + spine3_rot6d + heights
+    #                            from oracle stage1_coarse, z-scored.
+    if stage == "stage1" and init_pose_dim > 0:
+        if init_pose_dim == 135:
+            from piano.training.stage1_losses import build_init_pose_f1
+            cond["init_pose"] = build_init_pose_f1(motion.float())
+        elif init_pose_dim == 14:
+            from piano.training.stage1_losses import build_init_pose_f2
+            from piano.data.stage1_coarse_oracle import extract_coarse_v1_batched
+            if stage1_norm is None:
+                raise ValueError(
+                    "Stage-1 init_pose_dim=14 (F2) requires stage1_norm "
+                    "for z-scoring; pass via sample_substitute_conds."
+                )
+            rest_offsets = batch["rest_offsets"].to(device).float()
+            coarse_raw = extract_coarse_v1_batched(
+                motion=motion.float(), rest_offsets=rest_offsets,
+            )
+            mean_t, std_t = stage1_norm
+            cond["init_pose"] = build_init_pose_f2(coarse_raw, mean_t, std_t)
+        else:
+            raise ValueError(
+                f"Stage-1 init_pose_dim must be 0, 14 (F2), or 135 (F1); "
+                f"got {init_pose_dim}."
+            )
 
     if stage == "stage1p5":
         # Need stage1_coarse cond.
@@ -307,9 +338,22 @@ def sample_substitute_conds(
         f"out_dir={out_dir} ckpt={ckpt_path.name}"
     )
 
-    # Need stage1 norm when stage1p5 has no upstream_dir (oracle path).
+    # Read Stage-1 init_pose_dim once so cond builder knows whether to
+    # populate cond["init_pose"]. 0 = OFF (V0/V7 baseline), 14 = F2,
+    # 135 = F1.
+    stage1_init_pose_dim = (
+        int(cfg.model.denoiser.get("init_pose_dim", 0))
+        if stage == "stage1" else 0
+    )
+
+    # Need stage1 norm when stage1p5 has no upstream_dir (oracle path)
+    # OR when Stage-1 uses init_pose F2 (which is z-scored).
     stage1_norm: tuple[torch.Tensor, torch.Tensor] | None = None
-    if stage == "stage1p5" and upstream_dir is None:
+    need_stage1_norm = (
+        (stage == "stage1p5" and upstream_dir is None)
+        or (stage == "stage1" and stage1_init_pose_dim == 14)
+    )
+    if need_stage1_norm:
         mean_np, std_np = load_stage1_coarse_norm(
             str(cfg.data.stage1_coarse_cache_root),
         )
@@ -343,6 +387,7 @@ def sample_substitute_conds(
             batch=batch, encoder=encoder, clip_model=clip_model,
             stage=stage, device=device,
             upstream_dir=upstream_dir, stage1_norm=stage1_norm,
+            init_pose_dim=stage1_init_pose_dim,
         )
 
         seq_len = int(batch["seq_len"][0].item())

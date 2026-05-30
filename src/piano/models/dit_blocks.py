@@ -59,8 +59,8 @@ class V12InputProjection(nn.Module):
     """Per-channel input projection: motion / obj_traj each get their
     own Linear(in_dim_i, d_model), summed.
 
-    Aux projections (obj, stage1_coarse) are zero-init'd so step-0
-    output equals motion_proj(x_t) only.
+    Aux projections (obj, stage1_coarse, init_pose) are zero-init'd so
+    step-0 output equals motion_proj(x_t) only.
     """
 
     def __init__(
@@ -69,15 +69,24 @@ class V12InputProjection(nn.Module):
         obj_traj_dim: int,
         d_model: int,
         stage1_coarse_dim: int = 0,
+        init_pose_dim: int = 0,
     ) -> None:
         super().__init__()
         self.stage1_coarse_dim = int(stage1_coarse_dim)
+        self.init_pose_dim = int(init_pose_dim)
         self.motion_proj = nn.Linear(motion_dim, d_model)
         self.obj_proj = nn.Linear(obj_traj_dim, d_model)
         if self.stage1_coarse_dim > 0:
             self.stage1_coarse_proj = nn.Linear(self.stage1_coarse_dim, d_model)
         else:
             self.stage1_coarse_proj = None
+        if self.init_pose_dim > 0:
+            # init_pose is (B, init_pose_dim); broadcast across T inside
+            # forward(). Per-token information about the starting pose
+            # arrives at every timestep through this zero-init Linear.
+            self.init_pose_proj = nn.Linear(self.init_pose_dim, d_model)
+        else:
+            self.init_pose_proj = None
         # Init in `initialize_weights_v12` (called by AnchorDenoiser).
 
     def forward(
@@ -85,8 +94,14 @@ class V12InputProjection(nn.Module):
         x_t: Tensor,
         obj_traj: Tensor,
         stage1_coarse: Tensor | None = None,
+        init_pose: Tensor | None = None,
     ) -> Tensor:
-        """All inputs (B, T, *). Output (B, T, d_model)."""
+        """All sequence inputs (B, T, *) → output (B, T, d_model).
+
+        ``init_pose`` is (B, init_pose_dim) — a per-sample pose summary
+        that is broadcast across the T axis before projection. (No per-
+        frame variation; this is a frame-0 anchor signal.)
+        """
         h = self.motion_proj(x_t) + self.obj_proj(obj_traj)
         if self.stage1_coarse_proj is not None:
             if stage1_coarse is None:
@@ -96,6 +111,17 @@ class V12InputProjection(nn.Module):
                     "must populate cond['stage1_coarse'] (B, T, stage1_coarse_dim)."
                 )
             h = h + self.stage1_coarse_proj(stage1_coarse)
+        if self.init_pose_proj is not None:
+            if init_pose is None:
+                raise KeyError(
+                    "V12InputProjection.init_pose_dim>0 but init_pose "
+                    "tensor was not provided. The trainer must populate "
+                    "cond['init_pose'] (B, init_pose_dim)."
+                )
+            # Broadcast (B, D_in) → (B, T, D_in) before projection.
+            T = x_t.shape[1]
+            ip_btd = init_pose.unsqueeze(1).expand(-1, T, -1)
+            h = h + self.init_pose_proj(ip_btd)
         return h
 
 
@@ -288,6 +314,8 @@ def initialize_weights_v12(
     aux_projs = [input_proj.obj_proj]
     if getattr(input_proj, "stage1_coarse_proj", None) is not None:
         aux_projs.append(input_proj.stage1_coarse_proj)
+    if getattr(input_proj, "init_pose_proj", None) is not None:
+        aux_projs.append(input_proj.init_pose_proj)
     for proj in aux_projs:
         nn.init.zeros_(proj.weight)
         nn.init.zeros_(proj.bias)

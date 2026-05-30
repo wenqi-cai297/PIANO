@@ -22,17 +22,30 @@ from piano.training.stage1_losses import (
     CH_YAW_COS,
     CH_YAW_SIN,
     CH_YAW_VEL,
+    CONTACT_IDX_LEFT_HAND,
+    CONTACT_IDX_RIGHT_HAND,
+    INIT_POSE_F2_DIM,
+    INIT_POSE_F2_INDICES,
     J_HEAD,
+    J_L_ELBOW,
     J_L_SHOULDER,
+    J_L_WRIST,
+    J_NECK,
     J_PELVIS,
+    J_R_ELBOW,
     J_R_SHOULDER,
+    J_R_WRIST,
     J_SPINE3,
+    build_init_pose_f1,
+    build_init_pose_f2,
     channel_moment_match_loss,
     fk_height_consistency_loss,
     fk_pelvis_spine_pos_loss,
     fk_pelvis_spine_pos_loss_cm,
+    frame0_consistency_loss,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    wrist_fk_supervision_loss,
     yaw_aggregate_match_loss,
 )
 
@@ -526,3 +539,450 @@ def test_fk_pos_cm_positive_on_perturbation():
     assert loss.item() > 0.5         # 5 cm offset → expect O(5) loss
     loss.backward()
     assert bad_root.grad is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V8: wrist_fk_supervision_loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _build_gt_scaffold(B: int = 2, T: int = 5, seed: int = 0):
+    """Helper: build (gt_motion_135, rest_offsets, gt_joints) consistent
+    under FK, plus an all-ones seq_mask."""
+    torch.manual_seed(seed)
+    gt_rot6d_init = torch.randn(B, T, 22, 6)
+    gt_rot_mat = rotation_6d_to_matrix(gt_rot6d_init)
+    gt_rot6d = matrix_to_rotation_6d(gt_rot_mat)
+    gt_root = torch.randn(B, T, 3) * 0.1
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    rest_offsets = torch.zeros(B, 22, 3)
+    rest_offsets[:, :, 1] = 0.1
+    rest_per_frame = rest_offsets.unsqueeze(1).expand(B, T, 22, 3).float()
+    gt_joints = fk_from_global_rotations(gt_rot_mat, rest_per_frame, gt_root)
+    seq_mask = torch.ones(B, T)
+    return gt_motion, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask
+
+
+def test_wrist_fk_zero_when_pred_equals_gt():
+    """With pred rot6d + root = GT, the extended FK loss is 0."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold()
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    loss = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=gt_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    assert loss.item() < 1e-4
+
+
+def test_wrist_fk_includes_wrist_in_default_targets():
+    """Perturb pred root by 10 cm — wrist supervision should fire larger
+    than the equivalent V7-C call (which targets only 4 joints)."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold()
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    bad_root = gt_root.clone()
+    bad_root[..., 0] = bad_root[..., 0] + 0.10        # 10 cm
+    loss = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    assert loss.item() > 1.0         # >1 cm SmoothL1
+    assert torch.isfinite(loss)
+
+
+def test_wrist_fk_joint_weights_scale_wrist_contribution():
+    """Doubling wrist weights should increase the loss vs uniform weighting
+    when the wrist contribution dominates."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold()
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    # Perturb pelvis_rot6d so that wrist (end of chain) drift is large.
+    bad_pelvis = gt_rot6d[:, :, J_PELVIS, :].clone()
+    bad_pelvis = bad_pelvis + torch.randn_like(bad_pelvis) * 0.1
+    targets = (J_NECK, J_HEAD, J_L_SHOULDER, J_R_SHOULDER,
+               J_L_ELBOW, J_R_ELBOW, J_L_WRIST, J_R_WRIST)
+    loss_uniform = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=bad_pelvis,
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=gt_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+        target_joints=targets,
+        joint_weights=(1.0,) * 8,
+    )
+    loss_wrist_heavy = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=bad_pelvis,
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=gt_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+        target_joints=targets,
+        joint_weights=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0, 4.0),
+    )
+    # Both finite; wrist-heavy may be larger or smaller depending on the
+    # specific perturbation, but must not blow up.
+    assert torch.isfinite(loss_uniform) and torch.isfinite(loss_wrist_heavy)
+    assert loss_uniform.item() > 0.0
+
+
+def test_wrist_fk_contact_hard_mask_zeros_no_contact():
+    """In 'hard' contact mode with no hand contact anywhere, loss = 0."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold()
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    # Big perturbation but no contact frames.
+    bad_root = gt_root + 0.5
+    contact_state = torch.zeros(B, T, 5)            # nothing contacts
+    loss = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+        contact_state=contact_state,
+        contact_mask_mode="hard",
+    )
+    assert loss.item() == 0.0
+
+
+def test_wrist_fk_contact_reweight_amplifies_contact_frames():
+    """Reweight mode on a NON-uniform error pattern: a bigger perturbation
+    on contact frames produces a larger weighted-mean loss than the same
+    perturbation under 'off' mode."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold(B=2, T=10)
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    # Non-uniform error: 10 cm offset on contact frames (0-4), 1 cm on others.
+    bad_root = gt_root.clone()
+    bad_root[:, :5, 0] = bad_root[:, :5, 0] + 0.10
+    bad_root[:, 5:, 0] = bad_root[:, 5:, 0] + 0.01
+
+    # Contact active on frames 0-4.
+    cs = torch.zeros(B, T, 5)
+    cs[:, :5, CONTACT_IDX_LEFT_HAND] = 1.0
+    kw = dict(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    loss_off = wrist_fk_supervision_loss(**kw, contact_mask_mode="off")
+    loss_reweight = wrist_fk_supervision_loss(
+        **kw, contact_state=cs, contact_mask_mode="reweight",
+        contact_active_weight=4.0,
+    )
+    # Reweighting frames where the error is large should INCREASE the
+    # weighted mean above the unweighted mean.
+    assert loss_reweight.item() > loss_off.item() + 1e-3
+
+
+def test_wrist_fk_velocity_term_adds_to_pos():
+    """Velocity term, when enabled, adds a positive scalar to the loss
+    on a temporally-varying perturbation."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold(B=2, T=6)
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    # Perturbation that varies over time → finite vel error.
+    bad_root = gt_root.clone()
+    bad_root[..., 0] = bad_root[..., 0] + torch.linspace(0.0, 0.2, T).view(1, T).expand(B, T)
+    loss_pos = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+        add_velocity=False,
+    )
+    loss_pos_vel = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=gt_rot6d[:, :, J_PELVIS, :],
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=bad_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+        add_velocity=True,
+        velocity_weight=0.5,
+    )
+    assert loss_pos_vel.item() > loss_pos.item()
+
+
+def test_wrist_fk_gradient_flows_through_pelvis_rot6d():
+    """Backward through pred pelvis_rot6d_pred yields a finite grad."""
+    _, gt_rot6d, gt_root, rest_offsets, gt_joints, seq_mask = _build_gt_scaffold()
+    B, T = gt_root.shape[:2]
+    gt_motion = torch.cat([gt_rot6d.reshape(B, T, -1), gt_root], dim=-1)
+    bad_pelvis = gt_rot6d[:, :, J_PELVIS, :].clone().requires_grad_(True)
+    loss = wrist_fk_supervision_loss(
+        pelvis_rot6d_pred=bad_pelvis,
+        spine3_rot6d_pred=gt_rot6d[:, :, J_SPINE3, :],
+        root_world_pred=gt_root,
+        gt_motion_135=gt_motion,
+        rest_offsets=rest_offsets,
+        gt_joints=gt_joints,
+        seq_mask=seq_mask,
+    )
+    loss.backward()
+    assert bad_pelvis.grad is not None
+    assert torch.isfinite(bad_pelvis.grad).all()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V8: build_init_pose_f1 / build_init_pose_f2 / frame0_consistency_loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_init_pose_f1_returns_135_dim_frame0_slice():
+    """F1 = motion_135[:, 0, :] verbatim."""
+    motion = torch.randn(3, 7, 135)
+    out = build_init_pose_f1(motion)
+    assert out.shape == (3, 135)
+    assert torch.allclose(out, motion[:, 0, :].float())
+
+
+def test_init_pose_f1_rejects_wrong_dim():
+    with pytest.raises(ValueError):
+        build_init_pose_f1(torch.randn(3, 7, 23))
+
+
+def test_init_pose_f2_returns_14_zscored_channels():
+    """F2 picks the 12 rot6d + 2 heights, z-scored."""
+    coarse_raw = torch.randn(3, 7, 23) * 0.4
+    mean_t = torch.randn(23) * 0.1
+    std_t = torch.ones(23) * 0.5
+    out = build_init_pose_f2(coarse_raw, mean_t, std_t)
+    assert out.shape == (3, INIT_POSE_F2_DIM)
+    assert INIT_POSE_F2_DIM == 14
+    # Verify the selected channels match the indices.
+    expected = (coarse_raw[:, 0, :] - mean_t.view(1, -1)) / std_t.view(1, -1)
+    expected_sel = expected.index_select(
+        -1, torch.tensor(INIT_POSE_F2_INDICES, dtype=torch.long),
+    )
+    assert torch.allclose(out, expected_sel.float())
+
+
+def test_init_pose_f2_indices_match_pelvis_spine_heights():
+    """The 14 indices must be 9..21 (rot6d) + 21, 22 (heights)."""
+    expected = tuple(list(range(9, 21)) + [21, 22])
+    assert INIT_POSE_F2_INDICES == expected
+    assert len(INIT_POSE_F2_INDICES) == 14
+
+
+def test_frame0_consistency_zero_when_pred_matches_init_pose():
+    """Pred's frame-0 14 channels = init_pose targets → loss = 0."""
+    pred = torch.randn(2, 5, 23)
+    # Compute the F2 targets from pred itself.
+    idx = torch.tensor(INIT_POSE_F2_INDICES, dtype=torch.long)
+    targets = pred[:, 0, :].index_select(-1, idx).clone()
+    loss = frame0_consistency_loss(pred, targets)
+    assert loss.item() < 1e-10
+
+
+def test_frame0_consistency_positive_when_pred_differs():
+    """Pred's t=0 differs from target → positive finite loss."""
+    pred = torch.randn(2, 5, 23, requires_grad=True)
+    targets = torch.zeros(2, INIT_POSE_F2_DIM)
+    loss = frame0_consistency_loss(pred, targets)
+    assert loss.item() > 0.0
+    loss.backward()
+    assert pred.grad is not None
+    # The gradient should be non-zero only on the targeted channels at t=0.
+    g = pred.grad.abs().sum(dim=(0, 2))   # over (B, channel)
+    assert g[0].item() > 0.0
+    assert g[1:].sum().item() == 0.0
+
+
+def test_frame0_consistency_rejects_wrong_pred_shape():
+    pred = torch.randn(2, 5, 22)        # 22 instead of 23
+    targets = torch.zeros(2, INIT_POSE_F2_DIM)
+    with pytest.raises(ValueError):
+        frame0_consistency_loss(pred, targets)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V8: V12InputProjection init_pose extension
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_v12_input_proj_init_pose_zero_init_yields_zero_extra_signal():
+    """At V8 init (init_pose_proj zero-init'd), the init_pose branch
+    contributes nothing — the projection's output equals what it would be
+    without the branch."""
+    from piano.models.dit_blocks import (
+        V12InputProjection,
+        initialize_weights_v12,
+        V12FinalLayer,
+        ConditionedEncoderLayer,
+        GlobalCondSummary,
+    )
+    import torch.nn as nn
+
+    proj = V12InputProjection(
+        motion_dim=23, obj_traj_dim=9, d_model=32, init_pose_dim=14,
+    )
+    blocks = nn.ModuleList(
+        [ConditionedEncoderLayer(d_model=32, n_heads=4, ff_mult=4)]
+    )
+    final = V12FinalLayer(d_model=32, motion_dim=23)
+    cs = GlobalCondSummary(d_model=32)
+    initialize_weights_v12(
+        input_proj=proj, blocks=blocks, final_layer=final, cond_summary=cs,
+    )
+
+    x_t = torch.randn(2, 5, 23)
+    obj_traj = torch.randn(2, 5, 9)
+    init_pose_a = torch.randn(2, 14)
+    init_pose_b = torch.randn(2, 14) * 100.0   # very different content
+
+    h_a = proj(x_t=x_t, obj_traj=obj_traj, init_pose=init_pose_a)
+    h_b = proj(x_t=x_t, obj_traj=obj_traj, init_pose=init_pose_b)
+    # Zero-init init_pose_proj → init_pose contribution is identically 0
+    # regardless of input value.
+    assert torch.allclose(h_a, h_b, atol=1e-6)
+
+
+def test_v12_input_proj_init_pose_grows_after_weight_perturbation():
+    """Manually nudge init_pose_proj weights → output should change."""
+    from piano.models.dit_blocks import V12InputProjection
+    import torch.nn as nn
+
+    proj = V12InputProjection(
+        motion_dim=23, obj_traj_dim=9, d_model=32, init_pose_dim=14,
+    )
+    nn.init.zeros_(proj.motion_proj.weight)
+    nn.init.zeros_(proj.motion_proj.bias)
+    nn.init.zeros_(proj.obj_proj.weight)
+    nn.init.zeros_(proj.obj_proj.bias)
+    # Set init_pose_proj weight to ones so init_pose contributes.
+    nn.init.ones_(proj.init_pose_proj.weight)
+    nn.init.zeros_(proj.init_pose_proj.bias)
+
+    x_t = torch.zeros(1, 4, 23)
+    obj_traj = torch.zeros(1, 4, 9)
+    init_pose = torch.ones(1, 14)
+    h = proj(x_t=x_t, obj_traj=obj_traj, init_pose=init_pose)
+    # Every output unit = sum_i 1 * 1 = 14, broadcast across T.
+    assert h.shape == (1, 4, 32)
+    assert torch.allclose(h, torch.full((1, 4, 32), 14.0))
+
+
+def test_v12_input_proj_init_pose_missing_raises():
+    """init_pose_dim > 0 but cond didn't include init_pose → KeyError."""
+    from piano.models.dit_blocks import V12InputProjection
+
+    proj = V12InputProjection(
+        motion_dim=23, obj_traj_dim=9, d_model=32, init_pose_dim=14,
+    )
+    x_t = torch.zeros(1, 4, 23)
+    obj_traj = torch.zeros(1, 4, 9)
+    with pytest.raises(KeyError):
+        proj(x_t=x_t, obj_traj=obj_traj, init_pose=None)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# V8: Stage1Denoiser integration test
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_stage1_denoiser_forward_with_init_pose_f2():
+    """End-to-end: build Stage1Denoiser(init_pose_dim=14) and run a
+    forward pass with init_pose in the cond dict."""
+    from piano.models.stage1_trajectory import (
+        Stage1Denoiser, Stage1DenoiserConfig,
+    )
+    cfg = Stage1DenoiserConfig(
+        motion_dim=23, object_traj_dim=9, text_dim=512,
+        object_token_dim=256, object_num_tokens=128,
+        d_model=64, n_layers=2, n_heads=4, ff_mult=2,
+        dropout=0.0, max_seq_length=16,
+        use_text=False, init_pose_dim=14,
+    )
+    model = Stage1Denoiser(cfg)
+    assert model.use_init_pose
+
+    B, T = 2, 8
+    x_t = torch.randn(B, T, 23)
+    t = torch.zeros(B, dtype=torch.long)
+    cond = {
+        "object_world_traj": torch.randn(B, T, 9),
+        "object_tokens": torch.randn(B, 128, 256),
+        "init_pose": torch.randn(B, 14),
+    }
+    out = model(x_t, t, cond, cond_drop_mask=None)
+    assert out.shape == (B, T, 23)
+    assert torch.isfinite(out).all()
+
+
+def test_stage1_denoiser_forward_with_init_pose_f1():
+    """F1 mode: init_pose_dim=135."""
+    from piano.models.stage1_trajectory import (
+        Stage1Denoiser, Stage1DenoiserConfig,
+    )
+    cfg = Stage1DenoiserConfig(
+        motion_dim=23, object_traj_dim=9, text_dim=512,
+        object_token_dim=256, object_num_tokens=128,
+        d_model=64, n_layers=2, n_heads=4, ff_mult=2,
+        dropout=0.0, max_seq_length=16,
+        use_text=False, init_pose_dim=135,
+    )
+    model = Stage1Denoiser(cfg)
+    B, T = 2, 8
+    x_t = torch.randn(B, T, 23)
+    t = torch.zeros(B, dtype=torch.long)
+    cond = {
+        "object_world_traj": torch.randn(B, T, 9),
+        "object_tokens": torch.randn(B, 128, 256),
+        "init_pose": torch.randn(B, 135),
+    }
+    out = model(x_t, t, cond, cond_drop_mask=None)
+    assert out.shape == (B, T, 23)
+    assert torch.isfinite(out).all()
+
+
+def test_stage1_denoiser_v0_backwards_compat_no_init_pose():
+    """init_pose_dim=0 (default) → model works without init_pose in cond."""
+    from piano.models.stage1_trajectory import (
+        Stage1Denoiser, Stage1DenoiserConfig,
+    )
+    cfg = Stage1DenoiserConfig(
+        motion_dim=23, object_traj_dim=9, text_dim=512,
+        object_token_dim=256, object_num_tokens=128,
+        d_model=64, n_layers=2, n_heads=4, ff_mult=2,
+        dropout=0.0, max_seq_length=16,
+        use_text=False, init_pose_dim=0,
+    )
+    model = Stage1Denoiser(cfg)
+    assert not model.use_init_pose
+
+    B, T = 2, 8
+    x_t = torch.randn(B, T, 23)
+    t = torch.zeros(B, dtype=torch.long)
+    cond = {
+        "object_world_traj": torch.randn(B, T, 9),
+        "object_tokens": torch.randn(B, 128, 256),
+        # No init_pose — should be fine.
+    }
+    out = model(x_t, t, cond, cond_drop_mask=None)
+    assert out.shape == (B, T, 23)

@@ -69,6 +69,12 @@ class Stage1DenoiserConfig:
     max_seq_length: int = 256
 
     use_text: bool = True
+    # R31 V8 — frame-0 anchor injection via zero-init Linear into the
+    # input-add lane. 0 = OFF (V0/V7 baseline). 14 = "F2" mode (only the
+    # 14 channels Stage-1 outputs, pulled from motion_135[:, 0, :] in
+    # raw space, z-scored against the same stage1_coarse stats). 135 =
+    # "F1" mode (the full SMPL-22 rot6d + root frame-0 vector).
+    init_pose_dim: int = 0
 
 
 class Stage1Denoiser(nn.Module):
@@ -82,10 +88,14 @@ class Stage1Denoiser(nn.Module):
       - ``object_world_traj`` : (B, T, 9)  — never CFG-dropped
       - ``object_tokens``     : (B, N_obj, object_token_dim)
       - ``text``              : (B, N_text, text_dim)  (only if use_text)
+      - ``init_pose``         : (B, init_pose_dim)  — only when
+                                  cfg.init_pose_dim > 0 (R31 V8).
+                                  Zero-init Linear → bandwidth grows
+                                  during training; never CFG-dropped.
 
     Cond keys NOT consumed (raise nothing — silently ignored):
-      ``init_pose``, ``stage1_coarse``, ``stage2_*`` — kept out of this
-      denoiser intentionally per the design doc.
+      ``stage1_coarse``, ``stage2_*`` — kept out of this denoiser
+      intentionally per the design doc.
     """
 
     def __init__(self, cfg: Stage1DenoiserConfig) -> None:
@@ -133,7 +143,9 @@ class Stage1Denoiser(nn.Module):
             obj_traj_dim=cfg.object_traj_dim,
             d_model=cfg.d_model,
             stage1_coarse_dim=0,                       # Stage-1 does not take it as cond
+            init_pose_dim=int(cfg.init_pose_dim),
         )
+        self.use_init_pose = int(cfg.init_pose_dim) > 0
         self.v12_cond_summary = GlobalCondSummary(
             d_model=cfg.d_model, use_cond_summary_mlp=False,
         )
@@ -187,6 +199,9 @@ class Stage1Denoiser(nn.Module):
         text_tok: Tensor | None = (
             cond.get("text") if self.use_text else None
         )
+        init_pose: Tensor | None = (
+            cond.get("init_pose") if self.use_init_pose else None
+        )
 
         # ─── CFG drop: obj_tokens + text only. obj_traj NEVER dropped. ───
         # (design doc §"CFG dropout": without obj_traj the model cannot
@@ -194,8 +209,11 @@ class Stage1Denoiser(nn.Module):
         # Timestep embedding (B, D)
         t_emb = self.time_embed(t)
 
-        # Input projection (B, T, D). stage1_coarse is intentionally absent.
-        h = self.v12_input_proj(x_t=x_t, obj_traj=obj_traj)
+        # Input projection (B, T, D). stage1_coarse is intentionally absent;
+        # init_pose is fed only when init_pose_dim > 0.
+        h = self.v12_input_proj(
+            x_t=x_t, obj_traj=obj_traj, init_pose=init_pose,
+        )
 
         # Global cond summary (timestep only for Stage-1).
         c = self.v12_cond_summary(t_emb=t_emb)            # (B, D)
