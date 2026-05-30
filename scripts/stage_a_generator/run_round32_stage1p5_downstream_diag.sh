@@ -25,8 +25,10 @@ PB1_CKPT="${ROUND32_DS_PB1_CKPT:-runs/training/stageB_anchordiff_${PB1_VARIANT}/
 BUCKETS_STR="${ROUND32_DS_BUCKETS:-train val}"
 SELECTION_TRAIN="analyses/round27_tier0_train_indices_48_balanced.json"
 SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
-SUB_DIR_ROOT="analyses/round32_stage1p5_substitute_conds"
-LOG_DIR="runs/round32_stage1p5_downstream"
+OUT_TAG="${ROUND32_DS_OUT_TAG:-}"
+SUB_DIR_ROOT="analyses/round32_stage1p5_substitute_conds${OUT_TAG}"
+DIAG_DIR_ROOT="analyses/round32_stage1p5_downstream_diag${OUT_TAG}"
+LOG_DIR="runs/round32_stage1p5_downstream${OUT_TAG}"
 mkdir -p "${LOG_DIR}"
 
 while [[ $# -gt 0 ]]; do
@@ -53,22 +55,25 @@ echo "[DS32] STAGE1P5_CKPT=${STAGE1P5_CKPT}"
 echo "[DS32] PB1_CKPT=${PB1_CKPT}"
 echo "[DS32] BUCKETS=${BUCKETS[*]}  SAMPLER=${SAMPLER}  SEED=${SEED}  CFG_SCALE=${CFG_SCALE}"
 
-# Preflight.
+# Preflight. Under --dry-run we tolerate missing ckpts/selections so a
+# laptop can sanity-check env passthrough.
 preflight_fail=0
 for p in "${STAGE1P5_CFG}" "${PB1_CFG}"; do
     [[ ! -e "${p}" ]] && { echo "[DS32 PREFLIGHT FAIL] missing config: ${p}"; preflight_fail=1; }
 done
-for p in "${STAGE1P5_CKPT}" "${PB1_CKPT}"; do
-    [[ ! -e "${p}" ]] && { echo "[DS32 PREFLIGHT FAIL] missing ckpt: ${p}"; preflight_fail=1; }
-done
-for b in "${BUCKETS[@]}"; do
-    case "${b}" in
-        train) sel="${SELECTION_TRAIN}" ;;
-        val)   sel="${SELECTION_VAL}"   ;;
-        *) echo "[DS32 PREFLIGHT FAIL] unknown bucket: ${b}"; preflight_fail=1; continue ;;
-    esac
-    [[ ! -e "${sel}" ]] && { echo "[DS32 PREFLIGHT FAIL] missing selection: ${sel}"; preflight_fail=1; }
-done
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    for p in "${STAGE1P5_CKPT}" "${PB1_CKPT}"; do
+        [[ ! -e "${p}" ]] && { echo "[DS32 PREFLIGHT FAIL] missing ckpt: ${p}"; preflight_fail=1; }
+    done
+    for b in "${BUCKETS[@]}"; do
+        case "${b}" in
+            train) sel="${SELECTION_TRAIN}" ;;
+            val)   sel="${SELECTION_VAL}"   ;;
+            *) echo "[DS32 PREFLIGHT FAIL] unknown bucket: ${b}"; preflight_fail=1; continue ;;
+        esac
+        [[ ! -e "${sel}" ]] && { echo "[DS32 PREFLIGHT FAIL] missing selection: ${sel}"; preflight_fail=1; }
+    done
+fi
 for s in scripts/stage_b_generator/round26_sustained_contact_diag.py \
          scripts/stage_b_generator/round26_gait_diag.py \
          scripts/stage_b_generator/round28_body_action_diag.py \
@@ -118,7 +123,7 @@ run_diag() {
         g1_soft_stance)    SCRIPT="scripts/stage_b_generator/round29_g1_soft_stance_diag.py" ;;
         *) echo "[DS32 DIAG] unknown kind ${KIND}"; return 1 ;;
     esac
-    OUT_DIR="analyses/round32_stage1p5_downstream_diag/${KIND}_${BUCKET}"
+    OUT_DIR="${DIAG_DIR_ROOT}/${KIND}_${BUCKET}"
     LOG="${LOG_DIR}/diag_${KIND}_${BUCKET}.log"
     mkdir -p "${OUT_DIR}"
     CMD=("${PY}" -u "${SCRIPT}"
@@ -157,7 +162,7 @@ fi
 # Phase 3: Pack.
 if [[ ${DRY_RUN} -eq 0 ]]; then
     STAMP=$(date +%Y%m%d_%H%M%S)
-    TARBALL="analyses/round32_stage1p5_downstream_results_${STAMP}.tar.gz"
+    TARBALL="analyses/round32_stage1p5_downstream_results${OUT_TAG}_${STAMP}.tar.gz"
     echo
     echo "================================================================"
     echo "[$(date '+%F %T')] PACK -> ${TARBALL}"
@@ -165,7 +170,7 @@ if [[ ${DRY_RUN} -eq 0 ]]; then
     PACK_TARGETS=()
     for b in "${BUCKETS[@]}"; do
         for KIND in sustained_contact gait body_action g1_soft_stance; do
-            D="analyses/round32_stage1p5_downstream_diag/${KIND}_${b}"
+            D="${DIAG_DIR_ROOT}/${KIND}_${b}"
             [[ -d "${D}" ]] && PACK_TARGETS+=("${D}")
         done
     done
