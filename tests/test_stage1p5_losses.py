@@ -18,9 +18,21 @@ from piano.training.stage1p5_losses import (
     CH_S4_PHASE_R_SIN,
     C41_DIM,
     R34_C41_WRIST_SLICE,
+    R37_C41_ALL_SLICE,
+    R37_C41_KNEE_SLICE,
+    R37_C41_LEFT_KNEE_SLICE,
+    R37_C41_LEFT_WRIST_SLICE,
+    R37_C41_NECK_SLICE,
+    R37_C41_PELVIS_SLICE,
+    R37_C41_RIGHT_KNEE_SLICE,
+    R37_C41_RIGHT_WRIST_SLICE,
+    R37_C41_WRIST_SLICE,
     S4_DIM,
     TOTAL_DIM,
     apply_stage1_coarse_cond_aug,
+    build_r37_group_masks,
+    c41_smoothl1_finite_diff_cm,
+    c41_speed_moment_cm,
     c41_temporal_derivative_loss,
     c41_wrist_frame0_consistency_loss,
     phase_unit_circle_loss,
@@ -493,3 +505,250 @@ def test_c41_temporal_derivative_respects_mask_and_grad():
     assert loss.item() == 0.0
     loss.backward()
     assert pred.grad is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R37: Stage-2-style C41 dynamics losses
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_r37_slice_constants():
+    assert R37_C41_LEFT_WRIST_SLICE == slice(0, 3)
+    assert R37_C41_RIGHT_WRIST_SLICE == slice(3, 6)
+    assert R37_C41_WRIST_SLICE == slice(0, 6)
+    assert R37_C41_LEFT_KNEE_SLICE == slice(6, 9)
+    assert R37_C41_RIGHT_KNEE_SLICE == slice(9, 12)
+    assert R37_C41_KNEE_SLICE == slice(6, 12)
+    assert R37_C41_NECK_SLICE == slice(12, 15)
+    assert R37_C41_PELVIS_SLICE == slice(15, 18)
+    assert R37_C41_ALL_SLICE == slice(0, 18)
+
+
+def test_r37_smoothl1_zero_when_pred_equals_gt():
+    """All three orders return ~0 when pred == gt across the full mask."""
+    c41 = torch.randn(2, 10, C41_DIM)
+    mask = torch.ones(2, 10)
+    for order in (1, 2, 3):
+        loss = c41_smoothl1_finite_diff_cm(
+            c41, c41, mask, order=order,
+            group_slice=R37_C41_WRIST_SLICE, beta=1.0,
+        )
+        assert loss.item() < 1e-10, f"order={order} loss = {loss.item()}"
+
+
+def test_r37_smoothl1_positive_on_kink():
+    """A predicted 1-frame spike on one channel produces positive vel/acc."""
+    gt = torch.zeros(1, 6, C41_DIM)
+    pred = gt.clone()
+    pred[0, 3, 15] = 0.01      # 1 cm spike on pelvis_x (m → cm = 1)
+    mask = torch.ones(1, 6)
+    vel = c41_smoothl1_finite_diff_cm(
+        pred, gt, mask, order=1,
+        group_slice=R37_C41_PELVIS_SLICE,
+    )
+    acc = c41_smoothl1_finite_diff_cm(
+        pred, gt, mask, order=2,
+        group_slice=R37_C41_PELVIS_SLICE,
+    )
+    assert vel.item() > 0
+    assert acc.item() > 0
+
+
+def test_r37_smoothl1_cm_scale_outlier_capped_by_smoothl1():
+    """SmoothL1 with beta=1 caps the loss linearly above ±1 cm.
+
+    A 10 cm spike should produce loss between 1 (purely linear,
+    if mean reduction ignored outlier scale) and 10 (purely quadratic).
+    With ~6 axes contributing per joint over the masked window, we
+    check the per-element growth is sub-quadratic.
+    """
+    gt = torch.zeros(1, 4, C41_DIM)
+    pred_small = gt.clone()
+    pred_large = gt.clone()
+    # 1 cm spike vs 10 cm spike — same channel, same window.
+    pred_small[0, 2, 15] = 0.01     # 1 cm
+    pred_large[0, 2, 15] = 0.10     # 10 cm
+    mask = torch.ones(1, 4)
+    small = c41_smoothl1_finite_diff_cm(
+        pred_small, gt, mask, order=1, group_slice=R37_C41_PELVIS_SLICE,
+    ).item()
+    large = c41_smoothl1_finite_diff_cm(
+        pred_large, gt, mask, order=1, group_slice=R37_C41_PELVIS_SLICE,
+    ).item()
+    # If it were pure MSE the ratio would be ~100; SmoothL1 caps it.
+    assert large / max(small, 1e-12) < 50
+
+
+def test_r37_smoothl1_zero_T_le_order():
+    c41 = torch.randn(1, 2, C41_DIM, requires_grad=True)
+    mask = torch.ones(1, 2)
+    # T = 2, order = 2 → too short, must return safe-grad zero.
+    loss = c41_smoothl1_finite_diff_cm(
+        c41, c41, mask, order=2, group_slice=R37_C41_WRIST_SLICE,
+    )
+    assert loss.item() == 0.0
+    loss.backward()
+    assert c41.grad is not None
+
+
+def test_r37_smoothl1_mask_shrinks_through_order():
+    """When all but `order` frames are masked out, loss is 0 (no valid
+    derivative pair)."""
+    gt = torch.zeros(1, 5, C41_DIM)
+    pred = torch.zeros(1, 5, C41_DIM)
+    pred[0, 4, 15] = 100.0
+    mask = torch.ones(1, 5)
+    mask[0, 3:] = 0.0    # only frames 0,1,2 valid
+    # order=2 needs three consecutive valid frames; 0,1,2 are valid so
+    # one derivative-2 sample at t=2 exists, but pred[0,2,15] = 0 so
+    # contribution is 0.
+    loss = c41_smoothl1_finite_diff_cm(
+        pred, gt, mask, order=2, group_slice=R37_C41_PELVIS_SLICE,
+    )
+    assert loss.item() == 0.0
+
+
+def test_r37_smoothl1_invalid_order_raises():
+    c41 = torch.randn(1, 5, C41_DIM)
+    mask = torch.ones(1, 5)
+    with pytest.raises(ValueError):
+        c41_smoothl1_finite_diff_cm(
+            c41, c41, mask, order=4, group_slice=R37_C41_WRIST_SLICE,
+        )
+
+
+def test_r37_smoothl1_shape_check():
+    c41 = torch.randn(1, 5, C41_DIM)
+    mask = torch.ones(1, 5)
+    with pytest.raises(ValueError):
+        c41_smoothl1_finite_diff_cm(
+            c41, c41[:, :, :10], mask, order=1, group_slice=R37_C41_WRIST_SLICE,
+        )
+
+
+def test_r37_speed_moment_zero_when_identical():
+    c41 = torch.randn(2, 10, C41_DIM)
+    mask = torch.ones(2, 10)
+    loss = c41_speed_moment_cm(c41, c41, mask)
+    assert loss.item() < 1e-10
+
+
+def test_r37_speed_moment_positive_on_scale_mismatch():
+    """Pred 2× faster than GT should produce non-zero moment loss."""
+    torch.manual_seed(0)
+    gt = torch.randn(2, 20, C41_DIM) * 0.01      # ~ 1 cm/frame motion
+    pred = gt * 2.0                              # double speed
+    mask = torch.ones(2, 20)
+    loss = c41_speed_moment_cm(pred, gt, mask)
+    assert loss.item() > 0.01
+
+
+def test_r37_speed_moment_invalid_slice_raises():
+    c41 = torch.randn(1, 4, C41_DIM)
+    mask = torch.ones(1, 4)
+    with pytest.raises(ValueError):
+        # Non-multiple-of-3 slice — speed_moment requires Δxyz joints.
+        c41_speed_moment_cm(c41, c41, mask, group_slice=slice(0, 5))
+
+
+def test_r37_build_group_masks_with_contact_state():
+    """Mask construction:
+      - foot_stance L (S4 ch 0) = 1 on frames 5-12
+      - walking_mask (S4 ch 4) = 1 on frames 8-15
+      - contact_state L_hand (ch 0) = 1 on frames 6-10
+      - pelvis_contact (ch 4) = 1 on frames 0-7
+    """
+    B, T = 1, 20
+    seq_mask = torch.ones(B, T)
+    s4 = torch.zeros(B, T, S4_DIM)
+    s4[0, 5:13, 0] = 1.0       # foot_stance L
+    s4[0, 8:16, 4] = 1.0       # walking_mask
+    cs = torch.zeros(B, T, 5)
+    cs[0, 6:11, 0] = 1.0       # L_hand
+    cs[0, 0:8, 4] = 1.0        # pelvis_contact
+    masks = build_r37_group_masks(
+        seq_mask, s4, cs, erode_half=0,
+    )
+    # neck = full
+    assert torch.equal(masks["neck"], seq_mask)
+    # knee = foot_stance OR pre-erode = frames 5-12
+    # erode_half=0 means no erosion, so should equal S4 stance.
+    assert masks["knee"][0, 5].item() == 1.0
+    assert masks["knee"][0, 12].item() == 1.0
+    assert masks["knee"][0, 4].item() == 0.0
+    assert masks["knee"][0, 13].item() == 0.0
+    # pelvis stable = NOT walking AND any-stance.
+    # Walking is 8-15; stance is 5-12. Intersection of "not walking" and
+    # "any-stance" = 5,6,7.
+    assert masks["pelvis"][0, 5].item() == 1.0
+    assert masks["pelvis"][0, 7].item() == 1.0
+    assert masks["pelvis"][0, 8].item() == 0.0
+    # wrist = (L_hand OR R_hand OR pelvis_contact). L_hand 6-10, pelvis 0-7.
+    # Union = 0..10.
+    assert masks["wrist"][0, 0].item() == 1.0
+    assert masks["wrist"][0, 10].item() == 1.0
+    assert masks["wrist"][0, 11].item() == 0.0
+
+
+def test_r37_build_group_masks_without_contact_state():
+    """When contact_state is None, wrist mask falls back to full seq_mask."""
+    B, T = 1, 10
+    seq_mask = torch.zeros(B, T)
+    seq_mask[0, :7] = 1.0       # padding past frame 7
+    s4 = torch.zeros(B, T, S4_DIM)
+    s4[0, 2:5, 0] = 1.0
+    masks = build_r37_group_masks(
+        seq_mask, s4, contact_state=None, erode_half=0,
+    )
+    # Padded frames (7-9) must be 0 in every mask.
+    for key in ("wrist", "knee", "pelvis", "neck"):
+        assert masks[key][0, 7:].sum().item() == 0.0
+    # Wrist fallback = seq_mask exactly.
+    assert torch.equal(masks["wrist"], seq_mask)
+
+
+def test_r37_build_group_masks_erosion_shrinks_edges():
+    """erode_half=2 should zero 2 frames on each side of a stance run."""
+    B, T = 1, 20
+    seq_mask = torch.ones(B, T)
+    s4 = torch.zeros(B, T, S4_DIM)
+    s4[0, 5:15, 0] = 1.0      # foot_stance L, span 5-14 (10 frames)
+    masks = build_r37_group_masks(
+        seq_mask, s4, contact_state=None, erode_half=2,
+    )
+    # Edges 5-6 and 13-14 should be eroded.
+    assert masks["knee"][0, 5].item() == 0.0
+    assert masks["knee"][0, 6].item() == 0.0
+    assert masks["knee"][0, 7].item() == 1.0
+    assert masks["knee"][0, 12].item() == 1.0
+    assert masks["knee"][0, 13].item() == 0.0
+    assert masks["knee"][0, 14].item() == 0.0
+
+
+def test_r37_build_group_masks_shape_checks():
+    seq_mask = torch.ones(1, 10)
+    bad_s4 = torch.zeros(1, 10, 12)        # wrong S4_DIM
+    with pytest.raises(ValueError):
+        build_r37_group_masks(seq_mask, bad_s4, contact_state=None)
+    good_s4 = torch.zeros(1, 10, S4_DIM)
+    bad_cs = torch.zeros(1, 10, 3)         # wrong last dim
+    with pytest.raises(ValueError):
+        build_r37_group_masks(seq_mask, good_s4, contact_state=bad_cs)
+
+
+def test_r37_smoothl1_grad_flow_through_pred():
+    """Loss must produce non-trivial gradient on pred."""
+    torch.manual_seed(1)
+    gt = torch.zeros(2, 8, C41_DIM)
+    pred = (torch.randn(2, 8, C41_DIM) * 0.05).requires_grad_(True)
+    mask = torch.ones(2, 8)
+    loss = c41_smoothl1_finite_diff_cm(
+        pred, gt, mask, order=1, group_slice=R37_C41_WRIST_SLICE,
+    )
+    loss.backward()
+    assert pred.grad is not None
+    # Gradient should be non-zero on the wrist slice.
+    assert pred.grad[..., R37_C41_WRIST_SLICE].abs().sum().item() > 0
+    # No gradient should flow to non-wrist channels since the slice
+    # excludes them.
+    assert pred.grad[..., 6:].abs().sum().item() == 0.0

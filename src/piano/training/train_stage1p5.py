@@ -51,7 +51,15 @@ from piano.models.stage1p5_interaction import (
 )
 from piano.training.stage1_losses import channel_moment_match_loss
 from piano.training.stage1p5_losses import (
+    R37_C41_KNEE_SLICE,
+    R37_C41_NECK_SLICE,
+    R37_C41_PELVIS_SLICE,
+    R37_C41_WRIST_SLICE,
+    R37_C41_ALL_SLICE,
     apply_stage1_coarse_cond_aug,
+    build_r37_group_masks,
+    c41_smoothl1_finite_diff_cm,
+    c41_speed_moment_cm,
     c41_wrist_frame0_consistency_loss,
     c41_temporal_derivative_loss,
     phase_unit_circle_loss,
@@ -107,6 +115,24 @@ def build_stage1p5_step_fn(
     w_r36_c41_acceleration: float = 0.0,
     r36_c41_dynamics_channel_subset: tuple[int, ...] | None = None,
     r36_c41_dynamics_normalize_by_gt_std: bool = True,
+    # R37: Stage-2-style C41 dynamics (cm-scale SmoothL1, per-bodypart mask,
+    # acc ≪ vel weight, paper-informed jerk smoothness, speed moment
+    # matching). All default 0 so old configs are byte-identical.
+    # Per-bodypart velocity terms (cm/frame SmoothL1).
+    w_r37_wrist_vel_cm: float = 0.0,
+    w_r37_knee_vel_cm: float = 0.0,
+    w_r37_pelvis_vel_cm: float = 0.0,
+    w_r37_neck_vel_cm: float = 0.0,
+    # Pelvis-only acceleration (cm/frame² SmoothL1).
+    w_r37_pelvis_acc_cm: float = 0.0,
+    # Whole-C41 jerk smoothness (cm/frame³ SmoothL1). Paper-informed.
+    w_r37_c41_jerk_cm: float = 0.0,
+    # Whole-C41 speed-magnitude moment matching (mean + std on cm/frame).
+    w_r37_c41_speed_moment_cm: float = 0.0,
+    # SmoothL1 transition point (cm) and stance/contact masks knobs.
+    r37_smoothl1_beta: float = 1.0,
+    r37_erode_half_window: int = 1,
+    r37_use_contact_state: bool = True,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -375,6 +401,112 @@ def build_stage1p5_step_fn(
         else:
             r36_c41_acc = torch.zeros((), device=device, dtype=mse_s4.dtype)
 
+        # ─── R37: Stage-2-style C41 dynamics ───────────────────────────────
+        # 7 optional terms; each defaults to 0 (off). Build the per-bodypart
+        # masks ONCE so the 4 velocity terms + pelvis acc share the same
+        # contact / stance / stable / full scope decisions.
+        r37_any = (
+            w_r37_wrist_vel_cm > 0
+            or w_r37_knee_vel_cm > 0
+            or w_r37_pelvis_vel_cm > 0
+            or w_r37_neck_vel_cm > 0
+            or w_r37_pelvis_acc_cm > 0
+            or w_r37_c41_jerk_cm > 0
+            or w_r37_c41_speed_moment_cm > 0
+        )
+        if r37_any:
+            if r37_use_contact_state:
+                contact_state_t = batch.get("contact_state")
+                if contact_state_t is not None:
+                    contact_state_t = contact_state_t.to(device).float()
+                r37_masks = build_r37_group_masks(
+                    seq_mask=seq_mask,
+                    s4_gt=s4_gt,
+                    contact_state=contact_state_t,
+                    erode_half=int(r37_erode_half_window),
+                )
+            else:
+                # R37-A3 ablation: full seq_mask for every body part
+                # (no contact mask, no stance mask, no erosion). Mirrors
+                # the paper's dense-supervision philosophy.
+                r37_masks = {
+                    "wrist": seq_mask,
+                    "knee": seq_mask,
+                    "pelvis": seq_mask,
+                    "neck": seq_mask,
+                }
+        else:
+            r37_masks = None
+
+        def _r37_smooth_l1_diff(group_slice: slice, order: int, mask_key: str) -> Tensor:
+            return c41_smoothl1_finite_diff_cm(
+                c41_pred,
+                c41_gt,
+                r37_masks[mask_key],
+                order=order,
+                group_slice=group_slice,
+                beta=float(r37_smoothl1_beta),
+            )
+
+        if w_r37_wrist_vel_cm > 0 and r37_masks is not None:
+            r37_wrist_vel = _r37_smooth_l1_diff(
+                R37_C41_WRIST_SLICE, 1, "wrist",
+            )
+        else:
+            r37_wrist_vel = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_knee_vel_cm > 0 and r37_masks is not None:
+            r37_knee_vel = _r37_smooth_l1_diff(
+                R37_C41_KNEE_SLICE, 1, "knee",
+            )
+        else:
+            r37_knee_vel = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_pelvis_vel_cm > 0 and r37_masks is not None:
+            r37_pelvis_vel = _r37_smooth_l1_diff(
+                R37_C41_PELVIS_SLICE, 1, "pelvis",
+            )
+        else:
+            r37_pelvis_vel = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_neck_vel_cm > 0 and r37_masks is not None:
+            r37_neck_vel = _r37_smooth_l1_diff(
+                R37_C41_NECK_SLICE, 1, "neck",
+            )
+        else:
+            r37_neck_vel = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_pelvis_acc_cm > 0 and r37_masks is not None:
+            r37_pelvis_acc = _r37_smooth_l1_diff(
+                R37_C41_PELVIS_SLICE, 2, "pelvis",
+            )
+        else:
+            r37_pelvis_acc = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_c41_jerk_cm > 0 and r37_masks is not None:
+            r37_c41_jerk = c41_smoothl1_finite_diff_cm(
+                c41_pred,
+                c41_gt,
+                r37_masks["neck"],     # full seq_mask
+                order=3,
+                group_slice=R37_C41_ALL_SLICE,
+                beta=float(r37_smoothl1_beta),
+            )
+        else:
+            r37_c41_jerk = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r37_c41_speed_moment_cm > 0 and r37_masks is not None:
+            r37_c41_speed_moment = c41_speed_moment_cm(
+                c41_pred,
+                c41_gt,
+                r37_masks["neck"],     # full seq_mask
+                group_slice=R37_C41_ALL_SLICE,
+            )
+        else:
+            r37_c41_speed_moment = torch.zeros(
+                (), device=device, dtype=mse_s4.dtype,
+            )
+
         loss = (
             w_x0_c41 * mse_c41
             + w_x0_s4 * mse_s4
@@ -390,6 +522,13 @@ def build_stage1p5_step_fn(
             + w_r34_wrist_lowband * r34_lowband
             + w_r36_c41_velocity * r36_c41_vel
             + w_r36_c41_acceleration * r36_c41_acc
+            + w_r37_wrist_vel_cm * r37_wrist_vel
+            + w_r37_knee_vel_cm * r37_knee_vel
+            + w_r37_pelvis_vel_cm * r37_pelvis_vel
+            + w_r37_neck_vel_cm * r37_neck_vel
+            + w_r37_pelvis_acc_cm * r37_pelvis_acc
+            + w_r37_c41_jerk_cm * r37_c41_jerk
+            + w_r37_c41_speed_moment_cm * r37_c41_speed_moment
         )
 
         # R34 diagnostics for separating raw vs weighted loss contributions
@@ -399,6 +538,17 @@ def build_stage1p5_step_fn(
         # decision rule §9.3, which needs separate raw vs weighted).
         r34_lowband_weighted = (w_r34_wrist_lowband * r34_lowband).detach()
         r34_cond_aug_sigma_mean = r34_cond_aug_sigma.mean().detach()
+
+        # R37 diagnostics — same raw / weighted split as R34. Both raw
+        # SmoothL1 values and weight-applied contributions are logged so a
+        # post-launch grad-norm-ratio audit can compare against mse_c41.
+        r37_wrist_vel_w = (w_r37_wrist_vel_cm * r37_wrist_vel).detach()
+        r37_knee_vel_w = (w_r37_knee_vel_cm * r37_knee_vel).detach()
+        r37_pelvis_vel_w = (w_r37_pelvis_vel_cm * r37_pelvis_vel).detach()
+        r37_neck_vel_w = (w_r37_neck_vel_cm * r37_neck_vel).detach()
+        r37_pelvis_acc_w = (w_r37_pelvis_acc_cm * r37_pelvis_acc).detach()
+        r37_jerk_w = (w_r37_c41_jerk_cm * r37_c41_jerk).detach()
+        r37_speed_moment_w = (w_r37_c41_speed_moment_cm * r37_c41_speed_moment).detach()
 
         return {
             "loss": loss,
@@ -416,6 +566,20 @@ def build_stage1p5_step_fn(
             "r34_cond_aug_sigma_mean": r34_cond_aug_sigma_mean,
             "r36_c41_velocity": r36_c41_vel.detach(),
             "r36_c41_acceleration": r36_c41_acc.detach(),
+            "r37_wrist_vel_cm": r37_wrist_vel.detach(),
+            "r37_wrist_vel_cm_weighted": r37_wrist_vel_w,
+            "r37_knee_vel_cm": r37_knee_vel.detach(),
+            "r37_knee_vel_cm_weighted": r37_knee_vel_w,
+            "r37_pelvis_vel_cm": r37_pelvis_vel.detach(),
+            "r37_pelvis_vel_cm_weighted": r37_pelvis_vel_w,
+            "r37_neck_vel_cm": r37_neck_vel.detach(),
+            "r37_neck_vel_cm_weighted": r37_neck_vel_w,
+            "r37_pelvis_acc_cm": r37_pelvis_acc.detach(),
+            "r37_pelvis_acc_cm_weighted": r37_pelvis_acc_w,
+            "r37_c41_jerk_cm": r37_c41_jerk.detach(),
+            "r37_c41_jerk_cm_weighted": r37_jerk_w,
+            "r37_c41_speed_moment_cm": r37_c41_speed_moment.detach(),
+            "r37_c41_speed_moment_cm_weighted": r37_speed_moment_w,
         }
 
     return step_fn
@@ -613,6 +777,21 @@ def main() -> None:
         r36_c41_dynamics_normalize_by_gt_std=bool(
             cfg.loss.get("r36_c41_dynamics_normalize_by_gt_std", True),
         ),
+        # R37 — Stage-2-style C41 dynamics losses.
+        w_r37_wrist_vel_cm=float(cfg.loss.get("w_r37_wrist_vel_cm", 0.0)),
+        w_r37_knee_vel_cm=float(cfg.loss.get("w_r37_knee_vel_cm", 0.0)),
+        w_r37_pelvis_vel_cm=float(cfg.loss.get("w_r37_pelvis_vel_cm", 0.0)),
+        w_r37_neck_vel_cm=float(cfg.loss.get("w_r37_neck_vel_cm", 0.0)),
+        w_r37_pelvis_acc_cm=float(cfg.loss.get("w_r37_pelvis_acc_cm", 0.0)),
+        w_r37_c41_jerk_cm=float(cfg.loss.get("w_r37_c41_jerk_cm", 0.0)),
+        w_r37_c41_speed_moment_cm=float(
+            cfg.loss.get("w_r37_c41_speed_moment_cm", 0.0),
+        ),
+        r37_smoothl1_beta=float(cfg.loss.get("r37_smoothl1_beta", 1.0)),
+        r37_erode_half_window=int(cfg.loss.get("r37_erode_half_window", 1)),
+        r37_use_contact_state=bool(
+            cfg.loss.get("r37_use_contact_state", True),
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -647,6 +826,34 @@ def main() -> None:
         accelerator.print(
             f"  R36   c41_vel={out['r36_c41_velocity'].item():.4e}  "
             f"c41_acc={out['r36_c41_acceleration'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R37   wrist_vel(raw cm/f)={out['r37_wrist_vel_cm'].item():.4e}  "
+            f"weighted={out['r37_wrist_vel_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        knee_vel(raw)={out['r37_knee_vel_cm'].item():.4e}  "
+            f"weighted={out['r37_knee_vel_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        pelvis_vel(raw)={out['r37_pelvis_vel_cm'].item():.4e}  "
+            f"weighted={out['r37_pelvis_vel_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        neck_vel(raw)={out['r37_neck_vel_cm'].item():.4e}  "
+            f"weighted={out['r37_neck_vel_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        pelvis_acc(raw cm/f^2)={out['r37_pelvis_acc_cm'].item():.4e}  "
+            f"weighted={out['r37_pelvis_acc_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        c41_jerk(raw cm/f^3)={out['r37_c41_jerk_cm'].item():.4e}  "
+            f"weighted={out['r37_c41_jerk_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"        c41_speed_moment(raw)={out['r37_c41_speed_moment_cm'].item():.4e}  "
+            f"weighted={out['r37_c41_speed_moment_cm_weighted'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

@@ -364,6 +364,315 @@ def apply_stage1_coarse_cond_aug(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# R37: C41 dynamics losses (Stage-2 philosophy + paper inform)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Design provenance:
+#   - Stage-2 (PB1) anchordiff trainer uses
+#       (a) m → cm physical unit conversion
+#       (b) SmoothL1 (beta=1.0) on cm-scale finite differences
+#       (c) stable-support / contact-active masks
+#       (d) acc weight ≪ vel weight
+#       (e) sparse per-bodypart scope (anchor_joint_vel only at active
+#           contact slots; stable_root_acc only on stable_mask)
+#     → ship metric drift_max = 7.55 cm.
+#
+#   - Paper arXiv:2605.26879 (Wei et al., CVPR 2026) confirms acc < vel
+#     weight ratio (λ_A : λ_V = 0.1 : 1.0 with NO normalization / clip),
+#     adds the idea of a *jerk smoothness regularizer* (E_jerk in §3.3,
+#     un-normalized third forward difference of FK joint positions).
+#     Paper uses pure L2² on plain finite differences; we keep SmoothL1
+#     because diffusion x0-pred can output wild values in high-noise
+#     timesteps (justifies the linear regime above ±1 cm).
+#
+#   - R36 helper above (`c41_temporal_derivative_loss`) used statistical
+#     `normalize_by_gt_std` which divides by `var_gt.clamp_min(1e-6)`.
+#     For acceleration (small GT variance) the clamp triggered and
+#     blew up the loss ~180× train-vs-val (raw 555 vs 3.06). R37 avoids
+#     this entirely by using physical cm units.
+#
+# Channel layout (matches stage2_oracle_conditions + Phase-1 audit):
+#   C41 [0:3]   left_wrist   Δxyz (m)
+#   C41 [3:6]   right_wrist  Δxyz (m)
+#   C41 [6:9]   left_knee    Δxyz (m)
+#   C41 [9:12]  right_knee   Δxyz (m)
+#   C41 [12:15] neck         Δxyz (m)
+#   C41 [15:18] pelvis       Δxzy (m)
+#
+# C41 GT is metric-space (meters); multiplying by 100 → cm/frame for
+# velocity, cm/frame² for acceleration, cm/frame³ for jerk. SmoothL1 with
+# beta=1.0 is half-quadratic below ±1 cm and linear above.
+
+
+# Public per-bodypart slices into the 18-D C41 vector. Trainer wiring
+# uses these names so configs and call sites stay synchronized.
+R37_C41_LEFT_WRIST_SLICE = slice(0, 3)
+R37_C41_RIGHT_WRIST_SLICE = slice(3, 6)
+R37_C41_WRIST_SLICE = slice(0, 6)         # L+R combined
+R37_C41_LEFT_KNEE_SLICE = slice(6, 9)
+R37_C41_RIGHT_KNEE_SLICE = slice(9, 12)
+R37_C41_KNEE_SLICE = slice(6, 12)         # L+R combined
+R37_C41_NECK_SLICE = slice(12, 15)
+R37_C41_PELVIS_SLICE = slice(15, 18)
+R37_C41_ALL_SLICE = slice(0, 18)
+
+
+def _erode_mask_1d(mask: Tensor, half_window: int) -> Tensor:
+    """Erode a (B, T) {0, 1} mask by ``half_window`` frames on EACH side.
+
+    Mirrors the Stage-2 ``stable_support`` erosion at
+    train_anchordiff.py:1029-1037 (window-half each side, AND across
+    shifts). When ``half_window=0`` this is identity. Padding at sequence
+    boundaries is treated as 0 (False).
+    """
+    if half_window <= 0:
+        return mask
+    out = mask
+    for shift in range(1, int(half_window) + 1):
+        left = torch.roll(mask, shifts=-shift, dims=-1)
+        right = torch.roll(mask, shifts=shift, dims=-1)
+        left[..., -shift:] = 0
+        right[..., :shift] = 0
+        out = out * left * right
+    return out
+
+
+def c41_smoothl1_finite_diff_cm(
+    c41_pred: Tensor,                 # (B, T, 18) — raw m
+    c41_gt: Tensor,                   # (B, T, 18) — raw m
+    frame_mask: Tensor,               # (B, T) {0, 1}; need order+1 valid frames
+    *,
+    order: int,                       # 1=velocity, 2=acceleration, 3=jerk
+    group_slice: slice,
+    beta: float = 1.0,
+) -> Tensor:
+    """R37 — Stage-2 style SmoothL1 on cm-scale finite differences.
+
+    Computes the order-th finite difference of ``c41_pred`` and
+    ``c41_gt`` restricted to ``group_slice``, multiplies by 100 to
+    convert meters → cm (so velocity is cm/frame, acceleration is
+    cm/frame², jerk is cm/frame³), shrinks ``frame_mask`` by ``order``
+    via pairwise AND across each derivative step, and reduces with
+    ``F.smooth_l1_loss(reduction='mean', beta=beta)`` over the masked
+    (b, t, c, axis) tuples.
+
+    Notes
+    -----
+    - ``order=3`` uses the SAME repeated backward difference as orders
+      1/2 (which yields the (+1, -3, +3, -1) stencil after three passes).
+      Paper Eq. 14 writes the jerk stencil as forward differences; the
+      repeated backward form is mathematically identical for our masked
+      MSE up to a sign on the residual (the sign cancels in the squared
+      loss). We pick repeated-diff for code symmetry across orders.
+    - SmoothL1 is on cm-scale residuals, not raw m-scale: the beta=1.0
+      transition point is therefore at ±1 cm per joint axis, matching
+      Stage-2's ``stable_local_vel_cm`` design.
+    - Returns a gradient-safe zero scalar when there aren't enough valid
+      frames or when the masked subset is empty.
+    """
+    if c41_pred.shape != c41_gt.shape:
+        raise ValueError(
+            f"shape mismatch: pred {c41_pred.shape} vs gt {c41_gt.shape}"
+        )
+    if c41_pred.ndim != 3 or c41_pred.shape[-1] != C41_DIM:
+        raise ValueError(f"expected (B, T, {C41_DIM}), got {c41_pred.shape}")
+    if order not in (1, 2, 3):
+        raise ValueError(f"order must be 1, 2, or 3; got {order}")
+    B, T, _ = c41_pred.shape
+    if frame_mask.shape != (B, T):
+        raise ValueError(
+            f"frame_mask shape {tuple(frame_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    if T <= order:
+        # Touch every parameter so backward graph is well-defined.
+        return c41_pred.sum() * 0.0
+
+    pred_slice = c41_pred[..., group_slice] * 100.0       # (B, T, G_dim) in cm
+    gt_slice = c41_gt[..., group_slice] * 100.0
+    if pred_slice.shape[-1] == 0:
+        return c41_pred.sum() * 0.0
+
+    d_pred = pred_slice
+    d_gt = gt_slice
+    valid = frame_mask.float()
+    for _ in range(order):
+        d_pred = d_pred[:, 1:] - d_pred[:, :-1]
+        d_gt = d_gt[:, 1:] - d_gt[:, :-1]
+        valid = valid[:, 1:] * valid[:, :-1]
+    # valid is (B, T - order); d_pred/d_gt are (B, T - order, G_dim).
+    if valid.sum() < 1.0:
+        return c41_pred.sum() * 0.0
+
+    residual_cm = (d_pred - d_gt).to(torch.float32)
+    valid_expand = valid.unsqueeze(-1).to(residual_cm.dtype)
+    masked = residual_cm * valid_expand
+    # Element count for mean reduction over the masked elements only.
+    n_valid_elements = valid_expand.sum() * float(residual_cm.shape[-1])
+    n_valid_elements = n_valid_elements.clamp_min(1.0)
+    # SmoothL1 with reduction='none' then mean ourselves to honour mask.
+    elementwise = F.smooth_l1_loss(
+        masked,
+        torch.zeros_like(masked),
+        reduction="none",
+        beta=float(beta),
+    )
+    return elementwise.sum() / n_valid_elements
+
+
+def c41_speed_moment_cm(
+    c41_pred: Tensor,                 # (B, T, 18)
+    c41_gt: Tensor,                   # (B, T, 18)
+    frame_mask: Tensor,               # (B, T)
+    *,
+    group_slice: slice = R37_C41_ALL_SLICE,
+) -> Tensor:
+    """R37 — speed-magnitude moment matching, cm/frame.
+
+    Mirrors Stage-2 ``loss_stable_local_speed_moment``
+    (train_anchordiff.py:1106-1121): per (b, t-1, j) joint-speed in
+    cm/frame, then match (mean, std) between pred and GT.
+
+        L = (mean_pred − mean_gt)² + (std_pred − std_gt)²
+
+    Speed is the per-joint xyz-norm of the velocity vector (so this is
+    a 1-D scalar per (b, t-1, joint) tuple, independent of which axis
+    moves). ``group_slice`` selects a contiguous Δxyz body part
+    (e.g. wrist = [0:6] picks both 3-D joints; pelvis = [15:18] picks
+    one 3-D joint). The slice must be a multiple of 3.
+    """
+    if c41_pred.shape != c41_gt.shape:
+        raise ValueError(
+            f"shape mismatch: pred {c41_pred.shape} vs gt {c41_gt.shape}"
+        )
+    if c41_pred.ndim != 3 or c41_pred.shape[-1] != C41_DIM:
+        raise ValueError(f"expected (B, T, {C41_DIM}), got {c41_pred.shape}")
+    B, T, _ = c41_pred.shape
+    if frame_mask.shape != (B, T):
+        raise ValueError(
+            f"frame_mask shape {tuple(frame_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    if T < 2:
+        return c41_pred.sum() * 0.0
+
+    pred_slice = c41_pred[..., group_slice] * 100.0    # (B, T, G_dim) in cm
+    gt_slice = c41_gt[..., group_slice] * 100.0
+    g_dim = pred_slice.shape[-1]
+    if g_dim == 0 or g_dim % 3 != 0:
+        raise ValueError(
+            f"group_slice dim {g_dim} must be a positive multiple of 3 "
+            "(each joint is Δxyz)."
+        )
+    n_joints = g_dim // 3
+    pred_xyz = pred_slice.reshape(B, T, n_joints, 3)
+    gt_xyz = gt_slice.reshape(B, T, n_joints, 3)
+    # Velocity then per-joint speed magnitude.
+    vel_pred = pred_xyz[:, 1:] - pred_xyz[:, :-1]      # (B, T-1, J, 3)
+    vel_gt = gt_xyz[:, 1:] - gt_xyz[:, :-1]
+    # Bevel by sqrt with clamp_min for numerical stability (same trick
+    # as Stage-2 anchordiff line 1109).
+    speed_pred = vel_pred.pow(2).sum(-1).clamp_min(1e-12).sqrt()  # (B, T-1, J)
+    speed_gt = vel_gt.pow(2).sum(-1).clamp_min(1e-12).sqrt()
+    pair_mask = (frame_mask[:, 1:] * frame_mask[:, :-1]).float()   # (B, T-1)
+    flat_mask = pair_mask.unsqueeze(-1).expand_as(speed_pred).reshape(-1)
+    flat_pred = speed_pred.reshape(-1)
+    flat_gt = speed_gt.reshape(-1)
+    valid_count = flat_mask.sum().clamp_min(1.0)
+    if flat_mask.sum() < 2.0:
+        return c41_pred.sum() * 0.0
+    # Masked mean and std (population variance, matches Stage-2's
+    # `.std(unbiased=False)`).
+    mean_pred = (flat_pred * flat_mask).sum() / valid_count
+    mean_gt = (flat_gt * flat_mask).sum() / valid_count
+    var_pred = (((flat_pred - mean_pred).pow(2)) * flat_mask).sum() / valid_count
+    var_gt = (((flat_gt - mean_gt).pow(2)) * flat_mask).sum() / valid_count
+    std_pred = var_pred.clamp_min(1e-12).sqrt()
+    std_gt = var_gt.clamp_min(1e-12).sqrt()
+    return (mean_pred - mean_gt).pow(2) + (std_pred - std_gt).pow(2)
+
+
+def build_r37_group_masks(
+    seq_mask: Tensor,                 # (B, T) {0, 1}
+    s4_gt: Tensor,                    # (B, T, 13)
+    contact_state: "Tensor | None",   # (B, T, 5) {0, 1} or None
+    *,
+    erode_half: int = 1,
+    stance_threshold: float = 0.5,
+    walking_threshold: float = 0.5,
+    contact_threshold: float = 0.5,
+) -> dict[str, Tensor]:
+    """Build the per-bodypart frame masks for R37 dynamics losses.
+
+    The masks AND the input ``seq_mask`` so padding is always excluded.
+    They are then eroded by ``erode_half`` frames each side so the
+    transition frames at the edges of each contact / stance / stable
+    region are excluded from the dynamics loss — mirrors Stage-2
+    ``stable_support`` erosion behaviour.
+
+    S4 channel layout (S4-LOCAL indices into the 13-D s4_gt):
+        [0:2] foot_stance L, R  (BCE targets, in [0, 1])
+        [2:4] ankle_height L, R
+        [4]   walking_mask      (BCE target, in [0, 1])
+        ...
+
+    ``contact_state`` (when provided) is the dataset's per-bodypart
+    contact (T, 5): [L_hand, R_hand, L_foot, R_foot, pelvis]. When None,
+    the wrist mask falls back to ``seq_mask`` (full-window) — used by
+    R37-A3 ablation cell.
+
+    Returns a dict with keys ``"wrist"``, ``"knee"``, ``"pelvis"``,
+    ``"neck"``, each (B, T) float in {0, 1}. ``"neck"`` is always
+    ``seq_mask`` (no anatomically meaningful stance condition for
+    neck dynamics).
+    """
+    if seq_mask.ndim != 2:
+        raise ValueError(f"seq_mask must be (B, T); got {seq_mask.shape}")
+    B, T = seq_mask.shape
+    if s4_gt.shape != (B, T, S4_DIM):
+        raise ValueError(
+            f"s4_gt shape {tuple(s4_gt.shape)} != (B, T, {S4_DIM}) = "
+            f"{(B, T, S4_DIM)}"
+        )
+    sm = seq_mask.float()
+
+    # Foot stance from S4 GT — channels 0 and 1 (logits → already in
+    # [0, 1] for GT). Either-foot-stance = OR.
+    stance_l = (s4_gt[..., 0] >= stance_threshold).float()
+    stance_r = (s4_gt[..., 1] >= stance_threshold).float()
+    any_stance = ((stance_l + stance_r) > 0).float()
+    knee_mask_raw = any_stance * sm
+
+    # Pelvis stable: not-walking AND any foot in stance.
+    walking = (s4_gt[..., 4] >= walking_threshold).float()
+    pelvis_stable_raw = (1.0 - walking) * any_stance * sm
+
+    # Wrist active: hand-contact OR pelvis-contact (per Stage-2 anchor
+    # mask philosophy — wrist is "anchored" both when grasping an
+    # object and when bracing against the floor/seat).
+    if contact_state is not None:
+        if contact_state.shape != (B, T, 5):
+            raise ValueError(
+                f"contact_state shape {tuple(contact_state.shape)} != "
+                f"(B, T, 5) = {(B, T, 5)}"
+            )
+        lh = (contact_state[..., 0] >= contact_threshold).float()
+        rh = (contact_state[..., 1] >= contact_threshold).float()
+        pelvis_contact = (contact_state[..., 4] >= contact_threshold).float()
+        wrist_active = ((lh + rh + pelvis_contact) > 0).float()
+        wrist_mask_raw = wrist_active * sm
+    else:
+        wrist_mask_raw = sm
+
+    # Erode each non-trivial mask. Pure-seq masks (neck) skip erode so
+    # they stay at full length.
+    erode = int(erode_half)
+    return {
+        "wrist": _erode_mask_1d(wrist_mask_raw, erode),
+        "knee": _erode_mask_1d(knee_mask_raw, erode),
+        "pelvis": _erode_mask_1d(pelvis_stable_raw, erode),
+        "neck": sm,
+    }
+
+
 # Convenience re-export for the trainer
 # ──────────────────────────────────────────────────────────────────────────
 
