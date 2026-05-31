@@ -51,21 +51,57 @@ S4_PHASE_SLICE = slice(5, 9)          # phase sin/cos L, R (unit circle)
 S4_FOOTSTEP_SLICE = slice(9, 13)      # footstep x/z L, R
 
 
-def psd_lowband_ratio(
+def psd_lowband_energy(
     pred: np.ndarray, gt: np.ndarray, valid_T: int,
     fps: float = FPS_DEFAULT, cutoff_hz: float = CUTOFF_HZ_DEFAULT,
-) -> float:
-    """Mean-over-channels ratio of LOW-band PSD energy (pred / GT).
+) -> tuple[float, float]:
+    """Per-clip LOW-band energy of (pred, GT).
 
-    ratio < 1.0 = pred under-energizes the low band (the Phase 1 audit's
-    signature of the wrist failure mode).
+    Returns raw scalar energies (sum of squared low-band amplitude over
+    valid frames and all channels). Two reasons we return raw energies
+    instead of a per-clip ratio:
+
+    1. The audit's PSD-ratio computation (round32_phase1_dyn_audit.py
+       lines 295-326) sums energies across clips first and divides ONCE,
+       producing an energy-weighted ratio that is robust to clips with
+       near-zero GT wrist motion. Taking the arithmetic mean of per-clip
+       ratios instead is pulled by outliers (a single clip with tiny GT
+       energy + normal pred energy gives ratio > 30, polluting the mean).
+
+    2. The R34 quality-metrics report at commit 3c7a7db used the
+       arithmetic-mean-of-per-clip-ratios convention, which produced
+       mean=3.076 for the C0 control while the median was 0.847 and the
+       audit-style energy-weighted ratio is 0.62 (cf. audit's welch-based
+       0.50/0.45 for L/R wrist). The arithmetic mean is the wrong central
+       tendency; the energy-weighted ratio is the correct one.
+
+    Caller (main) aggregates by summing pred_energy + gt_energy across
+    clips, then computes ratio = sum_pred / sum_gt. Per-clip ratios are
+    also reported as median + q25/q75 for distribution shape.
     """
     pred_v = pred[:valid_T]
     gt_v = gt[:valid_T]
     pred_low, _ = split_low_high(pred_v, fps=fps, cutoff_hz=cutoff_hz)
     gt_low, _ = split_low_high(gt_v, fps=fps, cutoff_hz=cutoff_hz)
-    pred_energy = float((pred_low ** 2).mean())
-    gt_energy = float((gt_low ** 2).mean())
+    pred_energy = float((pred_low ** 2).sum())   # sum over (valid_T, n_ch)
+    gt_energy = float((gt_low ** 2).sum())
+    return pred_energy, gt_energy
+
+
+def psd_lowband_ratio(
+    pred: np.ndarray, gt: np.ndarray, valid_T: int,
+    fps: float = FPS_DEFAULT, cutoff_hz: float = CUTOFF_HZ_DEFAULT,
+) -> float:
+    """Per-clip LOW-band energy ratio (pred / GT). Kept for back-compat.
+
+    DEPRECATED for aggregate reporting — use ``psd_lowband_energy`` and
+    sum across clips before dividing. See the docstring of
+    ``psd_lowband_energy`` for the rationale.
+
+    ratio < 1.0 = pred under-energizes the low band (the Phase 1 audit's
+    signature of the wrist failure mode).
+    """
+    pred_energy, gt_energy = psd_lowband_energy(pred, gt, valid_T, fps, cutoff_hz)
     if gt_energy < 1e-12:
         return float("nan")
     return pred_energy / gt_energy
@@ -133,6 +169,10 @@ def aggregate_clip(
     c41_wrist_gt = c41_gt[..., C41_WRIST_SLICE]
     c41_wrist_pred = c41_pred[..., C41_WRIST_SLICE]
     psd_ratio = psd_lowband_ratio(c41_wrist_pred, c41_wrist_gt, vt, fps, cutoff_hz)
+    # Raw energies for the audit-style energy-weighted aggregation.
+    pred_energy_low, gt_energy_low = psd_lowband_energy(
+        c41_wrist_pred, c41_wrist_gt, vt, fps, cutoff_hz,
+    )
     wrist_mse_low = band_mse(c41_wrist_pred, c41_wrist_gt, vt, "low", fps, cutoff_hz)
     wrist_mse_high = band_mse(c41_wrist_pred, c41_wrist_gt, vt, "high", fps, cutoff_hz)
     wrist_mse_full = band_mse(c41_wrist_pred, c41_wrist_gt, vt, "full", fps, cutoff_hz)
@@ -149,6 +189,8 @@ def aggregate_clip(
 
     return {
         "c41_wrist_lowband_psd_ratio": psd_ratio,
+        "c41_wrist_lowband_pred_energy": pred_energy_low,
+        "c41_wrist_lowband_gt_energy": gt_energy_low,
         "c41_wrist_lowband_mse": wrist_mse_low,
         "c41_wrist_highband_mse": wrist_mse_high,
         "c41_wrist_full_mse": wrist_mse_full,
@@ -205,8 +247,39 @@ def main() -> int:
     if not per_clip:
         raise SystemExit(f"no pred files matched gt under {pred_root}")
 
+    # Energy-weighted aggregation. This is the audit-style aggregation
+    # (round32_phase1_dyn_audit.py:295-326) and is the correct central
+    # tendency for energy ratios. The arithmetic-mean-of-per-clip-ratios
+    # used by the v1 of this script (commit 3c7a7db) is pulled by clips
+    # with near-zero GT energy and reported mean=3.076 for the R34 C0
+    # control while the true energy-weighted ratio was ~0.62 (consistent
+    # with the audit's welch-based 0.50/0.45).
+    total_pred_energy_low = float(
+        sum(c["c41_wrist_lowband_pred_energy"] for c in per_clip)
+    )
+    total_gt_energy_low = float(
+        sum(c["c41_wrist_lowband_gt_energy"] for c in per_clip)
+    )
+    energy_weighted_ratio = (
+        total_pred_energy_low / max(total_gt_energy_low, 1e-12)
+    )
+
+    # Per-clip ratio distribution shape (median, q25, q75, mean for
+    # comparison with the broken v1). Filter out non-finite (clips with
+    # near-zero GT energy that produced NaN per-clip ratios).
+    per_clip_ratios = np.array([
+        c["c41_wrist_lowband_psd_ratio"] for c in per_clip
+        if np.isfinite(c["c41_wrist_lowband_psd_ratio"])
+    ])
+    ratio_median = float(np.median(per_clip_ratios)) if len(per_clip_ratios) else float("nan")
+    ratio_q25 = float(np.percentile(per_clip_ratios, 25)) if len(per_clip_ratios) else float("nan")
+    ratio_q75 = float(np.percentile(per_clip_ratios, 75)) if len(per_clip_ratios) else float("nan")
+    ratio_mean_broken = float(per_clip_ratios.mean()) if len(per_clip_ratios) else float("nan")
+
+    # Other metrics use arithmetic mean over clips, which is fine because
+    # they are bounded MSE / BCE / scalar values (not ratios with a
+    # potentially-zero denominator).
     keys = [
-        "c41_wrist_lowband_psd_ratio",
         "c41_wrist_lowband_mse",
         "c41_wrist_highband_mse",
         "c41_wrist_full_mse",
@@ -216,6 +289,12 @@ def main() -> int:
         "s4_phase_unit_violation",
     ]
     agg = {k: float(np.mean([c[k] for c in per_clip if np.isfinite(c[k])])) for k in keys}
+    # Stash PSD-ratio stats in agg for JSON consumers.
+    agg["c41_wrist_lowband_psd_ratio_energy_weighted"] = energy_weighted_ratio
+    agg["c41_wrist_lowband_psd_ratio_per_clip_median"] = ratio_median
+    agg["c41_wrist_lowband_psd_ratio_per_clip_q25"] = ratio_q25
+    agg["c41_wrist_lowband_psd_ratio_per_clip_q75"] = ratio_q75
+    agg["c41_wrist_lowband_psd_ratio_per_clip_mean"] = ratio_mean_broken
 
     md = [
         f"# R34 C41/S4 quality metrics — {args.variant_label}",
@@ -227,24 +306,30 @@ def main() -> int:
         f"- fps      : {args.fps}",
         f"- cutoff_hz: {args.cutoff_hz}",
         "",
-        "## Aggregate (mean over clips)",
+        "## Aggregate (energy-weighted, audit-style for PSD ratio; mean for the rest)",
         "",
         "| metric | value | reference (Stage-1.5 V0 audit) |",
         "|---|---:|---|",
-        f"| C41 wrist LOW-band PSD ratio | {agg['c41_wrist_lowband_psd_ratio']:.3f} | left_wrist 0.50, right_wrist 0.45 (R32 Phase 1 audit) |",
-        f"| C41 wrist LOW-band MSE       | {agg['c41_wrist_lowband_mse']:.4f}      | — |",
-        f"| C41 wrist HIGH-band MSE      | {agg['c41_wrist_highband_mse']:.4f}     | — |",
-        f"| C41 wrist FULL MSE           | {agg['c41_wrist_full_mse']:.4f}         | — |",
-        f"| C41 non-wrist FULL MSE       | {agg['c41_nonwrist_full_mse']:.4f}      | — |",
-        f"| S4 FULL MSE                  | {agg['s4_full_mse']:.4f}                | — |",
-        f"| S4 stance BCE                | {agg['s4_stance_bce']:.4f}              | — |",
-        f"| S4 phase unit-circle violation | {agg['s4_phase_unit_violation']:.4f} | 0.027–0.030 (R32 Phase 1 audit) |",
+        f"| C41 wrist LOW-band PSD ratio (energy-weighted) | {energy_weighted_ratio:.3f} | left_wrist 0.50, right_wrist 0.45 (R32 Phase 1 audit, welch-based) |",
+        f"| ↳ per-clip ratio median                        | {ratio_median:.3f}            | — |",
+        f"| ↳ per-clip ratio q25 / q75                     | {ratio_q25:.3f} / {ratio_q75:.3f} | — |",
+        f"| ↳ per-clip ratio MEAN (BROKEN, kept for audit) | {ratio_mean_broken:.3f}      | — |",
+        f"| C41 wrist LOW-band MSE                         | {agg['c41_wrist_lowband_mse']:.4f}      | — |",
+        f"| C41 wrist HIGH-band MSE                        | {agg['c41_wrist_highband_mse']:.4f}     | — |",
+        f"| C41 wrist FULL MSE                             | {agg['c41_wrist_full_mse']:.4f}         | — |",
+        f"| C41 non-wrist FULL MSE                         | {agg['c41_nonwrist_full_mse']:.4f}      | — |",
+        f"| S4 FULL MSE                                    | {agg['s4_full_mse']:.4f}                | — |",
+        f"| S4 stance BCE                                  | {agg['s4_stance_bce']:.4f}              | — |",
+        f"| S4 phase unit-circle violation                 | {agg['s4_phase_unit_violation']:.4f}    | 0.027–0.030 (R32 Phase 1 audit) |",
         "",
         "## Interpretation (per ChatGPT followup §9.3/§9.4 decision rules)",
         "",
+        "Use the **energy-weighted** PSD ratio for decision rules — the per-clip MEAN",
+        "is dominated by 1-2 outlier clips with near-zero GT wrist energy.",
+        "",
         "If this variant is R34-C2 (lowband-loss-only) and downstream `drift_max` did NOT improve:",
         "",
-        "- C41 wrist LOW-band PSD ratio close to 1.0 + drift_max unchanged → §9.4 branch:",
+        "- C41 wrist LOW-band PSD ratio (energy-weighted) close to 1.0 + drift_max unchanged → §9.4 branch:",
         "  audit signal moved but downstream metric decoupled. Pivot to contact-window",
         "  weighted wrist MSE / DCT loss / inference-time spatial guidance (§10).",
         "- C41 wrist LOW-band MSE NOT decreased vs C0 control → §9.3 branch: implementation",
