@@ -180,11 +180,13 @@ def build_stage1p5_step_fn(
         # R34 — conditioning augmentation (Ho 2021 §3.3 non-truncated mode).
         # Applied on Z-SCORED stage1_coarse only; sigma is NOT fed to the
         # model (no architecture change). Identity when sigma_max <= 0 or
-        # model is in eval mode.
-        coarse_v1 = apply_stage1_coarse_cond_aug(
+        # model is in eval mode. ``r34_cond_aug_sigma`` is (B,) tensor of
+        # sampled σ per batch item, logged for diagnostics.
+        coarse_v1, r34_cond_aug_sigma = apply_stage1_coarse_cond_aug(
             coarse_v1,
             sigma_max=float(r34_cond_aug_sigma_max),
             training=bool(_model.training),
+            return_sigma=True,
         )
 
         cond: dict[str, Tensor] = {
@@ -358,6 +360,14 @@ def build_stage1p5_step_fn(
             + w_r34_wrist_lowband * r34_lowband
         )
 
+        # R34 diagnostics for separating raw vs weighted loss contributions
+        # and tracking sampled σ distribution. ``r34_wrist_lowband_weighted``
+        # is the term that actually enters the total loss; ``r34_wrist_lowband``
+        # is the raw helper output (per ChatGPT followup §6.3 grad-norm-ratio
+        # decision rule §9.3, which needs separate raw vs weighted).
+        r34_lowband_weighted = (w_r34_wrist_lowband * r34_lowband).detach()
+        r34_cond_aug_sigma_mean = r34_cond_aug_sigma.mean().detach()
+
         return {
             "loss": loss,
             "mse_c41": mse_c41.detach(),
@@ -370,6 +380,8 @@ def build_stage1p5_step_fn(
             "v7_phase": phase_v7.detach(),
             "v7_c41_frame0_wrist": c41_frame0.detach(),
             "r34_wrist_lowband": r34_lowband.detach(),
+            "r34_wrist_lowband_weighted": r34_lowband_weighted,
+            "r34_cond_aug_sigma_mean": r34_cond_aug_sigma_mean,
         }
 
     return step_fn
@@ -584,7 +596,9 @@ def main() -> None:
             f"c41_f0_wrist={out['v7_c41_frame0_wrist'].item():.4e}"
         )
         accelerator.print(
-            f"  R34   — wrist_lowband={out['r34_wrist_lowband'].item():.4e}"
+            f"  R34   — wrist_lowband(raw)={out['r34_wrist_lowband'].item():.4e}  "
+            f"weighted={out['r34_wrist_lowband_weighted'].item():.4e}  "
+            f"cond_aug_sigma_mean={out['r34_cond_aug_sigma_mean'].item():.4f}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

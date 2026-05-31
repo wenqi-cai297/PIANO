@@ -404,3 +404,48 @@ def test_r34_cond_aug_wrong_shape_raises():
         apply_stage1_coarse_cond_aug(
             torch.zeros(4, 100), sigma_max=0.1, training=True,
         )
+
+
+def test_r34_cond_aug_return_sigma_shape_and_values():
+    """return_sigma=True returns (out, sigma) where sigma is (B,) in [0, sigma_max]."""
+    B, T, C = 8, 50, 23
+    torch.manual_seed(0)
+    z = torch.randn(B, T, C)
+    out, sigma = apply_stage1_coarse_cond_aug(
+        z, sigma_max=0.2, training=True, return_sigma=True,
+    )
+    assert out.shape == z.shape
+    assert sigma.shape == (B,)
+    assert (sigma >= 0).all()
+    assert (sigma <= 0.2 + 1e-6).all()
+
+
+def test_r34_cond_aug_return_sigma_zero_in_eval():
+    """In eval mode, sigma is all zeros (no augmentation)."""
+    B = 4
+    z = torch.zeros(B, 50, 23)
+    out, sigma = apply_stage1_coarse_cond_aug(
+        z, sigma_max=0.5, training=False, return_sigma=True,
+    )
+    assert torch.equal(out, z)
+    assert torch.equal(sigma, torch.zeros(B))
+
+
+def test_r34_cond_aug_return_sigma_zero_when_sigma_max_zero():
+    """sigma_max=0 → sigma is all zeros (identity path)."""
+    B = 4
+    z = torch.zeros(B, 50, 23)
+    out, sigma = apply_stage1_coarse_cond_aug(
+        z, sigma_max=0.0, training=True, return_sigma=True,
+    )
+    assert torch.equal(out, z)
+    assert torch.equal(sigma, torch.zeros(B))
+
+
+def test_r34_cond_aug_back_compat_default_return():
+    """Default return_sigma=False returns plain tensor (back-compat with prior callers)."""
+    z = torch.randn(4, 50, 23)
+    out = apply_stage1_coarse_cond_aug(z, sigma_max=0.1, training=True)
+    # Not a tuple
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == z.shape

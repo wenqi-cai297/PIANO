@@ -86,6 +86,19 @@ PB1_CKPT="runs/training/stageB_anchordiff_${PB1_VARIANT}/final.pt"
 SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
 SELECTION_TRAIN="analyses/round27_tier0_train_indices_48_balanced.json"
 
+# R34 — second eval mode: generated Stage-1 cond.
+# Per ChatGPT followup §7.2, R34 variants must be evaluated under BOTH
+# (a) oracle Stage-1 cond and (b) Stage-1 generated cond, to measure
+# both Stage-1.5 fix and cascaded-robustness benefit.
+# UPSTREAM_DIR points to the Stage-1 V8 V6 generated stage1_coarse cache,
+# layout <subset>/<seq>.npz with key 'stage1_coarse' z-scored.
+GENERATED_UPSTREAM_DIR="${ROUND34_GENERATED_UPSTREAM_DIR:-analyses/round31_stage1_substitute_conds_v8_stage1_v8_v6_full_f1}"
+SKIP_GENERATED_EVAL="${ROUND34_SKIP_GENERATED_EVAL:-0}"
+
+# C41/S4 quality metrics — optional post-diag analysis per ChatGPT §7.4.
+GT_DUMP_DIR="${ROUND34_GT_DUMP_DIR:-analyses/2026-05-31_stage1p5_wrist_external_review_work/oracle_dump}"
+SKIP_QUALITY_METRICS="${ROUND34_SKIP_QUALITY_METRICS:-0}"
+
 OVERALL_LOG_DIR="runs/round34_matrix"
 mkdir -p "${OVERALL_LOG_DIR}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -277,8 +290,59 @@ while IFS=' ' read -r VID CFG OUTDIR; do
             mkdir -p "$(dirname "${DIAG_ARCHIVE}")"
             rm -rf "${DIAG_ARCHIVE}"
             mv "${DIAG_DIR_ROOT}" "${DIAG_ARCHIVE}"
-            log "[R34] [${VID}] DIAG OK -> ${DIAG_ARCHIVE}"
+            log "[R34] [${VID}] DIAG OK (oracle Stage-1) -> ${DIAG_ARCHIVE}"
             DIAGED_OK_VIDS+=("${VID}")
+
+            # ── Second eval mode: generated Stage-1 cond (per §7.2) ──
+            if [[ ${SKIP_GENERATED_EVAL} -eq 0 && -d "${GENERATED_UPSTREAM_DIR}" ]]; then
+                DS_OUT_TAG_GEN="_r34_${VID}_genstage1"
+                SUB_DIR_ROOT_GEN="analyses/round32_stage1p5_substitute_conds${DS_OUT_TAG_GEN}"
+                DIAG_DIR_ROOT_GEN="analyses/round32_stage1p5_downstream_diag${DS_OUT_TAG_GEN}"
+                DIAG_ARCHIVE_GEN="analyses/round34_diag_${VID}_genstage1"
+                rm -rf "${SUB_DIR_ROOT_GEN}"
+                rm -rf "${DIAG_DIR_ROOT_GEN}"
+
+                log
+                log "[R34] [${VID}] DIAG mode=generated_stage1_cond (UPSTREAM_DIR=${GENERATED_UPSTREAM_DIR})"
+                set +e
+                ROUND32_DS_STAGE1P5_CFG="${CFG}" \
+                ROUND32_DS_STAGE1P5_CKPT="${FINAL}" \
+                ROUND32_DS_PB1_CKPT="${PB1_CKPT}" \
+                ROUND32_DS_BUCKETS="${BUCKETS_STR}" \
+                ROUND32_DS_OUT_TAG="${DS_OUT_TAG_GEN}" \
+                ROUND32_DS_UPSTREAM_DIR="${GENERATED_UPSTREAM_DIR}" \
+                    bash scripts/stage_a_generator/run_round32_stage1p5_downstream_diag.sh \
+                        2>&1 | tee -a "${VARIANT_LOG}"
+                rc_gen=${PIPESTATUS[0]}
+                set -e
+                if [[ ${rc_gen} -eq 0 && -d "${DIAG_DIR_ROOT_GEN}" ]]; then
+                    rm -rf "${DIAG_ARCHIVE_GEN}"
+                    mv "${DIAG_DIR_ROOT_GEN}" "${DIAG_ARCHIVE_GEN}"
+                    log "[R34] [${VID}] DIAG OK (generated Stage-1) -> ${DIAG_ARCHIVE_GEN}"
+                else
+                    log "[R34] [${VID}] DIAG FAILED (generated Stage-1, rc=${rc_gen}); continuing"
+                fi
+            elif [[ ${SKIP_GENERATED_EVAL} -ne 0 ]]; then
+                log "[R34] [${VID}] generated-Stage-1 eval skipped (ROUND34_SKIP_GENERATED_EVAL=1)"
+            else
+                log "[R34] [${VID}] generated-Stage-1 eval skipped (UPSTREAM_DIR ${GENERATED_UPSTREAM_DIR} missing)"
+            fi
+
+            # ── C41/S4 quality metrics (per §7.4) ──
+            if [[ ${SKIP_QUALITY_METRICS} -eq 0 && -d "${GT_DUMP_DIR}/${BUCKETS_STR%% *}" ]]; then
+                QUALITY_OUT="analyses/round34_rfft_followup_20260531/c41_s4_quality_${VID}.md"
+                mkdir -p "$(dirname "${QUALITY_OUT}")"
+                log "[R34] [${VID}] C41/S4 quality metrics → ${QUALITY_OUT}"
+                set +e
+                "${PY}" -u scripts/stage_a_generator/round34_c41_s4_quality_metrics.py \
+                    --gt-dir "${GT_DUMP_DIR}" \
+                    --pred-dir "analyses/round32_stage1p5_substitute_conds${DS_OUT_TAG}" \
+                    --bucket "${BUCKETS_STR%% *}" \
+                    --variant-label "${VID} (oracle Stage-1)" \
+                    --out "${QUALITY_OUT}" \
+                    2>&1 | tee -a "${VARIANT_LOG}"
+                set -e
+            fi
         else
             log "[R34] [${VID}] DIAG FAILED (rc=${rc}, dir=$([[ -d ${DIAG_DIR_ROOT} ]] && echo present || echo missing))"
             if [[ "${ALLOW_PARTIAL}" != "1" ]]; then exit 1; fi

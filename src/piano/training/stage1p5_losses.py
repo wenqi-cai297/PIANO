@@ -242,7 +242,8 @@ def apply_stage1_coarse_cond_aug(
     sigma_max: float = 0.0,
     *,
     training: bool = True,
-) -> Tensor:
+    return_sigma: bool = False,
+) -> "Tensor | tuple[Tensor, Tensor]":
     """R34 — per-sample Gaussian noise on z-scored stage1_coarse cond.
 
     Implementation per brief §7.3:
@@ -258,12 +259,25 @@ def apply_stage1_coarse_cond_aug(
         stage1_coarse_z: (B, T, 23) — already z-scored.
         sigma_max: float >= 0 — upper bound of per-batch σ.
         training: bool — when False, no aug.
+        return_sigma: bool — when True, returns (out, sigma) where sigma
+            is a (B,) tensor of the per-batch-item sampled σ. Useful for
+            train-time logging of the actually-sampled sigma distribution.
+            When False (default), returns the augmented tensor directly
+            (back-compat with prior API).
 
     Returns
     -------
-    Tensor of the same shape as ``stage1_coarse_z``.
+    Tensor of the same shape as ``stage1_coarse_z``, or
+    (augmented_tensor, sigma) if ``return_sigma=True``. ``sigma`` is a
+    ``(B,)`` tensor (zeros when augmentation is off).
     """
     if sigma_max <= 0.0 or not training:
+        if return_sigma:
+            B = stage1_coarse_z.shape[0]
+            zero_sigma = torch.zeros(
+                (B,), device=stage1_coarse_z.device, dtype=stage1_coarse_z.dtype,
+            )
+            return stage1_coarse_z, zero_sigma
         return stage1_coarse_z
     if stage1_coarse_z.ndim != 3:
         raise ValueError(
@@ -276,7 +290,10 @@ def apply_stage1_coarse_cond_aug(
         dtype=stage1_coarse_z.dtype,
     ) * float(sigma_max)
     noise = torch.randn_like(stage1_coarse_z) * sigma
-    return stage1_coarse_z + noise
+    out = stage1_coarse_z + noise
+    if return_sigma:
+        return out, sigma.squeeze(-1).squeeze(-1)   # (B,)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────

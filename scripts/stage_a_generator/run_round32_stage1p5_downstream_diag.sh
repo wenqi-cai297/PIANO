@@ -19,6 +19,11 @@ CFG_SCALE="${ROUND32_DS_CFG_SCALE:-1.0}"
 SAMPLER="${ROUND32_DS_SAMPLER:-ddim_eta0}"
 STAGE1P5_CFG="${ROUND32_DS_STAGE1P5_CFG:-configs/training/stage1p5_interaction_v0.yaml}"
 STAGE1P5_CKPT="${ROUND32_DS_STAGE1P5_CKPT:-runs/training/stage1p5_interaction_v0/final.pt}"
+# Optional: when set, Stage-1.5 sampling pulls stage1_coarse from this dir
+# (Stage-1's generated cache) instead of the oracle motion-derived path.
+# This is the "generated Stage-1 cond" eval mode for R34 (per ChatGPT
+# followup §7.2). Leave empty for default "oracle Stage-1 cond" mode.
+UPSTREAM_DIR="${ROUND32_DS_UPSTREAM_DIR:-}"
 PB1_VARIANT="r29_pb_a1_adaln_s4"
 PB1_CFG="configs/training/anchordiff_${PB1_VARIANT}.yaml"
 PB1_CKPT="${ROUND32_DS_PB1_CKPT:-runs/training/stageB_anchordiff_${PB1_VARIANT}/final.pt}"
@@ -54,6 +59,11 @@ BUCKETS=(${BUCKETS_STR})
 echo "[DS32] STAGE1P5_CKPT=${STAGE1P5_CKPT}"
 echo "[DS32] PB1_CKPT=${PB1_CKPT}"
 echo "[DS32] BUCKETS=${BUCKETS[*]}  SAMPLER=${SAMPLER}  SEED=${SEED}  CFG_SCALE=${CFG_SCALE}"
+if [[ -n "${UPSTREAM_DIR}" ]]; then
+    echo "[DS32] UPSTREAM_DIR=${UPSTREAM_DIR}  (generated Stage-1 cond mode)"
+else
+    echo "[DS32] UPSTREAM_DIR=(empty)  (oracle Stage-1 cond mode)"
+fi
 
 # Preflight. Under --dry-run we tolerate missing ckpts/selections so a
 # laptop can sanity-check env passthrough.
@@ -93,7 +103,12 @@ for b in "${BUCKETS[@]}"; do
     fi
     echo
     echo "================================================================"
-    echo "[$(date '+%F %T')] PHASE 1: SAMPLE Stage-1.5 (oracle Stage-1 cond) → ${SUB_DIR}"
+    if [[ -n "${UPSTREAM_DIR}" ]]; then
+        MODE_LABEL="generated Stage-1 cond from ${UPSTREAM_DIR}/${b}"
+    else
+        MODE_LABEL="oracle Stage-1 cond"
+    fi
+    echo "[$(date '+%F %T')] PHASE 1: SAMPLE Stage-1.5 (${MODE_LABEL}) → ${SUB_DIR}"
     echo "================================================================"
     SAMPLE_CMD=("${PY}" -u scripts/stage_a_generator/sample_substitute_conds_cli.py
         --stage stage1p5
@@ -105,6 +120,9 @@ for b in "${BUCKETS[@]}"; do
         --seed "${SEED}"
         --cfg-scale "${CFG_SCALE}"
         --sampler "${SAMPLER}")
+    if [[ -n "${UPSTREAM_DIR}" ]]; then
+        SAMPLE_CMD+=(--upstream-dir "${UPSTREAM_DIR}/${b}")
+    fi
     if [[ ${DRY_RUN} -eq 1 ]]; then
         echo "[DS32 DRY-RUN]"; echo "    \$ ${SAMPLE_CMD[*]}"
     else
