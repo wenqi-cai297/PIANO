@@ -422,6 +422,76 @@ def channel_moment_match_loss(
     return loss
 
 
+def temporal_derivative_mse_loss(
+    pred: Tensor,
+    gt: Tensor,
+    seq_mask: Tensor,
+    *,
+    order: int = 1,
+    channel_subset: tuple[int, ...] | None = None,
+    normalize_by_gt_std: bool = True,
+) -> Tensor:
+    """Masked raw-space finite-difference MSE for velocity/acceleration.
+
+    ``order=1`` compares frame-to-frame velocity. ``order=2`` compares
+    acceleration. The helper is intentionally generic so Stage-1 can apply it
+    to the 23-D raw coarse target and Stage-1.5 can reuse the same convention
+    on C41 via its own thin wrapper.
+    """
+    if pred.shape != gt.shape:
+        raise ValueError(f"shape mismatch: pred {pred.shape} vs gt {gt.shape}")
+    if pred.ndim != 3:
+        raise ValueError(f"expected (B, T, C), got {pred.shape}")
+    if order not in (1, 2):
+        raise ValueError(f"order must be 1 or 2, got {order}")
+
+    B, T, D = pred.shape
+    if seq_mask.shape != (B, T):
+        raise ValueError(
+            f"seq_mask shape {tuple(seq_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    if T <= order:
+        return pred.sum() * 0.0
+
+    if channel_subset is None:
+        pred_sel = pred
+        gt_sel = gt
+        n_ch = D
+    else:
+        idx = torch.tensor(
+            channel_subset, device=pred.device, dtype=torch.long,
+        )
+        pred_sel = pred.index_select(-1, idx)
+        gt_sel = gt.index_select(-1, idx)
+        n_ch = int(idx.numel())
+        if n_ch == 0:
+            return pred.sum() * 0.0
+
+    d_pred = pred_sel
+    d_gt = gt_sel
+    valid = seq_mask.float()
+    for _ in range(order):
+        d_pred = d_pred[:, 1:] - d_pred[:, :-1]
+        d_gt = d_gt[:, 1:] - d_gt[:, :-1]
+        valid = valid[:, 1:] * valid[:, :-1]
+
+    err = (d_pred - d_gt).pow(2)
+    if normalize_by_gt_std:
+        # Per-channel variance under the same derivative mask. This prevents
+        # high-magnitude channels from drowning out small but important ones.
+        flat_gt = d_gt.reshape(-1, n_ch)
+        flat_valid = valid.reshape(-1).to(dtype=flat_gt.dtype)
+        w_sum = flat_valid.sum().clamp_min(1.0)
+        mean_gt = (flat_gt * flat_valid.unsqueeze(-1)).sum(0) / w_sum
+        var_gt = (
+            (flat_gt - mean_gt).pow(2) * flat_valid.unsqueeze(-1)
+        ).sum(0) / w_sum
+        err = err / var_gt.clamp_min(1e-6).view(1, 1, n_ch)
+
+    denom = valid.sum().clamp_min(1.0) * float(n_ch)
+    return (err * valid.unsqueeze(-1).to(err.dtype)).sum() / denom
+
+
 def yaw_aggregate_match_loss(
     stage1_raw_pred: Tensor,        # (B, T, 23) — raw (un-z-scored) prediction
     stage1_raw_gt: Tensor,          # (B, T, 23) — raw GT

@@ -21,6 +21,7 @@ from piano.training.stage1p5_losses import (
     S4_DIM,
     TOTAL_DIM,
     apply_stage1_coarse_cond_aug,
+    c41_temporal_derivative_loss,
     c41_wrist_frame0_consistency_loss,
     phase_unit_circle_loss,
     wrist_lowband_rfft_loss,
@@ -449,3 +450,46 @@ def test_r34_cond_aug_back_compat_default_return():
     # Not a tuple
     assert isinstance(out, torch.Tensor)
     assert out.shape == z.shape
+
+
+def test_c41_temporal_derivative_zero_when_pred_equals_gt():
+    c41 = torch.randn(2, 8, C41_DIM)
+    mask = torch.ones(2, 8)
+    vel = c41_temporal_derivative_loss(c41, c41, mask, order=1)
+    acc = c41_temporal_derivative_loss(c41, c41, mask, order=2)
+    assert vel.item() < 1e-10
+    assert acc.item() < 1e-10
+
+
+def test_c41_temporal_derivative_acceleration_positive_on_kink():
+    gt = torch.zeros(1, 5, C41_DIM)
+    pred = gt.clone()
+    pred[0, 2, 0] = 1.0
+    loss = c41_temporal_derivative_loss(
+        pred,
+        gt,
+        torch.ones(1, 5),
+        order=2,
+        channel_subset=(0,),
+        normalize_by_gt_std=False,
+    )
+    assert loss.item() > 0.0
+
+
+def test_c41_temporal_derivative_respects_mask_and_grad():
+    gt = torch.zeros(1, 5, C41_DIM)
+    pred = gt.clone().requires_grad_(True)
+    pred.data[0, 4, 0] = 100.0
+    mask = torch.ones(1, 5)
+    mask[0, 3:] = 0.0
+    loss = c41_temporal_derivative_loss(
+        pred,
+        gt,
+        mask,
+        order=1,
+        channel_subset=(0,),
+        normalize_by_gt_std=False,
+    )
+    assert loss.item() == 0.0
+    loss.backward()
+    assert pred.grad is not None

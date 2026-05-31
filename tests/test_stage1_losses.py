@@ -45,6 +45,7 @@ from piano.training.stage1_losses import (
     frame0_consistency_loss,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    temporal_derivative_mse_loss,
     wrist_fk_supervision_loss,
     yaw_aggregate_match_loss,
 )
@@ -933,6 +934,50 @@ def test_stage1_denoiser_forward_with_init_pose_f2():
     out = model(x_t, t, cond, cond_drop_mask=None)
     assert out.shape == (B, T, 23)
     assert torch.isfinite(out).all()
+
+
+def test_temporal_derivative_loss_zero_when_pred_equals_gt():
+    gt = torch.randn(2, 8, 23)
+    mask = torch.ones(2, 8)
+    vel = temporal_derivative_mse_loss(gt, gt, mask, order=1)
+    acc = temporal_derivative_mse_loss(gt, gt, mask, order=2)
+    assert vel.item() < 1e-10
+    assert acc.item() < 1e-10
+
+
+def test_temporal_derivative_loss_acceleration_catches_curvature_change():
+    gt = torch.zeros(1, 5, 23)
+    pred = gt.clone()
+    pred[0, 2, 0] = 1.0
+    mask = torch.ones(1, 5)
+    loss = temporal_derivative_mse_loss(
+        pred,
+        gt,
+        mask,
+        order=2,
+        channel_subset=(0,),
+        normalize_by_gt_std=False,
+    )
+    assert loss.item() > 0.0
+
+
+def test_temporal_derivative_loss_respects_mask_and_grad():
+    gt = torch.zeros(1, 5, 23)
+    pred = gt.clone().requires_grad_(True)
+    pred.data[0, 4, 0] = 100.0
+    mask = torch.ones(1, 5)
+    mask[0, 3:] = 0.0
+    loss = temporal_derivative_mse_loss(
+        pred,
+        gt,
+        mask,
+        order=1,
+        channel_subset=(0,),
+        normalize_by_gt_std=False,
+    )
+    assert loss.item() == 0.0
+    loss.backward()
+    assert pred.grad is not None
 
 
 def test_stage1_denoiser_forward_with_init_pose_f1():

@@ -53,6 +53,7 @@ from piano.training.stage1_losses import channel_moment_match_loss
 from piano.training.stage1p5_losses import (
     apply_stage1_coarse_cond_aug,
     c41_wrist_frame0_consistency_loss,
+    c41_temporal_derivative_loss,
     phase_unit_circle_loss,
     wrist_lowband_rfft_loss,
 )
@@ -101,6 +102,11 @@ def build_stage1p5_step_fn(
     r34_wrist_lowband_cutoff_hz: float = 1.0,
     r34_wrist_lowband_fps: float = 20.0,
     r34_cond_aug_sigma_max: float = 0.0,
+    # R36: explicit temporal dynamics on raw C41.
+    w_r36_c41_velocity: float = 0.0,
+    w_r36_c41_acceleration: float = 0.0,
+    r36_c41_dynamics_channel_subset: tuple[int, ...] | None = None,
+    r36_c41_dynamics_normalize_by_gt_std: bool = True,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -345,6 +351,30 @@ def build_stage1p5_step_fn(
         else:
             r34_lowband = torch.zeros((), device=device, dtype=mse_s4.dtype)
 
+        if w_r36_c41_velocity > 0:
+            r36_c41_vel = c41_temporal_derivative_loss(
+                c41_pred,
+                c41_gt,
+                seq_mask,
+                order=1,
+                channel_subset=r36_c41_dynamics_channel_subset,
+                normalize_by_gt_std=bool(r36_c41_dynamics_normalize_by_gt_std),
+            )
+        else:
+            r36_c41_vel = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
+        if w_r36_c41_acceleration > 0:
+            r36_c41_acc = c41_temporal_derivative_loss(
+                c41_pred,
+                c41_gt,
+                seq_mask,
+                order=2,
+                channel_subset=r36_c41_dynamics_channel_subset,
+                normalize_by_gt_std=bool(r36_c41_dynamics_normalize_by_gt_std),
+            )
+        else:
+            r36_c41_acc = torch.zeros((), device=device, dtype=mse_s4.dtype)
+
         loss = (
             w_x0_c41 * mse_c41
             + w_x0_s4 * mse_s4
@@ -358,6 +388,8 @@ def build_stage1p5_step_fn(
             + 1.0 * phase_v7
             + w_v7_c41_frame0_wrist * c41_frame0
             + w_r34_wrist_lowband * r34_lowband
+            + w_r36_c41_velocity * r36_c41_vel
+            + w_r36_c41_acceleration * r36_c41_acc
         )
 
         # R34 diagnostics for separating raw vs weighted loss contributions
@@ -382,6 +414,8 @@ def build_stage1p5_step_fn(
             "r34_wrist_lowband": r34_lowband.detach(),
             "r34_wrist_lowband_weighted": r34_lowband_weighted,
             "r34_cond_aug_sigma_mean": r34_cond_aug_sigma_mean,
+            "r36_c41_velocity": r36_c41_vel.detach(),
+            "r36_c41_acceleration": r36_c41_acc.detach(),
         }
 
     return step_fn
@@ -569,6 +603,16 @@ def main() -> None:
         r34_cond_aug_sigma_max=float(
             cfg.loss.get("r34_cond_aug_sigma_max", 0.0),
         ),
+        w_r36_c41_velocity=float(cfg.loss.get("w_r36_c41_velocity", 0.0)),
+        w_r36_c41_acceleration=float(
+            cfg.loss.get("w_r36_c41_acceleration", 0.0),
+        ),
+        r36_c41_dynamics_channel_subset=tuple(
+            cfg.loss.get("r36_c41_dynamics_channel_subset", [])
+        ) or None,
+        r36_c41_dynamics_normalize_by_gt_std=bool(
+            cfg.loss.get("r36_c41_dynamics_normalize_by_gt_std", True),
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -599,6 +643,10 @@ def main() -> None:
             f"  R34   — wrist_lowband(raw)={out['r34_wrist_lowband'].item():.4e}  "
             f"weighted={out['r34_wrist_lowband_weighted'].item():.4e}  "
             f"cond_aug_sigma_mean={out['r34_cond_aug_sigma_mean'].item():.4f}"
+        )
+        accelerator.print(
+            f"  R36   c41_vel={out['r36_c41_velocity'].item():.4e}  "
+            f"c41_acc={out['r36_c41_acceleration'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

@@ -160,6 +160,73 @@ def c41_wrist_frame0_consistency_loss(
     return frame0_wrist.pow(2).mean()
 
 
+def c41_temporal_derivative_loss(
+    c41_pred: Tensor,
+    c41_gt: Tensor,
+    seq_mask: Tensor,
+    *,
+    order: int = 1,
+    channel_subset: tuple[int, ...] | None = None,
+    normalize_by_gt_std: bool = True,
+) -> Tensor:
+    """Masked C41 velocity/acceleration MSE.
+
+    ``order=1`` compares C41 velocity and ``order=2`` compares C41
+    acceleration. C41 is raw metric-space delta xyz, so this complements the
+    per-frame MSE with explicit temporal dynamics supervision.
+    """
+    if c41_pred.shape != c41_gt.shape:
+        raise ValueError(
+            f"shape mismatch: pred {c41_pred.shape} vs gt {c41_gt.shape}"
+        )
+    if c41_pred.ndim != 3 or c41_pred.shape[-1] != C41_DIM:
+        raise ValueError(f"expected (B, T, {C41_DIM}), got {c41_pred.shape}")
+    if order not in (1, 2):
+        raise ValueError(f"order must be 1 or 2, got {order}")
+
+    B, T, D = c41_pred.shape
+    if seq_mask.shape != (B, T):
+        raise ValueError(
+            f"seq_mask shape {tuple(seq_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    if T <= order:
+        return c41_pred.sum() * 0.0
+
+    if channel_subset is None:
+        pred = c41_pred
+        gt = c41_gt
+        n_ch = D
+    else:
+        idx = torch.tensor(channel_subset, device=c41_pred.device, dtype=torch.long)
+        pred = c41_pred.index_select(-1, idx)
+        gt = c41_gt.index_select(-1, idx)
+        n_ch = int(idx.numel())
+        if n_ch == 0:
+            return c41_pred.sum() * 0.0
+
+    d_pred = pred
+    d_gt = gt
+    valid = seq_mask.float()
+    for _ in range(order):
+        d_pred = d_pred[:, 1:] - d_pred[:, :-1]
+        d_gt = d_gt[:, 1:] - d_gt[:, :-1]
+        valid = valid[:, 1:] * valid[:, :-1]
+
+    err = (d_pred - d_gt).pow(2)
+    if normalize_by_gt_std:
+        flat_gt = d_gt.reshape(-1, n_ch)
+        flat_valid = valid.reshape(-1).to(dtype=flat_gt.dtype)
+        w_sum = flat_valid.sum().clamp_min(1.0)
+        mean_gt = (flat_gt * flat_valid.unsqueeze(-1)).sum(0) / w_sum
+        var_gt = (
+            (flat_gt - mean_gt).pow(2) * flat_valid.unsqueeze(-1)
+        ).sum(0) / w_sum
+        err = err / var_gt.clamp_min(1e-6).view(1, 1, n_ch)
+
+    denom = valid.sum().clamp_min(1.0) * float(n_ch)
+    return (err * valid.unsqueeze(-1).to(err.dtype)).sum() / denom
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # R34: targeted wrist low-band rFFT loss
 # ──────────────────────────────────────────────────────────────────────────

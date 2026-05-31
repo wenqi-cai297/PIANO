@@ -60,6 +60,7 @@ from piano.training.stage1_losses import (
     frame0_consistency_loss,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    temporal_derivative_mse_loss,
     wrist_fk_supervision_loss,
     yaw_aggregate_match_loss,
 )
@@ -121,6 +122,11 @@ def build_stage1_step_fn(
     # R31 V8 — frame-0 consistency loss (applied on Stage-1 t=0 prediction).
     # Used together with denoiser config init_pose_dim > 0 (F1 or F2 mode).
     w_init_pose_consistency: float = 0.0,
+    # R36 raw-space temporal dynamics. Defaults off for back-compat.
+    w_r36_raw_velocity: float = 0.0,
+    w_r36_raw_acceleration: float = 0.0,
+    r36_raw_dynamics_channel_subset: tuple[int, ...] | None = None,
+    r36_raw_dynamics_normalize_by_gt_std: bool = True,
     # R31 V8 — denoiser-injected init_pose mode (0 = OFF, 14 = F2,
     # 135 = F1). Must match cfg.model.denoiser.init_pose_dim.
     init_pose_dim: int = 0,
@@ -309,6 +315,7 @@ def build_stage1_step_fn(
             or w_moment_velocity > 0 or w_moment_value > 0
             or w_yaw_aggregate > 0 or w_fk_pos_cm > 0
             or w_wrist_fk_pos > 0
+            or w_r36_raw_velocity > 0 or w_r36_raw_acceleration > 0
         )
         if need_raw:
             x0_raw = x0_pred * stage1_coarse_std_t + stage1_coarse_mean_t   # (B, T, 23)
@@ -494,6 +501,30 @@ def build_stage1_step_fn(
         else:
             init_pose_cons = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
+        if w_r36_raw_velocity > 0 and x0_raw is not None and x0_gt_raw is not None:
+            r36_raw_vel = temporal_derivative_mse_loss(
+                x0_raw,
+                x0_gt_raw,
+                seq_mask,
+                order=1,
+                channel_subset=r36_raw_dynamics_channel_subset,
+                normalize_by_gt_std=bool(r36_raw_dynamics_normalize_by_gt_std),
+            )
+        else:
+            r36_raw_vel = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
+        if w_r36_raw_acceleration > 0 and x0_raw is not None and x0_gt_raw is not None:
+            r36_raw_acc = temporal_derivative_mse_loss(
+                x0_raw,
+                x0_gt_raw,
+                seq_mask,
+                order=2,
+                channel_subset=r36_raw_dynamics_channel_subset,
+                normalize_by_gt_std=bool(r36_raw_dynamics_normalize_by_gt_std),
+            )
+        else:
+            r36_raw_acc = torch.zeros((), device=device, dtype=mse_x0.dtype)
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
@@ -507,6 +538,8 @@ def build_stage1_step_fn(
             + w_fk_pos_cm * fk_pos_cm
             + w_wrist_fk_pos * wrist_fk
             + w_init_pose_consistency * init_pose_cons
+            + w_r36_raw_velocity * r36_raw_vel
+            + w_r36_raw_acceleration * r36_raw_acc
         )
 
         return {
@@ -524,6 +557,8 @@ def build_stage1_step_fn(
             "fk_pos_cm": fk_pos_cm.detach(),
             "wrist_fk": wrist_fk.detach(),
             "init_pose_consistency": init_pose_cons.detach(),
+            "r36_raw_velocity": r36_raw_vel.detach(),
+            "r36_raw_acceleration": r36_raw_acc.detach(),
         }
 
     return step_fn
@@ -729,6 +764,14 @@ def main() -> None:
         wrist_fk_velocity_weight=float(cfg.loss.get("wrist_fk_velocity_weight", 0.5)),
         wrist_fk_beta_cm=float(cfg.loss.get("wrist_fk_beta_cm", 1.0)),
         w_init_pose_consistency=float(cfg.loss.get("w_init_pose_consistency", 0.0)),
+        w_r36_raw_velocity=float(cfg.loss.get("w_r36_raw_velocity", 0.0)),
+        w_r36_raw_acceleration=float(cfg.loss.get("w_r36_raw_acceleration", 0.0)),
+        r36_raw_dynamics_channel_subset=tuple(
+            cfg.loss.get("r36_raw_dynamics_channel_subset", [])
+        ) or None,
+        r36_raw_dynamics_normalize_by_gt_std=bool(
+            cfg.loss.get("r36_raw_dynamics_normalize_by_gt_std", True),
+        ),
         init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
         vel_rot6d_weight=float(cfg.loss.get("vel_rot6d_weight", 1.0)),
         use_min_snr_weighting=bool(
@@ -761,6 +804,10 @@ def main() -> None:
         accelerator.print(
             f"  R31V8 — wrist_fk={out['wrist_fk'].item():.4e}  "
             f"init_pose_cons={out['init_pose_consistency'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R36   raw_vel={out['r36_raw_velocity'].item():.4e}  "
+            f"raw_acc={out['r36_raw_acceleration'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")
