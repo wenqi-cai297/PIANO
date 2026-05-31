@@ -116,6 +116,7 @@ def _build_stage1p5_model(cfg, device: torch.device) -> tuple[Stage1p5Denoiser, 
         enable_per_block_obj_xattn=bool(
             d.get("enable_per_block_obj_xattn", False),
         ),
+        init_pose_dim=int(d.get("init_pose_dim", 0)),
     )
     model = Stage1p5Denoiser(denoiser_cfg).to(device)
     encoder = ObjectEncoder(
@@ -304,6 +305,39 @@ def _build_cond_for_upstream(
             )
             cond["stage1_coarse"] = (coarse_raw - mean_t) / std_t
 
+        # R38 — Stage-1.5 init_pose (frame-0 anchor) injection. Symmetric
+        # with the Stage-1 init_pose construction above. F1 reads
+        # motion[:, 0, :] (135-D), F2 reads frame-0 of oracle stage1_coarse
+        # then z-scores. The trainer uses oracle motion (motion derived
+        # from GT) at train time; sample_substitute_conds uses the same
+        # ``motion`` from the dataset batch at inference time. PIANO's
+        # end-to-end design assumes the user supplies frame-0 motion
+        # (parallel to PB1's ``init_pose`` cond).
+        if init_pose_dim > 0:
+            if init_pose_dim == 135:
+                from piano.training.stage1_losses import build_init_pose_f1
+                cond["init_pose"] = build_init_pose_f1(motion.float())
+            elif init_pose_dim == 14:
+                from piano.training.stage1_losses import build_init_pose_f2
+                from piano.data.stage1_coarse_oracle import extract_coarse_v1_batched
+                if stage1_norm is None:
+                    raise ValueError(
+                        "Stage-1.5 init_pose_dim=14 (F2) requires "
+                        "stage1_norm for z-scoring; pass via "
+                        "sample_substitute_conds."
+                    )
+                rest_offsets = batch["rest_offsets"].to(device).float()
+                coarse_raw = extract_coarse_v1_batched(
+                    motion=motion.float(), rest_offsets=rest_offsets,
+                )
+                mean_t, std_t = stage1_norm
+                cond["init_pose"] = build_init_pose_f2(coarse_raw, mean_t, std_t)
+            else:
+                raise ValueError(
+                    f"Stage-1.5 init_pose_dim must be 0, 14 (F2), or "
+                    f"135 (F1); got {init_pose_dim}."
+                )
+
     return cond, T
 
 
@@ -341,20 +375,17 @@ def sample_substitute_conds(
         f"out_dir={out_dir} ckpt={ckpt_path.name}"
     )
 
-    # Read Stage-1 init_pose_dim once so cond builder knows whether to
-    # populate cond["init_pose"]. 0 = OFF (V0/V7 baseline), 14 = F2,
-    # 135 = F1.
-    stage1_init_pose_dim = (
-        int(cfg.model.denoiser.get("init_pose_dim", 0))
-        if stage == "stage1" else 0
-    )
+    # Read init_pose_dim once so cond builder knows whether to populate
+    # cond["init_pose"]. 0 = OFF (V0/V7 baseline), 14 = F2, 135 = F1.
+    # R38 — Stage-1.5 also uses init_pose now; read from same cfg key.
+    init_pose_dim_eff = int(cfg.model.denoiser.get("init_pose_dim", 0))
 
     # Need stage1 norm when stage1p5 has no upstream_dir (oracle path)
-    # OR when Stage-1 uses init_pose F2 (which is z-scored).
+    # OR when either stage uses init_pose F2 (which is z-scored).
     stage1_norm: tuple[torch.Tensor, torch.Tensor] | None = None
     need_stage1_norm = (
         (stage == "stage1p5" and upstream_dir is None)
-        or (stage == "stage1" and stage1_init_pose_dim == 14)
+        or (init_pose_dim_eff == 14)
     )
     if need_stage1_norm:
         mean_np, std_np = load_stage1_coarse_norm(
@@ -390,7 +421,7 @@ def sample_substitute_conds(
             batch=batch, encoder=encoder, clip_model=clip_model,
             stage=stage, device=device,
             upstream_dir=upstream_dir, stage1_norm=stage1_norm,
-            init_pose_dim=stage1_init_pose_dim,
+            init_pose_dim=init_pose_dim_eff,
         )
 
         seq_len = int(batch["seq_len"][0].item())

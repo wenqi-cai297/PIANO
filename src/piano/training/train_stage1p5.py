@@ -49,7 +49,11 @@ from piano.models.stage1p5_interaction import (
     Stage1p5Denoiser,
     Stage1p5DenoiserConfig,
 )
-from piano.training.stage1_losses import channel_moment_match_loss
+from piano.training.stage1_losses import (
+    build_init_pose_f1,
+    build_init_pose_f2,
+    channel_moment_match_loss,
+)
 from piano.training.stage1p5_losses import (
     R37_C41_KNEE_SLICE,
     R37_C41_NECK_SLICE,
@@ -58,6 +62,7 @@ from piano.training.stage1p5_losses import (
     R37_C41_ALL_SLICE,
     apply_stage1_coarse_cond_aug,
     build_r37_group_masks,
+    c41_contact_window_wrist_loss,
     c41_smoothl1_finite_diff_cm,
     c41_speed_moment_cm,
     c41_wrist_frame0_consistency_loss,
@@ -115,6 +120,23 @@ def build_stage1p5_step_fn(
     w_r36_c41_acceleration: float = 0.0,
     r36_c41_dynamics_channel_subset: tuple[int, ...] | None = None,
     r36_c41_dynamics_normalize_by_gt_std: bool = True,
+    # R38 — init_pose injection (frame-0 anchor) into Stage-1.5 input
+    # projection. 0 = OFF (V0/V7/R33/R34/R37 baseline). 135 = F1 mode
+    # (full motion_135[:, 0, :] slice, raw). The trainer builds
+    # init_pose via ``build_init_pose_f1`` from the batch's motion. At
+    # inference, sample_substitute_conds and the diagnostic helper take
+    # frame-0 motion from the same dataset path, so train/inference are
+    # symmetric. Must match cfg.model.denoiser.init_pose_dim.
+    init_pose_dim: int = 0,
+    # R38 — contact-window weighted wrist value MSE (PB1 anchor pattern).
+    # When > 0, adds a value-domain MSE on C41 wrist channels [0:6]
+    # restricted to contact-active frames (L_hand OR R_hand contact_state
+    # >= contact_threshold), eroded by erode_half. Pure value supervision,
+    # NOT dynamics — avoids the R37 failure mode (entangled vel/acc on
+    # pelvis-local C41).
+    w_r38_contact_wrist: float = 0.0,
+    r38_contact_threshold: float = 0.5,
+    r38_contact_erode_half: int = 1,
     # R37: Stage-2-style C41 dynamics (cm-scale SmoothL1, per-bodypart mask,
     # acc ≪ vel weight, paper-informed jerk smoothness, speed moment
     # matching). All default 0 so old configs are byte-identical.
@@ -228,6 +250,26 @@ def build_stage1p5_step_fn(
         }
         if text_features is not None:
             cond["text"] = text_features
+
+        # ─── R38 — init_pose (frame-0 anchor), only when wired in cfg ───
+        # F1 mode (init_pose_dim=135): full motion_135[:, 0, :] slice.
+        # F2 mode (init_pose_dim=14): pelvis_rot6d + spine3_rot6d +
+        # heights from oracle stage1_coarse, z-scored. F1 is the default
+        # for R38 because we already have motion in the trainer and at
+        # inference (sample_substitute_conds / diagnostic_helpers both
+        # see motion[:, 0, :]); F2 is provided for parity with Stage-1
+        # V8 ablations.
+        if init_pose_dim == 135:
+            cond["init_pose"] = build_init_pose_f1(motion.float())
+        elif init_pose_dim == 14:
+            cond["init_pose"] = build_init_pose_f2(
+                coarse_v1_raw, stage1_coarse_mean_t, stage1_coarse_std_t,
+            )
+        elif init_pose_dim not in (0,):
+            raise ValueError(
+                f"Stage-1.5 init_pose_dim must be 0, 14 (F2), or 135 "
+                f"(F1); got {init_pose_dim}."
+            )
 
         # ─── Diffusion training step ───
         x0 = torch.cat([c41_gt, s4_gt], dim=-1)                     # (B, T, 31)
@@ -507,6 +549,36 @@ def build_stage1p5_step_fn(
                 (), device=device, dtype=mse_s4.dtype,
             )
 
+        # ─── R38: contact-window weighted wrist value MSE ────────────────
+        # Value-domain supervision on C41 wrist channels [0:6], restricted
+        # to L_hand/R_hand contact-active frames. Mirrors PB1's anchor
+        # loss pattern (anchor_joint_vel/pos at contact-active joints).
+        # Pure value, NOT dynamics — avoids R37 entanglement failure.
+        if w_r38_contact_wrist > 0:
+            cs_b = batch.get("contact_state")
+            if cs_b is None:
+                # Configured but dataset variant didn't surface
+                # contact_state — fail loud rather than silently zero.
+                raise KeyError(
+                    "w_r38_contact_wrist > 0 but batch['contact_state'] "
+                    "is missing. Ensure the dataset variant carries it "
+                    "(v18 pseudo_labels do)."
+                )
+            cs_t = cs_b.to(device).float()
+            r38_contact_wrist = c41_contact_window_wrist_loss(
+                c41_pred=c41_pred,
+                c41_gt=c41_gt,
+                seq_mask=seq_mask,
+                contact_state=cs_t,
+                contact_threshold=float(r38_contact_threshold),
+                erode_half=int(r38_contact_erode_half),
+                per_sample_loss_weighting_b=w_b_norm.view(-1),
+            )
+        else:
+            r38_contact_wrist = torch.zeros(
+                (), device=device, dtype=mse_s4.dtype,
+            )
+
         loss = (
             w_x0_c41 * mse_c41
             + w_x0_s4 * mse_s4
@@ -529,6 +601,7 @@ def build_stage1p5_step_fn(
             + w_r37_pelvis_acc_cm * r37_pelvis_acc
             + w_r37_c41_jerk_cm * r37_c41_jerk
             + w_r37_c41_speed_moment_cm * r37_c41_speed_moment
+            + w_r38_contact_wrist * r38_contact_wrist
         )
 
         # R34 diagnostics for separating raw vs weighted loss contributions
@@ -549,6 +622,7 @@ def build_stage1p5_step_fn(
         r37_pelvis_acc_w = (w_r37_pelvis_acc_cm * r37_pelvis_acc).detach()
         r37_jerk_w = (w_r37_c41_jerk_cm * r37_c41_jerk).detach()
         r37_speed_moment_w = (w_r37_c41_speed_moment_cm * r37_c41_speed_moment).detach()
+        r38_contact_wrist_w = (w_r38_contact_wrist * r38_contact_wrist).detach()
 
         return {
             "loss": loss,
@@ -580,6 +654,8 @@ def build_stage1p5_step_fn(
             "r37_c41_jerk_cm_weighted": r37_jerk_w,
             "r37_c41_speed_moment_cm": r37_c41_speed_moment.detach(),
             "r37_c41_speed_moment_cm_weighted": r37_speed_moment_w,
+            "r38_contact_wrist": r38_contact_wrist.detach(),
+            "r38_contact_wrist_weighted": r38_contact_wrist_w,
         }
 
     return step_fn
@@ -663,6 +739,7 @@ def main() -> None:
         enable_per_block_obj_xattn=bool(
             cfg.model.denoiser.get("enable_per_block_obj_xattn", False),
         ),
+        init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
     )
     if denoiser_cfg.motion_dim != STAGE1P5_TOTAL_DIM:
         raise ValueError(
@@ -792,6 +869,18 @@ def main() -> None:
         r37_use_contact_state=bool(
             cfg.loss.get("r37_use_contact_state", True),
         ),
+        # R38 — init_pose dim must match cfg.model.denoiser.init_pose_dim.
+        init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
+        # R38 — contact-window weighted wrist value MSE.
+        w_r38_contact_wrist=float(
+            cfg.loss.get("w_r38_contact_wrist", 0.0),
+        ),
+        r38_contact_threshold=float(
+            cfg.loss.get("r38_contact_threshold", 0.5),
+        ),
+        r38_contact_erode_half=int(
+            cfg.loss.get("r38_contact_erode_half", 1),
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -854,6 +943,10 @@ def main() -> None:
         accelerator.print(
             f"        c41_speed_moment(raw)={out['r37_c41_speed_moment_cm'].item():.4e}  "
             f"weighted={out['r37_c41_speed_moment_cm_weighted'].item():.4e}"
+        )
+        accelerator.print(
+            f"  R38   contact_wrist(raw)={out['r38_contact_wrist'].item():.4e}  "
+            f"weighted={out['r38_contact_wrist_weighted'].item():.4e}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

@@ -83,6 +83,19 @@ class Stage1p5DenoiserConfig:
     # Zero-init AdaLN means step-0 forward is bit-identical to V0/V7.
     enable_per_block_obj_xattn: bool = False
 
+    # R38 — frame-0 anchor injection via zero-init Linear into the
+    # input-add lane (same mechanism Stage-1 uses; see
+    # ``Stage1DenoiserConfig.init_pose_dim``). 0 = OFF (V0/V7/R33/R34
+    # baseline). 135 = full motion_135[:, 0, :] slice (F1 mode). 66 =
+    # SMPL-22 joint world positions reshaped to (B, 22*3) at frame 0.
+    # The R38 cfg gen uses F1 (135) because the inference path already
+    # supplies frame-0 motion (sample_substitute_conds and diagnostic
+    # paths take it from ``batch["motion"][:, 0, :]``). Zero-init Linear
+    # → step-0 output is bit-identical to the baseline so a non-init
+    # variant of an R34 V2-A ckpt can be re-used as warm start, although
+    # the R38 cells train from scratch for cleanliness.
+    init_pose_dim: int = 0
+
 
 class _SplitReadout(nn.Module):
     """Final readout that emits (C41, S4) separately, both AdaLN-Zero gated.
@@ -175,7 +188,9 @@ class Stage1p5Denoiser(nn.Module):
             obj_traj_dim=cfg.object_traj_dim,
             d_model=cfg.d_model,
             stage1_coarse_dim=cfg.stage1_coarse_dim,
+            init_pose_dim=int(cfg.init_pose_dim),
         )
+        self.use_init_pose = int(cfg.init_pose_dim) > 0
         self.v12_cond_summary = GlobalCondSummary(
             d_model=cfg.d_model, use_cond_summary_mlp=False,
         )
@@ -244,6 +259,9 @@ class Stage1p5Denoiser(nn.Module):
                     "cond['stage1_coarse'] is missing."
                 )
             stage1_coarse_eff = cond["stage1_coarse"]
+        init_pose_eff: Tensor | None = (
+            cond.get("init_pose") if self.use_init_pose else None
+        )
         text_tok: Tensor | None = (
             cond.get("text") if self.use_text else None
         )
@@ -251,9 +269,11 @@ class Stage1p5Denoiser(nn.Module):
         # Timestep embedding.
         t_emb = self.time_embed(t)
 
-        # Input projection. stage1_coarse never CFG-dropped (design).
+        # Input projection. stage1_coarse and init_pose never CFG-dropped
+        # (per Stage-1 R31 V8 design and V12InputProjection contract).
         h = self.v12_input_proj(
             x_t=x_t, obj_traj=obj_traj, stage1_coarse=stage1_coarse_eff,
+            init_pose=init_pose_eff,
         )
 
         # Global cond summary (timestep only).

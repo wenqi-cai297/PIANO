@@ -31,6 +31,7 @@ from piano.training.stage1p5_losses import (
     TOTAL_DIM,
     apply_stage1_coarse_cond_aug,
     build_r37_group_masks,
+    c41_contact_window_wrist_loss,
     c41_smoothl1_finite_diff_cm,
     c41_speed_moment_cm,
     c41_temporal_derivative_loss,
@@ -752,3 +753,245 @@ def test_r37_smoothl1_grad_flow_through_pred():
     # No gradient should flow to non-wrist channels since the slice
     # excludes them.
     assert pred.grad[..., 6:].abs().sum().item() == 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R38: contact-window weighted wrist value MSE
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _make_contact_state(B: int, T: int, l_seg: slice, r_seg: slice) -> torch.Tensor:
+    """Helper: build a (B, T, 5) contact_state with L/R hand contact
+    set on the given frame slices, foot/pelvis zero."""
+    cs = torch.zeros(B, T, 5)
+    cs[:, l_seg, 0] = 1.0      # L_hand
+    cs[:, r_seg, 1] = 1.0      # R_hand
+    return cs
+
+
+def test_r38_contact_wrist_zero_when_pred_equals_gt():
+    c41 = torch.randn(2, 20, C41_DIM)
+    seq_mask = torch.ones(2, 20)
+    cs = _make_contact_state(2, 20, slice(5, 10), slice(8, 15))
+    loss = c41_contact_window_wrist_loss(c41, c41, seq_mask, cs, erode_half=0)
+    assert loss.item() < 1e-10
+
+
+def test_r38_contact_wrist_positive_on_wrist_offset_in_contact():
+    gt = torch.zeros(1, 10, C41_DIM)
+    pred = gt.clone()
+    # Inject 1 cm error on wrist L channel only at a contact frame.
+    pred[0, 5, 0] = 0.01
+    seq_mask = torch.ones(1, 10)
+    cs = _make_contact_state(1, 10, slice(4, 8), slice(20, 21))
+    loss = c41_contact_window_wrist_loss(
+        gt, pred, seq_mask, cs, erode_half=0,
+    )
+    # 0.01^2 = 1e-4 per frame; denominator is # of contact frames inside
+    # the mask. With erode_half=0, contact frames = [4, 5, 6, 7] = 4
+    # frames. Loss = 1e-4 / 4 = 2.5e-5 ish.
+    assert loss.item() > 0
+    assert loss.item() < 1e-3
+
+
+def test_r38_contact_wrist_ignores_non_wrist_channels():
+    """Error on non-wrist channels should NOT contribute."""
+    gt = torch.zeros(1, 10, C41_DIM)
+    pred = gt.clone()
+    pred[0, 5, 7] = 100.0      # left_knee
+    pred[0, 5, 13] = 100.0     # neck
+    seq_mask = torch.ones(1, 10)
+    cs = _make_contact_state(1, 10, slice(4, 8), slice(20, 21))
+    loss = c41_contact_window_wrist_loss(gt, pred, seq_mask, cs, erode_half=0)
+    assert loss.item() == 0.0
+
+
+def test_r38_contact_wrist_only_active_frames():
+    """Error outside contact window should NOT contribute."""
+    gt = torch.zeros(1, 10, C41_DIM)
+    pred = gt.clone()
+    pred[0, 0, 0] = 1.0        # frame 0 - no contact
+    pred[0, 9, 0] = 1.0        # frame 9 - no contact
+    seq_mask = torch.ones(1, 10)
+    cs = _make_contact_state(1, 10, slice(4, 8), slice(20, 21))
+    loss = c41_contact_window_wrist_loss(gt, pred, seq_mask, cs, erode_half=0)
+    assert loss.item() == 0.0
+
+
+def test_r38_contact_wrist_erosion_shrinks_contact_window():
+    """With erode_half=1, the contact frames at the edges are excluded."""
+    gt = torch.zeros(1, 10, C41_DIM)
+    pred = gt.clone()
+    # Inject 1 cm on the edge frame of the L_hand contact (4 and 7).
+    pred[0, 4, 0] = 1.0
+    pred[0, 7, 0] = 1.0
+    seq_mask = torch.ones(1, 10)
+    cs = _make_contact_state(1, 10, slice(4, 8), slice(20, 21))
+    # erode_half=1 removes the edge frames 4 and 7 from the mask.
+    # Interior frames 5 and 6 have pred=gt=0 → loss=0.
+    loss = c41_contact_window_wrist_loss(gt, pred, seq_mask, cs, erode_half=1)
+    assert loss.item() == 0.0
+    # Without erosion, the edge errors DO contribute.
+    loss_no_erode = c41_contact_window_wrist_loss(
+        gt, pred, seq_mask, cs, erode_half=0,
+    )
+    assert loss_no_erode.item() > 0
+
+
+def test_r38_contact_wrist_safe_zero_on_no_contact():
+    """All-zero contact_state must return a gradient-safe zero (not NaN
+    or KeyError)."""
+    pred = torch.randn(1, 10, C41_DIM, requires_grad=True)
+    gt = torch.zeros(1, 10, C41_DIM)
+    seq_mask = torch.ones(1, 10)
+    cs = torch.zeros(1, 10, 5)
+    loss = c41_contact_window_wrist_loss(pred, gt, seq_mask, cs)
+    assert loss.item() == 0.0
+    loss.backward()
+    assert pred.grad is not None
+
+
+def test_r38_contact_wrist_seq_mask_excludes_padded_frames():
+    """A padded frame even if contact_state says contact should NOT
+    contribute (seq_mask wins)."""
+    gt = torch.zeros(1, 10, C41_DIM)
+    pred = gt.clone()
+    pred[0, 8, 0] = 1.0        # would be a contact frame, but padded
+    seq_mask = torch.ones(1, 10)
+    seq_mask[0, 8:] = 0.0
+    cs = _make_contact_state(1, 10, slice(7, 10), slice(20, 21))
+    loss = c41_contact_window_wrist_loss(gt, pred, seq_mask, cs, erode_half=0)
+    # Frame 7 has contact and is valid; pred=gt=0 there. Frames 8, 9 are
+    # padded (seq_mask=0) so even though contact_state says contact,
+    # they are excluded. Loss = 0.
+    assert loss.item() == 0.0
+
+
+def test_r38_contact_wrist_per_sample_loss_weighting_b():
+    """The optional min-SNR weight should scale the per-frame loss
+    consistently."""
+    gt = torch.zeros(2, 10, C41_DIM)
+    pred = gt.clone()
+    pred[0, 5, 0] = 0.01       # batch 0 has an error
+    seq_mask = torch.ones(2, 10)
+    cs = _make_contact_state(2, 10, slice(5, 6), slice(20, 21))
+    # Unweighted: both batches use weight 1.
+    loss_uniform = c41_contact_window_wrist_loss(
+        gt, pred, seq_mask, cs, erode_half=0,
+    )
+    # Weighted with w=(2, 1): batch 0's contribution is doubled.
+    w_b = torch.tensor([2.0, 1.0])
+    loss_weighted = c41_contact_window_wrist_loss(
+        gt, pred, seq_mask, cs, erode_half=0,
+        per_sample_loss_weighting_b=w_b,
+    )
+    # Batch 1 has no error → contributes 0. Loss is just batch 0's
+    # contribution divided by total active frames.
+    # The denom (sum of mask) is the SAME in both cases (the mask
+    # doesn't see w_b), so loss_weighted = 2 * loss_uniform.
+    assert loss_weighted.item() == pytest.approx(
+        2 * loss_uniform.item(), rel=1e-5,
+    )
+
+
+def test_r38_contact_wrist_shape_check_pred_gt():
+    bad = torch.randn(1, 10, 17)   # wrong last dim
+    ok = torch.randn(1, 10, C41_DIM)
+    seq_mask = torch.ones(1, 10)
+    cs = torch.zeros(1, 10, 5)
+    with pytest.raises(ValueError):
+        c41_contact_window_wrist_loss(bad, ok, seq_mask, cs)
+
+
+def test_r38_contact_wrist_shape_check_contact_state():
+    c41 = torch.randn(1, 10, C41_DIM)
+    seq_mask = torch.ones(1, 10)
+    bad_cs = torch.zeros(1, 10, 3)
+    with pytest.raises(ValueError):
+        c41_contact_window_wrist_loss(c41, c41, seq_mask, bad_cs)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R38: Stage-1.5 denoiser init_pose injection (integration)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_r38_stage1p5_denoiser_init_pose_forward():
+    """End-to-end: enabling init_pose_dim=135 changes the forward output
+    deterministically, but starts identical at init (zero-init Linear)."""
+    from piano.models.stage1p5_interaction import (
+        Stage1p5Denoiser, Stage1p5DenoiserConfig,
+    )
+
+    torch.manual_seed(0)
+    base_cfg = Stage1p5DenoiserConfig(
+        d_model=64, n_layers=2, n_heads=2, ff_mult=2, dropout=0.0,
+        max_seq_length=32, object_num_tokens=4, object_token_dim=32,
+        text_dim=0,                     # disable text path
+        use_text=False,
+    )
+    init_cfg = Stage1p5DenoiserConfig(
+        d_model=64, n_layers=2, n_heads=2, ff_mult=2, dropout=0.0,
+        max_seq_length=32, object_num_tokens=4, object_token_dim=32,
+        text_dim=0, use_text=False,
+        init_pose_dim=135,
+    )
+
+    torch.manual_seed(123)
+    base = Stage1p5Denoiser(base_cfg)
+    torch.manual_seed(123)
+    init = Stage1p5Denoiser(init_cfg)
+
+    # Same RNG state was used for both; the only difference is the
+    # init_pose Linear which is zero-init. Confirm step-0 output equality.
+    B, T = 2, 8
+    x_t = torch.randn(B, T, base_cfg.motion_dim)
+    t = torch.randint(0, 1000, (B,))
+    cond_base = {
+        "object_world_traj": torch.randn(B, T, 9),
+        "object_tokens": torch.randn(B, 4, 32),
+        "stage1_coarse": torch.randn(B, T, 23),
+    }
+    cond_init = dict(cond_base)
+    cond_init["init_pose"] = torch.randn(B, 135)
+
+    with torch.no_grad():
+        out_base = base(x_t, t, cond_base, cond_drop_mask=None)
+        out_init = init(x_t, t, cond_init, cond_drop_mask=None)
+
+    assert out_base.shape == (B, T, base_cfg.motion_dim)
+    assert out_init.shape == out_base.shape
+    # init_pose_proj is zero-init → adds 0 → outputs should match.
+    diff = (out_base - out_init).abs().max().item()
+    assert diff < 1e-5, (
+        f"Zero-init init_pose_proj should not change step-0 output; "
+        f"max diff = {diff:.2e}"
+    )
+
+
+def test_r38_stage1p5_denoiser_init_pose_missing_raises():
+    """When init_pose_dim>0 but cond['init_pose'] is missing, forward
+    must raise (clear error vs silent bug)."""
+    from piano.models.stage1p5_interaction import (
+        Stage1p5Denoiser, Stage1p5DenoiserConfig,
+    )
+
+    cfg = Stage1p5DenoiserConfig(
+        d_model=64, n_layers=2, n_heads=2, ff_mult=2, dropout=0.0,
+        max_seq_length=32, object_num_tokens=4, object_token_dim=32,
+        text_dim=0, use_text=False,
+        init_pose_dim=135,
+    )
+    model = Stage1p5Denoiser(cfg)
+
+    B, T = 2, 8
+    x_t = torch.randn(B, T, cfg.motion_dim)
+    t = torch.randint(0, 1000, (B,))
+    cond = {
+        "object_world_traj": torch.randn(B, T, 9),
+        "object_tokens": torch.randn(B, 4, 32),
+        "stage1_coarse": torch.randn(B, T, 23),
+        # NO init_pose — should raise.
+    }
+    with pytest.raises(KeyError):
+        model(x_t, t, cond, cond_drop_mask=None)

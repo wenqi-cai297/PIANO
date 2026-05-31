@@ -673,6 +673,128 @@ def build_r37_group_masks(
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# R38 — contact-window weighted wrist value MSE
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Design provenance:
+#   - PB1 uses ``anchor_joint_vel_weight=2.0`` + ``anchor_joint_pos_weight``
+#     to supervise wrist xyz on contact-active frames only (see
+#     train_anchordiff.py:565-574 / 559-564). PB1 cond does NOT include
+#     ``contact_state``; contact awareness comes purely from this
+#     supervision pattern.
+#   - We replicate the pattern on Stage-1.5 C41 wrist channels. C41 wrist
+#     is pelvis-local Δxyz (not world xyz like PB1), so this is value-domain
+#     supervision: rewards low MSE between predicted and GT C41 wrist on
+#     the frames where the hand is in contact.
+#   - This is value supervision, NOT dynamics (no finite differences).
+#     R37 tried dynamics on C41 and the entangled (wrist motion +
+#     pelvis-frame rotation) supervision drove the model into a sub-space
+#     PB1 could not consume → drift_max 86 cm. R38's contact-window
+#     value supervision avoids that failure mode by keeping the
+#     supervision target the same as mse_c41 (just up-weighted).
+#
+# Inference-time accessibility:
+#   ``contact_state`` is NOT a model cond — it is purely a supervision
+#   signal at train time. At inference, the model has already learned
+#   "wrist locks during contact" from training, and uses object_world_traj
+#   + object_tokens + text + stage1_coarse + (R38) init_pose to decide
+#   when contact is happening. This mirrors PB1's design — contact_state
+#   never enters PB1's cond either.
+
+
+def c41_contact_window_wrist_loss(
+    c41_pred: Tensor,                      # (B, T, 18)
+    c41_gt: Tensor,                        # (B, T, 18)
+    seq_mask: Tensor,                      # (B, T) {0, 1}
+    contact_state: Tensor,                 # (B, T, 5) {0, 1} or soft
+    *,
+    contact_threshold: float = 0.5,
+    erode_half: int = 1,
+    per_sample_loss_weighting_b: Tensor | None = None,
+) -> Tensor:
+    """R38 — value-domain wrist MSE on contact-active frames only.
+
+    Loss:
+        L = mean_over_(b, t in contact)
+            sum_(c in wrist_channels) (c41_pred[b, t, c] - c41_gt[b, t, c])^2
+
+    where the contact mask is
+        contact_active[b, t] = (contact_state[b, t, L_hand] >= thr
+                              OR contact_state[b, t, R_hand] >= thr)
+                              AND seq_mask[b, t]
+    eroded by ``erode_half`` frames on each side. Erosion excludes
+    contact-transition frames where the hand is mid-grasp / mid-release.
+
+    Reduction matches ``mse_c41``'s structure (sum over channels per
+    frame, then masked mean over valid (b, t) tuples) so the value enters
+    the total loss at the same scale as mse_c41 itself. The cfg weight
+    ``w_r38_contact_wrist`` multiplies this term to control its share of
+    the gradient budget.
+
+    ``per_sample_loss_weighting_b`` is the optional (B,) min-SNR-γ weight
+    used by the main mse_c41 path; if supplied we apply it consistently so
+    contact-window MSE and mse_c41 stay scale-comparable at the same
+    diffusion timestep.
+
+    Returns
+    -------
+    Scalar tensor. Returns gradient-safe zero when no frame qualifies
+    (e.g. all clips have zero hand-contact, which happens for "no
+    object grasp" clips).
+    """
+    if c41_pred.shape != c41_gt.shape:
+        raise ValueError(
+            f"shape mismatch: pred {c41_pred.shape} vs gt {c41_gt.shape}"
+        )
+    if c41_pred.ndim != 3 or c41_pred.shape[-1] != C41_DIM:
+        raise ValueError(f"expected (B, T, {C41_DIM}), got {c41_pred.shape}")
+    B, T, _ = c41_pred.shape
+    if seq_mask.shape != (B, T):
+        raise ValueError(
+            f"seq_mask shape {tuple(seq_mask.shape)} != (B, T) = {(B, T)}"
+        )
+    if contact_state.shape != (B, T, 5):
+        raise ValueError(
+            f"contact_state shape {tuple(contact_state.shape)} != "
+            f"(B, T, 5) = {(B, T, 5)}"
+        )
+
+    # Hand contact mask = L_hand OR R_hand (channels 0 + 1).
+    lh = (contact_state[..., 0] >= contact_threshold).float()
+    rh = (contact_state[..., 1] >= contact_threshold).float()
+    hand_raw = ((lh + rh) > 0).float() * seq_mask.float()           # (B, T)
+    # Erode by ``erode_half`` frames on each side. Identical pattern to
+    # ``_erode_mask_1d``: AND the original mask with its left/right
+    # shifts by k for k=1..erode_half. Padding at sequence boundaries
+    # is treated as 0.
+    hand = hand_raw
+    if erode_half > 0:
+        for shift in range(1, int(erode_half) + 1):
+            left = torch.roll(hand_raw, shifts=-shift, dims=-1)
+            right = torch.roll(hand_raw, shifts=shift, dims=-1)
+            left[..., -shift:] = 0
+            right[..., :shift] = 0
+            hand = hand * left * right
+    if hand.sum() < 1.0:
+        return c41_pred.sum() * 0.0
+
+    wrist_pred = c41_pred[..., R37_C41_WRIST_SLICE]                # (B, T, 6)
+    wrist_gt = c41_gt[..., R37_C41_WRIST_SLICE]
+    per_frame_sq = (wrist_pred - wrist_gt).pow(2).sum(-1)           # (B, T)
+    if per_sample_loss_weighting_b is not None:
+        if per_sample_loss_weighting_b.shape[0] != B:
+            raise ValueError(
+                f"per_sample_loss_weighting_b shape {tuple(per_sample_loss_weighting_b.shape)} "
+                f"does not start with B={B}"
+            )
+        # Broadcast (B,) or (B, 1) → (B, T) and multiply.
+        w_b = per_sample_loss_weighting_b.view(B, 1).to(per_frame_sq.dtype)
+        per_frame_sq = per_frame_sq * w_b
+    denom = hand.sum().clamp_min(1.0)
+    return (per_frame_sq * hand).sum() / denom
+
+
 # Convenience re-export for the trainer
 # ──────────────────────────────────────────────────────────────────────────
 
