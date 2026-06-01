@@ -1011,6 +1011,16 @@ _R40_DEFAULT_COMPONENT_WEIGHTS: dict[str, float] = {
     "smoothness": 0.05,
 }
 
+# bf16-safe epsilon for ``sqrt(x + _SQRT_EPS)``. The gradient of sqrt at
+# x is 1/(2*sqrt(x)), so at x=eps it equals 1/(2*sqrt(eps)). With eps=1e-6
+# the per-element grad floor is 500 (vs 5e5 for 1e-12) — orders of
+# magnitude safer in bf16, which only has ~3 decimal digits of mantissa
+# precision. C3's step-50 NaN cascade in R40 came from sqrt(clamp_min(1e-12))
+# back-propagating undefined gradients through degenerate inputs (e.g.
+# pred velocity ≈ 0 on a frozen-root mode-collapse step), so every value-
+# domain sqrt in the plan-invariant loss uses this floor.
+_SQRT_EPS: float = 1e-6
+
 
 def _masked_mean_std(
     x: Tensor, mask_btc: Tensor,
@@ -1033,7 +1043,11 @@ def _masked_mean_std(
     mean = x_sum / w_sum
     centered = (x - mean.unsqueeze(-1)) * mask_btc             # (B, T)
     var = (centered.pow(2)).sum(dim=-1) / w_sum                # (B,)
-    std = var.clamp_min(0.0).sqrt()                            # (B,)
+    # bf16-safe: clamping at 0 then sqrt leaves the gradient as 1/(2*0)
+    # = inf at degenerate (constant) inputs. Adding _SQRT_EPS floors the
+    # backward grad at ~500 instead, which bf16 can represent without
+    # overflow.
+    std = (var.clamp_min(0.0) + _SQRT_EPS).sqrt()              # (B,)
     return mean, std
 
 
@@ -1169,10 +1183,10 @@ def stage1_plan_invariant_loss(
     if T >= 2 and weights["root_speed"] != 0:
         dx_p = rwx_pred[:, 1:] - rwx_pred[:, :-1]
         dz_p = rwz_pred[:, 1:] - rwz_pred[:, :-1]
-        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(1e-12).sqrt()
+        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         dx_g = rwx_gt[:, 1:] - rwx_gt[:, :-1]
         dz_g = rwz_gt[:, 1:] - rwz_gt[:, :-1]
-        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(1e-12).sqrt()
+        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         mean_p, std_p = _masked_mean_std(sp_p, pair_mask)
         mean_g, std_g = _masked_mean_std(sp_g, pair_mask)
         loss_rs = (
@@ -1185,10 +1199,10 @@ def stage1_plan_invariant_loss(
     if T >= 2 and weights["root_arc"] != 0:
         dx_p = rwx_pred[:, 1:] - rwx_pred[:, :-1]
         dz_p = rwz_pred[:, 1:] - rwz_pred[:, :-1]
-        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(1e-12).sqrt()
+        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         dx_g = rwx_gt[:, 1:] - rwx_gt[:, :-1]
         dz_g = rwz_gt[:, 1:] - rwz_gt[:, :-1]
-        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(1e-12).sqrt()
+        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         arc_p = (sp_p * pair_mask).sum(dim=-1)                   # (B,)
         arc_g = (sp_g * pair_mask).sum(dim=-1)
         components["root_arc"] = _sl1_mean(arc_p - arc_g.detach())
@@ -1203,21 +1217,21 @@ def stage1_plan_invariant_loss(
         d_pred = (
             (gathered_pred_x - t0_world_x.squeeze(-1)).pow(2)
             + (gathered_pred_z - t0_world_z.squeeze(-1)).pow(2)
-        ).clamp_min(1e-12).sqrt()
+        ).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         d_gt = (
             (gathered_gt_x - t0_world_x.squeeze(-1)).pow(2)
             + (gathered_gt_z - t0_world_z.squeeze(-1)).pow(2)
-        ).clamp_min(1e-12).sqrt()
+        ).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         components["root_displacement"] = _sl1_mean(d_pred - d_gt.detach())
 
     # ── (4) root_object_radial: distance-to-object profile stats ──
     if weights["root_object_radial"] != 0:
         dist_p = (
             (rwx_pred - obj_x).pow(2) + (rwz_pred - obj_z).pow(2)
-        ).clamp_min(1e-12).sqrt()                                # (B, T)
+        ).clamp_min(0.0).add(_SQRT_EPS).sqrt()                                # (B, T)
         dist_g = (
             (rwx_gt - obj_x).pow(2) + (rwz_gt - obj_z).pow(2)
-        ).clamp_min(1e-12).sqrt()
+        ).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         mean_p, std_p = _masked_mean_std(dist_p, seq_mask_f)
         mean_g, std_g = _masked_mean_std(dist_g, seq_mask_f)
         # Min: replace invalid frames with +inf so they don't dominate.
@@ -1288,10 +1302,10 @@ def stage1_plan_invariant_loss(
         pel_g = stage1_raw_gt[..., CH_PELVIS_ROT6D]
         sp_p = stage1_raw_pred[..., CH_SPINE3_ROT6D]
         sp_g = stage1_raw_gt[..., CH_SPINE3_ROT6D]
-        d_pel_p = (pel_p[:, 1:] - pel_p[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
-        d_pel_g = (pel_g[:, 1:] - pel_g[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
-        d_sp_p = (sp_p[:, 1:] - sp_p[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
-        d_sp_g = (sp_g[:, 1:] - sp_g[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+        d_pel_p = (pel_p[:, 1:] - pel_p[:, :-1]).pow(2).sum(-1).clamp_min(0.0).add(_SQRT_EPS).sqrt()
+        d_pel_g = (pel_g[:, 1:] - pel_g[:, :-1]).pow(2).sum(-1).clamp_min(0.0).add(_SQRT_EPS).sqrt()
+        d_sp_p = (sp_p[:, 1:] - sp_p[:, :-1]).pow(2).sum(-1).clamp_min(0.0).add(_SQRT_EPS).sqrt()
+        d_sp_g = (sp_g[:, 1:] - sp_g[:, :-1]).pow(2).sum(-1).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         m_pel_p, s_pel_p = _masked_mean_std(d_pel_p, pair_mask)
         m_pel_g, s_pel_g = _masked_mean_std(d_pel_g, pair_mask)
         m_sp_p, s_sp_p = _masked_mean_std(d_sp_p, pair_mask)
@@ -1340,7 +1354,7 @@ def stage1_plan_invariant_loss(
         vz = rwz_pred[:, 1:] - rwz_pred[:, :-1]
         ax = vx[:, 1:] - vx[:, :-1]                              # (B, T-2)
         az = vz[:, 1:] - vz[:, :-1]
-        acc_mag = (ax.pow(2) + az.pow(2)).clamp_min(1e-12).sqrt()
+        acc_mag = (ax.pow(2) + az.pow(2)).clamp_min(0.0).add(_SQRT_EPS).sqrt()
         yaw_p = torch.atan2(stage1_raw_pred[..., CH_YAW_SIN],
                             stage1_raw_pred[..., CH_YAW_COS])
         d_yaw = yaw_p[:, 1:] - yaw_p[:, :-1]

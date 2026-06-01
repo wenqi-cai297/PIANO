@@ -1313,3 +1313,49 @@ def test_plan_invariant_unknown_component_raises():
             seq_mask=mask.float(),
             component_weights={"not_a_real_component": 1.0},
         )
+
+
+def test_plan_invariant_finite_grad_on_frozen_root_degenerate_batch():
+    """Regression test for the R40 C3 step-50 NaN cascade.
+
+    A frozen-root prediction has ``vx = vz = 0`` at every pair, so
+    ``(dx_p.pow(2) + dz_p.pow(2)) = 0`` exactly. The pre-hotfix
+    ``clamp_min(1e-12).sqrt()`` then back-propagates a 5e5-magnitude
+    gradient that overflows bf16, cascading to NaN for every loss term
+    that touches the trainable parameters. The hotfix replaces it with
+    ``(x.clamp_min(0) + 1e-6).sqrt()`` whose backward gradient is
+    bounded at ~500.
+
+    This test reproduces the degenerate input on float32 (which has
+    enough range to expose the bug without bf16) and asserts grads
+    are finite. Also exercises the constant-rot6d degenerate case
+    that hits rot_activity.
+    """
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+
+    B, T = 2, 8
+    # pred = pure constant (frozen root, frozen yaw, frozen rot6d, etc.)
+    raw_pred = torch.zeros(B, T, 23, dtype=torch.float32, requires_grad=True)
+    # gt = a real moving clip so the components are nonzero on the GT side.
+    raw_gt, obj, t0, mask = _build_simple_plan_inputs(
+        B=B, T=T, speed=0.05, yaw_rate=0.05,
+    )
+
+    total, comps = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw_pred,
+        stage1_raw_gt=raw_gt.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    assert torch.isfinite(total), f"total loss is NaN/Inf: {total.item()}"
+    for name, val in comps.items():
+        assert torch.isfinite(val), \
+            f"component {name} is NaN/Inf: {val.item()}"
+
+    total.backward()
+    assert raw_pred.grad is not None
+    assert torch.isfinite(raw_pred.grad).all(), (
+        "gradient contains NaN/Inf on frozen-root degenerate batch — "
+        "the R40 C3 step-50 NaN cascade can recur"
+    )

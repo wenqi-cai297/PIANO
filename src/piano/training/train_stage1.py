@@ -608,6 +608,48 @@ def build_stage1_step_fn(
             + w_r40_plan_invariant * r40_plan
         )
 
+        # R40 hotfix — NaN/Inf guard. If any per-component loss is
+        # non-finite, identify the FIRST offender and replace the total
+        # loss with a zero-grad sentinel for this step so the optimizer
+        # skips it instead of poisoning every parameter with NaN.
+        # (C3 step-50 NaN, 2026-06-01 — the original log showed every
+        # component nan simultaneously, which is the cascade signature
+        # of a single upstream NaN propagating. Without this guard the
+        # next NaN is unfindable from training output.)
+        _components_for_check = (
+            ("mse_x0", mse_x0),
+            ("vel_mse", vel_mse),
+            ("yaw_smooth", yaw_sm),
+            ("rot6d_ortho", ortho_loss),
+            ("fk_pos", fk_pos),
+            ("height_fk", height_fk),
+            ("self_consistency", self_cons),
+            ("moment_match", moment_match),
+            ("yaw_aggregate", yaw_agg),
+            ("fk_pos_cm", fk_pos_cm),
+            ("wrist_fk", wrist_fk),
+            ("init_pose_consistency", init_pose_cons),
+            ("r36_raw_velocity", r36_raw_vel),
+            ("r36_raw_acceleration", r36_raw_acc),
+            ("r40_plan_invariant", r40_plan),
+        )
+        first_bad: str | None = None
+        for _name, _val in _components_for_check:
+            if not torch.isfinite(_val).all():
+                first_bad = _name
+                break
+        if first_bad is not None:
+            print(
+                f"[stage1 step {global_step}] NaN/Inf detected — first bad "
+                f"component: {first_bad}. Replacing loss with zero-grad "
+                f"sentinel so this step is skipped by the optimizer."
+            )
+            # Zero-grad sentinel: detach the toxic loss and replace with
+            # 0 * sum(x0_pred), which has a valid gradient path (= 0) so
+            # backward() succeeds and the optimizer step is effectively
+            # a no-op.
+            loss = (x0_pred.sum() * 0.0)
+
         result: dict[str, Tensor] = {
             "loss": loss,
             "mse_x0": mse_x0.detach(),
