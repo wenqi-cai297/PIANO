@@ -7,9 +7,8 @@
 #
 # Pre-launch calibration is its own standalone script (run it first):
 #   # First-round NUDGE PROBE (Codex r41_calibration_next_steps 2026-06-02):
-#   python scripts/stage_a_generator/round41_cascade_calibration.py \\
-#       --target-min 0.2 --target-max 0.5 --target-center 0.3 \\
-#       --max-w-total 5.0
+#   # Defaults: target_center=0.3, band [0.2, 0.5], cap 5.0, N=5 batches.
+#   python scripts/stage_a_generator/round41_cascade_calibration.py
 #   python scripts/stage_a_generator/round41_apply_calibration.py \\
 #       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply
 #   # Re-run calibration to confirm all cells are in-band (or capped).
@@ -18,6 +17,12 @@
 # Do NOT use target_center=1.0 for the first formal R41 run: step-0
 # parity can drift large mid-training (R36/R37/R40 history). Start at
 # 0.3, raise on evidence.
+#
+# Why N=5 batches by default: single-batch ratio estimates were observed
+# to swing 4-8× between consecutive runs on 2026-06-02 (A4 jumped
+# 0.122 → 1.258), making the calibration recommendation unreliable
+# under that level of noise. Geometric mean over 5 batches keeps
+# log-ratio stdev typically < 0.3 (factor 1.35× spread).
 #
 # Pass --with-inline-calibration to re-enable a per-cell smoke check
 # inside the launcher (legacy mode; not recommended — its log parsing
@@ -191,11 +196,10 @@ fi
 log
 log "===== R41 cascade matrix launch ${STAMP} ====="
 log "*** R36/R37 GUARDRAIL: standalone calibration phase ***"
-log "If you haven't run the standalone calibration yet (recommended first-round nudge probe):"
-log "   python scripts/stage_a_generator/round41_cascade_calibration.py \\"
-log "       --target-min 0.2 --target-max 0.5 --target-center 0.3 --max-w-total 5.0"
+log "If you haven't run the standalone calibration yet (nudge probe defaults: center=0.3, N=5 batches):"
+log "   python scripts/stage_a_generator/round41_cascade_calibration.py"
 log "   python scripts/stage_a_generator/round41_apply_calibration.py \\"
-log "       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply"
+log "       --calibration \$(ls -t analyses/round41_cascade_calibration/*.json | head -1) --apply"
 log "Then re-run this launcher. Inline calibration is off by default."
 log
 log "DATASETS_ROOT=${DATASETS_ROOT}"
@@ -277,8 +281,7 @@ print(json.dumps(out))
             # disabled; only warn on enabled cascade cells.
             if awk -v w="${CFG_W_TOTAL}" 'BEGIN {exit !(w == 1.0)}'; then
                 log "[audit] WARN ${VID} cascade.w_total == 1.0 (default). Did you run"
-                log "[audit]      round41_cascade_calibration.py --target-center 0.3 --max-w-total 5.0"
-                log "[audit]      + round41_apply_calibration.py --apply ?"
+                log "[audit]      round41_cascade_calibration.py + round41_apply_calibration.py --apply ?"
                 log "[audit]      Training will proceed but step-0 grad ratio is uncalibrated."
             fi
         else

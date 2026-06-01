@@ -129,6 +129,7 @@ def _run_p0_calibration(
     out_dir: Path,
     bucket: str = "val",
     batch_size: int = 16,
+    n_calibration_batches: int = 5,
 ) -> tuple[int, dict[str, Any], str]:
     """Invoke ``round41_stage1_cascade_p0_diag.py --calibration-only`` for
     one cfg, then read the resulting p0_stats.json.
@@ -161,6 +162,7 @@ def _run_p0_calibration(
         "--out-dir", str(cell_dir),
         "--bucket", bucket,
         "--batch-size", str(int(batch_size)),
+        "--n-calibration-batches", str(int(n_calibration_batches)),
         "--calibration-only",
     ]
     print(f"[calib] running: {' '.join(cmd)}")
@@ -214,6 +216,9 @@ def _extract_calibration_metrics(p0_stats: dict[str, Any]) -> dict[str, Any]:
         "recommended_w_total_for_ratio_1"
     )
     out["cascade_weights_at_probe"] = c10.get("cascade_weights", {})
+    out["per_batch_ratios"] = c10.get("per_batch_ratios", [])
+    out["log_ratio_std"] = c10.get("log_ratio_std")
+    out["n_batches"] = c10.get("n_batches", 1)
     return out
 
 
@@ -305,6 +310,7 @@ def _write_summary_md(
     target_min: float, target_max: float, target_center: float,
     abort_ratio: float,
     max_w_total: float | None = None,
+    n_calibration_batches: int = 1,
 ) -> None:
     cap_line = (
         f"- max w_total cap: {max_w_total}"
@@ -319,6 +325,8 @@ def _write_summary_md(
         f"(center {target_center})",
         f"- abort threshold: actual grad ratio > {abort_ratio}",
         cap_line,
+        f"- batches averaged per cell: {n_calibration_batches} "
+        f"(geometric mean of cascade/self grad-norm ratios)",
         "- Recommendation is based on the **actual cascade gradient ratio** "
         "(grad_norm(weighted cascade)/grad_norm(self loss)), measured by "
         "round41_stage1_cascade_p0_diag.py --calibration-only.",
@@ -382,9 +390,24 @@ def _write_summary_md(
                     f"{r.get('grad_norm_actual_cascade_weighted', '?'):.4e}"
                 )
                 lines.append(
-                    f"- **actual grad ratio**: "
+                    f"- **actual grad ratio (geom mean over N batches)**: "
                     f"{r.get('ratio_actual_cascade_over_self', '?'):.4f}"
                 )
+                lines.append(
+                    f"- N batches averaged: {r.get('n_batches', 1)}"
+                )
+                per_batch = r.get("per_batch_ratios") or []
+                if per_batch:
+                    lines.append(
+                        f"- per-batch ratios: "
+                        f"[{', '.join(f'{x:.3f}' for x in per_batch)}]"
+                    )
+                lrs = r.get("log_ratio_std")
+                if lrs is not None:
+                    lines.append(
+                        f"- log-ratio stdev: {lrs:.3f}  "
+                        f"(spread factor exp(stdev) ≈ {2.718281828 ** lrs:.2f}×)"
+                    )
                 lines.append(
                     f"- cascade_weighted_value (loss, informational): "
                     f"{r.get('cascade_weighted_value', '?')}"
@@ -501,6 +524,14 @@ def main() -> int:
         help="Batch size for the calibration smoke (default 16 fits single "
              "GPU; gradient ratio is bs-invariant).",
     )
+    ap.add_argument(
+        "--n-calibration-batches", type=int, default=5,
+        help="Forwarded to P0 --n-calibration-batches. Each cell's "
+             "ratio is the geometric mean over N independent val "
+             "batches. Default 5 (single-batch estimates swung 4-8× "
+             "between consecutive runs on 2026-06-02). Set to 1 for "
+             "the legacy single-batch behavior.",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +595,7 @@ def main() -> int:
             out_dir=args.out_dir,
             bucket=args.bucket,
             batch_size=int(args.batch_size),
+            n_calibration_batches=int(args.n_calibration_batches),
         )
         metrics = _extract_calibration_metrics(p0_stats)
         row = {
@@ -611,6 +643,7 @@ def main() -> int:
             "target_center": args.target_center,
             "abort_ratio": args.abort_ratio,
             "max_w_total": max_w_total,
+            "n_calibration_batches": int(args.n_calibration_batches),
             "rows": rows,
         }, indent=2),
         encoding="utf-8",
@@ -620,6 +653,7 @@ def main() -> int:
         target_min=args.target_min, target_max=args.target_max,
         target_center=args.target_center, abort_ratio=args.abort_ratio,
         max_w_total=max_w_total,
+        n_calibration_batches=int(args.n_calibration_batches),
     )
     print(f"[calib] wrote {out_md}")
     print(f"[calib] wrote {out_json}")

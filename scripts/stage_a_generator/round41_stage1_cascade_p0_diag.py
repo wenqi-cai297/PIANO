@@ -781,7 +781,7 @@ def _compute_actual_cascade_loss(
 
 
 def check_10_grad_scale_actual_stack(
-    *, fwd_args: dict, batch: dict, stage1: Stage1Denoiser,
+    *, fwd_args: dict, batches: list[dict], stage1: Stage1Denoiser,
     stage1_encoder: ObjectEncoder, pb1: MotionAnchorDiff,
     pb1_encoder: ObjectEncoder,
     cascade_weights: dict[str, float],
@@ -795,12 +795,28 @@ def check_10_grad_scale_actual_stack(
     weights and w_total), backprops it, and reports the resulting
     Stage-1 grad norm vs Stage-1 self loss grad norm.
 
+    Accepts N batches. Each batch produces one ``(self_norm,
+    cascade_norm, ratio)`` triple; the headline ``ratio_actual_
+    cascade_over_self`` is the **geometric mean** across the N batches
+    (ratios live on log scale: a ratio of 2 and 0.5 should average to
+    1, not 1.25). The standard deviation of log-ratios is reported
+    alongside so the calibration driver can flag high-variance cells.
+
+    Single batch (``len(batches)==1``) keeps the legacy behavior: one
+    measurement reported as-is.
+
     This is what calibration should use to recommend w_total: loss
     ratio is a misleading proxy when PB1's Jacobian is in the chain
-    (Codex code-review blocker §2).
+    (Codex code-review blocker §2). Single-batch ratios were observed
+    to swing by ~4-8× between consecutive calibration runs in the
+    2026-06-02 server probes (A4 jumped 0.122 → 1.258 across two
+    consecutive single-batch runs), so averaging over N ≥ 5 batches
+    is the recommended default to keep ratio noise below the band's
+    width.
     """
     out: dict[str, Any] = {"name": "grad_scale_actual_stack"}
     out["cascade_weights"] = dict(cascade_weights)
+    out["n_batches"] = int(len(batches))
 
     # Defensive guard for control cells (A0-style: cascade disabled or
     # all component weights zero). Backward on a zero-weight stack would
@@ -820,43 +836,96 @@ def check_10_grad_scale_actual_stack(
         out["grad_norm_stage1_self"] = None
         out["grad_norm_actual_cascade_weighted"] = 0.0
         out["ratio_actual_cascade_over_self"] = None
+        out["per_batch_ratios"] = []
+        out["log_ratio_std"] = None
         out["component_loss_values"] = {}
         out["cascade_weighted_value"] = 0.0
         out["recommended_w_total_for_ratio_1"] = w_total_now
         out["pass"] = True
         return out
 
-    # 1) self loss only.
-    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
-    r1 = _cascade_forward(**{**fwd_args, "batch": batch})
-    r1["stage1_self_loss"].backward()
-    self_norm = _grad_norm(stage1)
+    per_batch_self: list[float] = []
+    per_batch_cascade: list[float] = []
+    per_batch_ratio: list[float] = []
+    per_batch_components: list[dict[str, float]] = []
+    per_batch_cascade_value: list[float] = []
+
+    for batch in batches:
+        # 1) self loss only.
+        _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+        r1 = _cascade_forward(**{**fwd_args, "batch": batch})
+        r1["stage1_self_loss"].backward()
+        self_norm_i = _grad_norm(stage1)
+
+        # 2) actual weighted cascade stack only.
+        _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+        r2 = _cascade_forward(**{**fwd_args, "batch": batch})
+        cascade_weighted, components = _compute_actual_cascade_loss(
+            fwd_result=r2, batch=batch, device=fwd_args["device"],
+            cascade_weights=cascade_weights,
+            cascade_extras=cascade_extras,
+            pb1=pb1,
+        )
+        cascade_value_i = float(cascade_weighted.item())
+        if cascade_weighted.requires_grad:
+            cascade_weighted.backward()
+        casc_norm_i = _grad_norm(stage1)
+        _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+
+        ratio_i = (
+            casc_norm_i / self_norm_i if self_norm_i > 0 else float("inf")
+        )
+        per_batch_self.append(self_norm_i)
+        per_batch_cascade.append(casc_norm_i)
+        per_batch_ratio.append(ratio_i)
+        per_batch_components.append(components)
+        per_batch_cascade_value.append(cascade_value_i)
+
+    # Geometric mean of ratios (ratios are log-scale; arithmetic mean
+    # would over-weight large outliers like the A4 1.258 spike).
+    finite_pos = [
+        r for r in per_batch_ratio if r > 0 and float("inf") != r
+    ]
+    if finite_pos:
+        import math
+        log_ratios = [math.log(r) for r in finite_pos]
+        mean_log = sum(log_ratios) / len(log_ratios)
+        ratio_geom = math.exp(mean_log)
+        if len(log_ratios) >= 2:
+            var = sum((lr - mean_log) ** 2 for lr in log_ratios) / (
+                len(log_ratios) - 1
+            )
+            log_ratio_std = math.sqrt(var)
+        else:
+            log_ratio_std = None
+    else:
+        ratio_geom = float("inf")
+        log_ratio_std = None
+
+    # Headline numbers — average across batches so the report stays
+    # legible.
+    self_norm = sum(per_batch_self) / len(per_batch_self)
+    casc_norm = sum(per_batch_cascade) / len(per_batch_cascade)
+
     out["grad_norm_stage1_self"] = self_norm
-
-    # 2) actual weighted cascade stack only.
-    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
-    r2 = _cascade_forward(**{**fwd_args, "batch": batch})
-    cascade_weighted, components = _compute_actual_cascade_loss(
-        fwd_result=r2, batch=batch, device=fwd_args["device"],
-        cascade_weights=cascade_weights,
-        cascade_extras=cascade_extras,
-        pb1=pb1,
-    )
-    out["component_loss_values"] = components
-    out["cascade_weighted_value"] = float(cascade_weighted.item())
-    if cascade_weighted.requires_grad:
-        cascade_weighted.backward()
-    casc_norm = _grad_norm(stage1)
     out["grad_norm_actual_cascade_weighted"] = casc_norm
-    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+    out["ratio_actual_cascade_over_self"] = ratio_geom
+    out["per_batch_ratios"] = per_batch_ratio
+    out["log_ratio_std"] = log_ratio_std
+    # Keep the legacy single-batch fields populated for backward
+    # compatibility with downstream report writers.
+    out["component_loss_values"] = (
+        per_batch_components[0] if per_batch_components else {}
+    )
+    out["cascade_weighted_value"] = (
+        per_batch_cascade_value[0] if per_batch_cascade_value else 0.0
+    )
 
-    ratio = casc_norm / self_norm if self_norm > 0 else float("inf")
-    out["ratio_actual_cascade_over_self"] = ratio
     # Linear recommendation: scale w_total so ratio = 1.0.
     current_w_total = float(cascade_weights.get("w_total", 1.0))
-    if ratio > 0:
+    if ratio_geom > 0 and ratio_geom != float("inf"):
         out["recommended_w_total_for_ratio_1"] = (
-            current_w_total * 1.0 / ratio
+            current_w_total * 1.0 / ratio_geom
         )
     else:
         out["recommended_w_total_for_ratio_1"] = current_w_total
@@ -1264,6 +1333,19 @@ def main() -> int:
             "grad), 7 (t-bucket), 8 (distribution alignment), 9 (memory)."
         ),
     )
+    ap.add_argument(
+        "--n-calibration-batches", type=int, default=5,
+        help=(
+            "How many independent val-bucket batches check 10 should "
+            "average grad ratio over. Single-batch estimates of the "
+            "cascade/self grad ratio were observed to swing 4-8× between "
+            "consecutive runs (A4 0.122 → 1.258 across two single-batch "
+            "calibrations on 2026-06-02), so the default is 5. The mean "
+            "is a geometric mean across batches (ratios live on log "
+            "scale) and the log-stdev is reported alongside. Set to 1 "
+            "for the legacy single-batch behavior."
+        ),
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1374,13 +1456,19 @@ def main() -> int:
     )
 
     # ─── Check 4: cascade forward (1 batch in calibration-only mode) ─
+    # Also accumulate the additional batches needed by check 10 below
+    # (when --n-calibration-batches > 1).
     sample_batches = [first_batch]
-    if not args.calibration_only:
-        for _ in range(2):
-            try:
-                sample_batches.append(next(loader_iter))
-            except StopIteration:
-                break
+    n_calib_batches = max(1, int(args.n_calibration_batches))
+    n_extra = max(
+        (0 if args.calibration_only else 2),  # check 4 wants ≥ 3 batches
+        n_calib_batches - 1,
+    )
+    for _ in range(n_extra):
+        try:
+            sample_batches.append(next(loader_iter))
+        except StopIteration:
+            break
     _record("cascade_forward", check_4_cascade_forward(
         fwd_args=base_fwd_args, batches=sample_batches,
     ))
@@ -1445,7 +1533,7 @@ def main() -> int:
             ),
         }
     _record("grad_scale_actual_stack", check_10_grad_scale_actual_stack(
-        fwd_args=base_fwd_args, batch=sample_batches[0],
+        fwd_args=base_fwd_args, batches=sample_batches[:n_calib_batches],
         stage1=stage1, stage1_encoder=stage1_encoder,
         pb1=pb1, pb1_encoder=pb1_encoder,
         cascade_weights=cascade_weights,
