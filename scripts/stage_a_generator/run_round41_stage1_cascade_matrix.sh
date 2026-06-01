@@ -5,10 +5,16 @@
 # from V8 V6 ckpt (drift_max 17.43 cm direct, 16.81 cm via cascade with
 # GT C41/S4) under frozen R29 PB1 ckpt.
 #
-# Per-cell calibration phase: smoke-test each cell, log cascade vs
-# stage1_self loss ratio. If ratio > 3.0, abort + warn (user must
-# manually scale cascade.w_total down). This guards against R36-style
-# scale-dominate disasters before any 40-epoch training starts.
+# Pre-launch calibration is its own standalone script (run it first):
+#   python scripts/stage_a_generator/round41_cascade_calibration.py
+#   python scripts/stage_a_generator/round41_apply_calibration.py \\
+#       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply
+#   (re-run calibration to confirm all cells are in-band)
+# Then this launcher trains + diags without re-running smoke checks.
+#
+# Pass --with-inline-calibration to re-enable a per-cell smoke check
+# inside the launcher (legacy mode; not recommended — its log parsing
+# is less robust than the standalone script).
 #
 # Usage:
 #   tmux new -s r41
@@ -35,7 +41,12 @@ ONLY=""
 DRY_RUN=0
 SKIP_TRAIN=0
 SKIP_DIAG=0
-SKIP_CALIBRATION="${ROUND41_SKIP_CALIBRATION:-0}"
+# Calibration is now a separate phase (round41_cascade_calibration.py).
+# Default is to skip in-band guard inside the launcher; user runs the
+# standalone calibration script first, applies it via
+# round41_apply_calibration.py, re-checks, then launches training.
+# Pass --with-inline-calibration to opt into the legacy in-band guard.
+INLINE_CALIBRATION="${ROUND41_INLINE_CALIBRATION:-0}"
 FORCE_RETRAIN=0
 FORCE_REDIAG=0
 ALLOW_PARTIAL="${ROUND41_ALLOW_PARTIAL:-0}"
@@ -44,15 +55,15 @@ ABORT_RATIO="${ROUND41_ABORT_IF_CASCADE_RATIO_OVER:-3.0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --only)              ONLY="$2"; shift 2 ;;
-        --dry-run)           DRY_RUN=1; shift ;;
-        --skip-train)        SKIP_TRAIN=1; shift ;;
-        --skip-diag)         SKIP_DIAG=1; shift ;;
-        --skip-calibration)  SKIP_CALIBRATION=1; shift ;;
-        --force-retrain)     FORCE_RETRAIN=1; shift ;;
-        --force-rediag)      FORCE_REDIAG=1; shift ;;
-        --buckets)           BUCKETS_STR="$2"; shift 2 ;;
-        -h|--help)           sed -n '1,40p' "$0"; exit 0 ;;
+        --only)                     ONLY="$2"; shift 2 ;;
+        --dry-run)                  DRY_RUN=1; shift ;;
+        --skip-train)               SKIP_TRAIN=1; shift ;;
+        --skip-diag)                SKIP_DIAG=1; shift ;;
+        --with-inline-calibration)  INLINE_CALIBRATION=1; shift ;;
+        --force-retrain)            FORCE_RETRAIN=1; shift ;;
+        --force-rediag)             FORCE_REDIAG=1; shift ;;
+        --buckets)                  BUCKETS_STR="$2"; shift 2 ;;
+        -h|--help)                  sed -n '1,40p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -151,8 +162,11 @@ while IFS=' ' read -r VID CFG OUTDIR; do
     [[ -z "${VID}" ]] && continue
     VARIANT_LOG="${OVERALL_LOG_DIR}/${VID}.log"
 
-    # ─── Calibration smoke test ────────────────────────────────────
-    if [[ ${SKIP_CALIBRATION} -eq 0 && ${DRY_RUN} -eq 0 ]]; then
+    # ─── Inline calibration smoke (legacy; off by default) ────────
+    # Standalone calibration is preferred:
+    #   bash scripts/stage_a_generator/run_round41_stage1_cascade_matrix.sh
+    #   → pre-train phase = round41_cascade_calibration.py (off-launcher)
+    if [[ ${INLINE_CALIBRATION} -eq 1 && ${DRY_RUN} -eq 0 ]]; then
         log
         log "================================================================"
         log "[$(date '+%F %T')] CALIBRATION SMOKE ${VID}"
