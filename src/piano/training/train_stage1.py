@@ -79,6 +79,96 @@ from piano.utils.clip_utils import encode_text_per_token, load_clip_text_encoder
 
 
 # ----------------------------------------------------------------------------
+# Warm-start (R41 prereq) — load a prior Stage-1 ckpt into a fresh trainer
+# ----------------------------------------------------------------------------
+
+
+def _maybe_load_stage1_init_checkpoint(
+    *,
+    model: "Stage1Denoiser",
+    object_encoder: "ObjectEncoder",
+    ckpt_path: str | None,
+    strict: bool = True,
+) -> None:
+    """Optionally warm-start Stage-1 training from a prior checkpoint.
+
+    R41 cascade fine-tunes V8 V6 (drift_max 17.43 cm on R31 V8 matrix)
+    by adding a frozen-PB1 motion-space loss on top of the existing
+    Stage-1 training objective. Without this loader, ``training.init_checkpoint``
+    in the config would be silently ignored and the run would start from
+    a fresh init — which would confound R41 results with from-scratch
+    training. See ``analyses/2026-06-02_r41_stage1_cascade_experiment_plan_for_claude.md``
+    §3.1.
+
+    Parameters
+    ----------
+    model
+        Pre-built ``Stage1Denoiser`` (not yet wrapped by Accelerator).
+    object_encoder
+        Pre-built ``ObjectEncoder`` (not yet wrapped). Loading the
+        object encoder state is required: leaving it at random init
+        means the object features fed to Stage-1 disagree with whatever
+        the original ckpt was trained against, which silently breaks
+        fine-tuning.
+    ckpt_path
+        Path to the ckpt to load. ``None`` or empty string → no-op
+        (preserves from-scratch behavior bit-for-bit when the cfg key
+        is absent).
+    strict
+        Forwarded to ``load_state_dict``. Default True: any key
+        mismatch raises so we never silently partial-load and ship a
+        broken warm-start.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``ckpt_path`` is non-empty but the file does not exist.
+    KeyError
+        If the ckpt has no ``object_encoder`` state under either the
+        top-level key or the ``extra_modules`` nested key (matches the
+        two save formats ``sample_substitute_conds.py`` supports).
+    """
+    if not ckpt_path:
+        return
+
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"training.init_checkpoint does not exist: {path}"
+        )
+
+    state = torch.load(str(path), map_location="cpu", weights_only=False)
+
+    # Denoiser. The trainer's save format wraps the model state under
+    # ``state["model"]``; fall back to a flat state_dict for legacy ckpts.
+    model_state = state.get("model", state)
+    model.load_state_dict(model_state, strict=strict)
+
+    # Object encoder. Two save formats coexist in the repo (matches
+    # ``sample_substitute_conds.py:143-156``):
+    #   1) state["object_encoder"]                          — newer
+    #   2) state["extra_modules"]["object_encoder"]         — older
+    if "object_encoder" in state:
+        object_encoder.load_state_dict(
+            state["object_encoder"], strict=strict,
+        )
+    elif (
+        isinstance(state.get("extra_modules"), dict)
+        and "object_encoder" in state["extra_modules"]
+    ):
+        object_encoder.load_state_dict(
+            state["extra_modules"]["object_encoder"], strict=strict,
+        )
+    else:
+        raise KeyError(
+            f"training.init_checkpoint {path} has no object_encoder "
+            "state. Cannot warm-start without it: the object features "
+            "would reset to random init while the denoiser is loaded "
+            "from the ckpt, silently breaking fine-tuning."
+        )
+
+
+# ----------------------------------------------------------------------------
 # Step function
 # ----------------------------------------------------------------------------
 
@@ -802,6 +892,25 @@ def main() -> None:
         )
     else:
         clip_model = None
+
+    # ─── R41 prereq — optional warm-start from a prior Stage-1 ckpt ──
+    # Default None → no-op, preserving V0/V7/V8 from-scratch behavior.
+    # Must run before the optimizer is built so the optimizer captures
+    # loaded params, and before ``accelerator.prepare(...)`` so the
+    # load happens on plain (un-DDP-wrapped) modules.
+    _init_ckpt_path = cfg.training.get("init_checkpoint", None)
+    _init_ckpt_strict = bool(cfg.training.get("init_checkpoint_strict", True))
+    if _init_ckpt_path:
+        accelerator.print(
+            f"[warm-start] loading init_checkpoint={_init_ckpt_path} "
+            f"(strict={_init_ckpt_strict})"
+        )
+    _maybe_load_stage1_init_checkpoint(
+        model=model,
+        object_encoder=object_encoder,
+        ckpt_path=str(_init_ckpt_path) if _init_ckpt_path else None,
+        strict=_init_ckpt_strict,
+    )
 
     # ─── Optimizer + scheduler ───
     optimizer = torch.optim.AdamW(
