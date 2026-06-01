@@ -83,6 +83,14 @@ from piano.models.stage1_trajectory import (
     Stage1Denoiser,
     Stage1DenoiserConfig,
 )
+from piano.training.pb1_loss_helpers import (
+    anchor_joint_pos_loss,
+    compute_min_snr_weight,
+    fk_motion_135_to_joints_22,
+    l_pos_full_loss,
+    masked_motion_mse_loss,
+    world_joint_velocity_loss,
+)
 from piano.training.stage1_losses import build_init_pose_f1
 from piano.training.train_anchordiff import _build_dataset
 from piano.training.train_stage1 import (
@@ -670,6 +678,168 @@ def check_6_grad_scale(
     return out
 
 
+def _compute_actual_cascade_loss(
+    *,
+    fwd_result: dict,
+    batch: dict,
+    device: torch.device,
+    cascade_weights: dict[str, float],
+    cascade_extras: dict[str, Any],
+    pb1: MotionAnchorDiff,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Reconstruct the same cascade loss the trainer's step_fn computes,
+    using the helpers in ``pb1_loss_helpers``.
+
+    Returns: (cascade_loss_weighted, component_dict)
+
+    The component_dict records the unweighted loss values for the
+    calibration report (informational).
+    """
+    motion = batch["motion"].to(device).float()
+    joints = batch["joints"].to(device).float()
+    rest_offsets = batch["rest_offsets"].to(device).float()
+    seq_mask = fwd_result["seq_mask"]
+    pb1_x0_pred = fwd_result["pb1_x0_pred"]
+    t_pb1 = fwd_result["t_pb1"]
+
+    w_motion = float(cascade_weights.get("w_motion_mse", 0.0))
+    w_world_vel = float(cascade_weights.get("w_world_joint_vel", 0.0))
+    w_lpos = float(cascade_weights.get("w_l_pos_full", 0.0))
+    w_anchor = float(cascade_weights.get("w_anchor_joint_pos", 0.0))
+    w_total = float(cascade_weights.get("w_total", 1.0))
+
+    # min-SNR weight on motion MSE only (matches trainer).
+    min_snr_w = None
+    if bool(cascade_extras.get("use_min_snr", True)):
+        _pb1_diff = (
+            pb1.diffusion.module if hasattr(pb1.diffusion, "module")
+            else pb1.diffusion
+        )
+        min_snr_w = compute_min_snr_weight(
+            t_pb1, _pb1_diff.alphas_cumprod,
+            gamma=float(cascade_extras.get("min_snr_gamma", 5.0)),
+        )
+
+    components: dict[str, float] = {}
+    cascade_raw = torch.zeros((), device=device, dtype=motion.dtype)
+
+    if w_motion > 0:
+        l = masked_motion_mse_loss(
+            pred=pb1_x0_pred, target=motion, seq_mask=seq_mask,
+            min_snr_weight=min_snr_w,
+        )
+        components["motion_mse"] = float(l.item())
+        cascade_raw = cascade_raw + w_motion * l
+
+    if w_world_vel > 0:
+        l = world_joint_velocity_loss(
+            pred=pb1_x0_pred, target=motion, seq_mask=seq_mask,
+        )
+        components["world_joint_vel"] = float(l.item())
+        cascade_raw = cascade_raw + w_world_vel * l
+
+    if w_lpos > 0 or w_anchor > 0:
+        jpos_pred = fk_motion_135_to_joints_22(
+            motion=pb1_x0_pred, rest_offsets=rest_offsets,
+        )
+        if w_lpos > 0:
+            l = l_pos_full_loss(
+                jpos_pred=jpos_pred, joints_gt=joints, seq_mask=seq_mask,
+                hand_endpoint_weight=float(
+                    cascade_extras.get("l_pos_hand_endpoint_weight", 2.0)
+                ),
+                foot_endpoint_weight=float(
+                    cascade_extras.get("l_pos_foot_endpoint_weight", 2.0)
+                ),
+            )
+            components["l_pos_full"] = float(l.item())
+            cascade_raw = cascade_raw + w_lpos * l
+        if w_anchor > 0:
+            if "contact_state" not in batch:
+                raise KeyError(
+                    "cascade_w_anchor_joint_pos > 0 but batch missing "
+                    "contact_state — confirm dataset has R29 pseudo-labels."
+                )
+            contact = batch["contact_state"].to(device).float()
+            l = anchor_joint_pos_loss(
+                jpos_pred=jpos_pred, joints_gt=joints,
+                contact_state=contact, seq_mask=seq_mask,
+                part_weights=tuple(
+                    float(w) for w in cascade_extras.get(
+                        "anchor_part_weights",
+                        (2.0, 2.0, 0.0, 0.0, 0.5),
+                    )
+                ),
+                contact_threshold=float(
+                    cascade_extras.get("anchor_contact_threshold", 0.5)
+                ),
+            )
+            components["anchor_joint_pos"] = float(l.item())
+            cascade_raw = cascade_raw + w_anchor * l
+
+    return w_total * cascade_raw, components
+
+
+def check_10_grad_scale_actual_stack(
+    *, fwd_args: dict, batch: dict, stage1: Stage1Denoiser,
+    stage1_encoder: ObjectEncoder, pb1: MotionAnchorDiff,
+    pb1_encoder: ObjectEncoder,
+    cascade_weights: dict[str, float],
+    cascade_extras: dict[str, Any],
+) -> dict[str, Any]:
+    """10. Actual cascade stack gradient ratio (drives R41 calibration).
+
+    Unlike check 6 which measures grad scale of motion-MSE only at w=1,
+    this check rebuilds the *actual* cascade loss the trainer would
+    compute for this specific cfg (with its current cascade_w_*
+    weights and w_total), backprops it, and reports the resulting
+    Stage-1 grad norm vs Stage-1 self loss grad norm.
+
+    This is what calibration should use to recommend w_total: loss
+    ratio is a misleading proxy when PB1's Jacobian is in the chain
+    (Codex code-review blocker §2).
+    """
+    out: dict[str, Any] = {"name": "grad_scale_actual_stack"}
+    out["cascade_weights"] = dict(cascade_weights)
+
+    # 1) self loss only.
+    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+    r1 = _cascade_forward(**{**fwd_args, "batch": batch})
+    r1["stage1_self_loss"].backward()
+    self_norm = _grad_norm(stage1)
+    out["grad_norm_stage1_self"] = self_norm
+
+    # 2) actual weighted cascade stack only.
+    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+    r2 = _cascade_forward(**{**fwd_args, "batch": batch})
+    cascade_weighted, components = _compute_actual_cascade_loss(
+        fwd_result=r2, batch=batch, device=fwd_args["device"],
+        cascade_weights=cascade_weights,
+        cascade_extras=cascade_extras,
+        pb1=pb1,
+    )
+    out["component_loss_values"] = components
+    out["cascade_weighted_value"] = float(cascade_weighted.item())
+    if cascade_weighted.requires_grad:
+        cascade_weighted.backward()
+    casc_norm = _grad_norm(stage1)
+    out["grad_norm_actual_cascade_weighted"] = casc_norm
+    _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
+
+    ratio = casc_norm / self_norm if self_norm > 0 else float("inf")
+    out["ratio_actual_cascade_over_self"] = ratio
+    # Linear recommendation: scale w_total so ratio = 1.0.
+    current_w_total = float(cascade_weights.get("w_total", 1.0))
+    if ratio > 0:
+        out["recommended_w_total_for_ratio_1"] = (
+            current_w_total * 1.0 / ratio
+        )
+    else:
+        out["recommended_w_total_for_ratio_1"] = current_w_total
+    out["pass"] = bool(self_norm > 0 and casc_norm > 0)
+    return out
+
+
 def check_7_grad_by_t_bucket(
     *, fwd_args: dict, batch: dict, stage1: Stage1Denoiser,
     stage1_encoder: ObjectEncoder, pb1: MotionAnchorDiff,
@@ -1060,6 +1230,16 @@ def main() -> int:
         "--n-mem-iters", type=int, default=5,
         help="How many forward+backward iters to time for check 9.",
     )
+    ap.add_argument(
+        "--calibration-only", action="store_true",
+        help=(
+            "Fast calibration mode for round41_cascade_calibration.py. "
+            "Runs only checks 1 (batch contract), 2 (Stage-1 warm-start), "
+            "3 (PB1 ckpt), 5 (grad path), 10 (actual cascade stack grad "
+            "scale). Skips check 4 (3-batch forward), 6 (motion-mse-only "
+            "grad), 7 (t-bucket), 8 (distribution alignment), 9 (memory)."
+        ),
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1169,14 +1349,14 @@ def main() -> int:
         pb1_cfg_drop_disabled=True,
     )
 
-    # ─── Check 4: cascade forward ───────────────────────────────────────
-    # Use 3 fresh batches.
+    # ─── Check 4: cascade forward (1 batch in calibration-only mode) ─
     sample_batches = [first_batch]
-    for _ in range(2):
-        try:
-            sample_batches.append(next(loader_iter))
-        except StopIteration:
-            break
+    if not args.calibration_only:
+        for _ in range(2):
+            try:
+                sample_batches.append(next(loader_iter))
+            except StopIteration:
+                break
     _record("cascade_forward", check_4_cascade_forward(
         fwd_args=base_fwd_args, batches=sample_batches,
     ))
@@ -1188,39 +1368,100 @@ def main() -> int:
         pb1=pb1, pb1_encoder=pb1_encoder,
     ))
 
-    # ─── Check 6: grad scale ────────────────────────────────────────────
-    _record("grad_scale", check_6_grad_scale(
+    # ─── Check 10: actual cascade stack grad ratio (calibration core) ─
+    # Reads the target stage1 cfg's cascade block and rebuilds the
+    # actual cascade loss the trainer would compute. Runs in both
+    # full and calibration-only modes because it is the load-bearing
+    # number for round41_cascade_calibration.py's recommendation.
+    _target_cascade = (
+        OmegaConf.load(str(args.stage1_config)).get("cascade", None)
+    )
+    if _target_cascade is None or not bool(_target_cascade.get("enabled", False)):
+        # Control cell (no cascade); check 10 is informational only.
+        cascade_weights = {
+            "w_motion_mse": 0.0, "w_world_joint_vel": 0.0,
+            "w_l_pos_full": 0.0, "w_anchor_joint_pos": 0.0,
+            "w_total": 1.0,
+        }
+        cascade_extras = {
+            "use_min_snr": True, "min_snr_gamma": 5.0,
+            "l_pos_hand_endpoint_weight": 2.0,
+            "l_pos_foot_endpoint_weight": 2.0,
+            "anchor_part_weights": (2.0, 2.0, 0.0, 0.0, 0.5),
+            "anchor_contact_threshold": 0.5,
+        }
+    else:
+        cascade_weights = {
+            "w_motion_mse": float(_target_cascade.get("w_motion_mse", 0.0)),
+            "w_world_joint_vel": float(
+                _target_cascade.get("w_world_joint_vel", 0.0)
+            ),
+            "w_l_pos_full": float(_target_cascade.get("w_l_pos_full", 0.0)),
+            "w_anchor_joint_pos": float(
+                _target_cascade.get("w_anchor_joint_pos", 0.0)
+            ),
+            "w_total": float(_target_cascade.get("w_total", 1.0)),
+        }
+        cascade_extras = {
+            "use_min_snr": bool(_target_cascade.get("use_min_snr", True)),
+            "min_snr_gamma": float(_target_cascade.get("min_snr_gamma", 5.0)),
+            "l_pos_hand_endpoint_weight": float(
+                _target_cascade.get("l_pos_hand_endpoint_weight", 2.0)
+            ),
+            "l_pos_foot_endpoint_weight": float(
+                _target_cascade.get("l_pos_foot_endpoint_weight", 2.0)
+            ),
+            "anchor_part_weights": tuple(
+                float(w) for w in _target_cascade.get(
+                    "anchor_part_weights", [2.0, 2.0, 0.0, 0.0, 0.5],
+                )
+            ),
+            "anchor_contact_threshold": float(
+                _target_cascade.get("anchor_contact_threshold", 0.5)
+            ),
+        }
+    _record("grad_scale_actual_stack", check_10_grad_scale_actual_stack(
         fwd_args=base_fwd_args, batch=sample_batches[0],
         stage1=stage1, stage1_encoder=stage1_encoder,
         pb1=pb1, pb1_encoder=pb1_encoder,
+        cascade_weights=cascade_weights,
+        cascade_extras=cascade_extras,
     ))
 
-    # ─── Check 7: grad by t_pb1 bucket ──────────────────────────────────
-    _record("grad_by_t_bucket", check_7_grad_by_t_bucket(
-        fwd_args=base_fwd_args, batch=sample_batches[0],
-        stage1=stage1, stage1_encoder=stage1_encoder,
-        pb1=pb1, pb1_encoder=pb1_encoder,
-    ))
+    if not args.calibration_only:
+        # ─── Check 6: grad scale (motion-MSE-only, legacy) ──────────────
+        _record("grad_scale", check_6_grad_scale(
+            fwd_args=base_fwd_args, batch=sample_batches[0],
+            stage1=stage1, stage1_encoder=stage1_encoder,
+            pb1=pb1, pb1_encoder=pb1_encoder,
+        ))
 
-    # ─── Check 8: distribution alignment ────────────────────────────────
-    def _fresh_batch_iter():
-        for b in sample_batches:
-            yield b
-        for b in loader_iter:
-            yield b
-    _record("distribution_alignment", check_8_distribution_alignment(
-        stage1_cfg=p0_cfg, device=device,
-        stage1_coarse_mean=stage1_coarse_mean,
-        stage1_coarse_std=stage1_coarse_std,
-        v8v6_cache_dir=args.stage1_v8v6_substitute_cache,
-        batch_iter=_fresh_batch_iter(),
-    ))
+        # ─── Check 7: grad by t_pb1 bucket ──────────────────────────────
+        _record("grad_by_t_bucket", check_7_grad_by_t_bucket(
+            fwd_args=base_fwd_args, batch=sample_batches[0],
+            stage1=stage1, stage1_encoder=stage1_encoder,
+            pb1=pb1, pb1_encoder=pb1_encoder,
+        ))
 
-    # ─── Check 9: memory + wallclock ────────────────────────────────────
-    _record("memory_wallclock", check_9_memory_wallclock(
-        fwd_args=base_fwd_args, batch=sample_batches[0],
-        n_iters=int(args.n_mem_iters),
-    ))
+        # ─── Check 8: distribution alignment ────────────────────────────
+        def _fresh_batch_iter():
+            for b in sample_batches:
+                yield b
+            for b in loader_iter:
+                yield b
+        _record("distribution_alignment", check_8_distribution_alignment(
+            stage1_cfg=p0_cfg, device=device,
+            stage1_coarse_mean=stage1_coarse_mean,
+            stage1_coarse_std=stage1_coarse_std,
+            v8v6_cache_dir=args.stage1_v8v6_substitute_cache,
+            batch_iter=_fresh_batch_iter(),
+        ))
+
+        # ─── Check 9: memory + wallclock ────────────────────────────────
+        _record("memory_wallclock", check_9_memory_wallclock(
+            fwd_args=base_fwd_args, batch=sample_batches[0],
+            n_iters=int(args.n_mem_iters),
+        ))
 
     # ─── Write outputs ──────────────────────────────────────────────────
     out_json = args.out_dir / "p0_stats.json"

@@ -136,6 +136,24 @@ def main() -> int:
         "--out-dir", type=Path,
         default=Path("configs/training/"),
     )
+    ap.add_argument(
+        "--pb1-config", type=str, default=DEFAULT_PB1_CFG,
+        help="PB1 cfg path written into every generated R41 cfg's "
+             "cascade.pb1_config. Single source of truth — the launcher "
+             "verifies each yaml's cascade.pb1_checkpoint against the "
+             "launcher's PB1_CKPT.",
+    )
+    ap.add_argument(
+        "--pb1-ckpt", type=str, default=DEFAULT_PB1_CKPT,
+        help="PB1 ckpt path written into every generated R41 cfg's "
+             "cascade.pb1_checkpoint.",
+    )
+    ap.add_argument(
+        "--init-checkpoint", type=str,
+        default=str(Path("runs/training/stage1_v8_v6_full_f1/final.pt")),
+        help="Stage-1 warm-start ckpt written into every generated R41 "
+             "cfg's training.init_checkpoint.",
+    )
     args = ap.parse_args()
 
     if not args.base_cfg.exists():
@@ -168,7 +186,7 @@ def main() -> int:
         cfg.logging.run_name = run_name
 
         # R41 training overrides.
-        cfg.training.init_checkpoint = R41_TRAINING["init_checkpoint"]
+        cfg.training.init_checkpoint = args.init_checkpoint
         cfg.training.init_checkpoint_strict = R41_TRAINING[
             "init_checkpoint_strict"
         ]
@@ -183,8 +201,12 @@ def main() -> int:
         for k, v in R41_DATA_R29_OVERRIDES.items():
             cfg.data[k] = v
 
-        # Cascade section.
+        # Cascade section. PB1 cfg/ckpt come from CLI args so the
+        # launcher can pass --pb1-ckpt and keep training cfgs and diag
+        # invocation in sync (Codex review §4).
         cascade_block = dict(SHARED_CASCADE)
+        cascade_block["pb1_config"] = args.pb1_config
+        cascade_block["pb1_checkpoint"] = args.pb1_ckpt
         cascade_block.update(cascade_overrides)
         cfg.cascade = cascade_block
 

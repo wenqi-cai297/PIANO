@@ -57,14 +57,22 @@ done
 for VID in "${DIAGED_VIDS[@]:-}"; do
     [[ -z "${VID}" ]] && continue
     add_if_exists_dir "analyses/round41_stage1_direct_diag_${VID}"
+    add_if_exists_dir "analyses/round41_stage1_ood_${VID}"
+    add_if_exists_dir "analyses/round41_stage1_kdiv_${VID}"
+    add_if_exists_dir "analyses/round41_full_cascade_${VID}"
     if [[ "${INCLUDE_NPZ}" == "1" ]]; then
-        add_if_exists_dir "analyses/round31_stage1_substitute_conds_r41_${VID}"
+        add_if_exists_dir "analyses/round41_stage1_substitute_conds_${VID}"
     fi
 done
+
+# Calibration reports (always small).
+add_if_exists_dir "analyses/round41_cascade_calibration"
 
 add_if_exists_file "${SUMMARY_LOG}"
 add_if_exists_file "analyses/2026-06-01_r41_stage1_cascade_handoff_for_codex.md"
 add_if_exists_file "analyses/2026-06-02_r41_stage1_cascade_experiment_plan_for_claude.md"
+add_if_exists_file "analyses/2026-06-02_r41_code_review_fix_instructions_for_claude.md"
+add_if_exists_file "analyses/2026-06-02_r41_return_for_codex.md"
 add_if_exists_dir "analyses/round41_p0_cascade_diag"
 
 if [[ ${#PACK_TARGETS[@]} -eq 0 ]]; then

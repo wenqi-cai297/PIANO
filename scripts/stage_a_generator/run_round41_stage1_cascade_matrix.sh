@@ -29,8 +29,20 @@
 #   ROUND41_NUM_PROCESSES=N            accelerate --num_processes
 #   ROUND41_BUCKETS="val"              diag bucket
 #   ROUND41_BASE_CFG=...               base V8 V6 cfg
-#   ROUND41_PB1_CKPT=...               PB1 ship ckpt
-#   ROUND41_SKIP_CALIBRATION=1         skip per-cell smoke probe
+#   ROUND41_PB1_CKPT=...               PB1 ship ckpt (must match each
+#                                        yaml's cascade.pb1_checkpoint;
+#                                        --regen-configs to realign, or
+#                                        ROUND41_ALLOW_PB1_CKPT_MISMATCH=1
+#                                        to override).
+#   ROUND41_PB1_CFG=...                PB1 ship yaml (used by config
+#                                        generator when --regen-configs
+#                                        is requested).
+#   ROUND41_REGEN_CONFIGS=1            force-regenerate all R41 cfgs
+#                                        (resets calibration!). Default
+#                                        is generate-if-missing.
+#   ROUND41_ALLOW_PB1_CKPT_MISMATCH=1  let cfg pb1_ckpt differ from
+#                                        launcher PB1_CKPT.
+#   ROUND41_INLINE_CALIBRATION=1       legacy in-shell smoke check.
 #   ROUND41_ABORT_IF_CASCADE_RATIO_OVER=3.0
 #   ROUND41_ALLOW_PARTIAL=1            keep going on per-variant failure
 
@@ -41,17 +53,33 @@ ONLY=""
 DRY_RUN=0
 SKIP_TRAIN=0
 SKIP_DIAG=0
-# Calibration is now a separate phase (round41_cascade_calibration.py).
+# Calibration is its own standalone phase (round41_cascade_calibration.py).
 # Default is to skip in-band guard inside the launcher; user runs the
 # standalone calibration script first, applies it via
 # round41_apply_calibration.py, re-checks, then launches training.
 # Pass --with-inline-calibration to opt into the legacy in-band guard.
 INLINE_CALIBRATION="${ROUND41_INLINE_CALIBRATION:-0}"
+# Config regeneration is OPT-IN. By default the launcher generates
+# missing configs only and leaves existing ones alone — this prevents
+# round41_apply_calibration.py's w_total writes from being clobbered
+# on the next launcher invocation. Pass --regen-configs to force a
+# full regeneration (you will need to re-apply calibration afterwards).
+REGEN_CONFIGS="${ROUND41_REGEN_CONFIGS:-0}"
 FORCE_RETRAIN=0
 FORCE_REDIAG=0
 ALLOW_PARTIAL="${ROUND41_ALLOW_PARTIAL:-0}"
 BUCKETS_STR="${ROUND41_BUCKETS:-val}"
 ABORT_RATIO="${ROUND41_ABORT_IF_CASCADE_RATIO_OVER:-3.0}"
+# Post-train diag suite. By default run all 3 cheap diags: direct,
+# R35 stage1_coarse OOD, K-sample diversity. Full cascade is opt-in.
+RUN_R35_AUDIT="${ROUND41_RUN_R35_AUDIT:-1}"
+RUN_KDIV="${ROUND41_RUN_KDIV:-1}"
+WITH_FULL_CASCADE="${ROUND41_WITH_FULL_CASCADE:-0}"
+KDIV_NUM_SAMPLES="${ROUND41_KDIV_NUM_SAMPLES:-8}"
+KDIV_CFG_SCALE="${ROUND41_KDIV_CFG_SCALE:-1.0}"
+# Full-cascade Stage-1.5 ckpt (R38-B1 ship reference).
+STAGE1P5_CFG="${ROUND41_STAGE1P5_CFG:-configs/training/stage1p5_r38_b1_init_pose.yaml}"
+STAGE1P5_CKPT="${ROUND41_STAGE1P5_CKPT:-runs/training/stage1p5_r38_b1_init_pose/final.pt}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -60,6 +88,10 @@ while [[ $# -gt 0 ]]; do
         --skip-train)               SKIP_TRAIN=1; shift ;;
         --skip-diag)                SKIP_DIAG=1; shift ;;
         --with-inline-calibration)  INLINE_CALIBRATION=1; shift ;;
+        --regen-configs)            REGEN_CONFIGS=1; shift ;;
+        --with-full-cascade)        WITH_FULL_CASCADE=1; shift ;;
+        --no-r35-audit)             RUN_R35_AUDIT=0; shift ;;
+        --no-kdiv)                  RUN_KDIV=0; shift ;;
         --force-retrain)            FORCE_RETRAIN=1; shift ;;
         --force-rediag)             FORCE_REDIAG=1; shift ;;
         --buckets)                  BUCKETS_STR="$2"; shift 2 ;;
@@ -83,6 +115,7 @@ export ROUND41_NUM_PROCESSES
 ROUND41_BASE_CFG="${ROUND41_BASE_CFG:-configs/training/stage1_v8_v6_full_f1.yaml}"
 PB1_VARIANT="r29_pb_a1_adaln_s4"
 PB1_CKPT="${ROUND41_PB1_CKPT:-runs/training/stageB_anchordiff_${PB1_VARIANT}/final.pt}"
+PB1_CFG="${ROUND41_PB1_CFG:-configs/training/anchordiff_${PB1_VARIANT}.yaml}"
 SELECTION_VAL="analyses/round29_val_diag_indices_48_balanced.json"
 
 OVERALL_LOG_DIR="runs/round41_cascade_matrix"
@@ -97,14 +130,6 @@ if [[ -z "${PY:-}" ]]; then
 fi
 
 log() { echo "$@" | tee -a "${SUMMARY_LOG}"; }
-
-# ─── Regenerate R41 configs ──────────────────────────────────────────
-if [[ ${DRY_RUN} -eq 0 ]]; then
-    log "[R41] Regenerating R41 configs from ${ROUND41_BASE_CFG}."
-    "${PY}" scripts/stage_a_generator/round41_make_stage1_cascade_configs.py \
-        --base-cfg "${ROUND41_BASE_CFG}" \
-        --out-dir configs/training/ 2>&1 | tee -a "${SUMMARY_LOG}"
-fi
 
 # Hard-coded variant table — matches round41_make_stage1_cascade_configs.py.
 VARIANT_TABLE=(
@@ -124,11 +149,46 @@ for row in "${VARIANT_TABLE[@]}"; do
     VARIANTS+="${row}"$'\n'
 done
 
+# ─── Conditional config (re)generation ───────────────────────────────
+# Default: only generate when a selected variant's cfg is missing.
+# --regen-configs forces a full regeneration (overwrites all configs,
+# including any cascade.w_total values applied by the calibration
+# pipeline; log loudly so the operator can re-calibrate).
+NEED_GEN=0
+if [[ ${REGEN_CONFIGS} -eq 1 ]]; then
+    NEED_GEN=1
+    log "[R41] --regen-configs set: WILL REGENERATE all R41 configs."
+    log "[R41] Any calibrated cascade.w_total values will be reset to 1.0."
+    log "[R41] You must re-run round41_cascade_calibration.py + apply afterwards."
+else
+    while IFS=' ' read -r VID CFG OUTDIR; do
+        [[ -z "${VID}" ]] && continue
+        if [[ ! -f "${CFG}" ]]; then
+            NEED_GEN=1
+            log "[R41] cfg missing: ${CFG} → will (re)generate."
+        fi
+    done <<< "${VARIANTS}"
+fi
+if [[ ${NEED_GEN} -eq 1 && ${DRY_RUN} -eq 0 ]]; then
+    log "[R41] Generating R41 configs from ${ROUND41_BASE_CFG}."
+    "${PY}" scripts/stage_a_generator/round41_make_stage1_cascade_configs.py \
+        --base-cfg "${ROUND41_BASE_CFG}" \
+        --pb1-config "${PB1_CFG:-configs/training/anchordiff_r29_pb_a1_adaln_s4.yaml}" \
+        --pb1-ckpt "${PB1_CKPT}" \
+        --out-dir configs/training/ 2>&1 | tee -a "${SUMMARY_LOG}"
+elif [[ ${NEED_GEN} -eq 0 ]]; then
+    log "[R41] All selected R41 cfgs exist; skipping regeneration."
+    log "[R41] (pass --regen-configs to force regen — will reset w_total to 1.0)"
+fi
+
 log
 log "===== R41 cascade matrix launch ${STAMP} ====="
-log "*** R36/R37 GUARDRAIL: per-cell smoke test BEFORE training ***"
-log "If any non-control cell shows cascade_weighted/mse_x0 > ${ABORT_RATIO},"
-log "the launcher aborts. Manually reduce cascade.w_total in the yaml."
+log "*** R36/R37 GUARDRAIL: standalone calibration phase ***"
+log "If you haven't run the standalone calibration yet:"
+log "   python scripts/stage_a_generator/round41_cascade_calibration.py"
+log "   python scripts/stage_a_generator/round41_apply_calibration.py \\"
+log "       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply"
+log "Then re-run this launcher. Inline calibration is off by default."
 log
 log "DATASETS_ROOT=${DATASETS_ROOT}"
 log "GPUS=${GPUS}  NUM_PROCESSES=${ROUND41_NUM_PROCESSES}"
@@ -152,6 +212,71 @@ fi
 if [[ ${preflight_fail} -ne 0 ]]; then
     log "[R41] FATAL preflight failures."
     exit 1
+fi
+
+# ─── Pre-train config audit ──────────────────────────────────────────
+# Read each variant's yaml, log cascade fields, verify PB1 ckpt path
+# matches the launcher's PB1_CKPT (single source of truth — Codex
+# blocker §4), warn if cascade.w_total == 1.0 on a non-control cell
+# (likely missed calibration).
+ALLOW_PB1_MISMATCH="${ROUND41_ALLOW_PB1_CKPT_MISMATCH:-0}"
+if [[ ${DRY_RUN} -eq 0 ]]; then
+    log
+    log "─── Pre-train config audit ──────────────────────────────────────"
+    audit_fail=0
+    while IFS=' ' read -r VID CFG OUTDIR; do
+        [[ -z "${VID}" ]] && continue
+        [[ ! -f "${CFG}" ]] && continue
+        AUDIT_JSON="$("${PY}" -c "
+import json, sys
+from omegaconf import OmegaConf
+cfg = OmegaConf.load('${CFG}')
+casc = cfg.get('cascade', None)
+out = {
+    'enabled': bool(casc.enabled) if casc else False,
+    'w_total': float(casc.get('w_total', 1.0)) if casc else 1.0,
+    'w_motion_mse': float(casc.get('w_motion_mse', 0.0)) if casc else 0.0,
+    'w_world_joint_vel': float(casc.get('w_world_joint_vel', 0.0)) if casc else 0.0,
+    'w_l_pos_full': float(casc.get('w_l_pos_full', 0.0)) if casc else 0.0,
+    'w_anchor_joint_pos': float(casc.get('w_anchor_joint_pos', 0.0)) if casc else 0.0,
+    'pb1_checkpoint': str(casc.get('pb1_checkpoint', '')) if casc else '',
+    'init_checkpoint': str(cfg.training.get('init_checkpoint', '')),
+}
+print(json.dumps(out))
+" 2>&1)"
+        log "[audit] ${VID}: ${AUDIT_JSON}"
+        # Parse a couple of fields back out for checks (jq may not be
+        # available; fall back to python).
+        CFG_PB1="$("${PY}" -c "import json; print(json.loads('''${AUDIT_JSON}''')['pb1_checkpoint'])" 2>/dev/null || echo "")"
+        CFG_ENABLED="$("${PY}" -c "import json; print(json.loads('''${AUDIT_JSON}''')['enabled'])" 2>/dev/null || echo "False")"
+        CFG_W_TOTAL="$("${PY}" -c "import json; print(json.loads('''${AUDIT_JSON}''')['w_total'])" 2>/dev/null || echo "1.0")"
+        if [[ "${CFG_ENABLED}" == "True" ]]; then
+            # Verify PB1 ckpt matches launcher's.
+            if [[ "${CFG_PB1}" != "${PB1_CKPT}" ]]; then
+                if [[ "${ALLOW_PB1_MISMATCH}" == "1" ]]; then
+                    log "[audit] WARN ${VID} pb1_checkpoint='${CFG_PB1}' != launcher PB1_CKPT='${PB1_CKPT}'"
+                    log "[audit]      (ROUND41_ALLOW_PB1_CKPT_MISMATCH=1, continuing)"
+                else
+                    log "[audit] FATAL ${VID} pb1_checkpoint='${CFG_PB1}' != launcher PB1_CKPT='${PB1_CKPT}'"
+                    log "[audit]       Training would load a different PB1 than diag uses, invalidating the experiment."
+                    log "[audit]       Either: (a) --regen-configs to align, or"
+                    log "[audit]               (b) export ROUND41_ALLOW_PB1_CKPT_MISMATCH=1."
+                    audit_fail=1
+                fi
+            fi
+            # Warn on default w_total (likely missed calibration).
+            if awk -v w="${CFG_W_TOTAL}" 'BEGIN {exit !(w == 1.0)}'; then
+                log "[audit] WARN ${VID} cascade.w_total == 1.0 (default). Did you run"
+                log "[audit]      round41_cascade_calibration.py + round41_apply_calibration.py?"
+                log "[audit]      Training will proceed but cascade signal may dominate (R36 risk)."
+            fi
+        fi
+    done <<< "${VARIANTS}"
+    if [[ ${audit_fail} -ne 0 ]]; then
+        log "[R41] FATAL config audit failures."
+        exit 1
+    fi
+    log
 fi
 
 # ─── Per-variant loop ──────────────────────────────────────────────
@@ -288,6 +413,14 @@ while IFS=' ' read -r VID CFG OUTDIR; do
                 if [[ ${rc} -eq 0 && -d "${DIAG_DIR_ROOT}" ]]; then
                     rm -rf "${DIRECT_ARCHIVE}"
                     mv "${DIAG_DIR_ROOT}" "${DIRECT_ARCHIVE}"
+                    # Preserve the substitute conds cache so R35 and
+                    # K-diversity audits can read it. Archive to R41
+                    # canonical path.
+                    R41_SUB_DIR="analyses/round41_stage1_substitute_conds_${VID}"
+                    if [[ -d "${DS_SUB_DIR_ROOT}" ]]; then
+                        rm -rf "${R41_SUB_DIR}"
+                        mv "${DS_SUB_DIR_ROOT}" "${R41_SUB_DIR}"
+                    fi
                     log "[R41] [${VID}] DIRECT DIAG OK -> ${DIRECT_ARCHIVE}"
                     DIAGED_OK_VIDS+=("${VID}")
                 else
@@ -295,6 +428,103 @@ while IFS=' ' read -r VID CFG OUTDIR; do
                     if [[ "${ALLOW_PARTIAL}" != "1" ]]; then exit 1; fi
                 fi
             fi
+        fi
+
+        # ─── Phase 3: R35 stage1_coarse OOD audit ──────────────────
+        R41_SUB_DIR="analyses/round41_stage1_substitute_conds_${VID}"
+        R35_OUT="analyses/round41_stage1_ood_${VID}"
+        if [[ ${RUN_R35_AUDIT} -eq 1 && ${DRY_RUN} -eq 0 \
+              && -d "${R41_SUB_DIR}" ]]; then
+            log
+            log "[R41] [${VID}] R35 stage1_coarse OOD audit"
+            mkdir -p "${R35_OUT}"
+            FIRST_BUCKET="${BUCKETS_STR%% *}"
+            SEL_JSON="${SELECTION_VAL}"
+            case "${FIRST_BUCKET}" in
+                train) SEL_JSON="${SELECTION_TRAIN:-analyses/round27_tier0_train_indices_48_balanced.json}" ;;
+            esac
+            set +e
+            "${PY}" -u scripts/stage_a_generator/round35_stage1_coarse_ood_audit.py \
+                --config "${CFG}" \
+                --generated-dir "${R41_SUB_DIR}" \
+                --selection-json "${SEL_JSON}" \
+                --bucket "${FIRST_BUCKET}" \
+                --out-md "${R35_OUT}/stage1_coarse_ood_audit_${FIRST_BUCKET}.md" \
+                --out-json "${R35_OUT}/stage1_coarse_ood_audit_${FIRST_BUCKET}.json" \
+                2>&1 | tee -a "${VARIANT_LOG}"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [[ ${rc} -eq 0 ]]; then
+                log "[R41] [${VID}] R35 AUDIT OK -> ${R35_OUT}"
+            else
+                log "[R41] [${VID}] R35 AUDIT FAILED (rc=${rc}); continuing"
+            fi
+        elif [[ ${RUN_R35_AUDIT} -eq 1 && ${DRY_RUN} -eq 1 ]]; then
+            log "[R41 DRY-RUN] [${VID}] R35 OOD audit"
+        fi
+
+        # ─── Phase 4: K-sample diversity audit ─────────────────────
+        KDIV_OUT="analyses/round41_stage1_kdiv_${VID}"
+        if [[ ${RUN_KDIV} -eq 1 && ${DRY_RUN} -eq 0 \
+              && -f "${OUTDIR}/final.pt" ]]; then
+            log
+            log "[R41] [${VID}] K-sample diversity (K=${KDIV_NUM_SAMPLES})"
+            FIRST_BUCKET="${BUCKETS_STR%% *}"
+            SEL_JSON="${SELECTION_VAL}"
+            case "${FIRST_BUCKET}" in
+                train) SEL_JSON="${SELECTION_TRAIN:-analyses/round27_tier0_train_indices_48_balanced.json}" ;;
+            esac
+            set +e
+            "${PY}" -u scripts/stage_a_generator/round40_stage1_k_sample_audit.py \
+                --config "${CFG}" \
+                --ckpt "${OUTDIR}/final.pt" \
+                --selection-json "${SEL_JSON}" \
+                --bucket "${FIRST_BUCKET}" \
+                --out-dir "${KDIV_OUT}" \
+                --num-samples "${KDIV_NUM_SAMPLES}" \
+                --cfg-scale "${KDIV_CFG_SCALE}" \
+                2>&1 | tee -a "${VARIANT_LOG}"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [[ ${rc} -eq 0 ]]; then
+                log "[R41] [${VID}] KDIV OK -> ${KDIV_OUT}"
+            else
+                log "[R41] [${VID}] KDIV FAILED (rc=${rc}); continuing"
+            fi
+        elif [[ ${RUN_KDIV} -eq 1 && ${DRY_RUN} -eq 1 ]]; then
+            log "[R41 DRY-RUN] [${VID}] KDIV"
+        fi
+
+        # ─── Phase 5: Full cascade diag (opt-in) ───────────────────
+        if [[ ${WITH_FULL_CASCADE} -eq 1 && ${DRY_RUN} -eq 0 \
+              && -d "${R41_SUB_DIR}" && -f "${STAGE1P5_CKPT}" ]]; then
+            log
+            log "[R41] [${VID}] FULL CASCADE (Stage-1 → R38-B1 → PB1)"
+            FC_OUT_TAG="_r41_${VID}"
+            FC_SUB_DIR="analyses/round32_stage1p5_substitute_conds${FC_OUT_TAG}"
+            FC_DIAG_DIR="analyses/round32_stage1p5_downstream_diag${FC_OUT_TAG}"
+            FC_ARCHIVE="analyses/round41_full_cascade_${VID}"
+            rm -rf "${FC_SUB_DIR}" "${FC_DIAG_DIR}"
+            set +e
+            ROUND32_DS_STAGE1P5_CFG="${STAGE1P5_CFG}" \
+            ROUND32_DS_STAGE1P5_CKPT="${STAGE1P5_CKPT}" \
+            ROUND32_DS_PB1_CKPT="${PB1_CKPT}" \
+            ROUND32_DS_BUCKETS="${BUCKETS_STR}" \
+            ROUND32_DS_OUT_TAG="${FC_OUT_TAG}" \
+            ROUND32_DS_UPSTREAM_DIR="${R41_SUB_DIR}" \
+                bash scripts/stage_a_generator/run_round32_stage1p5_downstream_diag.sh \
+                2>&1 | tee -a "${VARIANT_LOG}"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [[ ${rc} -eq 0 && -d "${FC_DIAG_DIR}" ]]; then
+                rm -rf "${FC_ARCHIVE}"
+                mv "${FC_DIAG_DIR}" "${FC_ARCHIVE}"
+                log "[R41] [${VID}] FULL CASCADE OK -> ${FC_ARCHIVE}"
+            else
+                log "[R41] [${VID}] FULL CASCADE FAILED (rc=${rc}); continuing"
+            fi
+        elif [[ ${WITH_FULL_CASCADE} -eq 1 && ${DRY_RUN} -eq 1 ]]; then
+            log "[R41 DRY-RUN] [${VID}] FULL CASCADE"
         fi
     fi
 done <<< "${VARIANTS}"
