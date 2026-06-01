@@ -1043,8 +1043,18 @@ def main() -> int:
         help="Dataset bucket for the dataloader. val is cheaper.",
     )
     ap.add_argument(
-        "--batch-size", type=int, default=64,
-        help="P0 batch size. Matches V8 V6 training default.",
+        "--batch-size", type=int, default=16,
+        help=(
+            "P0 batch size. Defaults to 16 because cascade forward "
+            "(Stage-1 encoder + Stage-1 denoiser + PB1 encoder + PB1 denoiser "
+            "+ Stage-1 grad activations + PB1 forward activations for grad "
+            "backprop) at bs=64 OOM's a single 5080 16 GB GPU. "
+            "Per-batch grad scale / cascade-loss / t-bucket gradient norm "
+            "are bs-invariant (loss is masked mean, grad is normalized) — "
+            "P0 numbers transfer to any bs used at training time. "
+            "Use a larger value only if peak GPU usage probe (check 9) is "
+            "the only quantity of interest."
+        ),
     )
     ap.add_argument(
         "--n-mem-iters", type=int, default=5,
