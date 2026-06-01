@@ -303,11 +303,12 @@ In dry-run on the laptop, the packer correctly enumerates targets and exits 0 wh
 ## 7. Commit + push
 
 ```
-commit <SHA>  Add round40 Stage-1 plan sampler training
-files: 8 (3 modified + 5 new)
+commit c0421e6  Add round40 Stage-1 plan sampler training
+files: 9 (3 modified + 5 new scripts + 1 return doc)
+3193 insertions(+), 3 deletions(-)
 ```
 
-Pushed to `origin/master`. Branch protection / signing per repo defaults (no `--no-verify`).
+Pushed: `c497495..c0421e6  master -> master`. No `--no-verify`, no hook bypass.
 
 ---
 
