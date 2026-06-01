@@ -51,6 +51,7 @@ from piano.training.stage1_losses import (
     CH_SHOULDER_H,
     CH_SPINE3_ROT6D,
     INIT_POSE_F2_DIM,
+    build_channel_weight_tensor,
     build_init_pose_f1,
     build_init_pose_f2,
     channel_moment_match_loss,
@@ -60,6 +61,7 @@ from piano.training.stage1_losses import (
     frame0_consistency_loss,
     kinematic_self_consistency_loss,
     rot6d_ortho_loss,
+    stage1_plan_invariant_loss,
     temporal_derivative_mse_loss,
     wrist_fk_supervision_loss,
     yaw_aggregate_match_loss,
@@ -133,6 +135,19 @@ def build_stage1_step_fn(
     # rot6d-weighted velocity loss: multiplies channels [9:21] of the
     # vel-MSE term by ``vel_rot6d_weight`` (default 1.0 = baseline).
     vel_rot6d_weight: float = 1.0,
+    # R40 — per-channel weighting for the exact-GT MSE terms.
+    # Empty / None means "all ones" → identical to pre-R40 behavior.
+    # When provided, each list must have length 23 (one per stage1_coarse
+    # channel) and is applied multiplicatively on top of the existing
+    # ``vel_rot6d_weight`` for the velocity term. Lets configs reduce
+    # GT pressure on under-determined channels (root, vel, yaw, pelvis_rot6d)
+    # so the plan-invariant loss can dominate.
+    x0_channel_weights: tuple[float, ...] | list[float] | None = None,
+    vel_channel_weights: tuple[float, ...] | list[float] | None = None,
+    # R40 — plan-invariant ("plan-energy") loss. Default 0 = OFF.
+    w_r40_plan_invariant: float = 0.0,
+    r40_plan_beta: float = 1.0,
+    r40_plan_component_weights: dict[str, float] | None = None,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -151,6 +166,19 @@ def build_stage1_step_fn(
     # Unwrap DDP for read-only diffusion access.
     _diff_for_read = (
         diffusion.module if hasattr(diffusion, "module") else diffusion
+    )
+
+    # R40 — materialise per-channel weight tensors once. ``None`` means
+    # all ones; the step_fn skips the multiplication branch entirely so
+    # default behavior is bit-identical to pre-R40.
+    _w_dtype = stage1_coarse_mean_t.dtype
+    x0_channel_w = build_channel_weight_tensor(
+        x0_channel_weights, expected_dim=STAGE1_COARSE_DIM,
+        device=device, dtype=_w_dtype, name="x0_channel_weights",
+    )
+    vel_channel_w = build_channel_weight_tensor(
+        vel_channel_weights, expected_dim=STAGE1_COARSE_DIM,
+        device=device, dtype=_w_dtype, name="vel_channel_weights",
     )
 
     def step_fn(_model, batch: dict, global_step: int = 0) -> dict[str, Tensor]:
@@ -252,7 +280,13 @@ def build_stage1_step_fn(
 
         # ─── Loss 1: MSE on x0 with optional min-SNR-γ weighting ───
         mse_per_dim = (x0_pred - x0).pow(2)                     # (B, T, 23)
-        per_frame = mse_per_dim.sum(-1)                         # (B, T)
+        # R40 — apply per-channel weighting before summing. Unweighted
+        # version is preserved as an audit metric.
+        if x0_channel_w is not None:
+            mse_per_dim_weighted = mse_per_dim * x0_channel_w
+        else:
+            mse_per_dim_weighted = mse_per_dim
+        per_frame = mse_per_dim_weighted.sum(-1)                # (B, T)
 
         if use_min_snr_weighting:
             alpha_bar = _diff_for_read.alphas_cumprod.gather(0, t)
@@ -274,7 +308,12 @@ def build_stage1_step_fn(
             vel_pred = x0_pred[:, 1:] - x0_pred[:, :-1]         # (B, T-1, 23)
             vel_gt = x0[:, 1:] - x0[:, :-1]
             vel_mask = seq_mask[:, 1:] * seq_mask[:, :-1]       # (B, T-1)
-            vel_per_dim = (vel_pred - vel_gt).pow(2)            # (B, T-1, 23)
+            vel_per_dim_raw = (vel_pred - vel_gt).pow(2)        # (B, T-1, 23)
+            # R40 audit metric — unweighted per-dim sum, no rot6d boost.
+            vel_mse_unweighted = (
+                vel_per_dim_raw.sum(-1) * vel_mask
+            ).sum() / vel_mask.sum().clamp_min(1.0)
+            vel_per_dim = vel_per_dim_raw
             if vel_rot6d_weight != 1.0:
                 # Re-weight the rot6d channels [9:21] in the velocity MSE.
                 channel_w = torch.ones(
@@ -283,9 +322,15 @@ def build_stage1_step_fn(
                 channel_w[CH_PELVIS_ROT6D] = float(vel_rot6d_weight)
                 channel_w[CH_SPINE3_ROT6D] = float(vel_rot6d_weight)
                 vel_per_dim = vel_per_dim * channel_w.view(1, 1, -1)
+            # R40 — per-channel velocity weights, composed multiplicatively
+            # on top of vel_rot6d_weight. Lets configs downweight exact-GT
+            # frame-to-frame velocity on under-determined channels.
+            if vel_channel_w is not None:
+                vel_per_dim = vel_per_dim * vel_channel_w
             vel_mse = (vel_per_dim.sum(-1) * vel_mask).sum() / vel_mask.sum().clamp_min(1.0)
         else:
             vel_mse = torch.zeros((), device=device, dtype=mse_x0.dtype)
+            vel_mse_unweighted = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
         # ─── Loss 3: yaw 2nd-derivative smoothness on PRED ───
         # Pred yaw is at channels [6: 8] (sin, cos). We compute the angle via
@@ -316,6 +361,7 @@ def build_stage1_step_fn(
             or w_yaw_aggregate > 0 or w_fk_pos_cm > 0
             or w_wrist_fk_pos > 0
             or w_r36_raw_velocity > 0 or w_r36_raw_acceleration > 0
+            or w_r40_plan_invariant > 0
         )
         if need_raw:
             x0_raw = x0_pred * stage1_coarse_std_t + stage1_coarse_mean_t   # (B, T, 23)
@@ -525,6 +571,25 @@ def build_stage1_step_fn(
         else:
             r36_raw_acc = torch.zeros((), device=device, dtype=mse_x0.dtype)
 
+        # ─── R40 — plan-invariant loss ─────────────────────────────────
+        # Match (pred, gt) on plan-level invariants (speed/arc/turn/
+        # root-object radial/heights/smoothness) rather than per-frame GT.
+        # Lets the model land on any plausible mode of the multi-modal
+        # plan distribution while keeping average/frozen plans expensive.
+        r40_plan = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        r40_components: dict[str, Tensor] = {}
+        if w_r40_plan_invariant > 0 and x0_raw is not None and x0_gt_raw is not None:
+            root_world_t0_for_plan = motion[:, :1, 132:135].float()
+            r40_plan, r40_components = stage1_plan_invariant_loss(
+                stage1_raw_pred=x0_raw,
+                stage1_raw_gt=x0_gt_raw,
+                object_world_traj=object_traj,
+                root_world_t0=root_world_t0_for_plan,
+                seq_mask=seq_mask,
+                component_weights=r40_plan_component_weights,
+                beta=float(r40_plan_beta),
+            )
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
@@ -540,13 +605,15 @@ def build_stage1_step_fn(
             + w_init_pose_consistency * init_pose_cons
             + w_r36_raw_velocity * r36_raw_vel
             + w_r36_raw_acceleration * r36_raw_acc
+            + w_r40_plan_invariant * r40_plan
         )
 
-        return {
+        result: dict[str, Tensor] = {
             "loss": loss,
             "mse_x0": mse_x0.detach(),
             "mse_x0_unweighted": mse_x0_unweighted.detach(),
             "vel_mse": vel_mse.detach(),
+            "vel_mse_unweighted": vel_mse_unweighted.detach(),
             "yaw_smooth": yaw_sm.detach(),
             "rot6d_ortho": ortho_loss.detach(),
             "fk_pos": fk_pos.detach(),
@@ -559,7 +626,14 @@ def build_stage1_step_fn(
             "init_pose_consistency": init_pose_cons.detach(),
             "r36_raw_velocity": r36_raw_vel.detach(),
             "r36_raw_acceleration": r36_raw_acc.detach(),
+            "r40_plan_invariant": r40_plan.detach(),
+            "r40_plan_invariant_weighted": (
+                w_r40_plan_invariant * r40_plan
+            ).detach(),
         }
+        for comp_name, comp_val in r40_components.items():
+            result[f"r40_plan_{comp_name}"] = comp_val.detach()
+        return result
 
     return step_fn
 
@@ -774,6 +848,20 @@ def main() -> None:
         ),
         init_pose_dim=int(cfg.model.denoiser.get("init_pose_dim", 0)),
         vel_rot6d_weight=float(cfg.loss.get("vel_rot6d_weight", 1.0)),
+        # R40 — per-channel x0 / vel weights + plan-invariant loss.
+        # Empty list / missing key → all-ones (pre-R40 default behavior).
+        x0_channel_weights=tuple(
+            cfg.loss.get("x0_channel_weights", [])
+        ) or None,
+        vel_channel_weights=tuple(
+            cfg.loss.get("vel_channel_weights", [])
+        ) or None,
+        w_r40_plan_invariant=float(cfg.loss.get("w_r40_plan_invariant", 0.0)),
+        r40_plan_beta=float(cfg.loss.get("r40_plan_beta", 1.0)),
+        r40_plan_component_weights=(
+            dict(cfg.loss.get("r40_plan_component_weights", {}))
+            or None
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -808,6 +896,14 @@ def main() -> None:
         accelerator.print(
             f"  R36   raw_vel={out['r36_raw_velocity'].item():.4e}  "
             f"raw_acc={out['r36_raw_acceleration'].item():.4e}"
+        )
+        mse_x0_val = out["mse_x0"].item()
+        r40_w_val = out["r40_plan_invariant_weighted"].item()
+        ratio = r40_w_val / mse_x0_val if mse_x0_val > 0 else float("nan")
+        accelerator.print(
+            f"  R40 plan={out['r40_plan_invariant'].item():.4e}  "
+            f"weighted={r40_w_val:.4e}  "
+            f"weighted/mse={ratio:.3f}"
         )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")

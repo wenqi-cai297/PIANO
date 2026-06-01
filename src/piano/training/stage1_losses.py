@@ -39,6 +39,61 @@ from piano.training.smpl_kinematics import (
 )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# R40 — per-channel weight helper (used by the Stage-1 trainer's x0/vel MSE)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def build_channel_weight_tensor(
+    weights,
+    *,
+    expected_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> Tensor | None:
+    """Validate a per-channel weight list and convert to a broadcast tensor.
+
+    R40 lets configs reduce exact-GT pressure on under-determined channels
+    (root, vel, yaw, pelvis_rot6d) by passing a 23-long weight list. An empty
+    or omitted list returns ``None``, which the caller treats as "all ones"
+    so the old MSE behavior is preserved bit-for-bit.
+
+    Parameters
+    ----------
+    weights
+        Per-channel scalar multipliers (list, tuple, or ``None``). Empty
+        or ``None`` → no weighting.
+    expected_dim
+        Required length when non-empty (23 for stage1_coarse).
+    device, dtype
+        Where/how to materialise the tensor.
+    name
+        Identifier used in the ValueError message.
+
+    Returns
+    -------
+    Tensor of shape ``(1, 1, expected_dim)`` ready to broadcast onto
+    ``(B, T, expected_dim)`` per-dim squared error, or ``None`` when no
+    weighting was requested.
+    """
+    if weights is None:
+        return None
+    if not isinstance(weights, (list, tuple)):
+        raise ValueError(
+            f"{name} must be a list/tuple or None; got {type(weights).__name__}."
+        )
+    if len(weights) == 0:
+        return None
+    if len(weights) != expected_dim:
+        raise ValueError(
+            f"{name} must have length {expected_dim}; got {len(weights)}."
+        )
+    return torch.tensor(
+        list(weights), device=device, dtype=dtype,
+    ).view(1, 1, expected_dim)
+
+
 # ─── Channel layout (23-D) — must match stage1_coarse_oracle.py:191-214 ────
 # [ 0: 3]  root_local_x, root_local_z, root_local_y
 # [ 3: 6]  vel_x, vel_z, vel_y
@@ -917,3 +972,395 @@ def frame0_consistency_loss(
     pred_sel = pred_frame0.index_select(-1, idx)                       # (B, 14)
     err = (pred_sel - init_pose_targets_zscored).pow(2)
     return err.mean()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R40 — Stage-1 plan-invariant loss (plan-energy)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Stage-1's training objective so far has been per-frame GT regression
+# (w_x0 + w_vel + V7 anti-collapse moments). R35 / R31 dynamics audits
+# showed Stage-1 still collapses on multi-modal channels (root path,
+# facing yaw, pelvis posture): generated stage1_coarse has vel_ratio
+# 0.379 on velocity_xzy and 0.474 on pelvis_rot6d vs GT, the canonical
+# mode-collapse fingerprint of MSE under multimodal-conditional sampling.
+#
+# The fix in R40 mirrors what got Stage-2 PB1 out of the same problem
+# (R29 PB1, train_anchordiff.py:1106): instead of forcing the per-frame
+# GT mode, supervise plan-level invariants that any valid sample should
+# satisfy (speed envelope, arc length, turn activity, root-object radial
+# distance, rotation activity, height envelope, plus a light smoothness
+# anchor). Combined with x0_channel_weights downweighting the ambiguous
+# channels in the exact-GT term, the model is free to pick a mode rather
+# than averaging.
+#
+# Mode-invariance design: all GT comparisons use moments (mean/std)
+# or cross-segment statistics, not signed per-frame values. So a CCW
+# vs CW path of the same magnitude, or left vs right routing past the
+# object, do not produce different penalties.
+
+
+_R40_DEFAULT_COMPONENT_WEIGHTS: dict[str, float] = {
+    "root_speed": 1.0,
+    "root_arc": 1.0,
+    "root_displacement": 0.5,
+    "root_object_radial": 1.0,
+    "yaw_activity": 1.0,
+    "rot_activity": 0.5,
+    "height_envelope": 0.5,
+    "smoothness": 0.05,
+}
+
+
+def _masked_mean_std(
+    x: Tensor, mask_btc: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Per-batch-element mean and std of ``x`` under ``mask_btc``.
+
+    Parameters
+    ----------
+    x : (B, T) or (B, T-1) — scalar-per-frame quantity.
+    mask_btc : same shape as ``x`` — float mask (0/1).
+
+    Returns
+    -------
+    mean : (B,) — masked mean per element. Zero when no valid frames.
+    std  : (B,) — masked std (population, sqrt of variance). Zero when
+                 fewer than 2 valid frames or constant.
+    """
+    w_sum = mask_btc.sum(dim=-1).clamp_min(1.0)                # (B,)
+    x_sum = (x * mask_btc).sum(dim=-1)                         # (B,)
+    mean = x_sum / w_sum
+    centered = (x - mean.unsqueeze(-1)) * mask_btc             # (B, T)
+    var = (centered.pow(2)).sum(dim=-1) / w_sum                # (B,)
+    std = var.clamp_min(0.0).sqrt()                            # (B,)
+    return mean, std
+
+
+def _final_valid_index(seq_mask: Tensor) -> Tensor:
+    """Index of the last valid frame per clip. Returns 0 when no valid frame.
+
+    seq_mask : (B, T) float 0/1.
+    """
+    B, T = seq_mask.shape
+    idx = torch.arange(T, device=seq_mask.device, dtype=seq_mask.dtype)
+    masked_idx = idx.view(1, T) * seq_mask                     # (B, T)
+    return masked_idx.argmax(dim=-1).long()                    # (B,)
+
+
+def stage1_plan_invariant_loss(
+    stage1_raw_pred: Tensor,           # (B, T, 23) raw (un-z-scored)
+    stage1_raw_gt: Tensor,             # (B, T, 23) raw (un-z-scored)
+    object_world_traj: Tensor,         # (B, T, 9) — COM(3, world xyz) + rot6d(6)
+    root_world_t0: Tensor,             # (B, 1, 3) — motion[:, :1, 132:135], world xyz
+    seq_mask: Tensor,                  # (B, T) float
+    *,
+    component_weights: dict[str, float] | None = None,
+    beta: float = 1.0,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """R40 plan-invariant ("plan-energy") loss.
+
+    Returns
+    -------
+    total : scalar — weighted sum of per-component SmoothL1 losses.
+    components : dict[str, Tensor] — the raw (unweighted) scalar per
+        component, detached. Includes only the components that were
+        actually evaluated.
+
+    Stage-1 channel order (oracle_v1):
+        [0:3]  root_local x, z, y     (offset from root_world_t0)
+        [3:6]  vel x, z, y            (world-frame finite diff)
+        [6:8]  yaw_sin, yaw_cos
+        [8]    yaw_vel (unwrapped)
+        [9:15] pelvis_rot6d
+        [15:21] spine3_rot6d
+        [21]   head_height_y
+        [22]   shoulder_center_h_y
+
+    Notes
+    -----
+    - All GT summary stats are detached (target should not back-prop).
+    - Root world XZ is reconstructed by adding root_world_t0's (x, z) to
+      the predicted root_local (x, z) channels (indices [0] and [1] in
+      the oracle layout — y is at index [2]).
+    - Object world XZ is ``object_world_traj[..., [0, 2]]`` (world COM
+      is stored as x, y, z).
+    - All reductions respect ``seq_mask`` (frame mask) and pair-masks
+      (where a finite-difference pair requires both frames valid).
+    - When the entire batch lacks valid frames/pairs, the function
+      returns a gradient-safe zero on ``stage1_raw_pred``.
+    """
+    if stage1_raw_pred.shape != stage1_raw_gt.shape:
+        raise ValueError(
+            f"pred/gt shape mismatch: {stage1_raw_pred.shape} vs "
+            f"{stage1_raw_gt.shape}"
+        )
+    if stage1_raw_pred.ndim != 3 or stage1_raw_pred.shape[-1] != 23:
+        raise ValueError(
+            f"expected (B, T, 23); got {tuple(stage1_raw_pred.shape)}"
+        )
+    if object_world_traj.shape[:2] != stage1_raw_pred.shape[:2]:
+        raise ValueError(
+            f"object_world_traj batch/seq mismatch: "
+            f"{tuple(object_world_traj.shape)} vs {tuple(stage1_raw_pred.shape)}"
+        )
+    if root_world_t0.shape[1] != 1 or root_world_t0.shape[-1] != 3:
+        raise ValueError(
+            f"root_world_t0 must be (B, 1, 3); got {tuple(root_world_t0.shape)}"
+        )
+    if seq_mask.shape != stage1_raw_pred.shape[:2]:
+        raise ValueError(
+            f"seq_mask shape {tuple(seq_mask.shape)} != (B, T)"
+        )
+
+    B, T, _ = stage1_raw_pred.shape
+    device = stage1_raw_pred.device
+    dtype = stage1_raw_pred.dtype
+
+    weights = dict(_R40_DEFAULT_COMPONENT_WEIGHTS)
+    if component_weights is not None:
+        for k, v in component_weights.items():
+            if k not in weights:
+                raise ValueError(
+                    f"unknown plan-invariant component: {k!r}; "
+                    f"expected one of {sorted(weights.keys())}"
+                )
+            weights[k] = float(v)
+
+    seq_mask_f = seq_mask.to(dtype=dtype)
+    pair_mask = (
+        seq_mask_f[:, 1:] * seq_mask_f[:, :-1]
+        if T >= 2 else seq_mask_f[:, :0]
+    )                                                            # (B, T-1)
+    triple_mask = (
+        seq_mask_f[:, 2:] * seq_mask_f[:, 1:-1] * seq_mask_f[:, :-2]
+        if T >= 3 else seq_mask_f[:, :0]
+    )                                                            # (B, T-2)
+
+    # ─── Build world-frame root XZ from root_local + t0 ──────────────
+    # Stage-1 layout: root_local (x, z, y); root_world_t0 (x, y, z).
+    rx_pred = stage1_raw_pred[..., 0]                            # (B, T)
+    rz_pred = stage1_raw_pred[..., 1]                            # (B, T)
+    rx_gt = stage1_raw_gt[..., 0]
+    rz_gt = stage1_raw_gt[..., 1]
+    t0_world_x = root_world_t0[..., 0]                           # (B, 1)
+    t0_world_z = root_world_t0[..., 2]                           # (B, 1)
+    rwx_pred = rx_pred + t0_world_x
+    rwz_pred = rz_pred + t0_world_z
+    rwx_gt = rx_gt + t0_world_x
+    rwz_gt = rz_gt + t0_world_z
+
+    # ─── Object XZ ──
+    obj_x = object_world_traj[..., 0].to(dtype=dtype)            # (B, T)
+    obj_z = object_world_traj[..., 2].to(dtype=dtype)            # (B, T)
+
+    components: dict[str, Tensor] = {}
+
+    def _sl1_mean(diff: Tensor) -> Tensor:
+        """Mean SmoothL1(diff, 0) with beta."""
+        abs_d = diff.abs()
+        return torch.where(
+            abs_d < beta,
+            0.5 * diff.pow(2) / beta,
+            abs_d - 0.5 * beta,
+        ).mean()
+
+    # ── (1) root_speed: SmoothL1 on (mean, std) of frame-to-frame XZ speed ──
+    if T >= 2 and weights["root_speed"] != 0:
+        dx_p = rwx_pred[:, 1:] - rwx_pred[:, :-1]
+        dz_p = rwz_pred[:, 1:] - rwz_pred[:, :-1]
+        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(1e-12).sqrt()
+        dx_g = rwx_gt[:, 1:] - rwx_gt[:, :-1]
+        dz_g = rwz_gt[:, 1:] - rwz_gt[:, :-1]
+        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(1e-12).sqrt()
+        mean_p, std_p = _masked_mean_std(sp_p, pair_mask)
+        mean_g, std_g = _masked_mean_std(sp_g, pair_mask)
+        loss_rs = (
+            _sl1_mean(mean_p - mean_g.detach())
+            + _sl1_mean(std_p - std_g.detach())
+        )
+        components["root_speed"] = loss_rs
+
+    # ── (2) root_arc: SmoothL1 on cumulative XZ speed sum per clip ──
+    if T >= 2 and weights["root_arc"] != 0:
+        dx_p = rwx_pred[:, 1:] - rwx_pred[:, :-1]
+        dz_p = rwz_pred[:, 1:] - rwz_pred[:, :-1]
+        sp_p = (dx_p.pow(2) + dz_p.pow(2)).clamp_min(1e-12).sqrt()
+        dx_g = rwx_gt[:, 1:] - rwx_gt[:, :-1]
+        dz_g = rwz_gt[:, 1:] - rwz_gt[:, :-1]
+        sp_g = (dx_g.pow(2) + dz_g.pow(2)).clamp_min(1e-12).sqrt()
+        arc_p = (sp_p * pair_mask).sum(dim=-1)                   # (B,)
+        arc_g = (sp_g * pair_mask).sum(dim=-1)
+        components["root_arc"] = _sl1_mean(arc_p - arc_g.detach())
+
+    # ── (3) root_displacement: final-frame XZ offset from t=0 ──
+    if weights["root_displacement"] != 0:
+        last = _final_valid_index(seq_mask_f)
+        gathered_pred_x = rwx_pred.gather(1, last.view(B, 1)).squeeze(1)
+        gathered_pred_z = rwz_pred.gather(1, last.view(B, 1)).squeeze(1)
+        gathered_gt_x = rwx_gt.gather(1, last.view(B, 1)).squeeze(1)
+        gathered_gt_z = rwz_gt.gather(1, last.view(B, 1)).squeeze(1)
+        d_pred = (
+            (gathered_pred_x - t0_world_x.squeeze(-1)).pow(2)
+            + (gathered_pred_z - t0_world_z.squeeze(-1)).pow(2)
+        ).clamp_min(1e-12).sqrt()
+        d_gt = (
+            (gathered_gt_x - t0_world_x.squeeze(-1)).pow(2)
+            + (gathered_gt_z - t0_world_z.squeeze(-1)).pow(2)
+        ).clamp_min(1e-12).sqrt()
+        components["root_displacement"] = _sl1_mean(d_pred - d_gt.detach())
+
+    # ── (4) root_object_radial: distance-to-object profile stats ──
+    if weights["root_object_radial"] != 0:
+        dist_p = (
+            (rwx_pred - obj_x).pow(2) + (rwz_pred - obj_z).pow(2)
+        ).clamp_min(1e-12).sqrt()                                # (B, T)
+        dist_g = (
+            (rwx_gt - obj_x).pow(2) + (rwz_gt - obj_z).pow(2)
+        ).clamp_min(1e-12).sqrt()
+        mean_p, std_p = _masked_mean_std(dist_p, seq_mask_f)
+        mean_g, std_g = _masked_mean_std(dist_g, seq_mask_f)
+        # Min: replace invalid frames with +inf so they don't dominate.
+        big = torch.full_like(dist_p, float(1e9))
+        valid_b = seq_mask_f > 0.5
+        min_p = torch.where(valid_b, dist_p, big).min(dim=-1).values
+        min_g = torch.where(valid_b, dist_g, big).min(dim=-1).values
+        # Final (last valid frame).
+        last = _final_valid_index(seq_mask_f)
+        final_p = dist_p.gather(1, last.view(B, 1)).squeeze(1)
+        final_g = dist_g.gather(1, last.view(B, 1)).squeeze(1)
+        loss_ror = (
+            _sl1_mean(mean_p - mean_g.detach())
+            + _sl1_mean(std_p - std_g.detach())
+            + _sl1_mean(min_p - min_g.detach())
+            + _sl1_mean(final_p - final_g.detach())
+        )
+        components["root_object_radial"] = loss_ror
+
+    # ── (5) yaw_activity: |Δyaw_unwrapped| moments + cumulative range ──
+    if T >= 2 and weights["yaw_activity"] != 0:
+        yaw_p = torch.atan2(stage1_raw_pred[..., CH_YAW_SIN],
+                            stage1_raw_pred[..., CH_YAW_COS])
+        yaw_g = torch.atan2(stage1_raw_gt[..., CH_YAW_SIN],
+                            stage1_raw_gt[..., CH_YAW_COS])
+        twopi = 2.0 * 3.141592653589793
+        d_p = yaw_p[:, 1:] - yaw_p[:, :-1]
+        d_g = yaw_g[:, 1:] - yaw_g[:, :-1]
+        d_p = (d_p + 3.141592653589793) % twopi - 3.141592653589793
+        d_g = (d_g + 3.141592653589793) % twopi - 3.141592653589793
+        abs_dp = d_p.abs()
+        abs_dg = d_g.abs()
+        mean_p, std_p = _masked_mean_std(abs_dp, pair_mask)
+        mean_g, std_g = _masked_mean_std(abs_dg, pair_mask)
+        # Cumulative yaw range from cumsum of wrapped diffs (avoids
+        # the atan2 ±π discontinuity).
+        cs_p = torch.cumsum(d_p, dim=-1)
+        cs_g = torch.cumsum(d_g, dim=-1)
+        valid_b = (pair_mask > 0.5)
+        big = float(1e6)
+        cp_max = torch.where(
+            valid_b, cs_p, cs_p.new_full((), -big)
+        ).max(dim=-1).values
+        cp_min = torch.where(
+            valid_b, cs_p, cs_p.new_full((), big)
+        ).min(dim=-1).values
+        cg_max = torch.where(
+            valid_b, cs_g, cs_g.new_full((), -big)
+        ).max(dim=-1).values
+        cg_min = torch.where(
+            valid_b, cs_g, cs_g.new_full((), big)
+        ).min(dim=-1).values
+        range_p = (cp_max - cp_min).clamp_min(0.0)
+        range_g = (cg_max - cg_min).clamp_min(0.0)
+        loss_yact = (
+            _sl1_mean(mean_p - mean_g.detach())
+            + _sl1_mean(std_p - std_g.detach())
+            + _sl1_mean(range_p - range_g.detach())
+        )
+        components["yaw_activity"] = loss_yact
+
+    # ── (6) rot_activity: |Δrot6d| moments for pelvis + spine3 ──
+    if T >= 2 and weights["rot_activity"] != 0:
+        # Per-frame finite-diff magnitude across the 6 channels of the
+        # rot6d block (vector L2 norm of the 6-D diff). Not strictly
+        # angular velocity but a representation-level activity stat.
+        pel_p = stage1_raw_pred[..., CH_PELVIS_ROT6D]
+        pel_g = stage1_raw_gt[..., CH_PELVIS_ROT6D]
+        sp_p = stage1_raw_pred[..., CH_SPINE3_ROT6D]
+        sp_g = stage1_raw_gt[..., CH_SPINE3_ROT6D]
+        d_pel_p = (pel_p[:, 1:] - pel_p[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+        d_pel_g = (pel_g[:, 1:] - pel_g[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+        d_sp_p = (sp_p[:, 1:] - sp_p[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+        d_sp_g = (sp_g[:, 1:] - sp_g[:, :-1]).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+        m_pel_p, s_pel_p = _masked_mean_std(d_pel_p, pair_mask)
+        m_pel_g, s_pel_g = _masked_mean_std(d_pel_g, pair_mask)
+        m_sp_p, s_sp_p = _masked_mean_std(d_sp_p, pair_mask)
+        m_sp_g, s_sp_g = _masked_mean_std(d_sp_g, pair_mask)
+        loss_ract = (
+            _sl1_mean(m_pel_p - m_pel_g.detach())
+            + _sl1_mean(s_pel_p - s_pel_g.detach())
+            + _sl1_mean(m_sp_p - m_sp_g.detach())
+            + _sl1_mean(s_sp_p - s_sp_g.detach())
+        )
+        components["rot_activity"] = loss_ract
+
+    # ── (7) height_envelope: head/shoulder height (mean, min, max) ──
+    if weights["height_envelope"] != 0:
+        head_p = stage1_raw_pred[..., CH_HEAD_HEIGHT]
+        head_g = stage1_raw_gt[..., CH_HEAD_HEIGHT]
+        sh_p = stage1_raw_pred[..., CH_SHOULDER_H]
+        sh_g = stage1_raw_gt[..., CH_SHOULDER_H]
+        m_head_p, _ = _masked_mean_std(head_p, seq_mask_f)
+        m_head_g, _ = _masked_mean_std(head_g, seq_mask_f)
+        m_sh_p, _ = _masked_mean_std(sh_p, seq_mask_f)
+        m_sh_g, _ = _masked_mean_std(sh_g, seq_mask_f)
+        big = torch.full_like(head_p, float(1e9))
+        valid_b = seq_mask_f > 0.5
+        min_head_p = torch.where(valid_b, head_p, big).min(dim=-1).values
+        min_head_g = torch.where(valid_b, head_g, big).min(dim=-1).values
+        max_head_p = torch.where(valid_b, head_p, -big).max(dim=-1).values
+        max_head_g = torch.where(valid_b, head_g, -big).max(dim=-1).values
+        min_sh_p = torch.where(valid_b, sh_p, big).min(dim=-1).values
+        min_sh_g = torch.where(valid_b, sh_g, big).min(dim=-1).values
+        max_sh_p = torch.where(valid_b, sh_p, -big).max(dim=-1).values
+        max_sh_g = torch.where(valid_b, sh_g, -big).max(dim=-1).values
+        loss_he = (
+            _sl1_mean(m_head_p - m_head_g.detach())
+            + _sl1_mean(m_sh_p - m_sh_g.detach())
+            + _sl1_mean(min_head_p - min_head_g.detach())
+            + _sl1_mean(max_head_p - max_head_g.detach())
+            + _sl1_mean(min_sh_p - min_sh_g.detach())
+            + _sl1_mean(max_sh_p - max_sh_g.detach())
+        )
+        components["height_envelope"] = loss_he
+
+    # ── (8) smoothness (pred-only): root XZ accel + yaw accel magnitude ──
+    if T >= 3 and weights["smoothness"] != 0:
+        vx = rwx_pred[:, 1:] - rwx_pred[:, :-1]                  # (B, T-1)
+        vz = rwz_pred[:, 1:] - rwz_pred[:, :-1]
+        ax = vx[:, 1:] - vx[:, :-1]                              # (B, T-2)
+        az = vz[:, 1:] - vz[:, :-1]
+        acc_mag = (ax.pow(2) + az.pow(2)).clamp_min(1e-12).sqrt()
+        yaw_p = torch.atan2(stage1_raw_pred[..., CH_YAW_SIN],
+                            stage1_raw_pred[..., CH_YAW_COS])
+        d_yaw = yaw_p[:, 1:] - yaw_p[:, :-1]
+        twopi = 2.0 * 3.141592653589793
+        d_yaw = (d_yaw + 3.141592653589793) % twopi - 3.141592653589793
+        a_yaw = (d_yaw[:, 1:] - d_yaw[:, :-1]).abs()
+        if triple_mask.numel() > 0:
+            denom = triple_mask.sum().clamp_min(1.0)
+            acc_term = (acc_mag * triple_mask).sum() / denom
+            yaw_term = (a_yaw * triple_mask).sum() / denom
+            components["smoothness"] = acc_term + yaw_term
+        else:
+            components["smoothness"] = stage1_raw_pred.sum() * 0.0
+    elif weights["smoothness"] != 0:
+        components["smoothness"] = stage1_raw_pred.sum() * 0.0
+
+    # Aggregate weighted components.
+    if not components:
+        return stage1_raw_pred.sum() * 0.0, {}
+    total = stage1_raw_pred.new_zeros(())
+    for name, val in components.items():
+        total = total + weights[name] * val
+    return total, components

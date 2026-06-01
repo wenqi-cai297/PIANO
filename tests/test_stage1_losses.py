@@ -1031,3 +1031,285 @@ def test_stage1_denoiser_v0_backwards_compat_no_init_pose():
     }
     out = model(x_t, t, cond, cond_drop_mask=None)
     assert out.shape == (B, T, 23)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R40 — channel-weight helper (build_channel_weight_tensor)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_channel_weight_helper_empty_returns_none():
+    """Empty list / None → ``None`` (caller treats as all-ones)."""
+    from piano.training.stage1_losses import build_channel_weight_tensor
+    device = torch.device("cpu")
+    for w in (None, [], ()):
+        out = build_channel_weight_tensor(
+            w, expected_dim=23, device=device, dtype=torch.float32, name="x",
+        )
+        assert out is None
+
+
+def test_channel_weight_helper_wrong_length_raises():
+    from piano.training.stage1_losses import build_channel_weight_tensor
+    with pytest.raises(ValueError, match="must have length 23"):
+        build_channel_weight_tensor(
+            [1.0] * 22, expected_dim=23,
+            device=torch.device("cpu"), dtype=torch.float32, name="bad",
+        )
+
+
+def test_channel_weight_helper_valid_shape():
+    from piano.training.stage1_losses import build_channel_weight_tensor
+    w = [float(i) for i in range(23)]
+    out = build_channel_weight_tensor(
+        w, expected_dim=23,
+        device=torch.device("cpu"), dtype=torch.float32, name="ok",
+    )
+    assert out is not None
+    assert out.shape == (1, 1, 23)
+    assert out.dtype == torch.float32
+    assert torch.allclose(out.view(-1), torch.tensor(w, dtype=torch.float32))
+
+
+def test_channel_weight_helper_zero_weight_removes_channel_contribution():
+    """A zero weight on a channel zeros its contribution to the weighted sum.
+
+    Models the production code path:
+        weighted_per_dim = per_dim * channel_w   # (1, 1, 23) broadcast
+        per_frame = weighted_per_dim.sum(-1)
+    Setting channel 5's weight to 0 must drop its (large) contribution.
+    """
+    from piano.training.stage1_losses import build_channel_weight_tensor
+    per_dim = torch.ones(1, 1, 23) * 1.0
+    per_dim[..., 5] = 100.0
+    w = [1.0] * 23
+    w[5] = 0.0
+    cw = build_channel_weight_tensor(
+        w, expected_dim=23,
+        device=torch.device("cpu"), dtype=per_dim.dtype, name="zero5",
+    )
+    weighted_sum = (per_dim * cw).sum(-1).item()
+    # 22 channels at 1.0 + 1 channel at 100*0 = 22.
+    assert weighted_sum == pytest.approx(22.0, abs=1e-6)
+
+
+def test_channel_weight_helper_non_list_raises():
+    from piano.training.stage1_losses import build_channel_weight_tensor
+    with pytest.raises(ValueError, match="must be a list/tuple or None"):
+        build_channel_weight_tensor(
+            "not-a-list", expected_dim=23,
+            device=torch.device("cpu"), dtype=torch.float32, name="bad",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# R40 — stage1_plan_invariant_loss
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _build_simple_plan_inputs(
+    *,
+    B: int = 2,
+    T: int = 12,
+    seed: int = 0,
+    speed: float = 0.05,
+    yaw_rate: float = 0.05,
+    object_xy_offset: tuple[float, float] = (0.5, 0.0),
+):
+    """Construct a hand-crafted (B, T, 23) stage1_raw + obj_traj + t0.
+
+    The clip walks at constant XZ speed, rotates pelvis yaw at constant
+    rate, and has a stationary object at the given offset.
+    """
+    torch.manual_seed(seed)
+    device = torch.device("cpu")
+    raw = torch.zeros(B, T, 23, device=device, dtype=torch.float64)
+    # Linear root path: (x_t, z_t) = t * (speed_x, speed_z) in oracle (x, z).
+    for t in range(T):
+        raw[:, t, 0] = t * speed                  # root_local_x
+        raw[:, t, 1] = t * speed * 0.5            # root_local_z
+        raw[:, t, 2] = 0.0                         # root_local_y
+        # vel channels (raw oracle stores frame-to-frame diff).
+        raw[:, t, 3] = speed
+        raw[:, t, 4] = speed * 0.5
+        raw[:, t, 5] = 0.0
+        # yaw — linear from 0.
+        ang = yaw_rate * t
+        raw[:, t, 6] = float(torch.sin(torch.tensor(ang)))
+        raw[:, t, 7] = float(torch.cos(torch.tensor(ang)))
+        raw[:, t, 8] = yaw_rate
+        # pelvis & spine3 rot6d — small constant offset.
+        raw[:, t, 9:15] = 0.0
+        raw[:, t, 9] = 1.0
+        raw[:, t, 13] = 1.0
+        raw[:, t, 15:21] = 0.0
+        raw[:, t, 15] = 1.0
+        raw[:, t, 19] = 1.0
+        raw[:, t, 21] = 1.7                        # head_height
+        raw[:, t, 22] = 1.4                        # shoulder_h
+    # Object traj (B, T, 9) — COM at (x_off, 0, z_off) world.
+    obj_traj = torch.zeros(B, T, 9, device=device, dtype=torch.float64)
+    obj_traj[..., 0] = object_xy_offset[0]
+    obj_traj[..., 2] = object_xy_offset[1]
+    # Root world t0 = (0, 0, 0) world.
+    root_world_t0 = torch.zeros(B, 1, 3, device=device, dtype=torch.float64)
+    seq_mask = torch.ones(B, T, device=device, dtype=torch.float64)
+    return raw, obj_traj, root_world_t0, seq_mask
+
+
+def test_plan_invariant_zero_on_identity():
+    """plan_invariant_loss(pred == gt) is zero on comparison components.
+
+    Smoothness is pred-only and may be nonzero; check the comparison
+    components individually.
+    """
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw, obj, t0, mask = _build_simple_plan_inputs(speed=0.05, yaw_rate=0.05)
+    total, comps = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw.float(),
+        stage1_raw_gt=raw.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    for name in (
+        "root_speed", "root_arc", "root_displacement",
+        "root_object_radial", "yaw_activity", "rot_activity",
+        "height_envelope",
+    ):
+        assert name in comps, f"missing {name}"
+        assert comps[name].item() == pytest.approx(0.0, abs=1e-4), \
+            f"{name} should be ~0 on identity, got {comps[name].item():.4e}"
+
+
+def test_plan_invariant_frozen_root_has_larger_speed_arc_than_gt():
+    """A frozen root path (zero motion) has a larger root_speed/root_arc
+    loss than a GT moving path.
+    """
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw_gt, obj, t0, mask = _build_simple_plan_inputs(
+        speed=0.05, yaw_rate=0.0,
+    )
+    raw_pred = raw_gt.clone()
+    raw_pred[..., :6] = 0.0                                       # frozen root
+    _total, comps = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw_pred.float(),
+        stage1_raw_gt=raw_gt.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    assert comps["root_speed"].item() > 1e-4
+    assert comps["root_arc"].item() > 1e-4
+
+
+def test_plan_invariant_mirrored_path_radial_low_penalty():
+    """A left-vs-right mirror of the root path that keeps the same
+    radial distance to the object should not incur a large
+    root_object_radial penalty.
+
+    Build GT going +x, pred going -x; object is at the origin so the
+    radial distance profile is identical (|x_t|).
+    """
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw_gt, obj, t0, mask = _build_simple_plan_inputs(
+        speed=0.05, yaw_rate=0.0,
+        object_xy_offset=(0.0, 0.0),
+    )
+    # Mirror x-channel and its velocity. Also zero z so radial = |x|.
+    raw_gt = raw_gt.clone()
+    raw_gt[..., 1] = 0.0
+    raw_gt[..., 4] = 0.0
+    raw_pred = raw_gt.clone()
+    raw_pred[..., 0] = -raw_gt[..., 0]
+    raw_pred[..., 3] = -raw_gt[..., 3]
+    _t, comps = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw_pred.float(),
+        stage1_raw_gt=raw_gt.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    # Radial distance |x_t| matches frame-by-frame → ~0 radial loss.
+    assert comps["root_object_radial"].item() == pytest.approx(0.0, abs=1e-4)
+
+
+def test_plan_invariant_masking_ignores_padded_frames():
+    """Padded frames must not contribute to plan stats."""
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw, obj, t0, mask = _build_simple_plan_inputs(T=12, speed=0.05)
+    # Mask out the last 4 frames.
+    mask = mask.clone()
+    mask[:, -4:] = 0.0
+    # Corrupt the masked frames in pred only — they should not change loss.
+    raw_pred = raw.clone()
+    raw_pred[:, -4:, :] = 999.0
+    total_a, _ = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw.float(),
+        stage1_raw_gt=raw.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    total_b, _ = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw_pred.float(),
+        stage1_raw_gt=raw.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    # Identity and "corrupted-after-mask" should match; final-index
+    # uses argmax over masked_idx → last valid is t=7 in both.
+    assert abs(total_a.item() - total_b.item()) < 1e-4, (
+        f"masking did not isolate padded frames: "
+        f"{total_a.item()=:.6f} vs {total_b.item()=:.6f}"
+    )
+
+
+def test_plan_invariant_smoothness_finite_and_nonneg():
+    """Smoothness must be a finite scalar ≥ 0."""
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw, obj, t0, mask = _build_simple_plan_inputs()
+    _t, comps = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw.float(),
+        stage1_raw_gt=raw.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    if "smoothness" in comps:
+        s = comps["smoothness"].item()
+        assert s >= 0.0
+        assert s == s  # not NaN
+        assert s != float("inf")
+
+
+def test_plan_invariant_gradients_flow_to_pred():
+    """Gradient flows from total loss to stage1_raw_pred."""
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw_gt, obj, t0, mask = _build_simple_plan_inputs(speed=0.05)
+    raw_pred = (raw_gt.float().clone() + 0.01).requires_grad_(True)
+    total, _ = stage1_plan_invariant_loss(
+        stage1_raw_pred=raw_pred,
+        stage1_raw_gt=raw_gt.float(),
+        object_world_traj=obj.float(),
+        root_world_t0=t0.float(),
+        seq_mask=mask.float(),
+    )
+    total.backward()
+    assert raw_pred.grad is not None
+    assert raw_pred.grad.abs().sum().item() > 0.0
+
+
+def test_plan_invariant_unknown_component_raises():
+    from piano.training.stage1_losses import stage1_plan_invariant_loss
+    raw, obj, t0, mask = _build_simple_plan_inputs()
+    with pytest.raises(ValueError, match="unknown plan-invariant component"):
+        stage1_plan_invariant_loss(
+            stage1_raw_pred=raw.float(),
+            stage1_raw_gt=raw.float(),
+            object_world_traj=obj.float(),
+            root_world_t0=t0.float(),
+            seq_mask=mask.float(),
+            component_weights={"not_a_real_component": 1.0},
+        )
