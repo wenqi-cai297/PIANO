@@ -802,6 +802,30 @@ def check_10_grad_scale_actual_stack(
     out: dict[str, Any] = {"name": "grad_scale_actual_stack"}
     out["cascade_weights"] = dict(cascade_weights)
 
+    # Defensive guard for control cells (A0-style: cascade disabled or
+    # all component weights zero). Backward on a zero-weight stack would
+    # produce a degenerate graph (cascade_weighted is a leaf zero with
+    # no Stage-1 path) and either crash or silently report 0/0. Bail
+    # cleanly and let callers mark this as a control cell rather than
+    # "P0 crashed" (Codex r41_calibration_next_steps §4.2).
+    active_weights = [
+        float(cascade_weights.get("w_motion_mse", 0.0)),
+        float(cascade_weights.get("w_world_joint_vel", 0.0)),
+        float(cascade_weights.get("w_l_pos_full", 0.0)),
+        float(cascade_weights.get("w_anchor_joint_pos", 0.0)),
+    ]
+    w_total_now = float(cascade_weights.get("w_total", 1.0))
+    if all(w == 0.0 for w in active_weights) or w_total_now == 0.0:
+        out["control_cell"] = True
+        out["grad_norm_stage1_self"] = None
+        out["grad_norm_actual_cascade_weighted"] = 0.0
+        out["ratio_actual_cascade_over_self"] = None
+        out["component_loss_values"] = {}
+        out["cascade_weighted_value"] = 0.0
+        out["recommended_w_total_for_ratio_1"] = w_total_now
+        out["pass"] = True
+        return out
+
     # 1) self loss only.
     _clear_grads([stage1, stage1_encoder, pb1, pb1_encoder])
     r1 = _cascade_forward(**{**fwd_args, "batch": batch})

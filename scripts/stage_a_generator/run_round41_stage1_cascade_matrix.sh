@@ -6,11 +6,18 @@
 # GT C41/S4) under frozen R29 PB1 ckpt.
 #
 # Pre-launch calibration is its own standalone script (run it first):
-#   python scripts/stage_a_generator/round41_cascade_calibration.py
+#   # First-round NUDGE PROBE (Codex r41_calibration_next_steps 2026-06-02):
+#   python scripts/stage_a_generator/round41_cascade_calibration.py \\
+#       --target-min 0.2 --target-max 0.5 --target-center 0.3 \\
+#       --max-w-total 5.0
 #   python scripts/stage_a_generator/round41_apply_calibration.py \\
 #       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply
-#   (re-run calibration to confirm all cells are in-band)
+#   # Re-run calibration to confirm all cells are in-band (or capped).
 # Then this launcher trains + diags without re-running smoke checks.
+#
+# Do NOT use target_center=1.0 for the first formal R41 run: step-0
+# parity can drift large mid-training (R36/R37/R40 history). Start at
+# 0.3, raise on evidence.
 #
 # Pass --with-inline-calibration to re-enable a per-cell smoke check
 # inside the launcher (legacy mode; not recommended — its log parsing
@@ -184,8 +191,9 @@ fi
 log
 log "===== R41 cascade matrix launch ${STAMP} ====="
 log "*** R36/R37 GUARDRAIL: standalone calibration phase ***"
-log "If you haven't run the standalone calibration yet:"
-log "   python scripts/stage_a_generator/round41_cascade_calibration.py"
+log "If you haven't run the standalone calibration yet (recommended first-round nudge probe):"
+log "   python scripts/stage_a_generator/round41_cascade_calibration.py \\"
+log "       --target-min 0.2 --target-max 0.5 --target-center 0.3 --max-w-total 5.0"
 log "   python scripts/stage_a_generator/round41_apply_calibration.py \\"
 log "       --calibration analyses/round41_cascade_calibration/<stamp>.json --apply"
 log "Then re-run this launcher. Inline calibration is off by default."
@@ -264,12 +272,17 @@ print(json.dumps(out))
                     audit_fail=1
                 fi
             fi
-            # Warn on default w_total (likely missed calibration).
+            # Warn on default w_total (likely missed calibration). A
+            # control cell legitimately stays at 1.0 because cascade is
+            # disabled; only warn on enabled cascade cells.
             if awk -v w="${CFG_W_TOTAL}" 'BEGIN {exit !(w == 1.0)}'; then
                 log "[audit] WARN ${VID} cascade.w_total == 1.0 (default). Did you run"
-                log "[audit]      round41_cascade_calibration.py + round41_apply_calibration.py?"
-                log "[audit]      Training will proceed but cascade signal may dominate (R36 risk)."
+                log "[audit]      round41_cascade_calibration.py --target-center 0.3 --max-w-total 5.0"
+                log "[audit]      + round41_apply_calibration.py --apply ?"
+                log "[audit]      Training will proceed but step-0 grad ratio is uncalibrated."
             fi
+        else
+            log "[audit] ${VID}: control cell (cascade disabled) — calibration N/A"
         fi
     done <<< "${VARIANTS}"
     if [[ ${audit_fail} -ne 0 ]]; then

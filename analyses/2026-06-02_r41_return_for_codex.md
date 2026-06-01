@@ -328,3 +328,125 @@ Pending — to be filled in after `git commit` succeeds.
   test-covered (it's a server-only diagnostic, not library code).
   The underlying `pb1_loss_helpers` helpers it calls are covered
   in `tests/test_pb1_loss_helpers.py` (20 tests).
+
+---
+
+# Addendum — 2026-06-02 eve: Calibration Q1/Q2/Q3 landed
+
+Codex's reply
+`analyses/2026-06-02_r41_calibration_next_steps_for_claude.md`
+answered the three design questions raised in
+`analyses/2026-06-02_r41_calibration_verdict_for_codex.md`. This
+addendum records what Claude landed in response.
+
+## A.1 Codex Decision → Code Change
+
+| Codex verdict | Lands as |
+|---|---|
+| **Q1** target_center=0.3 (nudge probe, not 1.0) | `round41_cascade_calibration.py` defaults updated: `DEFAULT_TARGET_MIN=0.2`, `DEFAULT_TARGET_MAX=0.5`, `DEFAULT_TARGET_CENTER=0.3` |
+| **Q2** cap A3 (and any future runaway cell) at w_total = 5.0 | New `DEFAULT_MAX_W_TOTAL=5.0` + `--max-w-total` CLI arg. `_recommend_w_total` returns `recommended_w_total_uncapped`, `recommended_w_total`, `capped`, `max_w_total` so apply step + report can show what the linear math wanted vs what was actually shipped. |
+| **Q3.1** Calibration skips control cells before P0 invocation | New `_read_cascade_info(cfg_path)` returns `control_cell` when `cascade.enabled=false` *or* all `w_*=0`. Calibration driver writes a `control_cell=True` row without running P0; `apply` skips it without reading `p0_rc`. |
+| **Q3.2** P0 `check_10` defensive zero-weight guard | Added to `check_10_grad_scale_actual_stack`: when `all(w_*==0)` or `w_total==0`, returns `control_cell=True, pass=True, ratio=None` before trying to backprop. Manual P0 invocation on A0 no longer surfaces as "crashed". |
+
+Server calibration run pending (waiting for the operator to push).
+
+## A.2 Files Changed in This Addendum Pass
+
+| File | Status | Purpose |
+|---|---|---|
+| `scripts/stage_a_generator/round41_cascade_calibration.py` | modified | nudge defaults, `--max-w-total`, control-cell detector, capped status in report |
+| `scripts/stage_a_generator/round41_apply_calibration.py` | modified | handle `control_cell`, log capped status, fix latent `smoke_rc` → `p0_rc` JSON key mismatch |
+| `scripts/stage_a_generator/round41_stage1_cascade_p0_diag.py` | modified | `check_10` zero-weight guard |
+| `scripts/stage_a_generator/run_round41_stage1_cascade_matrix.sh` | modified | help text + banner show nudge-probe recommended cmd; audit log treats control cell explicitly |
+| `tests/test_r41_calibration.py` | new | 6 unit tests over `_recommend_w_total` + 3 OmegaConf-skip tests over `_read_cascade_info` |
+
+## A.3 Latent Bug Fixed (apply script)
+
+The pre-existing `round41_apply_calibration.py` checked
+`row.get("smoke_rc") != 0` to detect P0 failures — but the calibration
+JSON writer uses the key `p0_rc`. The check therefore reported "no
+key" → `None != 0` → True for **every row**, so the failed-skip
+branch was effectively never reached (other branches caught
+in-band/equal-current first, masking it). Fixed to use `p0_rc` and to
+report the count of control / failed / in-band rows separately in the
+DONE / DRY-RUN summary line.
+
+## A.4 Test Coverage
+
+`tests/test_r41_calibration.py` runs locally without OmegaConf;
+OmegaConf-dependent tests skip cleanly (Windows dev → server has
+omegaconf installed and will run them).
+
+Local run:
+
+    python -m pytest -q tests/test_r41_calibration.py
+    # 6 passed, 3 skipped
+
+Adjacent suites still pass:
+
+    python -m pytest -q tests/test_stage1_init_checkpoint.py tests/test_pb1_loss_helpers.py
+    # 20 passed, 1 skipped
+
+Targeted asserts:
+
+- `_recommend_w_total(ratio=0.069, center=0.3, max=5)`
+  → `~4.35, capped=False` (server A3 case at nudge band)
+- `_recommend_w_total(ratio=0.069, center=1.0, max=5)`
+  → `5.0, capped=True, uncapped~14.5` (Codex Q2 cap demo)
+- `_recommend_w_total(ratio=0.3, center=0.3, …)`
+  → `in_band=True, recommended_w_total=current` (no-op when in band)
+- `_read_cascade_info(<A0-style yaml>)` → `control_cell=True`
+- `_read_cascade_info(<A1-style yaml>)` → `control_cell=False`
+- `_read_cascade_info(<enabled=true, all-w=0>)` → still `control_cell=True`
+
+## A.5 Server Recalibration Workflow (unchanged from Codex §7)
+
+Once this commit is pushed:
+
+    git pull --ff-only origin master
+    conda activate piano
+
+    export DATASETS_ROOT=/media/8TB_data/Cai/datasets/InterAct/piano_official_process_4
+    export ROUND41_GPUS="0,2"
+    export ROUND41_NUM_PROCESSES=2
+    export ROUND41_BUCKETS="val"
+
+    # Defaults now match Codex's nudge-probe spec; no CLI flags needed
+    # to get center=0.3 / band [0.2, 0.5] / cap 5.0.
+    python -u scripts/stage_a_generator/round41_cascade_calibration.py \
+      --out-dir analyses/round41_cascade_calibration
+
+    python scripts/stage_a_generator/round41_apply_calibration.py \
+      --calibration analyses/round41_cascade_calibration/<stamp>.json \
+      --apply
+
+    python -u scripts/stage_a_generator/round41_cascade_calibration.py \
+      --out-dir analyses/round41_cascade_calibration
+
+Expected second-round result:
+
+- A0: `control` row, no P0 call, `recommended_w_total = 1.0`
+- A1/A2/A4: ratio in `[0.2, 0.5]` (uncapped recommendations were
+  1.78 / 1.25 / 1.94 — all under the 5.0 cap)
+- A3: `recommended_w_total ≈ 4.35` (just under cap), ratio in band
+  *after* apply step
+
+If the second calibration shows any non-control cell still out of
+band, do not launch — the linear-rescale assumption broke (likely
+the cascade has non-linear coupling at higher w_total) and Codex
+should be asked.
+
+## A.6 Deferred From This Pass
+
+- **Per-component min-SNR separation.** Right now `compute_min_snr_weight`
+  is applied only inside `masked_motion_mse_loss`; world-vel / L_pos /
+  anchor terms get unit weight in cascade calibration. Codex's
+  next-steps doc didn't request changing this for the first run.
+
+- **`_build_pb1_from_cfg` public refactor** — still flagged for R42.
+
+- **Per-component cap.** Right now the cap is on `w_total` only, not
+  on individual `w_*`. A3's L_pos coefficient (5×) is unchanged by
+  any calibration step. Codex did not request changing this. If
+  A3 mid-training shows L_pos dominating mode collapse, the next
+  step is to lower `w_l_pos_full` not `w_total`.

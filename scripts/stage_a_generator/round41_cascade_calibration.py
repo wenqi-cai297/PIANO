@@ -51,16 +51,74 @@ from typing import Any
 # Below this band cascade signal is too weak to move the optimization
 # direction; above it cascade dominates and Stage-1 self loss can't
 # anchor the model (= R36 disaster shape).
-DEFAULT_TARGET_MIN = 0.5
-DEFAULT_TARGET_MAX = 1.5
-DEFAULT_TARGET_CENTER = 1.0
+#
+# Defaults updated 2026-06-02 per Codex r41_calibration_next_steps:
+# first R41 run is a *nudge probe* (center=0.3), not parity (center=1.0).
+# Single-batch step-0 ratio of 1.0 can drift much larger mid-training
+# (R36/R37/R40 history); start conservative, raise on evidence.
+DEFAULT_TARGET_MIN = 0.2
+DEFAULT_TARGET_MAX = 0.5
+DEFAULT_TARGET_CENTER = 0.3
 
 # R36 disaster threshold: if measured ratio exceeds this, recommend a
 # much harder rescale + flag for user review.
 DEFAULT_ABORT_RATIO = 3.0
 
+# Hard cap on the linear-rescale recommendation so a cell with very
+# small initial cascade gradient (e.g. A3 = 0.069 → uncapped 14.5x)
+# does not silently bump w_total into R36 territory mid-training.
+DEFAULT_MAX_W_TOTAL = 5.0
+
 # (Loss-based stdout parsing removed; calibration now reads grad ratios
 # from the P0 diagnostic's JSON output, see _extract_calibration_metrics.)
+
+
+def _read_cascade_info(cfg_path: Path) -> dict[str, Any]:
+    """Inspect a cfg yaml's cascade block.
+
+    Returns ``control_cell=True`` when cascade is disabled or all
+    component weights are zero. Used by the calibration driver to skip
+    P0 entirely for A0-style control cells (P0 check_10 has no gradient
+    to backprop when all w_* are zero, which surfaces as a confusing
+    "P0 crashed" row).
+    """
+    from omegaconf import OmegaConf
+    try:
+        cfg = OmegaConf.load(str(cfg_path))
+    except Exception as exc:
+        return {
+            "load_error": repr(exc),
+            "enabled": False,
+            "w_total": 1.0,
+            "weights": {},
+            "control_cell": False,
+            "pb1_checkpoint": None,
+        }
+    casc = cfg.get("cascade", None)
+    if casc is None:
+        return {
+            "enabled": False,
+            "w_total": 1.0,
+            "weights": {},
+            "control_cell": True,
+            "pb1_checkpoint": None,
+        }
+    enabled = bool(casc.get("enabled", False))
+    w_total = float(casc.get("w_total", 1.0))
+    weights = {
+        "w_motion_mse": float(casc.get("w_motion_mse", 0.0)),
+        "w_world_joint_vel": float(casc.get("w_world_joint_vel", 0.0)),
+        "w_l_pos_full": float(casc.get("w_l_pos_full", 0.0)),
+        "w_anchor_joint_pos": float(casc.get("w_anchor_joint_pos", 0.0)),
+    }
+    all_zero = all(v == 0.0 for v in weights.values())
+    return {
+        "enabled": enabled,
+        "w_total": w_total,
+        "weights": weights,
+        "control_cell": (not enabled) or all_zero,
+        "pb1_checkpoint": str(casc.get("pb1_checkpoint", "")) or None,
+    }
 
 
 def _run_p0_calibration(
@@ -159,6 +217,15 @@ def _extract_calibration_metrics(p0_stats: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _round_w(rec_w: float) -> float:
+    """Round to a few significant figures for cfg readability."""
+    if rec_w >= 1.0:
+        return round(rec_w, 2)
+    if rec_w >= 0.01:
+        return round(rec_w, 3)
+    return float(f"{rec_w:.2e}")
+
+
 def _recommend_w_total(
     measured_ratio: float,
     *,
@@ -167,32 +234,44 @@ def _recommend_w_total(
     target_max: float = DEFAULT_TARGET_MAX,
     abort_ratio: float = DEFAULT_ABORT_RATIO,
     current_w_total: float = 1.0,
+    max_w_total: float | None = DEFAULT_MAX_W_TOTAL,
 ) -> dict[str, Any]:
     """Suggest a new ``cascade.w_total`` that brings the ratio into band.
 
     The relationship is linear: ratio scales linearly with w_total
     (cascade_weighted = w_total * sum(w_k * loss_k)).
     So new_w_total = current * (target_center / measured_ratio).
+
+    A ``max_w_total`` cap is applied on top of the linear rescale.
+    Without a cap, a small-grad cell (e.g. A3 at ratio 0.069) would be
+    recommended a 14× w_total bump, which is mathematically correct for
+    the step-0 ratio but risks letting cascade dominate mid-training
+    (R36 shape). The cap defaults to 5.0 per Codex r41 next-steps doc.
     """
     if measured_ratio <= 0:
         return {
             "in_band": False,
             "exceeds_abort": False,
+            "recommended_w_total_uncapped": current_w_total,
             "recommended_w_total": current_w_total,
+            "capped": False,
+            "max_w_total": max_w_total,
             "rec_reason": (
                 "measured ratio is 0 — cascade likely off, no rescale needed"
             ),
         }
     in_band = target_min <= measured_ratio <= target_max
     exceeds_abort = measured_ratio > abort_ratio
-    rec_w = current_w_total * (target_center / measured_ratio)
-    # Round to 2 significant figures for cfg readability.
-    if rec_w >= 1.0:
-        rec_w_round = round(rec_w, 2)
-    elif rec_w >= 0.01:
-        rec_w_round = round(rec_w, 3)
-    else:
-        rec_w_round = float(f"{rec_w:.2e}")
+    rec_uncapped = current_w_total * (target_center / measured_ratio)
+    rec_uncapped_round = _round_w(rec_uncapped)
+
+    rec_w = rec_uncapped
+    capped = False
+    if max_w_total is not None and rec_w > max_w_total:
+        rec_w = float(max_w_total)
+        capped = True
+    rec_w_round = _round_w(rec_w)
+
     if in_band:
         reason = f"in band [{target_min}, {target_max}] — keep current w_total"
         rec_w_round = current_w_total
@@ -201,15 +280,22 @@ def _recommend_w_total(
             f"ratio {measured_ratio:.2f} > abort threshold {abort_ratio} — "
             f"R36-style scale-dominate risk. Rescale w_total to {rec_w_round:.4g}"
         )
+        if capped:
+            reason += f" (capped at {max_w_total}; uncapped {rec_uncapped_round:.4g})"
     else:
         reason = (
             f"ratio {measured_ratio:.3f} outside band — "
             f"scale w_total to {rec_w_round:.4g}"
         )
+        if capped:
+            reason += f" (capped at {max_w_total}; uncapped {rec_uncapped_round:.4g})"
     return {
         "in_band": in_band,
         "exceeds_abort": exceeds_abort,
+        "recommended_w_total_uncapped": rec_uncapped_round,
         "recommended_w_total": rec_w_round,
+        "capped": capped,
+        "max_w_total": max_w_total,
         "rec_reason": reason,
     }
 
@@ -218,7 +304,13 @@ def _write_summary_md(
     out_md: Path, stamp: str, rows: list[dict[str, Any]],
     target_min: float, target_max: float, target_center: float,
     abort_ratio: float,
+    max_w_total: float | None = None,
 ) -> None:
+    cap_line = (
+        f"- max w_total cap: {max_w_total}"
+        if max_w_total is not None
+        else "- max w_total cap: (disabled)"
+    )
     lines = [
         "# R41 cascade calibration",
         "",
@@ -226,6 +318,7 @@ def _write_summary_md(
         f"- target band: actual grad ratio ∈ [{target_min}, {target_max}] "
         f"(center {target_center})",
         f"- abort threshold: actual grad ratio > {abort_ratio}",
+        cap_line,
         "- Recommendation is based on the **actual cascade gradient ratio** "
         "(grad_norm(weighted cascade)/grad_norm(self loss)), measured by "
         "round41_stage1_cascade_p0_diag.py --calibration-only.",
@@ -237,7 +330,9 @@ def _write_summary_md(
         "|---|---:|---:|---:|---:|---|",
     ]
     for r in rows:
-        if r.get("p0_rc") != 0:
+        if r.get("control_cell"):
+            status = "control"
+        elif r.get("p0_rc") != 0:
             status = "✗ P0 crashed"
         elif not r.get("ratio_present"):
             status = "✗ no grad ratio (cascade disabled?)"
@@ -245,16 +340,19 @@ def _write_summary_md(
             status = "⚠ exceeds abort"
         elif r["recommendation"].get("in_band"):
             status = "✓ in band"
+        elif r["recommendation"].get("capped"):
+            status = "↻ rescale (capped)"
         else:
             status = "↻ rescale"
         ratio = (
             f"{r.get('ratio_actual_cascade_over_self', 0.0):.3f}"
-            if r.get("ratio_present") else "?"
+            if r.get("ratio_present") else "n/a"
         )
         cur_w = r.get("current_w_total")
         rec_w = r["recommendation"].get("recommended_w_total", cur_w)
+        rc_disp = "—" if r.get("control_cell") else r.get("p0_rc", "?")
         lines.append(
-            f"| {r['vid']} | {r.get('p0_rc', '?')} | {ratio} | "
+            f"| {r['vid']} | {rc_disp} | {ratio} | "
             f"{cur_w} | {rec_w} | {status} |"
         )
 
@@ -267,6 +365,11 @@ def _write_summary_md(
         lines.append(f"### {r['vid']}")
         lines.append("")
         lines.append(f"- cfg: `{r['cfg']}`")
+        if r.get("control_cell"):
+            lines.append("- **control cell** — cascade disabled, P0 skipped.")
+            lines.append(f"  recommended_w_total = current = {r.get('current_w_total')}")
+            lines.append("")
+            continue
         lines.append(f"- P0 rc: {r.get('p0_rc')}")
         if r.get("p0_rc") == 0:
             if r.get("ratio_present"):
@@ -371,6 +474,12 @@ def main() -> int:
         "--abort-ratio", type=float, default=DEFAULT_ABORT_RATIO,
     )
     ap.add_argument(
+        "--max-w-total", type=float, default=DEFAULT_MAX_W_TOTAL,
+        help="Hard cap on recommended_w_total (default 5.0). Without "
+             "a cap, low-grad cells (e.g. A3) would get a 14× bump that "
+             "risks R36 mid-training. Set to <=0 to disable the cap.",
+    )
+    ap.add_argument(
         "--stage1-ckpt", type=Path,
         default=Path("runs/training/stage1_v8_v6_full_f1/final.pt"),
         help="Stage-1 warm-start ckpt (V8 V6).",
@@ -407,10 +516,47 @@ def main() -> int:
         return 1
     print(f"[calib] {len(cfgs)} cells: {[str(p.stem) for p in cfgs]}")
 
+    max_w_total: float | None = (
+        float(args.max_w_total) if args.max_w_total > 0 else None
+    )
+
     rows: list[dict[str, Any]] = []
     for cfg_path in cfgs:
         vid = cfg_path.stem
-        current_w = _load_current_w_total(cfg_path)
+        info = _read_cascade_info(cfg_path)
+        current_w = float(info.get("w_total", 1.0))
+
+        if info.get("control_cell"):
+            # A0-style control cell — no cascade, no calibration needed.
+            print(
+                f"[calib] {vid}: control cell (cascade disabled / all "
+                "weights zero); skipping P0."
+            )
+            row: dict[str, Any] = {
+                "vid": vid,
+                "cfg": str(cfg_path),
+                "current_w_total": current_w,
+                "control_cell": True,
+                "p0_rc": None,
+                "p0_stdout_tail": None,
+                "ratio_present": False,
+                "cascade_info": info,
+                "recommendation": {
+                    "in_band": True,
+                    "exceeds_abort": False,
+                    "recommended_w_total_uncapped": current_w,
+                    "recommended_w_total": current_w,
+                    "capped": False,
+                    "max_w_total": max_w_total,
+                    "rec_reason": (
+                        "control cell: cascade disabled, no calibration "
+                        "needed"
+                    ),
+                },
+            }
+            rows.append(row)
+            continue
+
         rc, p0_stats, stdout_tail = _run_p0_calibration(
             cfg_path,
             stage1_ckpt=Path(args.stage1_ckpt),
@@ -420,12 +566,14 @@ def main() -> int:
             batch_size=int(args.batch_size),
         )
         metrics = _extract_calibration_metrics(p0_stats)
-        row: dict[str, Any] = {
+        row = {
             "vid": vid,
             "cfg": str(cfg_path),
             "current_w_total": current_w,
+            "control_cell": False,
             "p0_rc": rc,
             "p0_stdout_tail": stdout_tail if rc != 0 else None,
+            "cascade_info": info,
             **metrics,
         }
         if rc == 0 and metrics.get("ratio_present"):
@@ -436,12 +584,16 @@ def main() -> int:
                 target_max=args.target_max,
                 abort_ratio=args.abort_ratio,
                 current_w_total=current_w,
+                max_w_total=max_w_total,
             )
         else:
             row["recommendation"] = {
                 "in_band": False,
                 "exceeds_abort": False,
+                "recommended_w_total_uncapped": current_w,
                 "recommended_w_total": current_w,
+                "capped": False,
+                "max_w_total": max_w_total,
                 "rec_reason": (
                     "P0 failed or grad_scale_actual_stack missing — "
                     "review p0_stdout_tail"
@@ -458,6 +610,7 @@ def main() -> int:
             "target_max": args.target_max,
             "target_center": args.target_center,
             "abort_ratio": args.abort_ratio,
+            "max_w_total": max_w_total,
             "rows": rows,
         }, indent=2),
         encoding="utf-8",
@@ -466,6 +619,7 @@ def main() -> int:
         out_md, stamp, rows,
         target_min=args.target_min, target_max=args.target_max,
         target_center=args.target_center, abort_ratio=args.abort_ratio,
+        max_w_total=max_w_total,
     )
     print(f"[calib] wrote {out_md}")
     print(f"[calib] wrote {out_json}")

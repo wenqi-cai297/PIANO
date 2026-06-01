@@ -54,6 +54,7 @@ def main() -> int:
     n_apply = 0
     n_skip = 0
     n_skip_failed = 0
+    n_skip_control = 0
     for row in rows:
         vid = row["vid"]
         cfg_path = Path(row["cfg"])
@@ -61,9 +62,19 @@ def main() -> int:
         current = float(row.get("current_w_total", 1.0))
         new_w = float(rec.get("recommended_w_total", current))
         in_band = bool(rec.get("in_band", False))
+        capped = bool(rec.get("capped", False))
 
-        if row.get("smoke_rc") != 0 or not row.get("ratio_present"):
-            print(f"[apply] {vid}: SKIP (smoke failed or no cascade line)")
+        if row.get("control_cell"):
+            print(f"[apply] {vid}: skip control cell (cascade disabled)")
+            n_skip_control += 1
+            continue
+
+        # P0 failure check — earlier this script read row["smoke_rc"]
+        # which never existed in the JSON; the calibration writer uses
+        # "p0_rc". Bug fixed 2026-06-02.
+        p0_rc = row.get("p0_rc")
+        if p0_rc != 0 or not row.get("ratio_present"):
+            print(f"[apply] {vid}: SKIP (P0 failed rc={p0_rc} or no grad ratio)")
             n_skip_failed += 1
             continue
 
@@ -78,9 +89,14 @@ def main() -> int:
             continue
 
         action = "WOULD WRITE" if not args.apply else "WRITING"
+        cap_note = ""
+        if capped:
+            uncapped = rec.get("recommended_w_total_uncapped")
+            max_w = rec.get("max_w_total")
+            cap_note = f" [capped at {max_w}; uncapped would be {uncapped}]"
         print(
-            f"[apply] {vid}: {action} cascade.w_total {current} → {new_w} "
-            f"({cfg_path})"
+            f"[apply] {vid}: {action} cascade.w_total {current} → {new_w}"
+            f"{cap_note} ({cfg_path})"
         )
 
         if args.apply:
@@ -95,10 +111,12 @@ def main() -> int:
     print()
     if args.apply:
         print(f"[apply] DONE — patched {n_apply} cells "
-              f"(skipped {n_skip} in-band, {n_skip_failed} failed)")
+              f"(skipped {n_skip} in-band, {n_skip_failed} failed, "
+              f"{n_skip_control} control)")
     else:
         print(f"[apply] DRY-RUN — would patch {n_apply} cells "
-              f"(would skip {n_skip} in-band, {n_skip_failed} failed)")
+              f"(would skip {n_skip} in-band, {n_skip_failed} failed, "
+              f"{n_skip_control} control)")
         print("[apply] re-run with --apply to actually mutate the yamls.")
     return 0
 
