@@ -70,6 +70,20 @@ from piano.training.smpl_kinematics import (
     fk_from_global_rotations,
     rotation_6d_to_matrix,
 )
+from piano.models.motion_anchordiff import (
+    AnchorDenoiserConfig,
+    AnchorDiffConfig,
+    DiffusionConfig as Pb1DiffusionConfig,
+    MotionAnchorDiff,
+)
+from piano.training.pb1_loss_helpers import (
+    anchor_joint_pos_loss,
+    compute_min_snr_weight,
+    fk_motion_135_to_joints_22,
+    l_pos_full_loss,
+    masked_motion_mse_loss,
+    world_joint_velocity_loss,
+)
 from piano.training.train_anchordiff import _build_dataset
 from piano.training.trainer import (
     build_scheduler,
@@ -169,6 +183,137 @@ def _maybe_load_stage1_init_checkpoint(
 
 
 # ----------------------------------------------------------------------------
+# R41 cascade — frozen PB1 builder + ckpt loader
+# ----------------------------------------------------------------------------
+
+
+def _build_pb1_from_cfg(
+    pb1_cfg, device: torch.device,
+) -> tuple[MotionAnchorDiff, ObjectEncoder]:
+    """Construct PB1 ``MotionAnchorDiff`` + own ``ObjectEncoder``.
+
+    Mirrors ``train_anchordiff.py:main`` lines 1549-1630 — that section
+    builds PB1 inline from an OmegaConf cfg with 30+ optional R29 fields.
+    R41 needs the same construction so its frozen-PB1 cascade loop sees
+    a bit-identical PB1 forward to what R29 PB1 itself was trained
+    against. R42 should refactor train_anchordiff.main() to call this
+    helper; for R41 we duplicate ~60 lines so PB1's trainer is not
+    modified.
+    """
+    d = pb1_cfg.model.denoiser
+    denoiser_cfg = AnchorDenoiserConfig(
+        motion_dim=int(d.motion_dim),
+        object_traj_dim=int(d.object_traj_dim),
+        init_pose_dim=int(d.init_pose_dim),
+        text_dim=int(d.text_dim),
+        object_token_dim=int(d.object_token_dim),
+        object_num_tokens=int(d.object_num_tokens),
+        stage1_coarse_dim=int(d.get("stage1_coarse_dim", 0)),
+        use_round29_cond_injection=bool(
+            d.get("use_round29_cond_injection", False),
+        ),
+        r29_coarse_extra_dim=int(d.get("r29_coarse_extra_dim", 0)),
+        r29_interaction_dim=int(d.get("r29_interaction_dim", 0)),
+        r29_support_dim=int(d.get("r29_support_dim", 0)),
+        r29_body_refine_dim=int(d.get("r29_body_refine_dim", 0)),
+        r29_injection_mode=str(d.get("r29_injection_mode", "input_add")),
+        r29_gate_bias_init=float(d.get("r29_gate_bias_init", -1.0)),
+        r29_per_family_modes=(
+            dict(d.get("r29_per_family_modes"))
+            if d.get("r29_per_family_modes") is not None
+            else None
+        ),
+        r29_zero_init_adapters=bool(d.get("r29_zero_init_adapters", True)),
+        r29_use_cond_adaln=bool(d.get("r29_use_cond_adaln", False)),
+        r29_adaln_families=(
+            list(d.get("r29_adaln_families"))
+            if d.get("r29_adaln_families") is not None
+            else None
+        ),
+        r29_adaln_pool=str(d.get("r29_adaln_pool", "mean")),
+        d_model=int(d.d_model),
+        n_layers=int(d.n_layers),
+        n_heads=int(d.n_heads),
+        ff_mult=int(d.ff_mult),
+        dropout=float(d.dropout),
+        max_seq_length=int(pb1_cfg.data.max_seq_length),
+    )
+    diff_cfg = Pb1DiffusionConfig(
+        num_steps=int(pb1_cfg.model.diffusion.num_steps),
+        schedule=str(pb1_cfg.model.diffusion.schedule),
+        objective=str(pb1_cfg.model.diffusion.get("objective", "ddpm")),
+        prediction_target=str(
+            pb1_cfg.model.diffusion.get("prediction_target", "x0"),
+        ),
+    )
+    model = MotionAnchorDiff(
+        AnchorDiffConfig(
+            diffusion=diff_cfg,
+            denoiser=denoiser_cfg,
+            cfg_drop_prob=float(pb1_cfg.model.cfg_drop_prob),
+        )
+    ).to(device)
+    encoder = ObjectEncoder(
+        num_input_points=int(pb1_cfg.model.object_encoder.num_input_points),
+        num_output_tokens=int(pb1_cfg.model.object_encoder.num_output_tokens),
+        feature_dim=int(pb1_cfg.model.object_encoder.feature_dim),
+    ).to(device)
+    return model, encoder
+
+
+def _load_and_freeze_pb1(
+    pb1: MotionAnchorDiff,
+    pb1_encoder: ObjectEncoder,
+    ckpt_path: str,
+) -> dict[str, str]:
+    """Load PB1 ckpt into both modules + freeze.
+
+    Returns a small dict with the load source paths for logging. The
+    freeze is unconditional: under R41 cascade training PB1 is **always**
+    frozen — there is no scenario where its parameters should update.
+    """
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"cascade.pb1_checkpoint does not exist: {path}"
+        )
+    state = torch.load(str(path), map_location="cpu", weights_only=False)
+
+    model_state = state.get("model", state)
+    pb1.load_state_dict(model_state, strict=True)
+
+    if "object_encoder" in state:
+        pb1_encoder.load_state_dict(state["object_encoder"], strict=True)
+        enc_from = "object_encoder"
+    elif (
+        isinstance(state.get("extra_modules"), dict)
+        and "object_encoder" in state["extra_modules"]
+    ):
+        pb1_encoder.load_state_dict(
+            state["extra_modules"]["object_encoder"], strict=True,
+        )
+        enc_from = "extra_modules.object_encoder"
+    else:
+        raise KeyError(
+            f"PB1 ckpt {ckpt_path} has no object_encoder state under "
+            "either 'object_encoder' or 'extra_modules.object_encoder'."
+        )
+
+    # Freeze unconditionally. PB1 is never trained in R41.
+    pb1.eval()
+    pb1_encoder.eval()
+    for p in pb1.parameters():
+        p.requires_grad_(False)
+    for p in pb1_encoder.parameters():
+        p.requires_grad_(False)
+
+    return {
+        "model_loaded_from": str(path),
+        "object_encoder_loaded_from": enc_from,
+    }
+
+
+# ----------------------------------------------------------------------------
 # Step function
 # ----------------------------------------------------------------------------
 
@@ -238,6 +383,26 @@ def build_stage1_step_fn(
     w_r40_plan_invariant: float = 0.0,
     r40_plan_beta: float = 1.0,
     r40_plan_component_weights: dict[str, float] | None = None,
+    # R41 — cascade training through frozen PB1. All four flavors of
+    # PB1 motion-space loss can be independently enabled; the launcher's
+    # per-cell calibration picks ``w_cascade_total`` so cascade grad norm
+    # is comparable to Stage-1 self grad norm (Codex §3.4 plan). When
+    # all weights are 0, the step_fn does not call PB1 at all (no PB1
+    # forward, no FK) so existing Stage-1 configs run unchanged.
+    pb1: MotionAnchorDiff | None = None,
+    pb1_object_encoder: ObjectEncoder | None = None,
+    cascade_w_motion_mse: float = 0.0,
+    cascade_w_world_joint_vel: float = 0.0,
+    cascade_w_l_pos_full: float = 0.0,
+    cascade_w_anchor_joint_pos: float = 0.0,
+    cascade_w_total: float = 1.0,
+    cascade_min_snr_gamma: float = 5.0,
+    cascade_use_min_snr: bool = True,
+    cascade_stage1_coarse_noise_std: float = 0.05,
+    cascade_l_pos_hand_endpoint_weight: float = 2.0,
+    cascade_l_pos_foot_endpoint_weight: float = 2.0,
+    cascade_anchor_part_weights: tuple[float, ...] = (2.0, 2.0, 0.0, 0.0, 0.5),
+    cascade_anchor_contact_threshold: float = 0.5,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
 ):
@@ -680,6 +845,154 @@ def build_stage1_step_fn(
                 beta=float(r40_plan_beta),
             )
 
+        # ─── R41 — frozen-PB1 cascade loss ─────────────────────────────
+        # Stage-1's stage1_x0_pred is fed into frozen PB1 to produce a
+        # pred_motion. PB1 motion-space losses (4 flavors, per-cell
+        # ablation A1-A4) are evaluated on (pred_motion, motion_gt).
+        # Gradient flows back through PB1 to Stage-1's denoiser+encoder.
+        # PB1 itself is frozen (no requires_grad on its params).
+        r41_motion_mse = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        r41_world_vel = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        r41_l_pos_full = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        r41_anchor_pos = torch.zeros((), device=device, dtype=mse_x0.dtype)
+        r41_pb1_x0_pred = None
+        r41_t_pb1 = None
+        cascade_any = (
+            cascade_w_motion_mse > 0
+            or cascade_w_world_joint_vel > 0
+            or cascade_w_l_pos_full > 0
+            or cascade_w_anchor_joint_pos > 0
+        )
+        if cascade_any and pb1 is not None and pb1_object_encoder is not None:
+            # Stage-1 outputs z-scored stage1_coarse; PB1 training-time
+            # batch saw GT z-scored + σ=0.05 noise. Match that
+            # distribution so PB1 forward stays in-training-distribution.
+            if cascade_stage1_coarse_noise_std > 0:
+                stage1_for_pb1 = (
+                    x0_pred + torch.randn_like(x0_pred).detach()
+                    * float(cascade_stage1_coarse_noise_std)
+                )
+            else:
+                stage1_for_pb1 = x0_pred
+
+            # PB1's own object_encoder is frozen; forward outside any
+            # grad path to save memory + avoid spurious grad accumulation.
+            with torch.no_grad():
+                obj_tokens_pb1 = pb1_object_encoder(object_pc)
+
+            # PB1 init_pose is 66-D (22 joints frame 0), not 135-D motion.
+            pb1_init_pose = gt_joints[:, 0, :, :].reshape(B, -1).float()
+
+            pb1_cond: dict[str, Tensor] = {
+                "object_world_traj": object_traj,
+                "object_tokens": obj_tokens_pb1,
+                "stage1_coarse": stage1_for_pb1,
+                "stage2_coarse_extra": batch["stage2_coarse_extra"].to(device).float(),
+                "stage2_support": batch["stage2_support"].to(device).float(),
+                "init_pose": pb1_init_pose,
+            }
+            if text_features is not None:
+                pb1_cond["text"] = text_features
+
+            # Disable PB1 CFG dropout for cascade forward — we want PB1
+            # to see full conditioning (Codex §3.3). Save/restore so
+            # nothing else in the trainer is affected.
+            _saved_pb1_cfg_drop = float(pb1.cfg.cfg_drop_prob)
+            pb1.cfg.cfg_drop_prob = 0.0
+            try:
+                pb1_out = pb1.training_step(motion, pb1_cond)
+            finally:
+                pb1.cfg.cfg_drop_prob = _saved_pb1_cfg_drop
+            r41_pb1_x0_pred = pb1_out["x0_pred"]       # (B, T, 135), has grad
+            r41_t_pb1 = pb1_out["t"]                   # (B,) long
+
+            # Optional per-sample min-SNR-γ weight (inverts the
+            # high-t-dominates-cascade-grad bias surfaced by P0 §7).
+            min_snr_w_r41 = None
+            if cascade_use_min_snr:
+                _pb1_diff_for_read = (
+                    pb1.diffusion.module if hasattr(pb1.diffusion, "module")
+                    else pb1.diffusion
+                )
+                min_snr_w_r41 = compute_min_snr_weight(
+                    r41_t_pb1,
+                    _pb1_diff_for_read.alphas_cumprod,
+                    gamma=float(cascade_min_snr_gamma),
+                )
+
+            # Building block 1: motion-space MSE.
+            if cascade_w_motion_mse > 0:
+                r41_motion_mse = masked_motion_mse_loss(
+                    pred=r41_pb1_x0_pred,
+                    target=motion.float(),
+                    seq_mask=seq_mask,
+                    min_snr_weight=min_snr_w_r41,
+                )
+
+            # Building block 2: world-joint velocity MSE.
+            if cascade_w_world_joint_vel > 0:
+                r41_world_vel = world_joint_velocity_loss(
+                    pred=r41_pb1_x0_pred,
+                    target=motion.float(),
+                    seq_mask=seq_mask,
+                )
+
+            # Building blocks 3 & 4 share FK output — compute once.
+            need_jpos = (
+                cascade_w_l_pos_full > 0 or cascade_w_anchor_joint_pos > 0
+            )
+            if need_jpos:
+                jpos_pred_r41 = fk_motion_135_to_joints_22(
+                    motion=r41_pb1_x0_pred,
+                    rest_offsets=rest_offsets,
+                )
+
+                if cascade_w_l_pos_full > 0:
+                    r41_l_pos_full = l_pos_full_loss(
+                        jpos_pred=jpos_pred_r41,
+                        joints_gt=gt_joints,
+                        seq_mask=seq_mask,
+                        hand_endpoint_weight=float(
+                            cascade_l_pos_hand_endpoint_weight,
+                        ),
+                        foot_endpoint_weight=float(
+                            cascade_l_pos_foot_endpoint_weight,
+                        ),
+                    )
+
+                if cascade_w_anchor_joint_pos > 0:
+                    # contact_state may be missing from the batch when
+                    # the trainer is run without R29 pseudo labels; A4
+                    # requires it, so KeyError early is correct.
+                    if "contact_state" not in batch:
+                        raise KeyError(
+                            "cascade_w_anchor_joint_pos > 0 but batch "
+                            "has no 'contact_state' field. Enable R29 "
+                            "pseudo labels in the dataset cfg."
+                        )
+                    contact_state_r41 = batch["contact_state"].to(device).float()
+                    r41_anchor_pos = anchor_joint_pos_loss(
+                        jpos_pred=jpos_pred_r41,
+                        joints_gt=gt_joints,
+                        contact_state=contact_state_r41,
+                        seq_mask=seq_mask,
+                        part_weights=tuple(
+                            float(w) for w in cascade_anchor_part_weights
+                        ),
+                        contact_threshold=float(
+                            cascade_anchor_contact_threshold,
+                        ),
+                    )
+
+        # Combined cascade contribution before the per-cell ``w_cascade_total``
+        # multiplier (which is set by per-cell calibration; see launcher).
+        cascade_loss_raw = (
+            cascade_w_motion_mse * r41_motion_mse
+            + cascade_w_world_joint_vel * r41_world_vel
+            + cascade_w_l_pos_full * r41_l_pos_full
+            + cascade_w_anchor_joint_pos * r41_anchor_pos
+        )
+
         loss = (
             w_x0 * mse_x0
             + w_vel * vel_mse
@@ -696,6 +1009,7 @@ def build_stage1_step_fn(
             + w_r36_raw_velocity * r36_raw_vel
             + w_r36_raw_acceleration * r36_raw_acc
             + w_r40_plan_invariant * r40_plan
+            + float(cascade_w_total) * cascade_loss_raw
         )
 
         # R40 hotfix — NaN/Inf guard. If any per-component loss is
@@ -722,6 +1036,11 @@ def build_stage1_step_fn(
             ("r36_raw_velocity", r36_raw_vel),
             ("r36_raw_acceleration", r36_raw_acc),
             ("r40_plan_invariant", r40_plan),
+            # R41 cascade components.
+            ("r41_motion_mse", r41_motion_mse),
+            ("r41_world_joint_vel", r41_world_vel),
+            ("r41_l_pos_full", r41_l_pos_full),
+            ("r41_anchor_joint_pos", r41_anchor_pos),
         )
         first_bad: str | None = None
         for _name, _val in _components_for_check:
@@ -762,7 +1081,18 @@ def build_stage1_step_fn(
             "r40_plan_invariant_weighted": (
                 w_r40_plan_invariant * r40_plan
             ).detach(),
+            # R41 cascade metrics.
+            "r41_motion_mse": r41_motion_mse.detach(),
+            "r41_world_joint_vel": r41_world_vel.detach(),
+            "r41_l_pos_full": r41_l_pos_full.detach(),
+            "r41_anchor_joint_pos": r41_anchor_pos.detach(),
+            "r41_cascade_loss_raw": cascade_loss_raw.detach(),
+            "r41_cascade_loss_weighted": (
+                float(cascade_w_total) * cascade_loss_raw
+            ).detach(),
         }
+        if r41_t_pb1 is not None:
+            result["r41_t_pb1_mean"] = r41_t_pb1.float().mean().detach()
         for comp_name, comp_val in r40_components.items():
             result[f"r40_plan_{comp_name}"] = comp_val.detach()
         return result
@@ -942,6 +1272,35 @@ def main() -> None:
         torch.from_numpy(norm_std_np).to(device).float()
     )
 
+    # ─── R41 — optional frozen-PB1 cascade build ──────────────────────
+    # Build + load + freeze BEFORE accelerator.prepare so PB1 stays a
+    # plain nn.Module — we don't want DDP wrapping it (its grads are
+    # always None, no all_reduce needed).
+    cascade_cfg = cfg.get("cascade", None) if hasattr(cfg, "get") else None
+    cascade_enabled = bool(cascade_cfg.get("enabled", False)) if cascade_cfg else False
+    pb1_model = None
+    pb1_object_encoder = None
+    if cascade_enabled:
+        pb1_cfg_path = str(cascade_cfg.get("pb1_config", ""))
+        pb1_ckpt_path = str(cascade_cfg.get("pb1_checkpoint", ""))
+        if not pb1_cfg_path or not pb1_ckpt_path:
+            raise ValueError(
+                "cascade.enabled=true requires both cascade.pb1_config "
+                "and cascade.pb1_checkpoint in the trainer cfg."
+            )
+        accelerator.print(
+            f"[cascade] loading PB1 cfg={pb1_cfg_path} ckpt={pb1_ckpt_path}"
+        )
+        pb1_cfg = OmegaConf.load(pb1_cfg_path)
+        pb1_model, pb1_object_encoder = _build_pb1_from_cfg(pb1_cfg, device)
+        load_info = _load_and_freeze_pb1(
+            pb1_model, pb1_object_encoder, pb1_ckpt_path,
+        )
+        accelerator.print(
+            f"[cascade] PB1 frozen ({sum(p.numel() for p in pb1_model.parameters())} params, "
+            f"object_encoder loaded from {load_info['object_encoder_loaded_from']!r})"
+        )
+
     # ─── Prepare with accelerator ───
     (
         model, object_encoder, optimizer, train_loader, scheduler,
@@ -1013,6 +1372,58 @@ def main() -> None:
             dict(cfg.loss.get("r40_plan_component_weights", {}))
             or None
         ),
+        # R41 — cascade (frozen PB1 motion-space loss family).
+        pb1=pb1_model,
+        pb1_object_encoder=pb1_object_encoder,
+        cascade_w_motion_mse=(
+            float(cascade_cfg.get("w_motion_mse", 0.0))
+            if cascade_cfg else 0.0
+        ),
+        cascade_w_world_joint_vel=(
+            float(cascade_cfg.get("w_world_joint_vel", 0.0))
+            if cascade_cfg else 0.0
+        ),
+        cascade_w_l_pos_full=(
+            float(cascade_cfg.get("w_l_pos_full", 0.0))
+            if cascade_cfg else 0.0
+        ),
+        cascade_w_anchor_joint_pos=(
+            float(cascade_cfg.get("w_anchor_joint_pos", 0.0))
+            if cascade_cfg else 0.0
+        ),
+        cascade_w_total=(
+            float(cascade_cfg.get("w_total", 1.0))
+            if cascade_cfg else 1.0
+        ),
+        cascade_min_snr_gamma=(
+            float(cascade_cfg.get("min_snr_gamma", 5.0))
+            if cascade_cfg else 5.0
+        ),
+        cascade_use_min_snr=(
+            bool(cascade_cfg.get("use_min_snr", True))
+            if cascade_cfg else True
+        ),
+        cascade_stage1_coarse_noise_std=(
+            float(cascade_cfg.get("stage1_coarse_noise_std", 0.05))
+            if cascade_cfg else 0.05
+        ),
+        cascade_l_pos_hand_endpoint_weight=(
+            float(cascade_cfg.get("l_pos_hand_endpoint_weight", 2.0))
+            if cascade_cfg else 2.0
+        ),
+        cascade_l_pos_foot_endpoint_weight=(
+            float(cascade_cfg.get("l_pos_foot_endpoint_weight", 2.0))
+            if cascade_cfg else 2.0
+        ),
+        cascade_anchor_part_weights=(
+            tuple(cascade_cfg.get("anchor_part_weights",
+                                  [2.0, 2.0, 0.0, 0.0, 0.5]))
+            if cascade_cfg else (2.0, 2.0, 0.0, 0.0, 0.5)
+        ),
+        cascade_anchor_contact_threshold=(
+            float(cascade_cfg.get("anchor_contact_threshold", 0.5))
+            if cascade_cfg else 0.5
+        ),
         use_min_snr_weighting=bool(
             cfg.loss.get("use_min_snr_weighting", True),
         ),
@@ -1056,6 +1467,20 @@ def main() -> None:
             f"weighted={r40_w_val:.4e}  "
             f"weighted/mse={ratio:.3f}"
         )
+        r41_casc_val = out.get("r41_cascade_loss_weighted")
+        if r41_casc_val is not None:
+            r41_w = float(r41_casc_val.item())
+            r41_ratio = r41_w / mse_x0_val if mse_x0_val > 0 else float("nan")
+            accelerator.print(
+                f"  R41 cascade — motion_mse={out['r41_motion_mse'].item():.4e} "
+                f"world_vel={out['r41_world_joint_vel'].item():.4e} "
+                f"l_pos={out['r41_l_pos_full'].item():.4e} "
+                f"anchor={out['r41_anchor_joint_pos'].item():.4e}"
+            )
+            accelerator.print(
+                f"  R41 cascade weighted={r41_w:.4e}  "
+                f"weighted/mse_x0={r41_ratio:.3f}"
+            )
         accelerator.backward(out["loss"])
         accelerator.print("Smoke test backward OK.")
         return
