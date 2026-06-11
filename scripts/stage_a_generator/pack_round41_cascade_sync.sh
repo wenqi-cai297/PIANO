@@ -40,8 +40,13 @@ TRAINED_VIDS=(${TRAINED_VIDS_STR})
 DIAGED_VIDS=(${DIAGED_VIDS_STR})
 
 PACK_TARGETS=()
-add_if_exists_file() { [[ -f "$1" ]] && PACK_TARGETS+=("$1"); }
-add_if_exists_dir()  { [[ -d "$1" ]] && PACK_TARGETS+=("$1"); }
+# Note: explicit if/then (not &&) so the function returns 0 even when
+# the path is absent. Under `set -e`, `[[ -f X ]] && ...` returns 1
+# from the false branch and kills the whole script — the bug that
+# silently stopped this script after the first missing smoke.log on
+# 2026-06-02. See https://mywiki.wooledge.org/BashFAQ/105 .
+add_if_exists_file() { if [[ -f "$1" ]]; then PACK_TARGETS+=("$1"); fi; }
+add_if_exists_dir()  { if [[ -d "$1" ]]; then PACK_TARGETS+=("$1"); fi; }
 
 for VID in "${TRAINED_VIDS[@]:-}"; do
     [[ -z "${VID}" ]] && continue
