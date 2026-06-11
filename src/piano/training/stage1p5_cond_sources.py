@@ -19,6 +19,16 @@ Convention (verified against
     valid_T:       int32                            -- present, unused here
     seed:          int32                            -- present, unused here
 
+The layout is **flat** (no train/val bucket subdir). The on-disk path
+written by ``sample_substitute_conds`` does NOT include the bucket
+(:mod:`piano.inference.sample_substitute_conds`:444-446 → ``out_dir /
+subset / f"{seq_id}.npz"``). Stage B sampling calls the CLI twice with
+the same ``--out-dir``, once with ``--bucket train`` and once with
+``--bucket val``; the bucket selects which clips to sample but does
+not become a path component. Subject-split is disjoint
+(:mod:`piano.data.split` ``build_subject_split``), so the train and
+val sets cannot collide on ``(subset, seq_id)``.
+
 The values are **already z-scored** by Stage-1's training target
 convention (``train_stage1.py:411,470``). Do NOT re-normalize.
 """
