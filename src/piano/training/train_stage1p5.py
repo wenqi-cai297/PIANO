@@ -21,6 +21,7 @@ Design source: ``analyses/2026-05-29_stage1_and_stage1_5_design.md``.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -53,6 +54,10 @@ from piano.training.stage1_losses import (
     build_init_pose_f1,
     build_init_pose_f2,
     channel_moment_match_loss,
+)
+from piano.training.stage1p5_cond_sources import (
+    VALID_COND_SOURCES,
+    select_stage1_coarse,
 )
 from piano.training.stage1p5_losses import (
     R37_C41_KNEE_SLICE,
@@ -157,6 +162,15 @@ def build_stage1p5_step_fn(
     r37_use_contact_state: bool = True,
     use_min_snr_weighting: bool = True,
     min_snr_gamma: float = 5.0,
+    # R43 — Stage-1 cond source. Default ``"oracle"`` reproduces R38-B1
+    # behavior bit-for-bit; ``"generated_cache"`` and ``"mixed"`` load
+    # Stage-1's actual generated z-scored output from a per-clip cache
+    # (see ``stage1p5_cond_sources.load_generated_coarse_z_for_batch``).
+    # R43 P0 trains on ``"mixed"`` with ``stage1p5_generated_prob=0.8``
+    # to expose Stage-1.5 to deployment-distribution Stage-1 coarse.
+    stage1p5_stage1_cond_source: str = "oracle",
+    stage1p5_generated_prob: float = 0.0,
+    stage1_generated_cache_root: Path | None = None,
 ):
     """Stage-1.5 step_fn closure.
 
@@ -224,18 +238,32 @@ def build_stage1p5_step_fn(
         else:
             text_features = None
 
-        # ─── Oracle Stage-1 coarse_v1 (z-scored), passed as cond ───
-        # During training we use the same oracle Stage-1 output Stage-2
-        # consumes. At inference we'll substitute Stage-1's prediction.
-        coarse_v1_raw = extract_coarse_v1_batched(
+        # ─── Stage-1 coarse_v1 (z-scored), passed as cond ───
+        # R43 — cond_source selector. ``"oracle"`` reproduces R38-B1
+        # exactly: extract from GT motion and z-score. ``"generated_cache"``
+        # / ``"mixed"`` load Stage-1's already-z-scored generated output
+        # from disk so Stage-1.5 trains on the distribution it will see
+        # at deployment. The generated cache values are NOT re-normalized
+        # (Codex r43_p0_finalized_review §1).
+        oracle_raw = extract_coarse_v1_batched(
             motion=motion, rest_offsets=rest_offsets,
         )
-        coarse_v1 = (coarse_v1_raw - stage1_coarse_mean_t) / stage1_coarse_std_t
+        oracle_z = (oracle_raw - stage1_coarse_mean_t) / stage1_coarse_std_t
+        coarse_v1 = select_stage1_coarse(
+            cond_source=stage1p5_stage1_cond_source,
+            oracle_z=oracle_z,
+            batch=batch,
+            cache_root=stage1_generated_cache_root,
+            generated_prob=stage1p5_generated_prob,
+            training=bool(_model.training),
+        )
         # R34 — conditioning augmentation (Ho 2021 §3.3 non-truncated mode).
         # Applied on Z-SCORED stage1_coarse only; sigma is NOT fed to the
         # model (no architecture change). Identity when sigma_max <= 0 or
         # model is in eval mode. ``r34_cond_aug_sigma`` is (B,) tensor of
-        # sampled σ per batch item, logged for diagnostics.
+        # sampled σ per batch item, logged for diagnostics. R43 user Q2
+        # ruling: σ-aug is applied AFTER cond_source selection, uniformly
+        # on whichever source was picked.
         coarse_v1, r34_cond_aug_sigma = apply_stage1_coarse_cond_aug(
             coarse_v1,
             sigma_max=float(r34_cond_aug_sigma_max),
@@ -811,6 +839,63 @@ def main() -> None:
         val_loader = accelerator.prepare(val_loader)
     diffusion = diffusion.to(device)
 
+    # R43 — Stage-1 cond source resolution. Default ``"oracle"`` is the
+    # R38-B1 behavior; ``"generated_cache"`` and ``"mixed"`` require the
+    # generated cache directory to exist and forbid init_pose F2 (which
+    # would silently leak oracle coarse via build_init_pose_f2).
+    stage1p5_stage1_cond_source = str(
+        cfg.training.get("stage1p5_stage1_cond_source", "oracle")
+    )
+    if stage1p5_stage1_cond_source not in VALID_COND_SOURCES:
+        raise SystemExit(
+            f"training.stage1p5_stage1_cond_source must be one of "
+            f"{VALID_COND_SOURCES}; got {stage1p5_stage1_cond_source!r}."
+        )
+    stage1p5_generated_prob = float(
+        cfg.training.get("stage1p5_generated_prob", 0.0)
+    )
+    if not (0.0 <= stage1p5_generated_prob <= 1.0):
+        raise SystemExit(
+            f"training.stage1p5_generated_prob must lie in [0, 1]; "
+            f"got {stage1p5_generated_prob!r}."
+        )
+    stage1_generated_cache_root: Path | None = None
+    if stage1p5_stage1_cond_source != "oracle":
+        gen_root = cfg.data.get("stage1_generated_cache_root", None)
+        if not gen_root:
+            raise SystemExit(
+                f"stage1p5_stage1_cond_source={stage1p5_stage1_cond_source!r} "
+                "requires data.stage1_generated_cache_root to be set."
+            )
+        stage1_generated_cache_root = Path(str(gen_root))
+        if not stage1_generated_cache_root.is_dir():
+            raise SystemExit(
+                f"data.stage1_generated_cache_root={stage1_generated_cache_root} "
+                "does not exist (must point at a populated cache directory). "
+                "Generate the cache with sample_substitute_conds_cli.py first."
+            )
+        # init_pose F2 reads from oracle coarse via build_init_pose_f2;
+        # under non-oracle cond_source this would be a hidden oracle leak.
+        # F1 (135) and OFF (0) are safe. Codex r43_p0_finalized_review §1.
+        _init_pose_dim_for_assert = int(
+            cfg.model.denoiser.get("init_pose_dim", 0)
+        )
+        if _init_pose_dim_for_assert not in (0, 135):
+            raise SystemExit(
+                f"init_pose_dim={_init_pose_dim_for_assert} (F2) reads "
+                "oracle coarse via build_init_pose_f2 and would leak "
+                "oracle under stage1p5_stage1_cond_source="
+                f"{stage1p5_stage1_cond_source!r}. Use init_pose_dim=135 "
+                "(F1) or 0 (OFF)."
+            )
+    accelerator.print(
+        f"[R43] stage1p5_stage1_cond_source={stage1p5_stage1_cond_source!r}  "
+        f"generated_prob={stage1p5_generated_prob}  "
+        f"generated_cache_root={stage1_generated_cache_root}  "
+        f"r34_cond_aug_sigma_max="
+        f"{float(cfg.loss.get('r34_cond_aug_sigma_max', 0.0)):.4f}"
+    )
+
     step_fn = build_stage1p5_step_fn(
         model=model,
         diffusion=diffusion,
@@ -885,6 +970,10 @@ def main() -> None:
             cfg.loss.get("use_min_snr_weighting", True),
         ),
         min_snr_gamma=float(cfg.loss.get("min_snr_gamma", 5.0)),
+        # R43 — Stage-1 cond source for Stage-1.5 training.
+        stage1p5_stage1_cond_source=stage1p5_stage1_cond_source,
+        stage1p5_generated_prob=stage1p5_generated_prob,
+        stage1_generated_cache_root=stage1_generated_cache_root,
     )
 
     if args.smoke_test:
