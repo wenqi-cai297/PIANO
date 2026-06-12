@@ -438,7 +438,29 @@ def main() -> int:
 
     print(f"[audit] wrote {out_md}")
     print(f"[audit] wrote {out_json}")
-    print(f"[audit] verdict: {'PASS' if not hard_fail else 'FAIL'}")
+    # R44 verdict clarity (Codex r43_pipeline_bottleneck §4):
+    # distinguish "no warnings" (PASS) from "warnings but caller chose
+    # not to fail" (PASS-WITH-WARNINGS) from "warnings + fail-on-warnings
+    # set" (FAIL). R43 P0 hit the silent middle case and trained on a
+    # collapsed cache because the prior log said "verdict: PASS".
+    if hard_fail:
+        print(
+            "[audit] verdict: FAIL "
+            "(per-channel deviations exceed warning thresholds; "
+            "--fail-on-warnings set, or missing/malformed cache entries)"
+        )
+    elif distribution_warnings:
+        print(
+            f"[audit] verdict: PASS-WITH-WARNINGS "
+            f"({len(distribution_warnings)} channel(s) deviate; "
+            "downstream training MUST treat this cache as OOD source. "
+            "Use --fail-on-warnings to make this a hard failure.)"
+        )
+    else:
+        print(
+            "[audit] verdict: PASS "
+            "(per-channel z-score within ±0.3 mean / ±0.4 std)"
+        )
     return 1 if hard_fail else 0
 
 

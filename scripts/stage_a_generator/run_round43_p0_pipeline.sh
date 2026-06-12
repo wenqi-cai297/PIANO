@@ -217,16 +217,29 @@ if [[ ${SKIP_AUDIT} -eq 0 ]]; then
     if [[ ${DRY_RUN} -eq 1 ]]; then
         log "[R43 DRY] would audit ${CACHE_DIR}"
     else
+        # R44 guardrail: pass --fail-on-warnings by default so a
+        # distribution-collapsed cache aborts the pipeline BEFORE
+        # Stage-1.5 training begins. Opt out for diagnostic-only runs
+        # with ROUND43_AUDIT_PERMISSIVE=1. Codex r43_pipeline_bottleneck §4.
+        AUDIT_FLAGS=()
+        if [[ "${ROUND43_AUDIT_PERMISSIVE:-0}" != "1" ]]; then
+            AUDIT_FLAGS+=( --fail-on-warnings )
+            log "[R43] audit guardrail ON (--fail-on-warnings)."
+        else
+            log "[R43] audit guardrail OFF (ROUND43_AUDIT_PERMISSIVE=1)."
+        fi
         "${PY}" -u scripts/stage_a_generator/round43_p0_cache_audit.py \
             --cache-root "${CACHE_DIR}" \
             --sel-train "${SEL_TRAIN}" \
             --sel-val "${SEL_VAL}" \
             --oracle-norm "${STAGE1_NORMALIZER}" \
             --out-dir "${AUDIT_DIR}" \
+            "${AUDIT_FLAGS[@]}" \
             2>&1 | tee -a "${SUMMARY_LOG}"
         # Hard fail if the audit's exit code is non-zero.
         if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
             log "[R43] FATAL: cache audit failed; see ${AUDIT_DIR}." >&2
+            log "[R43]   Pass ROUND43_AUDIT_PERMISSIVE=1 to override (NOT recommended for training)."
             exit 1
         fi
     fi
