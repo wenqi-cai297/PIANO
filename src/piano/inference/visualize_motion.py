@@ -300,6 +300,179 @@ def render_motion_video(
 
 
 # ---------------------------------------------------------------------------
+# Side-by-side pair rendering (for R44 OO vs GG comparison)
+# ---------------------------------------------------------------------------
+
+def render_motion_pair_video(
+    joints_left: np.ndarray,
+    joints_right: np.ndarray,
+    output_path: Path,
+    fps: float = 20.0,
+    title_left: str = "left",
+    title_right: str = "right",
+    suptitle: str = "",
+    object_positions: np.ndarray | None = None,
+    object_rotations: np.ndarray | None = None,
+    object_pc: np.ndarray | None = None,
+    elev: float = 15.0,
+    azim: float = -60.0,
+    dpi: int = 80,
+) -> None:
+    """Render two skeleton animations side-by-side into one MP4.
+
+    Same conventions as :func:`render_motion_video`. Both panes share
+    one object trajectory (the GT object is the same regardless of
+    which Stage-1/Stage-1.5 cond the body was sampled under).
+
+    Parameters
+    ----------
+    joints_left, joints_right : (T, 22, 3) — must share T.
+    suptitle : figure-level title across both panes.
+    title_left, title_right : per-pane sub-title.
+    object_positions / object_rotations / object_pc : optional, shared.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    T = min(len(joints_left), len(joints_right))
+    joints_left = joints_left[:T]
+    joints_right = joints_right[:T]
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    obj_cloud_world: np.ndarray | None = None
+    if object_pc is not None and object_positions is not None:
+        T_obj = min(T, len(object_positions))
+        if object_rotations is not None:
+            T_obj = min(T_obj, len(object_rotations))
+        N = object_pc.shape[0]
+        obj_cloud_world = np.empty((T_obj, N, 3), dtype=np.float32)
+        for t in range(T_obj):
+            if object_rotations is not None:
+                R = _axis_angle_to_rotmat(object_rotations[t])
+                obj_cloud_world[t] = object_pc @ R.T + object_positions[t]
+            else:
+                obj_cloud_world[t] = object_pc + object_positions[t]
+
+    # Shared axis limits — cover BOTH bodies + object so panes are
+    # visually comparable (same scale, same center).
+    all_pos = [
+        joints_left.reshape(-1, 3),
+        joints_right.reshape(-1, 3),
+    ]
+    if obj_cloud_world is not None:
+        all_pos.append(obj_cloud_world.reshape(-1, 3))
+    elif object_positions is not None:
+        all_pos.append(object_positions[:T])
+    all_pos = np.concatenate(all_pos, axis=0)
+    center = all_pos.mean(axis=0)
+    max_range = max((all_pos.max(axis=0) - all_pos.min(axis=0)).max() / 2 * 1.2, 0.5)
+
+    fig = plt.figure(figsize=(14, 7))
+    ax_l = fig.add_subplot(1, 2, 1, projection="3d")
+    ax_r = fig.add_subplot(1, 2, 2, projection="3d")
+
+    def _setup(ax, sub_title):
+        ax.set_xlim(center[0] - max_range, center[0] + max_range)
+        ax.set_ylim(center[2] - max_range, center[2] + max_range)
+        ax.set_zlim(center[1] - max_range, center[1] + max_range)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Z")
+        ax.set_zlabel("Y")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(sub_title)
+
+    _setup(ax_l, title_left)
+    _setup(ax_r, title_right)
+
+    def _make_pane(ax):
+        joint_scatter = ax.scatter([], [], [], c="blue", s=20)
+        lines = [
+            ax.plot([], [], [], c="gray", linewidth=1.5)[0]
+            for _ in SKELETON_CONNECTIONS
+        ]
+        obj_scatter = None
+        if obj_cloud_world is not None:
+            obj_scatter = ax.scatter(
+                [], [], [], c="red", s=2, marker="o", alpha=0.5,
+            )
+        elif object_positions is not None:
+            obj_scatter = ax.scatter([], [], [], c="red", s=30, marker="^")
+        return joint_scatter, lines, obj_scatter
+
+    js_l, ln_l, os_l = _make_pane(ax_l)
+    js_r, ln_r, os_r = _make_pane(ax_r)
+
+    suptitle_artist = fig.suptitle("", fontsize=10)
+
+    def _update_pane(t, joints, joint_scatter, lines, obj_scatter):
+        artists: list = []
+        joint_scatter._offsets3d = (
+            joints[t, :, 0], joints[t, :, 2], joints[t, :, 1],
+        )
+        artists.append(joint_scatter)
+        for (i, j), line in zip(SKELETON_CONNECTIONS, lines):
+            line.set_data(
+                [joints[t, i, 0], joints[t, j, 0]],
+                [joints[t, i, 2], joints[t, j, 2]],
+            )
+            line.set_3d_properties([joints[t, i, 1], joints[t, j, 1]])
+            artists.append(line)
+        if obj_scatter is not None:
+            if obj_cloud_world is not None and t < len(obj_cloud_world):
+                pos = obj_cloud_world[t]
+                obj_scatter._offsets3d = (pos[:, 0], pos[:, 2], pos[:, 1])
+            elif object_positions is not None and t < len(object_positions):
+                p = object_positions[t]
+                obj_scatter._offsets3d = ([p[0]], [p[2]], [p[1]])
+            artists.append(obj_scatter)
+        return artists
+
+    def update(t: int) -> list:
+        a1 = _update_pane(t, joints_left, js_l, ln_l, os_l)
+        a2 = _update_pane(t, joints_right, js_r, ln_r, os_r)
+        suptitle_artist.set_text(
+            f"{suptitle}\nFrame {t + 1}/{T} ({t / fps:.2f}s)"
+        )
+        return a1 + a2 + [suptitle_artist]
+
+    anim = FuncAnimation(
+        fig, update, frames=T, interval=1000 / fps, blit=False, repeat=False,
+    )
+
+    import os as _os
+    allow_broken = _os.environ.get(
+        "PIANO_ALLOW_BROKEN_GIF_FALLBACK", "0",
+    ) == "1"
+    suffix = output_path.suffix.lower()
+    try:
+        if suffix == ".mp4":
+            anim.save(str(output_path), writer="ffmpeg", fps=fps, dpi=dpi)
+        else:
+            anim.save(str(output_path), writer="pillow", fps=fps, dpi=dpi)
+    except Exception as e:
+        if allow_broken:
+            gif_path = output_path.with_suffix(".gif")
+            print(
+                f"  [warn] {e}; PIANO_ALLOW_BROKEN_GIF_FALLBACK=1, "
+                f"writing GIF to {gif_path}",
+            )
+            anim.save(str(gif_path), writer="pillow", fps=fps, dpi=dpi)
+            output_path = gif_path
+        else:
+            plt.close(fig)
+            raise RuntimeError(
+                f"render_motion_pair_video failed: {e}\n"
+                "Install ffmpeg or set PIANO_ALLOW_BROKEN_GIF_FALLBACK=1."
+            ) from e
+    finally:
+        plt.close(fig)
+
+    print(f"  Saved: {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Input source adapters
 # ---------------------------------------------------------------------------
 
